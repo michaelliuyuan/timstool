@@ -11,9 +11,9 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/config"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/reporter"
+	"github.com/michaelliuyuan/timstool/internal/common"
+	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/common/reporter"
 	"go.uber.org/zap"
 )
 

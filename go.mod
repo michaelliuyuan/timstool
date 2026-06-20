@@ -1,4 +1,4 @@
-module github.com/pg2tidb/pg2tidb-migrator
+module github.com/michaelliuyuan/timstool
 
 go 1.25.0
 

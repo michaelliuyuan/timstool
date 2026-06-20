@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/config"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/store"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/webapi"
+	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/store"
+	"github.com/michaelliuyuan/timstool/internal/webapi"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )

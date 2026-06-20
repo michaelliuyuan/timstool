@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/pg2tidb/pg2tidb-migrator/cmd"
+	"github.com/michaelliuyuan/timstool/cmd"
 )
 
 func main() {

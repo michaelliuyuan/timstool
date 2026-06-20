@@ -3,7 +3,7 @@ package common
 import (
 	"context"
 
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/reporter"
+	"github.com/michaelliuyuan/timstool/internal/common/reporter"
 )
 
 type SchemaMigrator interface {

@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pg2tidb/pg2tidb-migrator/internal/cdc"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/cdc"
+	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"go.uber.org/zap"
 )
 

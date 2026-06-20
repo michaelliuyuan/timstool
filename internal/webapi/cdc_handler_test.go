@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pg2tidb/pg2tidb-migrator/internal/cdc"
+	"github.com/michaelliuyuan/timstool/internal/cdc"
 )
 
 func writeCDCStatusFile(t *testing.T, path string, st cdc.CDCStatusFile) {

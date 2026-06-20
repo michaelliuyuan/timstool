@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/pg2tidb/pg2tidb-migrator/internal/cdc"
+	"github.com/michaelliuyuan/timstool/internal/cdc"
 )
 
 // CDCStatusResponse is returned by GET /api/v1/cdc/status.

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/config"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/orchestrator"
+	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/orchestrator"
 	"github.com/spf13/cobra"
 )
 

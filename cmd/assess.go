@@ -7,9 +7,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/pg2tidb/pg2tidb-migrator/internal/assess"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/config"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/logger"
+	"github.com/michaelliuyuan/timstool/internal/assess"
+	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/common/logger"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )

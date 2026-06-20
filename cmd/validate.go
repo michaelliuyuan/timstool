@@ -3,10 +3,10 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/config"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/logger"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/validator"
+	"github.com/michaelliuyuan/timstool/internal/common"
+	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/common/logger"
+	"github.com/michaelliuyuan/timstool/internal/validator"
 	"github.com/spf13/cobra"
 )
 

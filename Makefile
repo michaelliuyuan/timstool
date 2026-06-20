@@ -1,6 +1,6 @@
 .PHONY: build test lint clean fmt vet
 
-BINARY_NAME := pg2tidb
+BINARY_NAME := timstool
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS := -s -w -X main.Version=$(VERSION)
 BUILD_DIR := build

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/common/config"
 )
 
 type TargetChecker struct {

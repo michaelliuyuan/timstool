@@ -19,13 +19,13 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	lightningpkg "github.com/pg2tidb/pg2tidb-migrator/internal/lightning"
+	lightningpkg "github.com/michaelliuyuan/timstool/internal/lightning"
 
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/checkpoint"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/config"
-	cerrors "github.com/pg2tidb/pg2tidb-migrator/internal/common/errors"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/progress"
+	"github.com/michaelliuyuan/timstool/internal/common"
+	"github.com/michaelliuyuan/timstool/internal/common/checkpoint"
+	"github.com/michaelliuyuan/timstool/internal/common/config"
+	cerrors "github.com/michaelliuyuan/timstool/internal/common/errors"
+	"github.com/michaelliuyuan/timstool/internal/common/progress"
 	"go.uber.org/zap"
 )
 

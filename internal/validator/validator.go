@@ -16,10 +16,10 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/go-sql-driver/mysql"
 
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/config"
-	cerrors "github.com/pg2tidb/pg2tidb-migrator/internal/common/errors"
-	"github.com/pg2tidb/pg2tidb-migrator/internal/common/reporter"
+	"github.com/michaelliuyuan/timstool/internal/common"
+	"github.com/michaelliuyuan/timstool/internal/common/config"
+	cerrors "github.com/michaelliuyuan/timstool/internal/common/errors"
+	"github.com/michaelliuyuan/timstool/internal/common/reporter"
 	"go.uber.org/zap"
 )
 

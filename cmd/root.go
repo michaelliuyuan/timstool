@@ -10,7 +10,7 @@ import (
 var cfgFile string
 
 var rootCmd = &cobra.Command{
-	Use:   "pg2tidb",
+	Use:   "timstool",
 	Short: "PostgreSQL to TiDB full data migration tool",
 	Long: `pg2tidb is a CLI tool for migrating data from PostgreSQL to TiDB.
 
