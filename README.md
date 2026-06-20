@@ -1,6 +1,8 @@
-# pg2tidb
+# timstool
 
-一键式 PostgreSQL → TiDB 全量数据迁移工具，覆盖兼容性评估、Schema 迁移、全量数据迁移、数据校验四大能力，并含**可选的 CDC 增量同步**（PostgreSQL → TiDB 实时增量 + DDL 复制，默认关闭）。支持 CLI 和 Web 管理界面两种使用方式。
+**TiDB 多源异构数据同步工具**（TiDB Multi-source Integrated Tool）—— 多源异构数据库 → TiDB 迁移/同步工具。当前以 PostgreSQL → TiDB 全量迁移（含可选 CDC 增量同步 + DDL 复制）为首个已实现源，架构上扩展为多源（MySQL/Oracle/SqlServer/DB2 … → TiDB）。
+
+覆盖兼容性评估、Schema 迁移、全量数据迁移、数据校验四大能力，并含**可选的 CDC 增量同步**（实时增量 + DDL 复制，默认关闭）。支持 CLI 和 Web 管理界面两种使用方式。
 
 ## 特性
 
