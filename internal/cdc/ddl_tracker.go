@@ -1,0 +1,391 @@
+package cdc
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"regexp"
+	"strings"
+	"sync"
+
+	"go.uber.org/zap"
+)
+
+// DDLTracker monitors PG DDL changes and transforms them for TiDB.
+// It uses PG's event trigger facility to capture DDL statements.
+type DDLTracker struct {
+	db  *sql.DB
+	log *zap.Logger
+
+	mu        sync.Mutex
+	ddlLog    []DDLEntry
+	filter    *TableFilter
+	transform *DDLTransformer
+}
+
+// DDLEntry records a captured DDL statement.
+type DDLEntry struct {
+	ID         int64  `json:"id"` // pg2tidb_ddl_log.id (DDL checkpoint cursor, #t59)
+	LSN        string `json:"lsn"`
+	Schema     string `json:"schema"`
+	ObjectName string `json:"object_name"`
+	ObjectType string `json:"object_type"` // TABLE, INDEX, VIEW, FUNCTION, etc.
+	DDL        string `json:"ddl"`
+	TiDBDDL    string `json:"tidb_ddl,omitempty"`
+}
+
+// DDLTransformer converts PG DDL statements to TiDB-compatible DDL.
+type DDLTransformer struct{}
+
+// NewDDLTransformer creates a new DDL transformer.
+func NewDDLTransformer() *DDLTransformer {
+	return &DDLTransformer{}
+}
+
+// NewDDLTracker creates a new DDL tracker.
+func NewDDLTracker(db *sql.DB, filter *TableFilter) *DDLTracker {
+	if filter == nil {
+		filter = NewTableFilter()
+	}
+	return &DDLTracker{
+		db:        db,
+		log:       zap.NewNop(),
+		filter:    filter,
+		transform: NewDDLTransformer(),
+	}
+}
+
+// SetLogger sets the logger.
+func (t *DDLTracker) SetLogger(log *zap.Logger) {
+	t.log = log
+}
+
+// SetupEventTrigger creates the PG event trigger function and trigger
+// to capture DDL changes. Call this once during initialization.
+func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
+	// Create the event trigger function
+	_, err := t.db.ExecContext(ctx, `
+		CREATE OR REPLACE FUNCTION pg2tidb_ddl_capture()
+		RETURNS event_trigger
+		LANGUAGE plpgsql AS $$
+		DECLARE
+			r RECORD;
+		BEGIN
+			FOR r IN SELECT * FROM pg_event_trigger_ddl_commands()
+			LOOP
+				INSERT INTO pg2tidb_ddl_log (ddl_time, schema_name, object_name,
+					object_type, ddl_command, txid)
+				VALUES (now(), r.schema_name, r.object_identity,
+					r.object_type, current_query(), txid_current());
+			END LOOP;
+		END;
+		$$;
+	`)
+	if err != nil {
+		return fmt.Errorf("create event trigger function: %w", err)
+	}
+
+	// Create the DDL log table
+	_, err = t.db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS pg2tidb_ddl_log (
+			id SERIAL PRIMARY KEY,
+			ddl_time TIMESTAMPTZ DEFAULT now(),
+			schema_name TEXT,
+			object_name TEXT,
+			object_type TEXT,
+			ddl_command TEXT,
+			txid BIGINT,
+			lsn_txid BIGINT
+		);
+	`)
+	if err != nil {
+		return fmt.Errorf("create ddl log table: %w", err)
+	}
+
+	// Create the event trigger (ddl_command_end captures CREATE/ALTER).
+	_, err = t.db.ExecContext(ctx, `
+		DROP EVENT TRIGGER IF EXISTS pg2tidb_ddl_trigger;
+		CREATE EVENT TRIGGER pg2tidb_ddl_trigger
+		ON ddl_command_end
+		EXECUTE FUNCTION pg2tidb_ddl_capture();
+	`)
+	if err != nil {
+		return fmt.Errorf("create event trigger: %w", err)
+	}
+
+	// DROP commands are NOT surfaced by pg_event_trigger_ddl_commands() at
+	// ddl_command_end — PG exposes dropped objects only via the sql_drop event +
+	// pg_event_trigger_dropped_objects(). Without this, DROP TABLE is never
+	// captured and the target schema drifts (#t61). For each dropped TABLE we
+	// synthesize a clean `DROP TABLE <schema>.<name>` (CASCADE sub-objects —
+	// sequences/indexes/constraints — are not logged; the table DROP cascades
+	// on the target). shouldApplyDDL routes DROP TABLE → table → apply.
+	_, err = t.db.ExecContext(ctx, `
+		CREATE OR REPLACE FUNCTION pg2tidb_ddl_drop_capture()
+		RETURNS event_trigger
+		LANGUAGE plpgsql AS $$
+		DECLARE
+			r RECORD;
+		BEGIN
+			FOR r IN SELECT * FROM pg_event_trigger_dropped_objects()
+			LOOP
+				IF r.object_type = 'table' THEN
+					INSERT INTO pg2tidb_ddl_log (ddl_time, schema_name, object_name,
+						object_type, ddl_command, txid)
+					VALUES (now(), r.schema_name, r.object_name, r.object_type,
+						'DROP TABLE ' || quote_ident(r.object_name),
+						txid_current());
+				END IF;
+			END LOOP;
+		END;
+		$$;
+	`)
+	if err != nil {
+		return fmt.Errorf("create ddl drop capture function: %w", err)
+	}
+	_, err = t.db.ExecContext(ctx, `
+		DROP EVENT TRIGGER IF EXISTS pg2tidb_ddl_drop_trigger;
+		CREATE EVENT TRIGGER pg2tidb_ddl_drop_trigger
+		ON sql_drop
+		EXECUTE FUNCTION pg2tidb_ddl_drop_capture();
+	`)
+	if err != nil {
+		return fmt.Errorf("create sql_drop event trigger: %w", err)
+	}
+
+	t.log.Info("ddl tracker: event trigger setup complete")
+	return nil
+}
+
+// TeardownEventTrigger removes the event triggers and capture functions.
+func (t *DDLTracker) TeardownEventTrigger(ctx context.Context) error {
+	_, err := t.db.ExecContext(ctx, `DROP EVENT TRIGGER IF EXISTS pg2tidb_ddl_trigger;`)
+	if err != nil {
+		t.log.Warn("drop event trigger", zap.Error(err))
+	}
+	_, err = t.db.ExecContext(ctx, `DROP EVENT TRIGGER IF EXISTS pg2tidb_ddl_drop_trigger;`)
+	if err != nil {
+		t.log.Warn("drop sql_drop event trigger", zap.Error(err))
+	}
+	_, err = t.db.ExecContext(ctx, `DROP FUNCTION IF EXISTS pg2tidb_ddl_capture();`)
+	if err != nil {
+		t.log.Warn("drop event trigger function", zap.Error(err))
+	}
+	_, err = t.db.ExecContext(ctx, `DROP FUNCTION IF EXISTS pg2tidb_ddl_drop_capture();`)
+	if err != nil {
+		t.log.Warn("drop sql_drop event trigger function", zap.Error(err))
+	}
+	return nil
+}
+
+// FetchNewDDL queries the DDL log for entries since the last checkpoint.
+func (t *DDLTracker) FetchNewDDL(ctx context.Context, sinceID int64) ([]DDLEntry, error) {
+	rows, err := t.db.QueryContext(ctx, `
+		SELECT id, ddl_time, schema_name, object_name, object_type, ddl_command
+		FROM pg2tidb_ddl_log
+		WHERE id > $1
+		ORDER BY id ASC
+	`, sinceID)
+	if err != nil {
+		return nil, fmt.Errorf("fetch ddl log: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []DDLEntry
+	for rows.Next() {
+		var id int64
+		var e DDLEntry
+		if err := rows.Scan(&id, &e.LSN, &e.Schema, &e.ObjectName,
+			&e.ObjectType, &e.DDL); err != nil {
+			return nil, fmt.Errorf("scan ddl entry: %w", err)
+		}
+		e.ID = id
+		e.LSN = fmt.Sprintf("ddl_%d", id)
+
+		// Transform DDL for TiDB
+		if t.filter.Allow(e.Schema, e.ObjectName) {
+			e.TiDBDDL = t.transform.Transform(e.DDL, e.ObjectType)
+			entries = append(entries, e)
+		}
+	}
+
+	t.mu.Lock()
+	t.ddlLog = append(t.ddlLog, entries...)
+	if len(t.ddlLog) > 1000 {
+		t.ddlLog = t.ddlLog[len(t.ddlLog)-1000:]
+	}
+	t.mu.Unlock()
+
+	return entries, nil
+}
+
+// RecentDDL returns the last N DDL entries.
+func (t *DDLTracker) RecentDDL(n int) []DDLEntry {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if n <= 0 || n > len(t.ddlLog) {
+		n = len(t.ddlLog)
+	}
+	return t.ddlLog[len(t.ddlLog)-n:]
+}
+
+// shouldApplyDDL reports whether a captured DDL entry should be applied to the
+// target. PG's ddl_command_end fires once per affected sub-object: a
+// `CREATE TABLE ... SERIAL PRIMARY KEY` emits rows for the sequence, the table,
+// AND the PK index — all carrying the same CREATE TABLE query. Only the entry
+// whose object type is the statement's primary object is applied; piggybacked
+// sub-objects are skipped (sequences → TiDB column AUTO_INCREMENT; a table's PK
+// index → created with the table). A standalone CREATE INDEX (its own
+// statement, object_type=index) IS applied. #t61.
+func shouldApplyDDL(e DDLEntry) bool {
+	ot := strings.ToUpper(e.ObjectType)
+	if ot == "SEQUENCE" {
+		return false // PG sequence → TiDB AUTO_INCREMENT; never replicate
+	}
+	ddl := strings.ToUpper(strings.TrimSpace(e.DDL))
+	switch {
+	case strings.HasPrefix(ddl, "CREATE TABLE"),
+		strings.HasPrefix(ddl, "ALTER TABLE"),
+		strings.HasPrefix(ddl, "DROP TABLE"):
+		return ot == "TABLE" // a sequence/index row riding a TABLE stmt → skip
+	case strings.HasPrefix(ddl, "CREATE UNIQUE INDEX"),
+		strings.HasPrefix(ddl, "CREATE INDEX"),
+		strings.HasPrefix(ddl, "DROP INDEX"):
+		return ot == "INDEX" // standalone index DDL → apply; non-index row → skip
+	}
+	// Other statement shapes (e.g. CREATE SEQUENCE) → out of scope; skip.
+	return false
+}
+
+// Transform converts a PG DDL statement to TiDB-compatible DDL.
+func (dt *DDLTransformer) Transform(ddl string, objectType string) string {
+	ddl = strings.TrimSpace(ddl)
+
+	switch strings.ToUpper(objectType) {
+	case "TABLE":
+		return dt.transformTableDDL(ddl)
+	case "INDEX":
+		return dt.transformIndexDDL(ddl)
+	case "VIEW":
+		return dt.transformViewDDL(ddl)
+	case "FUNCTION":
+		return dt.transformFunctionDDL(ddl)
+	case "TRIGGER":
+		return dt.transformTriggerDDL(ddl)
+	default:
+		return "-- TODO: transform " + objectType + "\n" + ddl
+	}
+}
+
+// ddlTableSchemaPrefixRe matches a PG schema qualifier on the leading table
+// reference of a CREATE/ALTER/DROP TABLE statement (e.g. "public." in
+// "CREATE TABLE public.foo"). TiDB has no schemas (only databases), so a PG
+// schema qualifier would be read as a *database* name and land in the wrong
+// place; it must be stripped so the table goes into the connected target
+// database — matching the DML side's quotedTable (unqualified name). Group 1
+// preserves the verb + optional IF [NOT] EXISTS (added by makeDDLIdempotent).
+var ddlTableSchemaPrefixRe = regexp.MustCompile(`(?i)^((?:CREATE|ALTER|DROP)\s+TABLE\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?)(?:"[a-zA-Z0-9_]+"|[a-zA-Z_][a-zA-Z0-9_]*)\.`)
+
+func (dt *DDLTransformer) transformTableDDL(ddl string) string {
+	// Cheap at-least-once idempotency (#t59 §4.2): CREATE/DROP get IF NOT
+	// EXISTS / IF EXISTS so a replayed DDL doesn't error. ALTER is not
+	// idempotent and relies on the ddl_log.id checkpoint to avoid replay
+	// (a crash-window replay that errors → halt, not silently masked).
+	ddl = makeDDLIdempotent(ddl)
+	upper := strings.ToUpper(ddl)
+
+	// Replace PG-specific types
+	ddl = strings.ReplaceAll(ddl, "SERIAL", "BIGINT AUTO_INCREMENT")
+	ddl = strings.ReplaceAll(ddl, "BIGSERIAL", "BIGINT AUTO_INCREMENT")
+	ddl = strings.ReplaceAll(ddl, "SMALLSERIAL", "INT AUTO_INCREMENT")
+	ddl = strings.ReplaceAll(ddl, "TEXT[]", "JSON")
+	ddl = strings.ReplaceAll(ddl, "INTEGER[]", "JSON")
+	ddl = strings.ReplaceAll(ddl, "VARCHAR[]", "JSON")
+	ddl = strings.ReplaceAll(ddl, "BYTEA", "BLOB")
+	ddl = strings.ReplaceAll(ddl, "TIMESTAMP WITH TIME ZONE", "TIMESTAMP")
+	ddl = strings.ReplaceAll(ddl, "TIMESTAMP WITHOUT TIME ZONE", "DATETIME")
+	ddl = strings.ReplaceAll(ddl, "TIMESTAMPTZ", "TIMESTAMP")
+	ddl = strings.ReplaceAll(ddl, "BOOLEAN", "BOOLEAN") // same in both
+	ddl = strings.ReplaceAll(ddl, "JSONB", "JSON")
+	ddl = strings.ReplaceAll(ddl, "UUID", "CHAR(36)")
+	ddl = strings.ReplaceAll(ddl, "MONEY", "DECIMAL(19,2)")
+
+	// Replace PG-specific syntax
+	ddl = strings.ReplaceAll(ddl, "IF NOT EXISTS", "IF NOT EXISTS")         // same
+	ddl = strings.ReplaceAll(ddl, "ON DELETE CASCADE", "ON DELETE CASCADE") // same
+
+	// Replace PG-only USING clauses in index creation
+	if strings.Contains(upper, "USING BTREE") {
+		ddl = strings.ReplaceAll(ddl, "USING BTREE", "")
+		ddl = strings.ReplaceAll(ddl, "USING btree", "")
+	}
+	if strings.Contains(upper, "USING HASH") {
+		ddl = strings.ReplaceAll(ddl, "USING HASH", "")
+		ddl = strings.ReplaceAll(ddl, "USING hash", "")
+	}
+
+	// Strip PG schema qualifier (schema.table → table): TiDB has no schemas, so a
+	// PG "public.foo" is read as database "public" and lands in the wrong place.
+	// Applied uniformly to CREATE/ALTER/DROP, matching the DML side's quotedTable
+	// (unqualified → target database). #t61.
+	ddl = ddlTableSchemaPrefixRe.ReplaceAllString(ddl, "${1}")
+
+	return ddl
+}
+
+func (dt *DDLTransformer) transformIndexDDL(ddl string) string {
+	upper := strings.ToUpper(ddl)
+
+	// Remove PG-only index methods
+	if strings.Contains(upper, "USING GIN") || strings.Contains(upper, "USING gin") {
+		return "-- GIN index not supported in TiDB, consider JSON index alternative:\n-- " + ddl
+	}
+	if strings.Contains(upper, "USING GIST") || strings.Contains(upper, "USING gist") {
+		return "-- GiST index not supported in TiDB:\n-- " + ddl
+	}
+	if strings.Contains(upper, "USING BRIN") || strings.Contains(upper, "USING brin") {
+		return "-- BRIN index not supported in TiDB, use partitioning instead:\n-- " + ddl
+	}
+
+	ddl = strings.ReplaceAll(ddl, "USING BTREE", "")
+	ddl = strings.ReplaceAll(ddl, "USING btree", "")
+	ddl = strings.ReplaceAll(ddl, "USING HASH", "")
+	ddl = strings.ReplaceAll(ddl, "USING hash", "")
+
+	// Partial index → comment out
+	if strings.Contains(upper, " WHERE ") || strings.Contains(upper, " WHERE\n") {
+		return "-- Partial index not supported in TiDB:\n-- " + ddl
+	}
+
+	return ddl
+}
+
+func (dt *DDLTransformer) transformViewDDL(ddl string) string {
+	// Views need manual review; return commented-out
+	return "-- View needs manual review for TiDB compatibility:\n-- " + ddl
+}
+
+func (dt *DDLTransformer) transformFunctionDDL(ddl string) string {
+	return "-- Functions not supported in TiDB, use application logic:\n-- " + ddl
+}
+
+func (dt *DDLTransformer) transformTriggerDDL(ddl string) string {
+	// Basic trigger transformation: plpgsql → application logic comment
+	return "-- Trigger needs conversion to application logic for TiDB:\n-- " + ddl
+}
+
+// makeDDLIdempotent rewrites a CREATE/DROP TABLE statement to be safely
+// replayable (IF NOT EXISTS / IF EXISTS) for at-least-once DDL apply (#t59 §4.2).
+// Statements already carrying the guard, and non-CREATE/DROP DDL (ALTER), are
+// returned unchanged — ALTER is not cheaply idempotent and relies on the
+// ddl_log.id checkpoint to avoid replay.
+func makeDDLIdempotent(ddl string) string {
+	upper := strings.ToUpper(ddl)
+	if idx := strings.Index(upper, "CREATE TABLE"); idx >= 0 && !strings.Contains(upper, "IF NOT EXISTS") {
+		return ddl[:idx] + "CREATE TABLE IF NOT EXISTS" + ddl[idx+len("CREATE TABLE"):]
+	}
+	if idx := strings.Index(upper, "DROP TABLE"); idx >= 0 && !strings.Contains(upper, "IF EXISTS") {
+		return ddl[:idx] + "DROP TABLE IF EXISTS" + ddl[idx+len("DROP TABLE"):]
+	}
+	return ddl
+}

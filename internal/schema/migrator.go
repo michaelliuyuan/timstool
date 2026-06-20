@@ -1,0 +1,349 @@
+package schema
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/pg2tidb/pg2tidb-migrator/internal/common"
+	"github.com/pg2tidb/pg2tidb-migrator/internal/common/config"
+	cerrors "github.com/pg2tidb/pg2tidb-migrator/internal/common/errors"
+	"github.com/pg2tidb/pg2tidb-migrator/internal/common/reporter"
+	"go.uber.org/zap"
+)
+
+type Migrator struct {
+	cfg config.Config
+}
+
+func NewMigrator(cfg config.Config) *Migrator {
+	return &Migrator{cfg: cfg}
+}
+
+func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
+	logger := zap.L()
+	logger.Info("starting schema migration")
+
+	pgDB, err := sql.Open("pgx", m.cfg.Source.DSN())
+	if err != nil {
+		return cerrors.Wrap(cerrors.ErrSourceConnect, "connect to PostgreSQL", err)
+	}
+	defer pgDB.Close()
+
+	if err := pgDB.PingContext(ctx); err != nil {
+		return cerrors.Wrap(cerrors.ErrSourceConnect, "ping PostgreSQL", err)
+	}
+	logger.Info("connected to PostgreSQL", zap.String("host", m.cfg.Source.Host))
+
+	collector := NewCollector(pgDB)
+	schema := m.cfg.Source.Schema
+	if schema == "" {
+		schema = "public"
+	}
+
+	tables, err := collector.CollectTables(ctx, schema, opts.ExcludeTables)
+	if err != nil {
+		return cerrors.Wrap(cerrors.ErrSchemaFetch, "collect tables", err)
+	}
+	logger.Info("collected tables", zap.Int("count", len(tables)))
+
+	views, err := collector.CollectViews(ctx, schema)
+	if err != nil {
+		logger.Warn("failed to collect views", zap.Error(err))
+	}
+
+	enums, err := collector.CollectEnums(ctx, schema)
+	if err != nil {
+		logger.Warn("failed to collect enums", zap.Error(err))
+	}
+
+	unsupported, err := collector.CollectUnsupported(ctx, schema)
+	if err != nil {
+		logger.Warn("failed to collect unsupported objects", zap.Error(err))
+	}
+
+	schemaInfo := &SchemaInfo{
+		Tables:      tables,
+		Views:       views,
+		Enums:       enums,
+		Unsupported: unsupported,
+	}
+
+	builder := NewDDLBuilder()
+	for _, enum := range schemaInfo.Enums {
+		ddl := builder.BuildEnumDDL(enum)
+		builder.statements = append(builder.statements, ddl)
+	}
+
+	rpt := reporter.NewReport("schema-migration")
+
+	checker := NewTargetChecker(m.cfg)
+
+	if !opts.DryRun && opts.OutputFile == "" {
+		if m.cfg.Migration.TargetPolicy != "truncate" && m.cfg.Migration.TargetPolicy != "drop" {
+			if err := checker.LoadExistingTables(ctx); err != nil {
+				logger.Warn("failed to check existing tables, proceeding without skip", zap.Error(err))
+			}
+			if len(checker.ExistingTables()) > 0 {
+				logger.Info("found existing tables in target", zap.Int("count", len(checker.ExistingTables())))
+			}
+		} else {
+			logger.Info("target policy is " + m.cfg.Migration.TargetPolicy + ", will recreate existing tables")
+		}
+	}
+
+	if m.cfg.Migration.TargetPolicy == "truncate" || m.cfg.Migration.TargetPolicy == "drop" {
+		builder.statements = append(builder.statements,
+			"SET FOREIGN_KEY_CHECKS = 0")
+	}
+
+	var deferredFKs []string
+
+	for _, table := range schemaInfo.Tables {
+		policy := m.cfg.Migration.TargetPolicy
+		if checker.TableExists(table.Name) && policy != "truncate" && policy != "drop" {
+			logger.Info("table already exists in target, skipping", zap.String("table", table.Name))
+			builder.statements = append(builder.statements,
+				fmt.Sprintf("-- Table: %s (SKIPPED: already exists in target)", table.Name))
+			rpt.AddTableReport(reporter.TableReport{
+				TableName:  table.Name,
+				Status:     reporter.StatusSkip,
+				SourceRows: int64(len(table.Columns)),
+			})
+			continue
+		}
+
+		if policy == "drop" {
+			builder.statements = append(builder.statements,
+				fmt.Sprintf("DROP TABLE IF EXISTS %s", QuoteIdentifier(table.Name)))
+		} else if checker.TableExists(table.Name) && policy == "truncate" {
+			builder.statements = append(builder.statements,
+				fmt.Sprintf("DROP TABLE IF EXISTS %s", QuoteIdentifier(table.Name)))
+		}
+
+		tableStart := fmt.Sprintf("-- Table: %s", table.Name)
+		builder.statements = append(builder.statements, tableStart)
+
+		if err := builder.BuildTableDDL(table); err != nil {
+			logger.Error(fmt.Sprintf("failed to build table DDL: %s", table.Name), zap.Error(err))
+			rpt.AddTableReport(reporter.TableReport{
+				TableName: table.Name,
+				Status:    reporter.StatusFail,
+				Error:     err.Error(),
+			})
+			continue
+		}
+		logger.Info(fmt.Sprintf("built table DDL: %s", table.Name))
+
+		for _, idx := range table.Indexes {
+			if idx.IsPrimary {
+				continue
+			}
+			idxDDL := builder.BuildIndexDDL(idx)
+			if idxDDL != "" {
+				builder.statements = append(builder.statements, idxDDL)
+			}
+		}
+
+		for _, fk := range table.ForeignKeys {
+			fkDDL := builder.BuildForeignKeyDDL(fk)
+			deferredFKs = append(deferredFKs, fkDDL)
+		}
+
+		rpt.AddTableReport(reporter.TableReport{
+			TableName: table.Name,
+			Status:    reporter.StatusPass,
+			SourceRows: int64(len(table.Columns)),
+		})
+	}
+
+	if len(deferredFKs) > 0 {
+		builder.statements = append(builder.statements, "-- Foreign Keys (deferred)")
+		builder.statements = append(builder.statements, deferredFKs...)
+	}
+
+	if m.cfg.Migration.TargetPolicy == "truncate" || m.cfg.Migration.TargetPolicy == "drop" {
+		builder.statements = append(builder.statements,
+			"SET FOREIGN_KEY_CHECKS = 1")
+	}
+
+	for _, view := range schemaInfo.Views {
+		if checker.TableExists(view.Name) {
+			logger.Info("view already exists in target, will use CREATE OR REPLACE", zap.String("view", view.Name))
+		}
+		viewDDL := builder.BuildViewDDL(view)
+		builder.statements = append(builder.statements, viewDDL)
+	}
+
+	for _, obj := range schemaInfo.Unsupported {
+		logger.Warn("unsupported object",
+			zap.String("type", string(obj.Type)),
+			zap.String("name", obj.Name),
+			zap.String("note", obj.Note))
+		builder.statements = append(builder.statements,
+			fmt.Sprintf("-- UNSUPPORTED: %s %s - %s", obj.Type, obj.Name, obj.Note))
+	}
+
+	sql := builder.JoinSQL()
+
+	if opts.OutputFile != "" {
+		if err := os.WriteFile(opts.OutputFile, []byte(sql), 0644); err != nil {
+			return cerrors.Wrap(cerrors.ErrSchemaApply, "write DDL file", err)
+		}
+		logger.Info("DDL written to file", zap.String("path", opts.OutputFile))
+	}
+
+	if !opts.DryRun && opts.OutputFile == "" {
+		zap.L().Info("executing DDL on TiDB", zap.Int("statements", len(builder.Statements())))
+		if err := m.executeDDL(ctx, sql); err != nil {
+			zap.L().Error("DDL execution failed, full SQL", zap.String("ddl", truncate(sql, 5000)))
+			return cerrors.Wrap(cerrors.ErrSchemaApply, "execute DDL", err)
+		}
+		logger.Info("DDL executed on TiDB")
+	}
+
+	if len(schemaInfo.Unsupported) > 0 {
+		m.writeUnsupportedLog(schemaInfo.Unsupported)
+	}
+
+	rpt.Finish(rpt.OverallStatus(), fmt.Sprintf("migrated %d tables, %d views, %d unsupported objects",
+		len(tables), len(views), len(unsupported)))
+
+	logger.Info("schema migration completed",
+		zap.Int("tables", len(tables)),
+		zap.Int("views", len(views)),
+		zap.Int("unsupported", len(unsupported)))
+
+	return nil
+}
+
+func (m *Migrator) executeDDL(ctx context.Context, ddl string) error {
+	tidbDB, err := sql.Open("mysql", m.cfg.Target.DSN())
+	if err != nil {
+		return fmt.Errorf("connect to TiDB: %w", err)
+	}
+	defer tidbDB.Close()
+
+	statements := strings.Split(ddl, ";")
+	executed := 0
+	failed := 0
+	for _, stmt := range statements {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		lines := strings.Split(stmt, "\n")
+		allComments := true
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line != "" && !strings.HasPrefix(line, "--") {
+				allComments = false
+				break
+			}
+		}
+		if allComments {
+			continue
+		}
+
+		action := extractDDLAction(stmt)
+		objectName := extractObjectName(stmt)
+		label := action
+		if objectName != "" {
+			label = fmt.Sprintf("%s %s", action, objectName)
+		}
+
+		var lastErr error
+		maxRetries := 3
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			if _, err := tidbDB.ExecContext(ctx, stmt); err != nil {
+				// Skip duplicate foreign key / index errors (idempotent re-run)
+				errStr := err.Error()
+				if strings.Contains(errStr, "Duplicate foreign key") ||
+					strings.Contains(errStr, "Duplicate key name") ||
+					strings.Contains(errStr, "1826") ||
+					strings.Contains(errStr, "1061") {
+					zap.L().Info(fmt.Sprintf("DDL SKIP (already exists): %s", label))
+					lastErr = nil
+					break
+				}
+				lastErr = err
+				if attempt < maxRetries {
+					zap.L().Warn(fmt.Sprintf("DDL %s failed (attempt %d/%d), retrying...", label, attempt, maxRetries), zap.Error(err))
+					time.Sleep(time.Duration(attempt) * time.Second)
+					continue
+				}
+				failed++
+				zap.L().Error(fmt.Sprintf("DDL failed: %s (after %d attempts)", label, maxRetries), zap.Error(err))
+				zap.L().Error(fmt.Sprintf("Failed DDL: %s", truncate(stmt, 500)))
+				if m.cfg.Migration.OnError != "skip" {
+					return fmt.Errorf("execute DDL: %w", err)
+				}
+			} else {
+				lastErr = nil
+				zap.L().Info(fmt.Sprintf("DDL OK: %s", label))
+				break
+			}
+		}
+		if lastErr != nil {
+			_ = lastErr
+		}
+		executed++
+	}
+	zap.L().Info(fmt.Sprintf("DDL execution completed: %d executed, %d failed", executed, failed))
+	return nil
+}
+
+func extractDDLAction(stmt string) string {
+	upper := strings.ToUpper(strings.TrimSpace(stmt))
+	switch {
+	case strings.HasPrefix(upper, "DROP TABLE"):
+		return "DROP TABLE"
+	case strings.HasPrefix(upper, "CREATE TABLE"):
+		return "CREATE TABLE"
+	case strings.HasPrefix(upper, "CREATE UNIQUE INDEX"):
+		return "CREATE UNIQUE INDEX"
+	case strings.HasPrefix(upper, "CREATE INDEX"):
+		return "CREATE INDEX"
+	case strings.HasPrefix(upper, "ALTER TABLE"):
+		return "ALTER TABLE"
+	case strings.HasPrefix(upper, "SET "):
+		return "SET"
+	default:
+		return "DDL"
+	}
+}
+
+func extractObjectName(stmt string) string {
+	upper := strings.ToUpper(stmt)
+	if strings.HasPrefix(upper, "SET ") || strings.HasPrefix(upper, "--") {
+		return ""
+	}
+	m := regexp.MustCompile("(?i)^(?:DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?|CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?|ALTER\\s+TABLE\\s+|CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+)`?([^`\\s(]+)")
+	match := m.FindStringSubmatch(stmt)
+	if len(match) >= 2 {
+		return match[1]
+	}
+	return ""
+}
+
+func (m *Migrator) writeUnsupportedLog(objects []Object) {
+	var lines []string
+	for _, obj := range objects {
+		lines = append(lines, fmt.Sprintf("%s\t%s\t%s", obj.Type, obj.Name, obj.Note))
+	}
+	content := "Type\tName\tNote\n" + strings.Join(lines, "\n") + "\n"
+	_ = os.WriteFile("unsupported-objects.log", []byte(content), 0644)
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}

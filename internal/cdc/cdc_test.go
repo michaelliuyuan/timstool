@@ -1,0 +1,688 @@
+package cdc
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/jackc/pglogrepl"
+	"go.uber.org/zap"
+)
+
+func TestTransformer_Insert(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+
+	event := &CDCEvent{
+		Kind:   EventInsert,
+		Schema: "public",
+		Table:  "users",
+		Columns: []ColumnValue{
+			{Name: "id", Value: "1", Type: "oid_23"},
+			{Name: "name", Value: "Alice", Type: "oid_25"},
+			{Name: "email", Value: "alice@example.com", Type: "oid_25"},
+		},
+	}
+
+	sql, err := tr.TransformEvent(event)
+	if err != nil {
+		t.Fatalf("TransformEvent(insert): %v", err)
+	}
+
+	expected := "REPLACE INTO `users` (`id`, `name`, `email`) VALUES ('1', 'Alice', 'alice@example.com')"
+	if sql != expected {
+		t.Errorf("got:\n  %s\nwant:\n  %s", sql, expected)
+	}
+}
+
+func TestTransformer_Update(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+
+	event := &CDCEvent{
+		Kind:   EventUpdate,
+		Schema: "public",
+		Table:  "users",
+		Columns: []ColumnValue{
+			{Name: "id", Value: "1", Type: "oid_23", IsKey: true},
+			{Name: "name", Value: "Bob", Type: "oid_25"},
+		},
+		OldColumns: []ColumnValue{
+			{Name: "id", Value: "1", Type: "oid_23", IsKey: true},
+			{Name: "name", Value: "Alice", Type: "oid_25"},
+		},
+	}
+
+	sql, err := tr.TransformEvent(event)
+	if err != nil {
+		t.Fatalf("TransformEvent(update): %v", err)
+	}
+
+	// WHERE targets the PK (id) from the old image, not the full row.
+	expected := "UPDATE `users` SET `id` = '1', `name` = 'Bob' WHERE `id` = '1'"
+	if sql != expected {
+		t.Errorf("got:\n  %s\nwant:\n  %s", sql, expected)
+	}
+}
+
+func TestTransformer_Delete(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+
+	event := &CDCEvent{
+		Kind:   EventDelete,
+		Schema: "public",
+		Table:  "users",
+		Columns: []ColumnValue{
+			{Name: "id", Value: "42", Type: "oid_23", IsKey: true},
+		},
+	}
+
+	sql, err := tr.TransformEvent(event)
+	if err != nil {
+		t.Fatalf("TransformEvent(delete): %v", err)
+	}
+
+	expected := "DELETE FROM `users` WHERE `id` = '42'"
+	if sql != expected {
+		t.Errorf("got:\n  %s\nwant:\n  %s", sql, expected)
+	}
+}
+
+// TestTransformer_UpdateNonKeyFallback covers #t48 Bug#5: under REPLICA IDENTITY
+// DEFAULT a non-key UPDATE carries NO old tuple, so the WHERE must be built from
+// the new image's PK (unchanged for a non-key update), not the new full-row
+// values. The old code built WHERE name='v_upd' and matched 0 rows.
+func TestTransformer_UpdateNonKeyFallback(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+
+	event := &CDCEvent{
+		Kind:   EventUpdate,
+		Schema: "public",
+		Table:  "users",
+		// No OldColumns: DEFAULT replica identity, non-key column change.
+		Columns: []ColumnValue{
+			{Name: "id", Value: "1", Type: "oid_23", IsKey: true},
+			{Name: "name", Value: "v_upd", Type: "oid_25"},
+		},
+	}
+
+	sql, err := tr.TransformEvent(event)
+	if err != nil {
+		t.Fatalf("TransformEvent(update non-key): %v", err)
+	}
+
+	expected := "UPDATE `users` SET `id` = '1', `name` = 'v_upd' WHERE `id` = '1'"
+	if sql != expected {
+		t.Errorf("got:\n  %s\nwant:\n  %s", sql, expected)
+	}
+}
+
+// TestTransformer_DeleteKeyImage covers #t48 Bug#5 DELETE: under DEFAULT the
+// 'K' key image carries only the PK (tagged IsKey), so the WHERE targets the PK.
+func TestTransformer_DeleteKeyImage(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+
+	event := &CDCEvent{
+		Kind:   EventDelete,
+		Schema: "public",
+		Table:  "users",
+		Columns: []ColumnValue{
+			{Name: "id", Value: "7", Type: "oid_23", IsKey: true},
+		},
+	}
+
+	sql, err := tr.TransformEvent(event)
+	if err != nil {
+		t.Fatalf("TransformEvent(delete key image): %v", err)
+	}
+
+	expected := "DELETE FROM `users` WHERE `id` = '7'"
+	if sql != expected {
+		t.Errorf("got:\n  %s\nwant:\n  %s", sql, expected)
+	}
+}
+
+// TestTransformer_NoPKErrors covers architect principle #2: a table with no
+// usable replica identity (no IsKey column) must error on UPDATE/DELETE rather
+// than emit a silent 0-row no-op.
+func TestTransformer_NoPKErrors(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+
+	upd := &CDCEvent{
+		Kind:   EventUpdate,
+		Schema: "public",
+		Table:  "heap",
+		Columns: []ColumnValue{
+			{Name: "name", Value: "x", Type: "oid_25"}, // no IsKey
+		},
+	}
+	if _, err := tr.TransformEvent(upd); err == nil {
+		t.Error("expected error for UPDATE on table without PK")
+	}
+
+	del := &CDCEvent{
+		Kind:   EventDelete,
+		Schema: "public",
+		Table:  "heap",
+		Columns: []ColumnValue{
+			{Name: "name", Value: "x", Type: "oid_25"}, // no IsKey
+		},
+	}
+	if _, err := tr.TransformEvent(del); err == nil {
+		t.Error("expected error for DELETE on table without PK")
+	}
+}
+
+// TestDecodeTupleColumns covers #t48 Bug#5 source mapping: a 'K' key image
+// carries ONLY the PK columns (must map to the relation's IsKey columns, in
+// order — NOT positional), while a full image maps positionally. NULL ('n') ->
+// nil value. This guards the "extra pit": positional mapping silently misnames
+// key-image columns.
+func TestDecodeTupleColumns(t *testing.T) {
+	// Relation columns: [id(key), email(key), name] — PK spans cols 0 and 1.
+	rel := &Relation{
+		OID:    1,
+		Schema: "public",
+		Name:   "users",
+		Columns: []RelationColumn{
+			{Name: "id", TypeName: "oid_23", IsKey: true, Ordinal: 0},
+			{Name: "email", TypeName: "oid_25", IsKey: true, Ordinal: 1},
+			{Name: "name", TypeName: "oid_25", IsKey: false, Ordinal: 2},
+		},
+	}
+
+	// Full image ('N'/'O'): all 3 columns positional; name is NULL.
+	full := &pglogrepl.TupleData{
+		Columns: []*pglogrepl.TupleDataColumn{
+			{DataType: pglogrepl.TupleDataTypeText, Data: []byte("1")},
+			{DataType: pglogrepl.TupleDataTypeText, Data: []byte("a@x")},
+			{DataType: pglogrepl.TupleDataTypeNull},
+		},
+	}
+	gotFull := decodeTupleColumns(rel, full, false)
+	if len(gotFull) != 3 {
+		t.Fatalf("full image: got %d cols, want 3", len(gotFull))
+	}
+	if gotFull[0].Name != "id" || !gotFull[0].IsKey || gotFull[0].Value != "1" {
+		t.Errorf("full[0] = %+v, want id/IsKey/'1'", gotFull[0])
+	}
+	if gotFull[2].Value != nil {
+		t.Errorf("full[2] value = %v, want nil for NULL column", gotFull[2].Value)
+	}
+
+	// Key image ('K'): only the 2 PK columns, mapped to id+email in order.
+	key := &pglogrepl.TupleData{
+		Columns: []*pglogrepl.TupleDataColumn{
+			{DataType: pglogrepl.TupleDataTypeText, Data: []byte("1")},
+			{DataType: pglogrepl.TupleDataTypeText, Data: []byte("a@x")},
+		},
+	}
+	gotKey := decodeTupleColumns(rel, key, true)
+	if len(gotKey) != 2 {
+		t.Fatalf("key image: got %d cols, want 2 (PK only)", len(gotKey))
+	}
+	wantNames := []string{"id", "email"}
+	for i, w := range wantNames {
+		if gotKey[i].Name != w || !gotKey[i].IsKey || gotKey[i].Value == nil {
+			t.Errorf("key[%d] = %+v, want name=%s IsKey=true non-nil", i, gotKey[i], w)
+		}
+	}
+}
+
+func TestTransformer_Truncate(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+
+	event := &CDCEvent{
+		Kind:   EventTruncate,
+		Schema: "public",
+		Table:  "users",
+	}
+
+	sql, err := tr.TransformEvent(event)
+	if err != nil {
+		t.Fatalf("TransformEvent(truncate): %v", err)
+	}
+
+	expected := "TRUNCATE TABLE `users`"
+	if sql != expected {
+		t.Errorf("got:\n  %s\nwant:\n  %s", sql, expected)
+	}
+}
+
+// TestNullInsertRoundTrip exercises the full source-mapping -> transformer path
+// for an INSERT with a NULL column, the exact shape of #t48 Bug#7. Proves the
+// NULL column is preserved (not omitted) and rendered as SQL NULL, so the row
+// is representable. If this passes, the row-drop is NOT in this code path.
+func TestNullInsertRoundTrip(t *testing.T) {
+	rel := &Relation{
+		Schema: "public",
+		Name:   "single_pk",
+		Columns: []RelationColumn{
+			{Name: "id", TypeName: "oid_23", IsKey: true},
+			{Name: "name", TypeName: "oid_25", IsKey: false},
+		},
+	}
+	// pgoutput 'N' image for: insert into single_pk values (9901, NULL)
+	tuple := &pglogrepl.TupleData{
+		Columns: []*pglogrepl.TupleDataColumn{
+			{DataType: pglogrepl.TupleDataTypeText, Data: []byte("9901")},
+			{DataType: pglogrepl.TupleDataTypeNull}, // name = NULL
+		},
+	}
+
+	cols := decodeTupleColumns(rel, tuple, false)
+	if len(cols) != 2 {
+		t.Fatalf("expected 2 columns preserved, got %d (NULL column must not be dropped)", len(cols))
+	}
+	if cols[0].Name != "id" || cols[0].Value != "9901" {
+		t.Errorf("cols[0] = %+v, want id='9901'", cols[0])
+	}
+	if cols[1].Name != "name" || cols[1].Value != nil {
+		t.Errorf("cols[1] = %+v, want name Value=nil", cols[1])
+	}
+
+	tr := NewTransformer(DefaultTransformerConfig())
+	sql, err := tr.TransformEvent(&CDCEvent{
+		Kind:    EventInsert,
+		Schema:  "public",
+		Table:   "single_pk",
+		Columns: cols,
+	})
+	if err != nil {
+		t.Fatalf("TransformEvent(null insert): %v", err)
+	}
+
+	want := "REPLACE INTO `single_pk` (`id`, `name`) VALUES ('9901', NULL)"
+	if sql != want {
+		t.Errorf("NULL insert SQL:\n  got:  %s\n  want: %s", sql, want)
+	}
+}
+
+// TestUpdateUnchangedTOAST guards the 'u' (unchanged TOAST) fix: an UPDATE
+// whose new image marks a column 'u' (value not sent) must DROP that column
+// from SET, never render it as ”/NULL (which would clobber an unchanged value).
+func TestUpdateUnchangedTOAST(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+
+	event := &CDCEvent{
+		Kind:   EventUpdate,
+		Schema: "public",
+		Table:  "users",
+		Columns: []ColumnValue{
+			{Name: "id", Value: "1", Type: "oid_23", IsKey: true},
+			{Name: "name", Value: "Bob", Type: "oid_25"},
+			{Name: "bio", Type: "oid_25", Unchanged: true}, // 'u' — no value
+		},
+	}
+
+	sql, err := tr.TransformEvent(event)
+	if err != nil {
+		t.Fatalf("TransformEvent(unchanged toast): %v", err)
+	}
+
+	// `bio` must not appear; SET only id + name.
+	want := "UPDATE `users` SET `id` = '1', `name` = 'Bob' WHERE `id` = '1'"
+	if sql != want {
+		t.Errorf("got:\n  %s\nwant:\n  %s", sql, want)
+	}
+}
+
+// TestDecodeUnchangedTOAST guards the source mapping: a pgoutput 'u' column
+// decodes to Unchanged=true (Value nil), while normal text columns do not.
+func TestDecodeUnchangedTOAST(t *testing.T) {
+	rel := &Relation{
+		Schema: "public", Name: "t",
+		Columns: []RelationColumn{
+			{Name: "id", TypeName: "oid_23", IsKey: true},
+			{Name: "name", TypeName: "oid_25"},
+			{Name: "bio", TypeName: "oid_25"},
+		},
+	}
+	tuple := &pglogrepl.TupleData{
+		Columns: []*pglogrepl.TupleDataColumn{
+			{DataType: pglogrepl.TupleDataTypeText, Data: []byte("1")},
+			{DataType: pglogrepl.TupleDataTypeText, Data: []byte("Bob")},
+			{DataType: pglogrepl.TupleDataTypeToast}, // 'u' unchanged
+		},
+	}
+
+	cols := decodeTupleColumns(rel, tuple, false)
+	if len(cols) != 3 {
+		t.Fatalf("expected 3 columns, got %d", len(cols))
+	}
+	if cols[1].Unchanged {
+		t.Errorf("name Unchanged = true, want false")
+	}
+	if !cols[2].Unchanged {
+		t.Errorf("bio Unchanged = false, want true for pgoutput 'u'")
+	}
+	if cols[2].Value != nil {
+		t.Errorf("bio Value = %v, want nil for unchanged column", cols[2].Value)
+	}
+}
+
+// TestParseLogicalMsg_BadInputReturnsError guards #t48 step 2: an unparseable
+// WAL record must surface as an error (so the caller halts), never a silent nil.
+func TestParseLogicalMsg_BadInputReturnsError(t *testing.T) {
+	s := &Source{log: zap.NewNop()}
+	// 0x5a ('Z') is not a pgoutput message type -> ParseV2 returns errMsgNotSupported.
+	xld := pglogrepl.XLogData{WALStart: 100, WALData: []byte{0x5a}}
+	event, err := s.parseLogicalMsg(map[uint32]*Relation{}, xld)
+	if err == nil {
+		t.Fatal("expected error for unparseable WAL data; parseLogicalMsg must not silently skip (data-loss prevention)")
+	}
+	if event != nil {
+		t.Errorf("expected nil event on parse error, got %+v", event)
+	}
+}
+
+// TestSource_FatalErr guards the halt-signaling mechanism (#t48 step 2): a fresh
+// Source has no fatal; setFatal records it (sticky); Err() exposes it so the
+// runner can report a halt rather than a clean shutdown.
+func TestSource_FatalErr(t *testing.T) {
+	s := &Source{log: zap.NewNop()}
+	if err := s.Err(); err != nil {
+		t.Errorf("fresh source Err() = %v, want nil", err)
+	}
+	s.setFatal(fmt.Errorf("boom"))
+	if err := s.Err(); err == nil || err.Error() != "boom" {
+		t.Errorf("after setFatal, Err() = %v, want \"boom\"", err)
+	}
+	// Sticky: the first fatal wins (don't clobber the original cause).
+	s.setFatal(fmt.Errorf("second"))
+	if err := s.Err(); err.Error() != "boom" {
+		t.Errorf("Err() = %v, want sticky \"boom\"", err)
+	}
+}
+
+// TestStructuralError_NoPKTable guards #t48 step 2 Part B: an UPDATE/DELETE on a
+// table with no usable replica identity (no IsKey column) must return a
+// StructuralError — the applier halts on these instead of silently accumulating
+// EventsFailed.
+func TestStructuralError_NoPKTable(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+
+	upd := &CDCEvent{
+		Kind: EventUpdate, Schema: "public", Table: "heap",
+		Columns: []ColumnValue{{Name: "name", Value: "x"}}, // no IsKey
+	}
+	_, err := tr.TransformEvent(upd)
+	if err == nil {
+		t.Fatal("expected error for UPDATE on a table without PK")
+	}
+	var se *StructuralError
+	if !errors.As(err, &se) {
+		t.Errorf("UPDATE no-PK: expected *StructuralError, got %T: %v", err, err)
+	}
+
+	del := &CDCEvent{
+		Kind: EventDelete, Schema: "public", Table: "heap",
+		Columns: []ColumnValue{{Name: "name", Value: "x"}}, // no IsKey
+	}
+	_, err = tr.TransformEvent(del)
+	if err == nil {
+		t.Fatal("expected error for DELETE on a table without PK")
+	}
+	if !errors.As(err, &se) {
+		t.Errorf("DELETE no-PK: expected *StructuralError, got %T: %v", err, err)
+	}
+}
+
+func TestTransformer_NullValue(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+
+	event := &CDCEvent{
+		Kind:   EventInsert,
+		Schema: "public",
+		Table:  "t",
+		Columns: []ColumnValue{
+			{Name: "id", Value: "1", Type: "oid_23"},
+			{Name: "description", Value: nil, Type: "oid_25"},
+		},
+	}
+
+	sql, err := tr.TransformEvent(event)
+	if err != nil {
+		t.Fatalf("TransformEvent(null): %v", err)
+	}
+
+	expected := "REPLACE INTO `t` (`id`, `description`) VALUES ('1', NULL)"
+	if sql != expected {
+		t.Errorf("got:\n  %s\nwant:\n  %s", sql, expected)
+	}
+}
+
+func TestTransformer_SpecialChars(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+
+	event := &CDCEvent{
+		Kind:   EventInsert,
+		Schema: "public",
+		Table:  "users",
+		Columns: []ColumnValue{
+			{Name: "id", Value: "1", Type: "oid_23"},
+			{Name: "bio", Value: "It's a \"test\"", Type: "oid_25"},
+		},
+	}
+
+	sql, err := tr.TransformEvent(event)
+	if err != nil {
+		t.Fatalf("TransformEvent(special): %v", err)
+	}
+
+	// Single quotes should be escaped
+	expected := "REPLACE INTO `users` (`id`, `bio`) VALUES ('1', 'It''s a \"test\"')"
+	if sql != expected {
+		t.Errorf("got:\n  %s\nwant:\n  %s", sql, expected)
+	}
+}
+
+// TestTransformer_ByteAValue: pgoutput sends BYTEA as PG hex text ("\xdeadbeef");
+// the transformer must render it as a MySQL hex literal X'deadbeef' so TiDB BLOB
+// stores raw bytes, not the textual representation. #t61.
+func TestTransformer_ByteAValue(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+
+	event := &CDCEvent{
+		Kind:   EventInsert,
+		Schema: "public",
+		Table:  "blobs",
+		Columns: []ColumnValue{
+			{Name: "id", Value: "1", Type: "oid_23"},
+			{Name: "b", Value: `\xdeadbeef`, Type: "oid_17"}, // BYTEA
+		},
+	}
+
+	sql, err := tr.TransformEvent(event)
+	if err != nil {
+		t.Fatalf("TransformEvent(bytea): %v", err)
+	}
+	expected := "REPLACE INTO `blobs` (`id`, `b`) VALUES ('1', X'deadbeef')"
+	if sql != expected {
+		t.Errorf("got:\n  %s\nwant:\n  %s", sql, expected)
+	}
+
+	// Empty bytea → X'' (zero-length binary), not the empty-string ''.
+	if got := tr.formatValue(ColumnValue{Name: "b", Value: `\x`, Type: "oid_17"}); got != "X''" {
+		t.Errorf("empty bytea: got %q, want X''", got)
+	}
+	// Non-BYTEA text is unaffected.
+	if got := tr.formatValue(ColumnValue{Name: "t", Value: "hello", Type: "oid_25"}); got != "'hello'" {
+		t.Errorf("text: got %q, want 'hello'", got)
+	}
+}
+
+func TestTransformer_SchemaQuoting(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+
+	event := &CDCEvent{
+		Kind:   EventInsert,
+		Schema: "myschema",
+		Table:  "users",
+		Columns: []ColumnValue{
+			{Name: "id", Value: "1", Type: "oid_23"},
+		},
+	}
+
+	sql, err := tr.TransformEvent(event)
+	if err != nil {
+		t.Fatalf("TransformEvent(schema): %v", err)
+	}
+
+	expected := "REPLACE INTO `myschema`.`users` (`id`) VALUES ('1')"
+	if sql != expected {
+		t.Errorf("got:\n  %s\nwant:\n  %s", sql, expected)
+	}
+}
+
+func TestCheckpointManager_SaveLoad(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test_checkpoint.json")
+
+	cm := NewCheckpointManager(path)
+	cm.SetSlotName("test_slot")
+	cm.Update(pglogrepl.LSN(12345))
+
+	if err := cm.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Verify file was written
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	var cp Checkpoint
+	if err := json.Unmarshal(data, &cp); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+
+	if cp.LSN != pglogrepl.LSN(12345) {
+		t.Errorf("LSN = %d, want 12345", cp.LSN)
+	}
+	if cp.SlotName != "test_slot" {
+		t.Errorf("SlotName = %q, want test_slot", cp.SlotName)
+	}
+
+	// Load into a new manager
+	cm2 := NewCheckpointManager(path)
+	loaded, err := cm2.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("expected checkpoint, got nil")
+	}
+	if loaded.LSN != pglogrepl.LSN(12345) {
+		t.Errorf("loaded LSN = %d, want 12345", loaded.LSN)
+	}
+}
+
+func TestCheckpointManager_LoadNonExistent(t *testing.T) {
+	cm := NewCheckpointManager("/nonexistent/path/checkpoint.json")
+	cp, err := cm.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cp != nil {
+		t.Errorf("expected nil checkpoint for non-existent file, got %v", cp)
+	}
+}
+
+func TestCheckpointManager_DirtyFlag(t *testing.T) {
+	cm := NewCheckpointManager(filepath.Join(t.TempDir(), "cp.json"))
+
+	if cm.IsDirty() {
+		t.Error("expected clean after creation")
+	}
+
+	cm.Update(pglogrepl.LSN(100))
+	if !cm.IsDirty() {
+		t.Error("expected dirty after Update")
+	}
+
+	cm.Save()
+	if cm.IsDirty() {
+		t.Error("expected clean after Save")
+	}
+}
+
+func TestTransformer_UnknownEventKind(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+	event := &CDCEvent{Kind: EventKind("unknown")}
+	_, err := tr.TransformEvent(event)
+	if err == nil {
+		t.Error("expected error for unknown event kind")
+	}
+}
+
+func TestTransformer_UpdateWithoutColumns(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+	event := &CDCEvent{
+		Kind:  EventUpdate,
+		Table: "users",
+	}
+	_, err := tr.TransformEvent(event)
+	if err == nil {
+		t.Error("expected error for UPDATE without WHERE columns")
+	}
+}
+
+func TestTransformer_DeleteWithoutColumns(t *testing.T) {
+	tr := NewTransformer(DefaultTransformerConfig())
+	event := &CDCEvent{
+		Kind:  EventDelete,
+		Table: "users",
+	}
+	_, err := tr.TransformEvent(event)
+	if err == nil {
+		t.Error("expected error for DELETE without WHERE columns")
+	}
+}
+
+func TestSourceConfigDefaults(t *testing.T) {
+	cfg := DefaultSourceConfig()
+	if cfg.SlotName != "pg2tidb_cdc" {
+		t.Errorf("SlotName = %q, want pg2tidb_cdc", cfg.SlotName)
+	}
+	if cfg.Publication != "pg2tidb_pub" {
+		t.Errorf("Publication = %q, want pg2tidb_pub", cfg.Publication)
+	}
+	if cfg.OutputPlugin != "pgoutput" {
+		t.Errorf("OutputPlugin = %q, want pgoutput", cfg.OutputPlugin)
+	}
+}
+
+// TestBuildPluginArgs guards #t48 Bug#6: pglogrepl joins PluginArgs raw with
+// ", " (no quoting), so each element must be a complete `name 'value'` option.
+// Bare "proto_version"/"2"/... made START_REPLICATION raise SQLSTATE 42601.
+func TestBuildPluginArgs(t *testing.T) {
+	args := buildPluginArgs("pg2tidb_pub")
+
+	if len(args) != 2 {
+		t.Fatalf("got %d args, want 2", len(args))
+	}
+	if args[0] != "proto_version '2'" {
+		t.Errorf("args[0] = %q, want `proto_version '2'`", args[0])
+	}
+	if args[1] != "publication_names 'pg2tidb_pub'" {
+		t.Errorf("args[1] = %q, want `publication_names 'pg2tidb_pub'`", args[1])
+	}
+
+	// Joined form must be valid PG START_REPLICATION option syntax:
+	// (proto_version '2', publication_names 'pg2tidb_pub')
+	joined := args[0] + ", " + args[1]
+	want := "proto_version '2', publication_names 'pg2tidb_pub'"
+	if joined != want {
+		t.Errorf("joined = %q, want %q", joined, want)
+	}
+
+	// No element may be a bare unquoted value (the Bug#6 regression shape).
+	for _, a := range args {
+		if a == "2" || a == "proto_version" || a == "publication_names" {
+			t.Errorf("bare token %q in plugin args (Bug#6 regression)", a)
+		}
+	}
+}

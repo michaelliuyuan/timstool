@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e"/>
+      <stop offset="100%" style="stop-color:#16213e"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#e23d3d"/>
+      <stop offset="100%" style="stop-color:#ff6b6b"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="24" fill="url(#bg)"/>
+  <text x="18" y="88" font-family="Arial, sans-serif" font-weight="900" font-size="64" fill="url(#accent)">Ti</text>
+  <text x="80" y="88" font-family="Arial, sans-serif" font-weight="700" font-size="56" fill="#ffffff">MS</text>
+  <rect x="12" y="100" width="104" height="4" rx="2" fill="#409eff" opacity="0.6"/>
+</svg>
