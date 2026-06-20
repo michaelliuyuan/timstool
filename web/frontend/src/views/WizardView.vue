@@ -3,21 +3,19 @@ import { ref, reactive, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, type FormRules } from 'element-plus'
 import apiClient from '../api'
+import ConnectionForm from '../components/ConnectionForm.vue'
+import { useSourceSchema } from '../composables/useSourceSchema'
+import { reconcileModel } from '../composables/reconcileModel'
 
 
 const router = useRouter()
 const loading = ref(false)
 const activeStep = ref(0)
 
-// Multi-source config (#t67 WSC): source type selector
+// Multi-source config: schema-driven selector + dynamic connection form (#t77).
+const { sources, load: loadSources, getSource } = useSourceSchema()
 const sourceType = ref('postgres')
-const sources = ref<any[]>([])
-onMounted(async () => {
-  try {
-    const r = await fetch('/api/v1/sources')
-    if (r.ok) sources.value = await r.json()
-  } catch { /* default empty */ }
-})
+const currentMeta = computed(() => getSource(sourceType.value))
 
 const availableTables = ref<{name: string; row_estimate: number}[]>([])
 const loadingTables = ref(false)
@@ -27,15 +25,7 @@ const tableRef = ref<any>(null)
 
 const form = reactive({
   name: '',
-  source: {
-    host: 'localhost',
-    port: 5432,
-    user: 'postgres',
-    password: '',
-    database: '',
-    schema: 'public',
-    sslmode: 'disable',
-  },
+  source: {} as Record<string, any>,
   target: {
     host: 'localhost',
     port: 4000,
@@ -122,7 +112,13 @@ function deleteConnection(idx: number) {
   saveConnectionsToStorage()
 }
 
-onMounted(() => {
+onMounted(async () => {
+  // Multi-source: load source metas, then seed the dynamic source form from the
+  // default source (postgres) defaults.
+  await loadSources()
+  const meta = getSource(sourceType.value)
+  if (meta) Object.assign(form.source, reconcileModel({}, meta, meta))
+
   loadSavedConnections()
   const last = localStorage.getItem('pg2tidb_last_connection')
   if (last) {
@@ -148,40 +144,55 @@ const rules: FormRules = {
   'target.database': [{ required: true, message: '请输入目标数据库名', trigger: 'blur' }],
 }
 
+// Switch source: reconcile the model to the new source's fields (drops stale
+// source-specific keys — FL-REQ) and reset the connection-test state.
+function onSourceTypeChange(name: string) {
+  const oldMeta = getSource(sourceType.value)
+  const newMeta = getSource(name)
+  if (!newMeta) return
+  const reconciled = reconcileModel(form.source, oldMeta ?? newMeta, newMeta)
+  Object.keys(form.source).forEach(k => { delete form.source[k] })
+  Object.assign(form.source, reconciled)
+  sourceType.value = name
+  sourceTestResult.value = null
+}
+
 async function testConnection(type: 'source' | 'target') {
   if (type === 'source') {
+    if (!currentMeta.value?.implemented) return
     testingSource.value = true
     sourceTestResult.value = null
-  } else {
-    testingTarget.value = true
-    targetTestResult.value = null
+    try {
+      // FL-REQ: send only the reconciled field keys (no stale source-specific keys).
+      const { data } = await apiClient.testSourceConnection(sourceType.value, { ...form.source })
+      sourceTestResult.value = data
+      if (data.success) ElMessage.success(`${currentMeta.value.displayName} 连接成功`)
+      else ElMessage.error(`连接失败: ${data.message}`)
+    } catch (e: any) {
+      ElMessage.error(`连接测试失败: ${e.message}`)
+    } finally {
+      testingSource.value = false
+    }
+    return
   }
-
+  // target (TiDB): legacy /config/test-connection
+  testingTarget.value = true
+  targetTestResult.value = null
   try {
     const { data } = await apiClient.testConnection({
       type,
-      host: type === 'source' ? form.source.host : form.target.host,
-      port: type === 'source' ? form.source.port : form.target.port,
-      user: type === 'source' ? form.source.user : form.target.user,
-      password: type === 'source' ? form.source.password : form.target.password,
-      database: type === 'source' ? form.source.database : form.target.database,
-      schema: type === 'source' ? form.source.schema : undefined,
-      sslmode: type === 'source' ? form.source.sslmode : undefined,
+      host: form.target.host,
+      port: form.target.port,
+      user: form.target.user,
+      password: form.target.password,
+      database: form.target.database,
     })
-    if (type === 'source') {
-      sourceTestResult.value = data
-    } else {
-      targetTestResult.value = data
-    }
-    if (data.ok) {
-      ElMessage.success(`${type === 'source' ? 'PostgreSQL' : 'TiDB'} 连接成功`)
-    } else {
-      ElMessage.error(`连接失败: ${data.error}`)
-    }
+    targetTestResult.value = data
+    if (data.ok) ElMessage.success('TiDB 连接成功')
+    else ElMessage.error(`连接失败: ${data.error}`)
   } catch (e: any) {
     ElMessage.error(`连接测试失败: ${e.message}`)
   } finally {
-    testingSource.value = false
     testingTarget.value = false
   }
 }
@@ -320,45 +331,20 @@ function prevStep() {
             <el-input v-model="form.name" placeholder="可选，自动生成" />
           </el-form-item>
           <el-form-item label="数据源类型" v-if="sources.length > 0">
-            <el-select v-model="sourceType" placeholder="选择数据源" style="width: 100%">
-              <el-option v-for="s in sources" :key="s.name" :label="s.display" :value="s.name" :disabled="s.status === 'stub'">
-                <span>{{ s.display }}</span>
-                <span v-if="s.status === 'stub'" style="color: #c0c4cc; font-size: 12px; margin-left: 8px;">即将支持</span>
+            <el-select :model-value="sourceType" placeholder="选择数据源" style="width: 100%" @change="onSourceTypeChange">
+              <el-option v-for="s in sources" :key="s.name" :label="s.displayName" :value="s.name" :disabled="!s.implemented">
+                <span>{{ s.displayName }}</span>
+                <span v-if="!s.implemented" style="color: #c0c4cc; font-size: 12px; margin-left: 8px;">即将支持</span>
               </el-option>
             </el-select>
           </el-form-item>
-          <el-form-item label="主机地址" prop="source.host">
-            <el-input v-model="form.source.host" />
-          </el-form-item>
-          <el-form-item label="端口">
-            <el-input-number v-model="form.source.port" :min="1" :max="65535" />
-          </el-form-item>
-          <el-form-item label="用户名">
-            <el-input v-model="form.source.user" />
-          </el-form-item>
-          <el-form-item label="密码">
-            <el-input v-model="form.source.password" type="password" show-password />
-          </el-form-item>
-          <el-form-item label="数据库名" prop="source.database">
-            <el-input v-model="form.source.database" />
-          </el-form-item>
-          <el-form-item label="Schema">
-            <el-input v-model="form.source.schema" />
-          </el-form-item>
-          <el-form-item label="SSL模式">
-            <el-select v-model="form.source.sslmode">
-              <el-option label="disable" value="disable" />
-              <el-option label="require" value="require" />
-              <el-option label="verify-ca" value="verify-ca" />
-              <el-option label="verify-full" value="verify-full" />
-            </el-select>
-          </el-form-item>
+          <ConnectionForm v-if="currentMeta" :meta="currentMeta" :model="form.source" />
           <el-form-item>
-            <el-button type="primary" :loading="testingSource" @click="testConnection('source')">
-              测试 PostgreSQL 连接
+            <el-button type="primary" :loading="testingSource" :disabled="!currentMeta?.implemented" @click="testConnection('source')">
+              测试 {{ currentMeta?.displayName || 'PostgreSQL' }} 连接
             </el-button>
-            <el-tag v-if="sourceTestResult" :type="sourceTestResult.ok ? 'success' : 'danger'" style="margin-left: 12px;">
-              {{ sourceTestResult.ok ? `连接成功 (${sourceTestResult.version?.substring(0, 50)})` : sourceTestResult.error }}
+            <el-tag v-if="sourceTestResult" :type="sourceTestResult.success ? 'success' : 'danger'" style="margin-left: 12px;">
+              {{ sourceTestResult.success ? '连接成功' : sourceTestResult.message }}
             </el-tag>
           </el-form-item>
         </div>

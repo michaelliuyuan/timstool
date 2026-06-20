@@ -21,20 +21,14 @@ func TestMySQLRegistered(t *testing.T) {
 		t.Error("Dialect()/TypeMapper() must not be nil")
 	}
 
-	// ConfigSchema must return the connection form fields.
-	schema := src.ConfigSchema()
-	if len(schema) == 0 {
-		t.Fatal("ConfigSchema() must return fields")
+	// Describe (schema-driven form) returns the mysql fields without opening a
+	// connection (the single source of truth for the Web form).
+	meta, err := source.Describe("mysql")
+	if err != nil {
+		t.Fatalf("Describe(mysql) err = %v", err)
 	}
-	names := make(map[string]bool)
-	for _, f := range schema {
-		names[f.Name] = true
-	}
-	required := []string{"host", "port", "user", "password", "database"}
-	for _, n := range required {
-		if !names[n] {
-			t.Errorf("ConfigSchema missing field %q", n)
-		}
+	if meta.DefaultPort != 3306 {
+		t.Errorf("Describe(mysql).DefaultPort = %d, want 3306", meta.DefaultPort)
 	}
 
 	// IncrementalCapture: MySQL CDC not yet implemented.
@@ -131,27 +125,31 @@ func TestMySQLDialect(t *testing.T) {
 	}
 }
 
-// TestMySQLConfigSchema verifies the required fields for Web UI.
-func TestMySQLConfigSchema(t *testing.T) {
-	s := &Source{cfg: source.SourceConfig{}}
-	schema := s.ConfigSchema()
-
-	// Verify fields are in order
-	expectedNames := []string{"host", "port", "user", "password", "database", "charset"}
-	if len(schema) != len(expectedNames) {
-		t.Fatalf("ConfigSchema length = %d, want %d", len(schema), len(expectedNames))
+// TestMySQLDescribe verifies the schema-driven form fields (single source of
+// truth, doc §5): order, charset as a source-group select.
+func TestMySQLDescribe(t *testing.T) {
+	meta, err := source.Describe("mysql")
+	if err != nil {
+		t.Fatalf("Describe(mysql) err = %v", err)
 	}
-	for i, f := range schema {
-		if f.Name != expectedNames[i] {
-			t.Errorf("ConfigSchema[%d].Name = %q, want %q", i, f.Name, expectedNames[i])
+	expectedKeys := []string{"host", "port", "user", "password", "database", "charset"}
+	if len(meta.Fields) != len(expectedKeys) {
+		t.Fatalf("Fields length = %d, want %d", len(meta.Fields), len(expectedKeys))
+	}
+	for i, f := range meta.Fields {
+		if f.Key != expectedKeys[i] {
+			t.Errorf("Fields[%d].Key = %q, want %q", i, f.Key, expectedKeys[i])
 		}
 	}
-	// charset should be a select with options
-	charsetField := schema[5]
-	if charsetField.Type != "select" {
-		t.Errorf("charset field Type = %q, want select", charsetField.Type)
+	// charset is a select with options, in the source group (no tls/advanced this phase)
+	charset := meta.Fields[5]
+	if charset.Type != "select" || len(charset.Options) == 0 {
+		t.Errorf("charset = %+v, want select with options", charset)
 	}
-	if len(charsetField.Options) == 0 {
-		t.Error("charset field must have options")
+	if charset.Group != "source" {
+		t.Errorf("charset.Group = %q, want source", charset.Group)
+	}
+	if !meta.Capabilities.Data || meta.Capabilities.CDC {
+		t.Errorf("mysql capabilities = %+v, want Data=true CDC=false", meta.Capabilities)
 	}
 }

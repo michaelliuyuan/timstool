@@ -11,69 +11,142 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/source"
 )
 
-// handleSources lists all registered source types for the Web selector (#t67 WSC).
+// handleSources lists all registered sources' metadata for the Web selector +
+// schema-driven form (doc multi-source-web-form-design §6.1). Does not open any
+// connection, so stubs are described too.
 func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
-	s.writeJSON(w, http.StatusOK, source.RegisteredMeta())
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{"sources": source.DescribeAll()})
 }
 
-// handleSourceConfigSchema returns the connection-form fields for a source type
-// (the Web UI renders the dynamic form from this).
+// handleSourceConfigSchema returns the connection-form fields for a source type.
+// (Standalone helper; the form usually gets fields from /sources in one fetch.)
 func (s *Server) handleSourceConfigSchema(w http.ResponseWriter, r *http.Request) {
 	srcType := chi.URLParam(r, "type")
-	fields := source.ConfigSchemaFor(srcType)
-	if fields == nil {
-		s.writeError(w, http.StatusNotFound, fmt.Sprintf("unknown or stub source %q", srcType))
+	meta, err := source.Describe(srcType)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("unknown source %q", srcType))
 		return
 	}
-	s.writeJSON(w, http.StatusOK, fields)
+	s.writeJSON(w, http.StatusOK, meta.Fields)
 }
 
-// handleSourceTest tests a source connection (#t67 WSC). Body = connection
-// fields → source.Open(type,cfg) → Connect with timeout → success/failure.
-func (s *Server) handleSourceTest(w http.ResponseWriter, r *http.Request) {
-	srcType := chi.URLParam(r, "type")
+// testSourceRequest is the {source, fields} body for the multi-source connection
+// test (doc §6.2). source defaults to "postgres" when empty (backward compat).
+type testSourceRequest struct {
+	Source string         `json:"source"`
+	Fields map[string]any `json:"fields"`
+}
 
-	var fields map[string]string
-	if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid request body")
-		return
+// testSource opens the named source, builds SourceConfig from the field map, and
+// pings. Shared by /sources/{type}/test and /test-connection. Returns the
+// {success, message, version} result map; stubs get a friendly "not implemented"
+// without a real connection attempt.
+func (s *Server) testSource(ctx context.Context, srcType string, fields map[string]any) map[string]interface{} {
+	if srcType == "" {
+		srcType = "postgres"
+	}
+	result := map[string]interface{}{"source": srcType}
+
+	meta, err := source.Describe(srcType)
+	if err != nil {
+		result["success"] = false
+		result["message"] = fmt.Sprintf("unknown source %q", srcType)
+		return result
+	}
+	if !meta.Implemented {
+		msg := meta.NotImplMsg
+		if msg == "" {
+			msg = fmt.Sprintf("source %q is not implemented yet", srcType)
+		}
+		result["success"] = false
+		result["message"] = msg
+		return result
 	}
 
 	cfg := source.SourceConfig{
 		Kind:     srcType,
-		Host:     fields["host"],
-		User:     fields["user"],
-		Password: fields["password"],
-		Database: fields["database"],
-		Schema:   fields["schema"],
-		Options:  fields, // all fields available for source-specific parsing
+		Host:     stringField(fields, "host"),
+		User:     stringField(fields, "user"),
+		Password: stringField(fields, "password"),
+		Database: stringField(fields, "database"),
+		Schema:   stringField(fields, "schema"),
+		Options:  stringifyMap(fields),
 	}
-	if port := fields["port"]; port != "" {
+	if port := stringField(fields, "port"); port != "" {
 		fmt.Sscanf(port, "%d", &cfg.Port)
 	}
 
 	src, err := source.Open(srcType, cfg)
 	if err != nil {
-		s.writeJSON(w, http.StatusOK, map[string]interface{}{
-			"ok":      false,
-			"message": fmt.Sprintf("source %q not available: %v", srcType, err),
-		})
-		return
+		result["success"] = false
+		result["message"] = fmt.Sprintf("source %q not available: %v", srcType, err)
+		return result
 	}
 	defer src.Close()
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := src.Connect(ctx); err != nil {
-		s.writeJSON(w, http.StatusOK, map[string]interface{}{
-			"ok":      false,
-			"message": err.Error(),
-		})
-		return
+	if err := src.Connect(cctx); err != nil {
+		result["success"] = false
+		result["message"] = err.Error()
+		return result
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok":      true,
-		"message": fmt.Sprintf("Connected to %s %s:%d", src.Name(), cfg.Host, cfg.Port),
-	})
+	result["success"] = true
+	result["message"] = fmt.Sprintf("Connected to %s %s:%d", src.Name(), cfg.Host, cfg.Port)
+	result["version"] = ""
+	return result
+}
+
+// handleSourceTest tests a source connection via the per-type URL (#t68 path).
+// Body = field map.
+func (s *Server) handleSourceTest(w http.ResponseWriter, r *http.Request) {
+	srcType := chi.URLParam(r, "type")
+	var fields map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, s.testSource(r.Context(), srcType, fields))
+}
+
+// handleTestConnectionMulti is the canonical multi-source connection test
+// (doc §6.2): body {source, fields}, source defaults to postgres. Response
+// {success, message, version}.
+func (s *Server) handleTestConnectionMulti(w http.ResponseWriter, r *http.Request) {
+	var req testSourceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, s.testSource(r.Context(), req.Source, req.Fields))
+}
+
+// stringField reads a string-valued field from the loose JSON map (numbers
+// arrive as float64).
+func stringField(fields map[string]any, key string) string {
+	v, ok := fields[key]
+	if !ok || v == nil {
+		return ""
+	}
+	switch x := v.(type) {
+	case string:
+		return x
+	default:
+		return fmt.Sprintf("%v", x)
+	}
+}
+
+// stringifyMap converts the loose field map to map[string]string (for
+// SourceConfig.Options) so source-specific DSN builders can read their keys
+// (charset/sslmode/...).
+func stringifyMap(fields map[string]any) map[string]string {
+	out := make(map[string]string, len(fields))
+	for k, v := range fields {
+		if v == nil {
+			continue
+		}
+		out[k] = fmt.Sprintf("%v", v)
+	}
+	return out
 }

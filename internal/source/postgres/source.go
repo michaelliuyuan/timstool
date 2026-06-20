@@ -24,6 +24,33 @@ func init() {
 	source.Register("postgres", func(cfg source.SourceConfig) (source.Source, error) {
 		return &Source{cfg: cfg}, nil
 	})
+	source.RegisterMeta("postgres", postgresMeta)
+}
+
+// postgresMeta is the single source of truth for the PG connection form
+// (common + source groups; advanced deferred — doc multi-source-web-form-design
+// §5/§7). Labels mirror the legacy PG form for zero visual regression (§9).
+var postgresMeta = source.SourceMeta{
+	Name:         "postgres",
+	DisplayName:  "PostgreSQL",
+	Implemented:  true,
+	DefaultPort:  5432,
+	Capabilities: source.Capabilities{Schema: true, Data: true, CDC: true},
+	Fields: []source.FieldSpec{
+		{Key: "host", Label: "主机地址", Type: "text", Required: true, Default: "localhost", Placeholder: "localhost", Group: "common"},
+		{Key: "port", Label: "端口", Type: "number", Required: true, Default: 5432, Group: "common"},
+		{Key: "user", Label: "用户名", Type: "text", Required: true, Default: "postgres", Group: "common"},
+		{Key: "password", Label: "密码", Type: "password", Group: "common"},
+		{Key: "database", Label: "数据库名", Type: "text", Required: true, Group: "common"},
+		{Key: "schema", Label: "Schema", Type: "text", Default: "public", Group: "source"},
+		{Key: "sslmode", Label: "SSL模式", Type: "select", Default: "disable", Group: "source",
+			Options: []source.Option{
+				{Label: "disable", Value: "disable"},
+				{Label: "require", Value: "require"},
+				{Label: "verify-ca", Value: "verify-ca"},
+				{Label: "verify-full", Value: "verify-full"},
+			}},
+	},
 }
 
 // Source is the PostgreSQL source adapter.
@@ -64,19 +91,6 @@ func (s *Source) Config() source.SourceConfig { return s.cfg }
 func (s *Source) Dialect() source.Dialect { return pgDialect{} }
 
 func (s *Source) TypeMapper() source.TypeMapper { return pgTypeMapper{} }
-
-// ConfigSchema declares the PG connection-form fields for the Web UI (#t67 WSC).
-func (s *Source) ConfigSchema() []source.ConfigField {
-	return []source.ConfigField{
-		{Name: "host", Label: "Host", Type: "text", Required: true, Default: "localhost", Placeholder: "localhost", Group: "connection"},
-		{Name: "port", Label: "Port", Type: "number", Required: true, Default: "5432", Group: "connection"},
-		{Name: "user", Label: "User", Type: "text", Required: true, Default: "postgres", Group: "connection"},
-		{Name: "password", Label: "Password", Type: "password", Group: "connection"},
-		{Name: "database", Label: "Database", Type: "text", Required: true, Group: "connection"},
-		{Name: "schema", Label: "Schema", Type: "text", Default: "public", Group: "connection"},
-		{Name: "sslmode", Label: "SSL Mode", Type: "select", Default: "disable", Options: []string{"disable", "require", "verify-ca", "verify-full"}, Group: "advanced"},
-	}
-}
 
 // SchemaReader is wired in 2b (internal/schema Collector → CIR). 2a stub.
 func (s *Source) SchemaReader() source.SchemaReader { return &schemaReader{src: s} }

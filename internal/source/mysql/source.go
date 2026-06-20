@@ -24,6 +24,33 @@ func init() {
 	source.Register("mysql", func(cfg source.SourceConfig) (source.Source, error) {
 		return &Source{cfg: cfg}, nil
 	})
+	source.RegisterMeta("mysql", mysqlMeta)
+}
+
+// mysqlMeta is the single source of truth for the MySQL connection form
+// (common + charset source field; tls/parseTime/collation advanced deferred —
+// doc §5/§7). MySQL has no PG-style schema (schema==database), which is why a
+// pg→mysql switch must drop the schema/sslmode keys.
+var mysqlMeta = source.SourceMeta{
+	Name:         "mysql",
+	DisplayName:  "MySQL",
+	Implemented:  true,
+	DefaultPort:  3306,
+	Capabilities: source.Capabilities{Schema: true, Data: true, CDC: false},
+	Fields: []source.FieldSpec{
+		{Key: "host", Label: "主机地址", Type: "text", Required: true, Default: "localhost", Placeholder: "localhost", Group: "common"},
+		{Key: "port", Label: "端口", Type: "number", Required: true, Default: 3306, Group: "common"},
+		{Key: "user", Label: "用户名", Type: "text", Required: true, Default: "root", Group: "common"},
+		{Key: "password", Label: "密码", Type: "password", Group: "common"},
+		{Key: "database", Label: "数据库名", Type: "text", Required: true, Group: "common"},
+		{Key: "charset", Label: "Charset", Type: "select", Default: "utf8mb4", Group: "source",
+			Options: []source.Option{
+				{Label: "utf8mb4", Value: "utf8mb4"},
+				{Label: "utf8", Value: "utf8"},
+				{Label: "latin1", Value: "latin1"},
+				{Label: "gbk", Value: "gbk"},
+			}},
+	},
 }
 
 // Source is the MySQL source adapter.
@@ -63,18 +90,6 @@ func (s *Source) Config() source.SourceConfig { return s.cfg }
 func (s *Source) Dialect() source.Dialect { return mysqlDialect{} }
 
 func (s *Source) TypeMapper() source.TypeMapper { return mysqlTypeMapper{} }
-
-// ConfigSchema declares the MySQL connection-form fields for the Web UI (#t65).
-func (s *Source) ConfigSchema() []source.ConfigField {
-	return []source.ConfigField{
-		{Name: "host", Label: "Host", Type: "text", Required: true, Default: "localhost", Placeholder: "localhost", Group: "connection"},
-		{Name: "port", Label: "Port", Type: "number", Required: true, Default: "3306", Group: "connection"},
-		{Name: "user", Label: "User", Type: "text", Required: true, Default: "root", Group: "connection"},
-		{Name: "password", Label: "Password", Type: "password", Group: "connection"},
-		{Name: "database", Label: "Database", Type: "text", Required: true, Group: "connection"},
-		{Name: "charset", Label: "Charset", Type: "select", Default: "utf8mb4", Options: []string{"utf8mb4", "utf8", "latin1", "gbk"}, Group: "advanced"},
-	}
-}
 
 // SchemaReader reads MySQL information_schema → CIR (3b).
 func (s *Source) SchemaReader() source.SchemaReader { return &schemaReader{src: s} }

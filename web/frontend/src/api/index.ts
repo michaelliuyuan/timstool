@@ -1,4 +1,5 @@
 import axios from 'axios'
+import type { SourceMeta } from '../composables/sourceTypes'
 
 const api = axios.create({
   baseURL: '/api/v1',
@@ -87,15 +88,7 @@ export interface ConnectionTestResult {
 
 export interface CreateTaskRequest {
   name: string
-  source: {
-    host: string
-    port: number
-    user: string
-    password: string
-    database: string
-    schema: string
-    sslmode: string
-  }
+  source: Record<string, any>
   target: {
     host: string
     port: number
@@ -125,6 +118,16 @@ export interface CreateTaskRequest {
 
 export const apiClient = {
   health: () => api.get('/health'),
+
+  getSources: () => api.get<{ sources: SourceMeta[] }>('/sources'),
+
+  // Multi-source connection test (doc §6.2): {source, fields} → {success,...}.
+  // source defaults to postgres server-side (backward compat).
+  testSourceConnection: (source: string, fields: Record<string, any>) =>
+    api.post<{ source: string; success: boolean; message: string; version?: string }>(
+      '/test-connection',
+      { source, fields },
+    ),
 
   testConnection: (req: ConnectionTestRequest) =>
     api.post<ConnectionTestResult>('/config/test-connection', req),
