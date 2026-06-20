@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -35,6 +36,13 @@ func (s *Server) handleSourceConfigSchema(w http.ResponseWriter, r *http.Request
 type testSourceRequest struct {
 	Source string         `json:"source"`
 	Fields map[string]any `json:"fields"`
+}
+
+// versioner is an optional Source capability: the server version string echoed
+// in the connection-test response (doc §6.2). PG/MySQL implement it; stubs
+// don't, and the field is simply left empty for them.
+type versioner interface {
+	Version(ctx context.Context) (string, error)
 }
 
 // testSource opens the named source, builds SourceConfig from the field map, and
@@ -94,7 +102,11 @@ func (s *Server) testSource(ctx context.Context, srcType string, fields map[stri
 
 	result["success"] = true
 	result["message"] = fmt.Sprintf("Connected to %s %s:%d", src.Name(), cfg.Host, cfg.Port)
-	result["version"] = ""
+	if v, ok := src.(versioner); ok {
+		if ver, err := v.Version(cctx); err == nil {
+			result["version"] = strings.TrimSpace(ver)
+		}
+	}
 	return result
 }
 

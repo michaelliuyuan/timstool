@@ -84,6 +84,19 @@ func (s *Source) Close() error {
 // DB exposes the underlying connection for the readers.
 func (s *Source) DB() *sql.DB { return s.db }
 
+// Version returns the MySQL server version string for the connection-test UI
+// (doc §6.2). Requires Connect first.
+func (s *Source) Version(ctx context.Context) (string, error) {
+	if s.db == nil {
+		return "", fmt.Errorf("mysql source: not connected")
+	}
+	var v string
+	if err := s.db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&v); err != nil {
+		return "", err
+	}
+	return v, nil
+}
+
 // Config exposes the source config for the readers.
 func (s *Source) Config() source.SourceConfig { return s.cfg }
 
