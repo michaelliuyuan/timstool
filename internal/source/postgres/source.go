@@ -120,13 +120,9 @@ func (pgTypeMapper) MapType(srcType string, precision, scale int) source.TiDBTyp
 	return source.TiDBType{Name: schema.MapTypeWithPrecision(schema.PGType(srcType), precision, scale)}
 }
 
-// --- SchemaReader / DataReader stubs (2b/2c) ---
+// --- SchemaReader / DataReader (2b wired, 2c stub) ---
 
 type schemaReader struct{ src *Source }
-
-func (schemaReader) ReadSchema(ctx context.Context, opts source.Filter) (*source.Schema, error) {
-	return nil, fmt.Errorf("postgres SchemaReader: not wired yet (P1 step 2b)")
-}
 
 type dataReader struct{ src *Source }
 

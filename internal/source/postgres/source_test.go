@@ -21,9 +21,10 @@ func TestPostgresRegistered(t *testing.T) {
 	if src.Dialect() == nil || src.TypeMapper() == nil {
 		t.Error("Dialect()/TypeMapper() must not be nil")
 	}
-	// 2a stubs: ReadSchema returns the not-wired error; CDC returns ErrNotImplemented.
-	if _, err := src.SchemaReader().ReadSchema(context.Background(), source.Filter{}); err == nil || !strings.Contains(err.Error(), "2b") {
-		t.Errorf("SchemaReader.ReadSchema (2a stub) err = %v, want a 2b-not-wired error", err)
+	// 2b: ReadSchema is wired (delegates to Collector → CIR); without Connect it
+	// returns "not connected". DataReader is still a 2c stub.
+	if _, err := src.SchemaReader().ReadSchema(context.Background(), source.Filter{}); err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Errorf("SchemaReader.ReadSchema (no Connect) err = %v, want not-connected", err)
 	}
 	if _, err := src.DataReader().ReadTable(context.Background(), source.Table{}, source.ChunkSpec{}); err == nil || !strings.Contains(err.Error(), "2c") {
 		t.Errorf("DataReader.ReadTable (2a stub) err = %v, want a 2c-not-wired error", err)
