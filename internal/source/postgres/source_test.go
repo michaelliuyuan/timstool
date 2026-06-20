@@ -29,8 +29,11 @@ func TestPostgresRegistered(t *testing.T) {
 	if _, err := src.DataReader().ReadTable(context.Background(), source.Table{}, source.ChunkSpec{}); err == nil || !strings.Contains(err.Error(), "not connected") {
 		t.Errorf("DataReader.ReadTable (no Connect) err = %v, want not-connected", err)
 	}
-	if _, err := src.IncrementalCapture(); err == nil {
-		t.Error("IncrementalCapture (2a) must return ErrNotImplemented")
+	// 2d: IncrementalCapture signals PG has CDC (non-nil, no error); Start
+	// delegates to the orchestrator (cdc.Runner, managed in 2e).
+	ic, err := src.IncrementalCapture()
+	if err != nil || ic == nil {
+		t.Errorf("IncrementalCapture() = (%v, %v), want non-nil capture (PG has CDC)", ic, err)
 	}
 }
 

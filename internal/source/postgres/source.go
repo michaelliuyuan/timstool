@@ -71,10 +71,13 @@ func (s *Source) SchemaReader() source.SchemaReader { return &schemaReader{src: 
 // DataReader is wired in 2c (internal/data COPY → CIR Row). 2a stub.
 func (s *Source) DataReader() source.DataReader { return &dataReader{src: s} }
 
-// IncrementalCapture is wired in 2d (internal/cdc wrapped as the PG adapter's
-// CDC). 2a: not yet — full-migration mode only.
+// IncrementalCapture signals that PG has CDC capability (unlike MySQL which
+// returns ErrNotImplemented). The full CDC pipeline (logical replication →
+// transform → apply + DDL replication + Web monitoring) stays intact in
+// internal/cdc.Runner and is managed by the orchestrator (2e) which has the
+// target config. Constraint §10.3: CDC kept intact, not split.
 func (s *Source) IncrementalCapture() (source.IncrementalCapture, error) {
-	return nil, source.ErrNotImplemented
+	return &pgIncrementalCapture{src: s}, nil
 }
 
 // dsn builds a libpq URL from the source config.
