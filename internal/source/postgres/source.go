@@ -65,6 +65,19 @@ func (s *Source) Dialect() source.Dialect { return pgDialect{} }
 
 func (s *Source) TypeMapper() source.TypeMapper { return pgTypeMapper{} }
 
+// ConfigSchema declares the PG connection-form fields for the Web UI (#t67 WSC).
+func (s *Source) ConfigSchema() []source.ConfigField {
+	return []source.ConfigField{
+		{Name: "host", Label: "Host", Type: "text", Required: true, Default: "localhost", Placeholder: "localhost", Group: "connection"},
+		{Name: "port", Label: "Port", Type: "number", Required: true, Default: "5432", Group: "connection"},
+		{Name: "user", Label: "User", Type: "text", Required: true, Default: "postgres", Group: "connection"},
+		{Name: "password", Label: "Password", Type: "password", Group: "connection"},
+		{Name: "database", Label: "Database", Type: "text", Required: true, Group: "connection"},
+		{Name: "schema", Label: "Schema", Type: "text", Default: "public", Group: "connection"},
+		{Name: "sslmode", Label: "SSL Mode", Type: "select", Default: "disable", Options: []string{"disable", "require", "verify-ca", "verify-full"}, Group: "advanced"},
+	}
+}
+
 // SchemaReader is wired in 2b (internal/schema Collector → CIR). 2a stub.
 func (s *Source) SchemaReader() source.SchemaReader { return &schemaReader{src: s} }
 

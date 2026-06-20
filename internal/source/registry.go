@@ -50,6 +50,85 @@ func Registered() []string {
 	return names
 }
 
+// SourceMeta is the metadata exposed by GET /sources for the Web UI's source
+// selector (#t67 WSC).
+type SourceMeta struct {
+	Name        string `json:"name"`    // "postgres" | "mysql" | …
+	Display     string `json:"display"` // "PostgreSQL" | "MySQL" | …
+	Status      string `json:"status"`  // "implemented" | "stub"
+	Description string `json:"description"`
+}
+
+// RegisteredMeta returns metadata for all registered sources (for the Web
+// selector). A source is "stub" if its factory is a StubFactory (Open fails
+// with "not implemented"). The Web UI disables stub sources with "即将支持".
+func RegisteredMeta() []SourceMeta {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	var metas []SourceMeta
+	for name, factory := range registry {
+		// Probe: stub factories return an error; implemented ones don't.
+		_, err := factory(SourceConfig{})
+		status := "implemented"
+		if err != nil {
+			status = "stub"
+		}
+		metas = append(metas, SourceMeta{
+			Name:        name,
+			Display:     sourceDisplayName(name),
+			Status:      status,
+			Description: sourceDescription(name),
+		})
+	}
+	sort.Slice(metas, func(i, j int) bool { return metas[i].Name < metas[j].Name })
+	return metas
+}
+
+// ConfigSchemaFor returns the ConfigField list for a source type (the Web UI
+// renders the connection form from this). Returns nil if the source is unknown
+// or a stub.
+func ConfigSchemaFor(name string) []ConfigField {
+	src, err := Open(name, SourceConfig{})
+	if err != nil {
+		return nil
+	}
+	return src.ConfigSchema()
+}
+
+func sourceDisplayName(name string) string {
+	switch name {
+	case "postgres":
+		return "PostgreSQL"
+	case "mysql":
+		return "MySQL"
+	case "oracle":
+		return "Oracle"
+	case "mssql":
+		return "SQL Server"
+	case "db2":
+		return "DB2"
+	default:
+		return name
+	}
+}
+
+func sourceDescription(name string) string {
+	switch name {
+	case "postgres":
+		return "PostgreSQL database"
+	case "mysql":
+		return "MySQL / TiDB-compatible database"
+	case "oracle":
+		return "Oracle database"
+	case "mssql":
+		return "Microsoft SQL Server"
+	case "db2":
+		return "IBM DB2"
+	default:
+		return ""
+	}
+}
+
 // StubFactory returns a factory that always fails with a "not implemented"
 // message, used to reserve the name for an unimplemented source (oracle/mssql/db2).
 func StubFactory(name string) func(SourceConfig) (Source, error) {

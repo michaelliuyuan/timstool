@@ -130,6 +130,10 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Get("/health", s.handleHealth)
 		r.Get("/features", s.handleFeatures)
+		// Multi-source config endpoints (#t67 WSC)
+		r.Get("/sources", s.handleSources)
+		r.Get("/sources/{type}/config-schema", s.handleSourceConfigSchema)
+		r.Post("/sources/{type}/test", s.handleSourceTest)
 		r.Post("/config/test-connection", s.handleTestConnection)
 		r.Post("/config/list-tables", s.handleListTables)
 		r.Post("/tasks", s.handleCreateTask)

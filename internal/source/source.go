@@ -87,4 +87,22 @@ type Source interface {
 	// source has no CDC yet (the caller falls back to full-migration mode).
 	IncrementalCapture() (IncrementalCapture, error)
 	Dialect() Dialect
+	// ConfigSchema declares the connection-form fields for the Web UI to render
+	// dynamically (self-describing — adding a source adapter auto-enables its
+	// form, no frontend changes needed). #t67 WSC.
+	ConfigSchema() []ConfigField
+}
+
+// ConfigField describes one source-connection field for the Web UI's dynamic
+// form. Each adapter returns its fields via Source.ConfigSchema().
+type ConfigField struct {
+	Name        string // "host" / "port" / "sslmode" …
+	Label       string // display label
+	Type        string // text | number | password | select | checkbox
+	Required    bool
+	Default     string
+	Options     []string // for select type (e.g. sslmode: disable/require/…)
+	Placeholder string
+	Help        string
+	Group       string // "connection" | "advanced" (frontend grouping)
 }
