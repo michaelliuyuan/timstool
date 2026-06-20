@@ -9,6 +9,16 @@ const router = useRouter()
 const loading = ref(false)
 const activeStep = ref(0)
 
+// Multi-source config (#t67 WSC): source type selector
+const sourceType = ref('postgres')
+const sources = ref<any[]>([])
+onMounted(async () => {
+  try {
+    const r = await fetch('/api/v1/sources')
+    if (r.ok) sources.value = await r.json()
+  } catch { /* default empty */ }
+})
+
 const availableTables = ref<{name: string; row_estimate: number}[]>([])
 const loadingTables = ref(false)
 const tableSearch = ref('')
@@ -308,6 +318,14 @@ function prevStep() {
         <div v-show="activeStep === 0">
           <el-form-item label="任务名称">
             <el-input v-model="form.name" placeholder="可选，自动生成" />
+          </el-form-item>
+          <el-form-item label="数据源类型" v-if="sources.length > 0">
+            <el-select v-model="sourceType" placeholder="选择数据源" style="width: 100%">
+              <el-option v-for="s in sources" :key="s.name" :label="s.display" :value="s.name" :disabled="s.status === 'stub'">
+                <span>{{ s.display }}</span>
+                <span v-if="s.status === 'stub'" style="color: #c0c4cc; font-size: 12px; margin-left: 8px;">即将支持</span>
+              </el-option>
+            </el-select>
           </el-form-item>
           <el-form-item label="主机地址" prop="source.host">
             <el-input v-model="form.source.host" />
