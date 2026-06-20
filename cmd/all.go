@@ -18,6 +18,15 @@ var allCmd = &cobra.Command{
   3. Migrate full data
   4. Validate data consistency`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Dual-path routing (#t64 P1 step 2e): --source=postgres (default) uses
+		// the existing high-performance PG pipeline (COPY→Lightning, zero
+		// regression). Non-PG sources will use the Source+CIR pipeline (P2
+		// MySQL); for now they return a clear "not yet" error.
+		sourceType, _ := cmd.Flags().GetString("source")
+		if sourceType != "postgres" {
+			return fmt.Errorf("full migration for source %q is not yet implemented (P2); use --source=postgres (default) for PostgreSQL → TiDB", sourceType)
+		}
+
 		cfg, err := config.Load(cfgFile)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
