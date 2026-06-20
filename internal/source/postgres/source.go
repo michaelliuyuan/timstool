@@ -125,7 +125,3 @@ func (pgTypeMapper) MapType(srcType string, precision, scale int) source.TiDBTyp
 type schemaReader struct{ src *Source }
 
 type dataReader struct{ src *Source }
-
-func (dataReader) ReadTable(ctx context.Context, t source.Table, chunk source.ChunkSpec) (source.RowIterator, error) {
-	return nil, fmt.Errorf("postgres DataReader: not wired yet (P1 step 2c)")
-}

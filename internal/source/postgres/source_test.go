@@ -26,8 +26,8 @@ func TestPostgresRegistered(t *testing.T) {
 	if _, err := src.SchemaReader().ReadSchema(context.Background(), source.Filter{}); err == nil || !strings.Contains(err.Error(), "not connected") {
 		t.Errorf("SchemaReader.ReadSchema (no Connect) err = %v, want not-connected", err)
 	}
-	if _, err := src.DataReader().ReadTable(context.Background(), source.Table{}, source.ChunkSpec{}); err == nil || !strings.Contains(err.Error(), "2c") {
-		t.Errorf("DataReader.ReadTable (2a stub) err = %v, want a 2c-not-wired error", err)
+	if _, err := src.DataReader().ReadTable(context.Background(), source.Table{}, source.ChunkSpec{}); err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Errorf("DataReader.ReadTable (no Connect) err = %v, want not-connected", err)
 	}
 	if _, err := src.IncrementalCapture(); err == nil {
 		t.Error("IncrementalCapture (2a) must return ErrNotImplemented")
