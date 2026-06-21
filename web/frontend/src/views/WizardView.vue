@@ -58,7 +58,7 @@ const targetTestResult = ref<any>(null)
 const testingSource = ref(false)
 const testingTarget = ref(false)
 
-const savedConnections = ref<Array<{ name: string; source: any; target: any }>>([])
+const savedConnections = ref<Array<{ name: string; sourceType?: string; source: any; target: any }>>([])
 const saveConnName = ref('')
 const saveConnDialogVisible = ref(false)
 const loadConnDialogVisible = ref(false)
@@ -86,6 +86,7 @@ function saveCurrentConnection() {
   const idx = savedConnections.value.findIndex(c => c.name === saveConnName.value.trim())
   const entry = {
     name: saveConnName.value.trim(),
+    sourceType: sourceType.value,
     source: { ...form.source },
     target: { ...form.target },
   }
@@ -100,9 +101,16 @@ function saveCurrentConnection() {
   ElMessage.success('连接配置已保存')
 }
 
-function loadConnection(conn: { source: any; target: any }) {
+function loadConnection(conn: { sourceType?: string; source: any; target: any }) {
+  // Restore the source type first (switch selector + reconcile the dynamic form
+  // fields), then overlay the saved values — same mechanism as the manual
+  // selector switch (onSourceTypeChange).
+  if (conn.sourceType && conn.sourceType !== sourceType.value) {
+    onSourceTypeChange(conn.sourceType)
+  }
   Object.assign(form.source, conn.source)
   Object.assign(form.target, conn.target)
+  sourceTestResult.value = null
   loadConnDialogVisible.value = false
   ElMessage.success('连接配置已加载')
 }
@@ -124,6 +132,9 @@ onMounted(async () => {
   if (last) {
     try {
       const c = JSON.parse(last)
+      if (c.sourceType && c.sourceType !== sourceType.value) {
+        onSourceTypeChange(c.sourceType)
+      }
       if (c.source) Object.assign(form.source, c.source)
       if (c.target) Object.assign(form.target, c.target)
     } catch {}
@@ -248,7 +259,7 @@ function toggleSelectAll() {
 async function submit() {
   loading.value = true
   try {
-    localStorage.setItem('pg2tidb_last_connection', JSON.stringify({ source: form.source, target: form.target }))
+    localStorage.setItem('pg2tidb_last_connection', JSON.stringify({ source: form.source, target: form.target, sourceType: sourceType.value }))
 
     const { data } = await apiClient.createTask({
       name: form.name || `Migration ${new Date().toLocaleString()}`,
@@ -555,7 +566,7 @@ function prevStep() {
           <div>
             <strong>{{ conn.name }}</strong>
             <div style="color: #909399; font-size: 12px; margin-top: 4px;">
-              PG: {{ conn.source.host }}:{{ conn.source.port }}/{{ conn.source.database }}
+              {{ getSource(conn.sourceType || 'postgres')?.displayName || 'Source' }}: {{ conn.source.host }}:{{ conn.source.port }}/{{ conn.source.database }}
               → TiDB: {{ conn.target.host }}:{{ conn.target.port }}/{{ conn.target.database }}
             </div>
           </div>
