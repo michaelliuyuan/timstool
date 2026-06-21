@@ -49,24 +49,7 @@ func (o *Orchestrator) Run(ctx context.Context, pipelineCfg PipelineConfig) ([]P
 	defer logger.Sync()
 
 	log := zap.L()
-	log.Info("starting pg2tidb migration pipeline")
-
-	// Dual-path routing (#t79): route by source type. PG uses the existing
-	// COPY->Lightning pipeline (zero-regression). Non-PG routes to the Source+CIR
-	// path, whose CIR->TiDB execution engine is #t81 (not built) — graceful-stop
-	// here with a routing log rather than silently run the PG pipeline against a
-	// non-PG source (FL-E2E-02③ routing visibility).
-	srcType := o.cfg.Source.SourceType()
-	route := "pg-copy-lightning"
-	if srcType != "postgres" {
-		route = "source-cir"
-	}
-	log.Info("migration routing", zap.String("source", srcType), zap.String("path", route))
-	if srcType != "postgres" {
-		// #t81 non-PG Source+CIR execution. Step 1 (ApplyDDL) builds the schema
-		// on TiDB; data load (Step 2) + validate (Step 3) follow.
-		return o.runSourceCIR(ctx)
-	}
+	log.Info("starting timstool migration pipeline")
 
 	var err error
 	o.cpMgr, err = checkpoint.NewManager(o.cfg.Migration.CheckpointDir)
@@ -83,6 +66,19 @@ func (o *Orchestrator) Run(ctx context.Context, pipelineCfg PipelineConfig) ([]P
 			log.Info("web monitor started", zap.String("addr", fmt.Sprintf("%s:%d", o.cfg.Web.Host, o.cfg.Web.Port)))
 		}
 		defer o.webServer.Stop()
+	}
+
+	// Dual-path routing (#t79): PG -> existing COPY->Lightning (zero-regression);
+	// non-PG -> Source+CIR execution (#t81). cpMgr + web monitor are started
+	// above so BOTH paths report phase/progress to the UI.
+	srcType := o.cfg.Source.SourceType()
+	route := "pg-copy-lightning"
+	if srcType != "postgres" {
+		route = "source-cir"
+	}
+	log.Info("migration routing", zap.String("source", srcType), zap.String("path", route))
+	if srcType != "postgres" {
+		return o.runSourceCIR(ctx)
 	}
 
 	var results []PipelineResult
@@ -186,6 +182,12 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	}
 	defer tidb.Close()
 
+	// Phase: schema (observability parity with the PG path — phase log + cpMgr).
+	if o.cpMgr != nil {
+		_ = o.cpMgr.SetPhase("schema")
+	}
+	log.Info("Phase: Schema 迁移", zap.String("source", srcType))
+
 	// Apply the target data policy (mirrors the PG path). Lightning local-backend
 	// requires EMPTY target tables, so drop/truncate empty them before import.
 	policy := o.cfg.Migration.TargetPolicy
@@ -206,17 +208,29 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	}
 	log.Info("source-cir schema applied", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)))
 
-	// #t81 Step 2: load data — CIR rows (via the adapter's DataReader) -> TSV
-	// CSV -> tidb-lightning -> TiDB. Source-agnostic.
+	// Phase: data (#t81 Step 2 — CIR rows via DataReader -> TSV CSV -> lightning -> TiDB).
+	if o.cpMgr != nil {
+		_ = o.cpMgr.SetPhase("data")
+	}
+	log.Info("Phase: 数据迁移", zap.String("source", srcType))
 	tempDir, err := os.MkdirTemp("", "timstool-cir-load-*")
 	if err != nil {
 		return nil, fmt.Errorf("source-cir: create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tempDir)
-	if err := target.LoadData(ctx, src, cir, o.cfg.Target, tempDir); err != nil {
+	if err := target.LoadData(ctx, src, cir, o.cfg.Target, tempDir, func(name string, rows int64) {
+		// progress parity: each exported table feeds tables_done/rows to the UI.
+		if o.cpMgr != nil {
+			o.cpMgr.GetOrCreateTable(name, rows)
+			_ = o.cpMgr.MarkTableCompleted(name, rows)
+		}
+	}); err != nil {
 		return nil, fmt.Errorf("source-cir: load data: %w", err)
 	}
 	log.Info("source-cir data loaded", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)))
+	if o.cpMgr != nil {
+		_ = o.cpMgr.SetPhaseWithReload("completed")
+	}
 
 	return []PipelineResult{
 		{Phase: PhaseSchema, Success: true},

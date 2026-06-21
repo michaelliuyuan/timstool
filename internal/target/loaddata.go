@@ -23,7 +23,7 @@ import (
 // It mirrors the existing PG path's Lightning invocation (same [mydumper.csv]
 // TSV contract, local backend, target config) but is self-contained so the PG
 // path is untouched (zero-regression).
-func LoadData(ctx context.Context, src source.Source, schema *source.Schema, target config.TargetConfig, tempDir string) error {
+func LoadData(ctx context.Context, src source.Source, schema *source.Schema, target config.TargetConfig, tempDir string, onTable func(string, int64)) error {
 	log := zap.L()
 	targetDB := target.Database
 	if targetDB == "" {
@@ -32,10 +32,14 @@ func LoadData(ctx context.Context, src source.Source, schema *source.Schema, tar
 
 	// 1. Export each table to {db}.{table}.csv (TSV).
 	for _, t := range schema.Tables {
-		if err := exportTableCSV(ctx, src, t, targetDB, tempDir); err != nil {
+		rows, err := exportTableCSV(ctx, src, t, targetDB, tempDir)
+		if err != nil {
 			return fmt.Errorf("LoadData: export table %q: %w", t.Name, err)
 		}
-		log.Info("LoadData: exported table", zap.String("table", t.Name))
+		log.Info("LoadData: exported table", zap.String("table", t.Name), zap.Int64("rows", rows))
+		if onTable != nil {
+			onTable(t.Name, rows)
+		}
 	}
 
 	// 2. Lightning import.
@@ -49,30 +53,35 @@ func LoadData(ctx context.Context, src source.Source, schema *source.Schema, tar
 // exportTableCSV streams one table's rows to {targetDB}.{table}.csv (TSV via
 // RenderCSVRow). Full-table read (no chunking) — fine for the data volumes in
 // scope; chunking is a future perf optimization.
-func exportTableCSV(ctx context.Context, src source.Source, t source.Table, targetDB, tempDir string) error {
+func exportTableCSV(ctx context.Context, src source.Source, t source.Table, targetDB, tempDir string) (int64, error) {
 	fileName := fmt.Sprintf("%s.%s.csv", targetDB, t.Name)
 	f, err := os.Create(filepath.Join(tempDir, fileName))
 	if err != nil {
-		return fmt.Errorf("create csv: %w", err)
+		return 0, fmt.Errorf("create csv: %w", err)
 	}
 	defer f.Close()
 
 	iter, err := src.DataReader().ReadTable(ctx, t, source.ChunkSpec{})
 	if err != nil {
-		return fmt.Errorf("read table: %w", err)
+		return 0, fmt.Errorf("read table: %w", err)
 	}
 	defer iter.Close()
 
 	bw := bufio.NewWriterSize(f, 256*1024)
+	var rows int64
 	for iter.Next() {
 		if _, err := bw.WriteString(RenderCSVRow(t.Columns, iter.Row())); err != nil {
-			return fmt.Errorf("write row: %w", err)
+			return 0, fmt.Errorf("write row: %w", err)
 		}
+		rows++
 	}
 	if err := iter.Err(); err != nil {
-		return fmt.Errorf("iterate: %w", err)
+		return 0, fmt.Errorf("iterate: %w", err)
 	}
-	return bw.Flush()
+	if err := bw.Flush(); err != nil {
+		return 0, fmt.Errorf("flush: %w", err)
+	}
+	return rows, nil
 }
 
 // runLightning generates the Lightning TOML config (mirroring the PG path's
