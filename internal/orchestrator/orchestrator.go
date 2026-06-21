@@ -185,8 +185,24 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 		return nil, fmt.Errorf("source-cir: open target: %w", err)
 	}
 	defer tidb.Close()
+
+	// Apply the target data policy (mirrors the PG path). Lightning local-backend
+	// requires EMPTY target tables, so drop/truncate empty them before import.
+	policy := o.cfg.Migration.TargetPolicy
+	if policy == "drop" {
+		if err := target.DropTables(ctx, tidb, cir); err != nil {
+			return nil, fmt.Errorf("source-cir: drop tables (policy=drop): %w", err)
+		}
+		log.Info("source-cir: dropped target tables", zap.String("policy", policy))
+	}
 	if err := target.ApplyDDL(ctx, tidb, cir); err != nil {
 		return nil, fmt.Errorf("source-cir: apply ddl: %w", err)
+	}
+	if policy == "truncate" {
+		if err := target.TruncateTables(ctx, tidb, cir); err != nil {
+			return nil, fmt.Errorf("source-cir: truncate tables (policy=truncate): %w", err)
+		}
+		log.Info("source-cir: truncated target tables", zap.String("policy", policy))
 	}
 	log.Info("source-cir schema applied", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)))
 

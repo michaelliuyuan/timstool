@@ -32,6 +32,35 @@ func ApplyDDL(ctx context.Context, db *sql.DB, schema *source.Schema) error {
 	return nil
 }
 
+// DropTables drops all CIR schema tables (DROP TABLE IF EXISTS). For the "drop"
+// target policy, called before ApplyDDL so Lightning imports into fresh empty
+// tables (Lightning local-backend requires empty target tables).
+func DropTables(ctx context.Context, db *sql.DB, schema *source.Schema) error {
+	if db == nil {
+		return fmt.Errorf("target.DropTables: nil db")
+	}
+	for _, t := range schema.Tables {
+		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS "+QuoteIdent(t.Name)); err != nil {
+			return fmt.Errorf("target.DropTables: drop %q: %w", t.Name, err)
+		}
+	}
+	return nil
+}
+
+// TruncateTables truncates all CIR schema tables. For the "truncate" target
+// policy, called after ApplyDDL / before Lightning so tables are empty.
+func TruncateTables(ctx context.Context, db *sql.DB, schema *source.Schema) error {
+	if db == nil {
+		return fmt.Errorf("target.TruncateTables: nil db")
+	}
+	for _, t := range schema.Tables {
+		if _, err := db.ExecContext(ctx, "TRUNCATE TABLE "+QuoteIdent(t.Name)); err != nil {
+			return fmt.Errorf("target.TruncateTables: truncate %q: %w", t.Name, err)
+		}
+	}
+	return nil
+}
+
 // RenderCreateTable renders a TiDB/MySQL CREATE TABLE IF NOT EXISTS from a CIR
 // Table. Pure function (unit-testable). Column order, PK, and indexes follow the
 // CIR definition.
