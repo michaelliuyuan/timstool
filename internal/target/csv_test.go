@@ -8,68 +8,56 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/source"
 )
 
-func TestRenderCSVRow_Types(t *testing.T) {
+// RenderCSVRow mirrors the PG path's Lightning TSV format (TAB-separated, \N
+// NULL, backslash-escape) so the same Lightning config reads it.
+func TestRenderCSVRow_TSVFormat(t *testing.T) {
 	cols := []source.Column{
-		{Name: "id", TiDBType: "BIGINT"},
-		{Name: "name", TiDBType: "VARCHAR(50)"},
-		{Name: "amount", TiDBType: "DECIMAL(10,2)"},
-		{Name: "flag", TiDBType: "TINYINT(1)"},
-		{Name: "created", TiDBType: "DATETIME"},
-		{Name: "data", TiDBType: "BLOB"},
-		{Name: "note", TiDBType: "TEXT"},
+		{Name: "id"}, {Name: "name"}, {Name: "amt"}, {Name: "flag"}, {Name: "ts"}, {Name: "note"},
 	}
 	ts := time.Date(2026, 6, 21, 17, 5, 0, 0, time.UTC)
 	row := source.Row{
-		"id":      {TiDBType: "BIGINT", Val: int64(7)},
-		"name":    {TiDBType: "VARCHAR(50)", Val: "hi, there"}, // comma -> quoted
-		"amount":  {TiDBType: "DECIMAL(10,2)", Val: 12.5},
-		"flag":    {TiDBType: "TINYINT(1)", Val: true},
-		"created": {TiDBType: "DATETIME", Val: ts},
-		"data":    {TiDBType: "BLOB", Val: []byte{0xAB, 0xCD}},
-		"note":    {TiDBType: "TEXT", Val: nil}, // NULL
+		"id":   {Val: int64(7)},
+		"name": {Val: "a\tb"}, // TAB in value → escaped \t
+		"amt":  {Val: 12.5},
+		"flag": {Val: true},
+		"ts":   {Val: ts},
+		"note": {Val: nil}, // NULL → \N
 	}
 	got := RenderCSVRow(cols, row)
-	// Fields: 7 | "hi, there" | 12.5 | 1 | 2026-06-21 17:05:00 | \xabcd | \N
-	if !strings.HasPrefix(got, "7,") {
-		t.Errorf("int field: %q", got)
+	if strings.Count(got, "\t") != 5 {
+		t.Errorf("want 5 TAB separators (6 fields), got %d:\n%s", strings.Count(got, "\t"), got)
 	}
-	if !strings.Contains(got, `"hi, there"`) {
-		t.Errorf("string with comma must be quoted: %q", got)
+	if !strings.HasPrefix(got, "7\t") {
+		t.Errorf("int field:\n%s", got)
 	}
-	if !strings.Contains(got, ",12.5,") {
-		t.Errorf("decimal field: %q", got)
+	if !strings.Contains(got, "a\\tb") {
+		t.Errorf("TAB in value must escape to \\t:\n%s", got)
 	}
-	if !strings.Contains(got, ",1,") { // bool true -> 1
-		t.Errorf("bool field: %q", got)
+	if !strings.Contains(got, "\t12.5\t") {
+		t.Errorf("float field:\n%s", got)
+	}
+	if !strings.Contains(got, "\t1\t") { // bool true → 1
+		t.Errorf("bool field:\n%s", got)
 	}
 	if !strings.Contains(got, "2026-06-21 17:05:00") {
-		t.Errorf("datetime field: %q", got)
+		t.Errorf("datetime field:\n%s", got)
 	}
-	if !strings.Contains(got, `\xabcd`) {
-		t.Errorf("blob hex field: %q", got)
-	}
-	if !strings.HasSuffix(got, `,`+`\N`+"\n") {
-		t.Errorf("trailing NULL field must be \\N: %q", got)
+	if !strings.HasSuffix(got, "\t"+`\N`+"\n") {
+		t.Errorf("trailing NULL field must be \\N:\n%s", got)
 	}
 }
 
-func TestRenderCSVRow_NullAndEmptyAndLiteralN(t *testing.T) {
-	cols := []source.Column{
-		{Name: "a"}, {Name: "b"}, {Name: "c"},
-	}
+func TestRenderCSVRow_NullAndBackslash(t *testing.T) {
+	cols := []source.Column{{Name: "a"}, {Name: "b"}}
 	row := source.Row{
-		"a": {Val: nil},           // NULL -> \N
-		"b": {Val: ""},            // empty string -> "" (distinct from NULL)
-		"c": {Val: `\N`},          // literal "\N" -> quoted to avoid NULL ambiguity
+		"a": {Val: nil},           // NULL → \N
+		"b": {Val: `back\slash`},  // backslash → escaped \\
 	}
 	got := RenderCSVRow(cols, row)
-	if !strings.HasPrefix(got, `\N,`) {
-		t.Errorf("NULL must be \\N: %q", got)
+	if !strings.HasPrefix(got, `\N`+"\t") {
+		t.Errorf("NULL field must be \\N:\n%s", got)
 	}
-	if !strings.Contains(got, `,"",`) {
-		t.Errorf("empty string must be \"\": %q", got)
-	}
-	if !strings.Contains(got, `"\N"`) {
-		t.Errorf("literal \\N must be quoted: %q", got)
+	if !strings.Contains(got, `back\\slash`) {
+		t.Errorf("backslash must be escaped:\n%s", got)
 	}
 }
