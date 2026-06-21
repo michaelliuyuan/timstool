@@ -10,5 +10,9 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue"],
+  // Exclude test files from the production type-check so `npm run build`
+  // (vue-tsc -b) does not pull in vitest (a devDependency). Tests still run via
+  // `npm test` (vitest). (#t80 — keep prod build decoupled from test deps.)
+  "exclude": ["src/**/*.spec.ts", "src/**/*.test.ts"]
 }
