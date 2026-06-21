@@ -48,6 +48,21 @@ func (o *Orchestrator) Run(ctx context.Context, pipelineCfg PipelineConfig) ([]P
 	log := zap.L()
 	log.Info("starting pg2tidb migration pipeline")
 
+	// Dual-path routing (#t79): route by source type. PG uses the existing
+	// COPY->Lightning pipeline (zero-regression). Non-PG routes to the Source+CIR
+	// path, whose CIR->TiDB execution engine is #t81 (not built) — graceful-stop
+	// here with a routing log rather than silently run the PG pipeline against a
+	// non-PG source (FL-E2E-02③ routing visibility).
+	srcType := o.cfg.Source.SourceType()
+	route := "pg-copy-lightning"
+	if srcType != "postgres" {
+		route = "source-cir (pending #t81)"
+	}
+	log.Info("migration routing", zap.String("source", srcType), zap.String("path", route))
+	if srcType != "postgres" {
+		return nil, fmt.Errorf("source %q: CIR→TiDB 执行层构建中（见 #t81），暂仅 PostgreSQL 可执行全量迁移", srcType)
+	}
+
 	var err error
 	o.cpMgr, err = checkpoint.NewManager(o.cfg.Migration.CheckpointDir)
 	if err != nil {

@@ -18,23 +18,17 @@ var allCmd = &cobra.Command{
   3. Migrate full data
   4. Validate data consistency`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// Dual-path routing (#t64 P1 step 2e): --source=postgres (default) uses
-		// the existing high-performance PG pipeline (COPY→Lightning, zero
-		// regression). MySQL (P2 #t65) uses the Source+CIR pipeline; other
-		// sources (oracle/mssql/db2) are stubs.
+		// --source overrides the config's source type; the orchestrator routes
+		// by it (#t79 dual-path: postgres→COPY→Lightning; non-PG→Source+CIR,
+		// graceful "见 #t81" until the CIR→TiDB execution engine lands).
 		sourceType, _ := cmd.Flags().GetString("source")
-		switch sourceType {
-		case "postgres":
-			// PG pipeline: existing path, zero regression.
-		case "mysql":
-			// MySQL pipeline: Source+CIR path, full migration only (no CDC yet).
-		default:
-			return fmt.Errorf("full migration for source %q is not yet implemented; use --source=postgres (default) or --source=mysql", sourceType)
-		}
 
 		cfg, err := config.Load(cfgFile)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
+		}
+		if sourceType != "" {
+			cfg.Source.Type = sourceType
 		}
 		if err := cfg.Validate(); err != nil {
 			return fmt.Errorf("invalid config: %w", err)
