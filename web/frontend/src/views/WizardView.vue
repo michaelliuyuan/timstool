@@ -278,7 +278,7 @@ async function submit() {
 }
 
 function nextStep() {
-  if (activeStep.value === 0 && !sourceTestResult.value?.ok) {
+  if (activeStep.value === 0 && !sourceTestResult.value?.success) {
     ElMessage.warning('请先测试源数据库连接')
     return
   }
