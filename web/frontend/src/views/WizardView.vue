@@ -246,10 +246,6 @@ function toggleSelectAll() {
 }
 
 async function submit() {
-  if (sourceType.value !== 'postgres') {
-    ElMessage.warning(`${currentMeta.value?.displayName || sourceType.value} 的迁移执行路径（CIR→TiDB 执行引擎）在建中（#t81），暂仅 PostgreSQL 可执行全量迁移。`)
-    return
-  }
   loading.value = true
   try {
     localStorage.setItem('pg2tidb_last_connection', JSON.stringify({ source: form.source, target: form.target }))

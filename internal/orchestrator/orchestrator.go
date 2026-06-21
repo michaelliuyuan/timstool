@@ -190,8 +190,22 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	}
 	log.Info("source-cir schema applied", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)))
 
-	return []PipelineResult{{Phase: PhaseSchema, Success: true}},
-		fmt.Errorf("source %q: schema applied (%d tables) — data load = #t81 Step 2 (pending)", srcType, len(cir.Tables))
+	// #t81 Step 2: load data — CIR rows (via the adapter's DataReader) -> TSV
+	// CSV -> tidb-lightning -> TiDB. Source-agnostic.
+	tempDir, err := os.MkdirTemp("", "timstool-cir-load-*")
+	if err != nil {
+		return nil, fmt.Errorf("source-cir: create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+	if err := target.LoadData(ctx, src, cir, o.cfg.Target, tempDir); err != nil {
+		return nil, fmt.Errorf("source-cir: load data: %w", err)
+	}
+	log.Info("source-cir data loaded", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)))
+
+	return []PipelineResult{
+		{Phase: PhaseSchema, Success: true},
+		{Phase: PhaseData, Success: true},
+	}, nil
 }
 
 func (o *Orchestrator) runPrecheck(ctx context.Context) PipelineResult {
