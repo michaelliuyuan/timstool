@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,6 +18,8 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/data"
 	"github.com/michaelliuyuan/timstool/internal/precheck"
 	"github.com/michaelliuyuan/timstool/internal/schema"
+	"github.com/michaelliuyuan/timstool/internal/source"
+	"github.com/michaelliuyuan/timstool/internal/target"
 	"github.com/michaelliuyuan/timstool/internal/validator"
 	"go.uber.org/zap"
 )
@@ -56,11 +59,13 @@ func (o *Orchestrator) Run(ctx context.Context, pipelineCfg PipelineConfig) ([]P
 	srcType := o.cfg.Source.SourceType()
 	route := "pg-copy-lightning"
 	if srcType != "postgres" {
-		route = "source-cir (pending #t81)"
+		route = "source-cir"
 	}
 	log.Info("migration routing", zap.String("source", srcType), zap.String("path", route))
 	if srcType != "postgres" {
-		return nil, fmt.Errorf("source %q: CIR→TiDB 执行层构建中（见 #t81），暂仅 PostgreSQL 可执行全量迁移", srcType)
+		// #t81 non-PG Source+CIR execution. Step 1 (ApplyDDL) builds the schema
+		// on TiDB; data load (Step 2) + validate (Step 3) follow.
+		return o.runSourceCIR(ctx)
 	}
 
 	var err error
@@ -137,6 +142,56 @@ func (o *Orchestrator) Run(ctx context.Context, pipelineCfg PipelineConfig) ([]P
 		zap.Int("phases", len(results)))
 
 	return results, nil
+}
+
+// runSourceCIR executes the non-PG Source+CIR path (#t81). Step 1 (ApplyDDL):
+// open the source adapter, read its schema into CIR, and create the tables on
+// the TiDB target — source-agnostic (the target only sees CIR). Data load
+// (Step 2) and validate (Step 3) are pending; until then this returns an honest
+// "schema applied, data pending" so a non-PG migration is never reported
+// complete without data. PG is unaffected (it takes the COPY->Lightning path).
+func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, error) {
+	log := zap.L()
+	srcType := o.cfg.Source.SourceType()
+
+	srcCfg := source.SourceConfig{
+		Kind:     srcType,
+		Host:     o.cfg.Source.Host,
+		Port:     o.cfg.Source.Port,
+		User:     o.cfg.Source.User,
+		Password: o.cfg.Source.Password,
+		Database: o.cfg.Source.Database,
+		Schema:   o.cfg.Source.Schema,
+		Options:  map[string]string{"sslmode": o.cfg.Source.SSLMode},
+	}
+	src, err := source.Open(srcType, srcCfg)
+	if err != nil {
+		return nil, fmt.Errorf("source-cir: open %s: %w", srcType, err)
+	}
+	defer src.Close()
+	if err := src.Connect(ctx); err != nil {
+		return nil, fmt.Errorf("source-cir: connect %s: %w", srcType, err)
+	}
+	cir, err := src.SchemaReader().ReadSchema(ctx, source.Filter{
+		Tables:        o.cfg.Migration.Tables,
+		ExcludeTables: o.cfg.Migration.ExcludeTables,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("source-cir: read schema: %w", err)
+	}
+
+	tidb, err := sql.Open("mysql", o.cfg.Target.DSN())
+	if err != nil {
+		return nil, fmt.Errorf("source-cir: open target: %w", err)
+	}
+	defer tidb.Close()
+	if err := target.ApplyDDL(ctx, tidb, cir); err != nil {
+		return nil, fmt.Errorf("source-cir: apply ddl: %w", err)
+	}
+	log.Info("source-cir schema applied", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)))
+
+	return []PipelineResult{{Phase: PhaseSchema, Success: true}},
+		fmt.Errorf("source %q: schema applied (%d tables) — data load = #t81 Step 2 (pending)", srcType, len(cir.Tables))
 }
 
 func (o *Orchestrator) runPrecheck(ctx context.Context) PipelineResult {
