@@ -198,6 +198,18 @@ async function testConnection(type: 'source' | 'target') {
 }
 
 async function loadTables() {
+  // Only PostgreSQL has a complete migration flow today (COPY→Lightning). The
+  // MySQL/Oracle/... adapters exist (#t65, incl. a real MySQL SchemaReader), but
+  // the orchestrator's non-PG execution path isn't wired yet (#t79) and the
+  // table-list endpoint is PG-only — so a non-PG source would hit a
+  // pgx↔MySQL protocol error ("unknown message type"). Guard with a clear
+  // message instead of letting the flow dead-end.
+  if (sourceType.value !== 'postgres') {
+    ElMessage.warning(`${currentMeta.value?.displayName || sourceType.value} 的完整迁移流程（orchestrator 非 PG 执行路径）尚在接线中（#t79）；表列表与迁移暂仅 PostgreSQL 走完整 Lightning 流程，可切回 PostgreSQL 验证。`)
+    availableTables.value = []
+    selectedTables.value = []
+    return
+  }
   loadingTables.value = true
   availableTables.value = []
   selectedTables.value = []
@@ -242,6 +254,10 @@ function toggleSelectAll() {
 }
 
 async function submit() {
+  if (sourceType.value !== 'postgres') {
+    ElMessage.warning(`${currentMeta.value?.displayName || sourceType.value} 的迁移执行路径尚在接线中（#t79），暂仅 PostgreSQL 可执行迁移。`)
+    return
+  }
   loading.value = true
   try {
     localStorage.setItem('pg2tidb_last_connection', JSON.stringify({ source: form.source, target: form.target }))
