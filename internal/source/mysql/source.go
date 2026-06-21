@@ -246,11 +246,13 @@ func mapMySQLType(srcType string, precision, scale int) string {
 	case "VARBINARY":
 		return t
 
-	// ENUM/SET: TiDB supports ENUM/SET but for migration purposes map to VARCHAR
-	case "ENUM":
-		return "VARCHAR(255)"
-	case "SET":
-		return "VARCHAR(255)"
+	// ENUM/SET: 1:1 fidelity (architect decision) — TiDB natively supports them;
+	// preserve the member values from the source type (case-sensitive).
+	case "ENUM", "SET":
+		if idx := strings.IndexByte(srcType, '('); idx >= 0 {
+			return base + srcType[idx:]
+		}
+		return base
 
 	// Date/time types
 	case "DATE":
@@ -268,7 +270,7 @@ func mapMySQLType(srcType string, precision, scale int) string {
 		}
 		return "TIMESTAMP"
 	case "YEAR":
-		return "SMALLINT" // TiDB has no YEAR type
+		return "YEAR" // TiDB natively supports YEAR (1:1 fidelity)
 
 	// JSON
 	case "JSON":

@@ -67,16 +67,16 @@ func TestMySQLTypeMapper(t *testing.T) {
 		{"mediumtext", 0, 0, "TEXT"},
 		{"longtext", 0, 0, "TEXT"},
 
-		// ENUM/SET
-		{"enum('a','b','c')", 0, 0, "VARCHAR(255)"},
-		{"set('x','y')", 0, 0, "VARCHAR(255)"},
+		// ENUM/SET: 1:1 fidelity, member values preserved (case-sensitive)
+		{"enum('a','b','c')", 0, 0, "ENUM('a','b','c')"},
+		{"set('x','y')", 0, 0, "SET('x','y')"},
 
 		// Date/time
 		{"datetime", 0, 0, "DATETIME"},
 		{"datetime(6)", 6, 0, "DATETIME(6)"},
 		{"timestamp", 0, 0, "TIMESTAMP"},
 		{"date", 0, 0, "DATE"},
-		{"year", 0, 0, "SMALLINT"},
+		{"year", 0, 0, "YEAR"},
 
 		// JSON
 		{"json", 0, 0, "JSON"},
