@@ -134,6 +134,74 @@ func (s *Server) handleTestConnectionMulti(w http.ResponseWriter, r *http.Reques
 	s.writeJSON(w, http.StatusOK, s.testSource(r.Context(), req.Source, req.Fields))
 }
 
+// handleSourceTables lists a source's tables via the adapter's SchemaReader
+// (multi-source; #t79 Phase 1). Body {source, fields}. This is the real fix for
+// the MySQL "选择表" failure (the PG-only /config/list-tables sent pgx at the
+// MySQL server). row_estimate is -1 (unknown) — CIR doesn't carry row counts;
+// PG keeps its dedicated endpoint with reltuples estimates for zero-regression.
+func (s *Server) handleSourceTables(w http.ResponseWriter, r *http.Request) {
+	var req testSourceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	srcType := req.Source
+	if srcType == "" {
+		srcType = "postgres"
+	}
+	meta, err := source.Describe(srcType)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("unknown source %q", srcType))
+		return
+	}
+	if !meta.Implemented {
+		s.writeError(w, http.StatusBadRequest, meta.NotImplMsg)
+		return
+	}
+
+	cfg := source.SourceConfig{
+		Kind:     srcType,
+		Host:     stringField(req.Fields, "host"),
+		User:     stringField(req.Fields, "user"),
+		Password: stringField(req.Fields, "password"),
+		Database: stringField(req.Fields, "database"),
+		Schema:   stringField(req.Fields, "schema"),
+		Options:  stringifyMap(req.Fields),
+	}
+	if port := stringField(req.Fields, "port"); port != "" {
+		fmt.Sscanf(port, "%d", &cfg.Port)
+	}
+
+	src, err := source.Open(srcType, cfg)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "open source: "+err.Error())
+		return
+	}
+	defer src.Close()
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	if err := src.Connect(ctx); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "connect: "+err.Error())
+		return
+	}
+	cir, err := src.SchemaReader().ReadSchema(ctx, source.Filter{})
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "read schema: "+err.Error())
+		return
+	}
+
+	type tableInfo struct {
+		Name        string `json:"name"`
+		RowEstimate int64  `json:"row_estimate"`
+	}
+	tables := make([]tableInfo, 0, len(cir.Tables))
+	for _, t := range cir.Tables {
+		tables = append(tables, tableInfo{Name: t.Name, RowEstimate: -1})
+	}
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{"tables": tables, "count": len(tables)})
+}
+
 // stringField reads a string-valued field from the loose JSON map (numbers
 // arrive as float64).
 func stringField(fields map[string]any, key string) string {

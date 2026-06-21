@@ -121,6 +121,14 @@ export const apiClient = {
 
   getSources: () => api.get<{ sources: SourceMeta[] }>('/sources'),
 
+  // Multi-source table listing via the adapter's SchemaReader (#t79). PG keeps
+  // its dedicated /config/list-tables (reltuples estimates); non-PG uses this.
+  getSourceTables: (source: string, fields: Record<string, any>) =>
+    api.post<{ tables: { name: string; row_estimate: number }[]; count: number }>(
+      '/sources/tables',
+      { source, fields },
+    ),
+
   // Multi-source connection test (doc §6.2): {source, fields} → {success,...}.
   // source defaults to postgres server-side (backward compat).
   testSourceConnection: (source: string, fields: Record<string, any>) =>

@@ -55,6 +55,7 @@ type CompareConfig struct {
 }
 
 type SourceConfig struct {
+	Type     string `yaml:"type" json:"type"` // source type: postgres (default) | mysql | oracle | ... (#t79)
 	Host     string `yaml:"host" json:"host"`
 	Port     int    `yaml:"port" json:"port"`
 	User     string `yaml:"user" json:"user"`
@@ -62,6 +63,15 @@ type SourceConfig struct {
 	Database string `yaml:"database" json:"database"`
 	Schema   string `yaml:"schema" json:"schema"`
 	SSLMode  string `yaml:"sslmode" json:"sslmode"`
+}
+
+// SourceType returns the configured source type, defaulting to "postgres"
+// (zero-regression: existing configs / task configs without a type stay PG).
+func (s SourceConfig) SourceType() string {
+	if s.Type == "" {
+		return "postgres"
+	}
+	return s.Type
 }
 
 func (s SourceConfig) DSN() string {
