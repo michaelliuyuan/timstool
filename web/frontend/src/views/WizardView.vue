@@ -247,7 +247,7 @@ function toggleSelectAll() {
 
 async function submit() {
   if (sourceType.value !== 'postgres') {
-    ElMessage.warning(`${currentMeta.value?.displayName || sourceType.value} 的迁移执行路径尚在接线中（#t79），暂仅 PostgreSQL 可执行迁移。`)
+    ElMessage.warning(`${currentMeta.value?.displayName || sourceType.value} 的迁移执行路径（CIR→TiDB 执行引擎）在建中（#t81），暂仅 PostgreSQL 可执行全量迁移。`)
     return
   }
   loading.value = true
