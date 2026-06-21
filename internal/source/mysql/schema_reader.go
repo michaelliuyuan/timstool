@@ -140,7 +140,7 @@ func (r *schemaReader) readColumns(ctx context.Context, db *sql.DB, database, ta
 		mapped := tm.MapType(colType, prec, sc)
 		var defVal string
 		if colDefault.Valid {
-			defVal = colDefault.String
+			defVal = quoteDefault(dataType, colDefault.String) // TiDB-DDL-ready (literals quoted)
 		}
 		var cmt string
 		if comment.Valid {

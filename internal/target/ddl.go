@@ -77,9 +77,9 @@ func renderColumn(b *strings.Builder, c source.Column) {
 		b.WriteString(" AUTO_INCREMENT")
 	}
 	if c.Default != "" {
-		// Default is a source expression; source→TiDB translation is the
-		// TypeMapper's concern (design §4). Rendered raw — CURRENT_TIMESTAMP /
-		// numeric defaults are directly valid for MySQL-family sources.
+		// Default is rendered TiDB-DDL-ready by the source adapter (literal vs
+		// expression is source semantics, decided where DATA_TYPE is known);
+		// emitted verbatim here. doc multi-source-execution-engine-design §4.
 		b.WriteString(" DEFAULT ")
 		b.WriteString(c.Default)
 	}

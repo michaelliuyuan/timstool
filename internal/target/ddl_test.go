@@ -54,6 +54,28 @@ func TestRenderCreateTable_NoPKNoIndex(t *testing.T) {
 	}
 }
 
+func TestRenderCreateTable_DefaultRawPassthrough(t *testing.T) {
+	// Renderer is dumb: it emits the CIR default verbatim. The source adapter
+	// pre-renders literals quoted (option b); the renderer must not alter them.
+	got := RenderCreateTable(source.Table{
+		Name: "t_orders",
+		Columns: []source.Column{
+			{Name: "currency", TiDBType: "CHAR(3)", Default: "'CNY'"},                  // adapter-quoted
+			{Name: "amount", TiDBType: "DECIMAL(10,2)", Default: "0.00"},               // numeric raw
+			{Name: "created_at", TiDBType: "DATETIME", Default: "CURRENT_TIMESTAMP"},   // expr raw
+		},
+	})
+	if !strings.Contains(got, "DEFAULT 'CNY'") {
+		t.Errorf("adapter-quoted default must pass through verbatim:\n%s", got)
+	}
+	if !strings.Contains(got, "DEFAULT 0.00") {
+		t.Errorf("numeric default must stay raw:\n%s", got)
+	}
+	if !strings.Contains(got, "DEFAULT CURRENT_TIMESTAMP") {
+		t.Errorf("expression default must stay raw:\n%s", got)
+	}
+}
+
 func TestQuoteIdent(t *testing.T) {
 	cases := map[string]string{
 		"col":       "`col`",
