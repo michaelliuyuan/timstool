@@ -63,26 +63,7 @@ type DumpConfig struct {
 func Dump(ctx context.Context, cfg DumpConfig) error {
 	log := zap.L()
 
-	args := []string{
-		"--host=" + cfg.Host,
-		fmt.Sprintf("--port=%d", cfg.Port),
-		"--user=" + cfg.User,
-		"--password=" + cfg.Password,
-		"--output=" + cfg.OutputDir,
-		"--filetype=" + firstNonEmpty(cfg.FileType, "csv"),
-		"--no-header", // lightning expects no header (header=false in config)
-		"--csv-separator", "\\t",
-		"--consistency=" + firstNonEmpty(cfg.Consistency, "lock"),
-	}
-	if cfg.Database != "" {
-		args = append(args, "--database="+cfg.Database)
-	}
-	if cfg.TablesList != "" {
-		args = append(args, "--tables-list="+cfg.TablesList)
-	}
-	if cfg.Threads > 0 {
-		args = append(args, fmt.Sprintf("--threads=%d", cfg.Threads))
-	}
+	args := buildArgs(cfg)
 
 	log.Info("dumpling export starting",
 		zap.String("binary", cfg.Binary),
@@ -103,6 +84,40 @@ func Dump(ctx context.Context, cfg DumpConfig) error {
 	}
 	log.Info("dumpling export completed", zap.Int("output_bytes", len(out)))
 	return nil
+}
+
+// buildArgs renders the tidb-dumpling CLI argument vector for cfg. Separated
+// from Dump so the separator/delimiter contract with Lightning can be unit-
+// tested without invoking the binary.
+func buildArgs(cfg DumpConfig) []string {
+	args := []string{
+		"--host=" + cfg.Host,
+		fmt.Sprintf("--port=%d", cfg.Port),
+		"--user=" + cfg.User,
+		"--password=" + cfg.Password,
+		"--output=" + cfg.OutputDir,
+		"--filetype=" + firstNonEmpty(cfg.FileType, "csv"),
+		"--no-header", // lightning expects no header (header=false in config)
+		// NOTE: "\t" is a single real TAB byte (0x09) in Go — exec.Command
+		// passes it verbatim to dumpling (no shell). Do NOT write "\\t" (a
+		// 2-char backslash-t literal): dumpling v7.1.9 treats that as a 2-byte
+		// separator (0x5c 0x74), which mismatches Lightning's separator="\t"
+		// (real TAB) and corrupts every value while row counts still pass.
+		// csv-delimiter="" matches Lightning delimiter="" (no quote wrapping).
+		"--csv-separator", "\t",
+		"--csv-delimiter", "",
+		"--consistency=" + firstNonEmpty(cfg.Consistency, "lock"),
+	}
+	if cfg.Database != "" {
+		args = append(args, "--database="+cfg.Database)
+	}
+	if cfg.TablesList != "" {
+		args = append(args, "--tables-list="+cfg.TablesList)
+	}
+	if cfg.Threads > 0 {
+		args = append(args, fmt.Sprintf("--threads=%d", cfg.Threads))
+	}
+	return args
 }
 
 // DumpFromConfig is a convenience that builds DumpConfig from a config.SourceConfig.
