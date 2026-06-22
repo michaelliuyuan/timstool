@@ -230,7 +230,7 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 			// Dumpling exports CSV directly to tempDir; LoadData then imports via lightning.
 			tableNames := make([]string, len(cir.Tables))
 			for i, t := range cir.Tables {
-				tableNames[i] = t.Name
+				tableNames[i] = o.cfg.Source.Database + "." + t.Name
 			}
 			if err := dumpling.Dump(ctx, dumpling.DumpFromConfig(o.cfg.Source, tempDir, bin, tableNames)); err != nil {
 				// Fall back to stream on dumpling failure.
