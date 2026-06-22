@@ -70,8 +70,9 @@ func Dump(ctx context.Context, cfg DumpConfig) error {
 		"--password=" + cfg.Password,
 		"--output=" + cfg.OutputDir,
 		"--filetype=" + firstNonEmpty(cfg.FileType, "csv"),
-		"--consistency=" + firstNonEmpty(cfg.Consistency, "lock"),
 		"--no-header", // lightning expects no header (header=false in config)
+		"--separator", "\\t",
+		"--consistency=" + firstNonEmpty(cfg.Consistency, "lock"),
 	}
 	if cfg.Database != "" {
 		args = append(args, "--database="+cfg.Database)

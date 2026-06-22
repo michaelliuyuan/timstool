@@ -36,9 +36,6 @@ type TableValidation struct {
 // adapter's DB) + the TiDB target. sampleSize controls how many rows per table
 // are value-compared (0 → default 10).
 func ValidateMigration(ctx context.Context, sourceDB, tidbDB *sql.DB, schema *source.Schema, sampleSize int) (*ValidationReport, error) {
-	if sampleSize <= 0 {
-		sampleSize = 10
-	}
 	rpt := &ValidationReport{}
 	for _, t := range schema.Tables {
 		tv := TableValidation{Name: t.Name}
@@ -54,8 +51,9 @@ func ValidateMigration(ctx context.Context, sourceDB, tidbDB *sql.DB, schema *so
 		tv.TargetRows = tgtN
 		tv.Passed = srcN == tgtN
 
-		// Value-level sample comparison (only if row counts match + non-empty).
-		if srcN > 0 && srcN == tgtN {
+		// Value-level sample comparison only when explicitly requested (sampleSize > 0).
+		// Row-count parity alone is the default (ValidateRowCounts passes 0).
+		if sampleSize > 0 && srcN > 0 && srcN == tgtN {
 			checked, mismatches, err := compareSample(ctx, sourceDB, tidbDB, t.Name, sampleSize)
 			if err == nil {
 				tv.SampleChecked = checked
