@@ -71,7 +71,7 @@ func Dump(ctx context.Context, cfg DumpConfig) error {
 		"--output=" + cfg.OutputDir,
 		"--filetype=" + firstNonEmpty(cfg.FileType, "csv"),
 		"--no-header", // lightning expects no header (header=false in config)
-		"--separator", "\\t",
+		"--csv-separator", "\\t",
 		"--consistency=" + firstNonEmpty(cfg.Consistency, "lock"),
 	}
 	if cfg.Database != "" {
