@@ -109,9 +109,15 @@ func runLightning(ctx context.Context, bin, tempDir string, target config.Target
 	if err := os.MkdirAll(sortedKVDir, 0o755); err != nil {
 		return fmt.Errorf("create sorted-kv dir: %w", err)
 	}
-	// Clean stale Lightning checkpoints (avoid "illegal checkpoints" errors).
-	os.Remove(filepath.Join(sortedKVDir, "tidb_lightning_checkpoint.pb"))
-	os.Remove(filepath.Join(absDir, "tidb_lightning_checkpoint.pb"))
+	// Clean stale Lightning checkpoints before import. A checkpoint left by a
+	// prior (failed) run makes the next run fail with "illegal checkpoints" —
+	// it records progress against data that no longer exists, which is
+	// especially likely under the drop strategy (the target table is wiped but
+	// the checkpoint still claims rows were imported). Cover every plausible
+	// location: the configured sorted-kv-dir, the data dir, and the system temp
+	// dirs (Lightning has been observed writing to /tmp when sorted-kv-dir was
+	// absent or unwritable in older runs).
+	cleanStaleLightningCheckpoints(absDir, sortedKVDir)
 
 	pdAddr := target.PDAddr
 	if pdAddr == "" {
@@ -192,3 +198,25 @@ analyze = "off"
 }
 
 func toSlash(p string) string { return strings.ReplaceAll(p, "\\", "/") }
+
+// lightningCheckpointFile is the file-based checkpoint Lightning writes for the
+// local backend. A stale copy from a prior failed run triggers
+// "illegal checkpoints" on the next import.
+const lightningCheckpointFile = "tidb_lightning_checkpoint.pb"
+
+// cleanStaleLightningCheckpoints removes any leftover Lightning checkpoint from
+// every plausible location. os.Remove ignores not-exist errors, so this is safe
+// and cheap to run unconditionally before each import.
+func cleanStaleLightningCheckpoints(absDir, sortedKVDir string) {
+	log := zap.L()
+	dirs := []string{sortedKVDir, absDir, os.TempDir(), "/tmp"}
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		path := filepath.Join(dir, lightningCheckpointFile)
+		if err := os.Remove(path); err == nil {
+			log.Info("LoadData: removed stale lightning checkpoint", zap.String("path", path))
+		}
+	}
+}
