@@ -84,6 +84,18 @@ func exportTableCSV(ctx context.Context, src source.Source, t source.Table, targ
 	return rows, nil
 }
 
+// RunLightningImport generates the Lightning TOML config and invokes
+// tidb-lightning to import CSV files from tempDir into the TiDB target.
+// Exported so the orchestrator can call it directly when CSV files are
+// produced by an external tool (e.g., dumpling) rather than by exportTableCSV.
+func RunLightningImport(ctx context.Context, tempDir string, target config.TargetConfig) error {
+	bin := lightningpkg.FindBinary(tempDir)
+	if bin == "" {
+		return fmt.Errorf("tidb-lightning binary not found")
+	}
+	return runLightning(ctx, bin, tempDir, target)
+}
+
 // runLightning generates the Lightning TOML config (mirroring the PG path's
 // [mydumper.csv] TSV contract + local backend + target) and invokes the
 // tidb-lightning binary, returning an error with the output tail on failure.

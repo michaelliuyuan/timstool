@@ -16,6 +16,7 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/common/logger"
 	"github.com/michaelliuyuan/timstool/internal/common/reporter"
 	"github.com/michaelliuyuan/timstool/internal/data"
+	"github.com/michaelliuyuan/timstool/internal/dumpling"
 	"github.com/michaelliuyuan/timstool/internal/precheck"
 	"github.com/michaelliuyuan/timstool/internal/schema"
 	"github.com/michaelliuyuan/timstool/internal/source"
@@ -218,16 +219,53 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 		return nil, fmt.Errorf("source-cir: create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tempDir)
-	if err := target.LoadData(ctx, src, cir, o.cfg.Target, tempDir, func(name string, rows int64) {
-		// progress parity: each exported table feeds tables_done/rows to the UI.
-		if o.cpMgr != nil {
-			o.cpMgr.GetOrCreateTable(name, rows)
-			_ = o.cpMgr.MarkTableCompleted(name, rows)
+
+	// Export mode: dumpling (fast-path, concurrent+snapshot) if binary available;
+	// otherwise stream (per-row CIR DataReader → CSV). Design §3.
+	exportMode := "stream"
+	if srcType == "mysql" {
+		if bin := dumpling.FindBinary(""); bin != "" {
+			exportMode = "dumpling"
+			log.Info("source-cir: using dumpling export (fast-path)", zap.String("binary", bin))
+			// Dumpling exports CSV directly to tempDir; LoadData then imports via lightning.
+			tableNames := make([]string, len(cir.Tables))
+			for i, t := range cir.Tables {
+				tableNames[i] = t.Name
+			}
+			if err := dumpling.Dump(ctx, dumpling.DumpFromConfig(o.cfg.Source, tempDir, bin, tableNames)); err != nil {
+				// Fall back to stream on dumpling failure.
+				log.Warn("source-cir: dumpling failed, falling back to stream", zap.Error(err))
+				exportMode = "stream"
+			}
+		} else {
+			log.Info("source-cir: dumpling binary not found, using stream export")
 		}
-	}); err != nil {
-		return nil, fmt.Errorf("source-cir: load data: %w", err)
 	}
-	log.Info("source-cir data loaded", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)))
+
+	if exportMode == "stream" {
+		if err := target.LoadData(ctx, src, cir, o.cfg.Target, tempDir, func(name string, rows int64) {
+			// progress parity: each exported table feeds tables_done/rows to the UI.
+			if o.cpMgr != nil {
+				o.cpMgr.GetOrCreateTable(name, rows)
+				_ = o.cpMgr.MarkTableCompleted(name, rows)
+			}
+		}); err != nil {
+			return nil, fmt.Errorf("source-cir: load data: %w", err)
+		}
+	} else {
+		// Dumpling produced CSVs directly; still run lightning import via LoadData's
+		// import step (CSVs already in tempDir from dumpling). Mark tables done.
+		for _, t := range cir.Tables {
+			if o.cpMgr != nil {
+				o.cpMgr.GetOrCreateTable(t.Name, 0)
+				_ = o.cpMgr.MarkTableCompleted(t.Name, 0)
+			}
+		}
+		if err := target.RunLightningImport(ctx, tempDir, o.cfg.Target); err != nil {
+			return nil, fmt.Errorf("source-cir: lightning import (dumpling): %w", err)
+		}
+	}
+	log.Info("source-cir data loaded", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)), zap.String("export", exportMode))
 
 	// Phase: validate (#t81 Step 3 — row-count parity source vs target).
 	if o.cpMgr != nil {
