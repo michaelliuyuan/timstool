@@ -248,7 +248,7 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 				validateSuccess = false
 				for _, tv := range vr.Tables {
 					if !tv.Passed {
-						log.Warn("row count mismatch",
+						log.Warn("validation mismatch",
 							zap.String("table", tv.Name),
 							zap.Int64("source", tv.SourceRows),
 							zap.Int64("target", tv.TargetRows))

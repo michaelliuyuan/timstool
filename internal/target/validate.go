@@ -175,7 +175,7 @@ func normalizeForCompare(v interface{}) string {
 	case string:
 		return x
 	case time.Time:
-		return x.UTC().Format("2006-01-02 15:04:05.999999")
+		return x.Format("2006-01-02 15:04:05.999999")
 	case float64:
 		return strconv.FormatFloat(x, 'f', -1, 64)
 	case float32:
