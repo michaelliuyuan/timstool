@@ -228,6 +228,36 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 		return nil, fmt.Errorf("source-cir: load data: %w", err)
 	}
 	log.Info("source-cir data loaded", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)))
+
+	// Phase: validate (#t81 Step 3 — row-count parity source vs target).
+	if o.cpMgr != nil {
+		_ = o.cpMgr.SetPhase("validate")
+	}
+	log.Info("Phase: 数据验证", zap.String("source", srcType))
+	validateSuccess := true
+	type dbConn interface{ DB() *sql.DB }
+	if dc, ok := src.(dbConn); ok {
+		vr, verr := target.ValidateRowCounts(ctx, dc.DB(), tidb, cir)
+		if verr != nil {
+			log.Warn("source-cir: validation error", zap.Error(verr))
+			validateSuccess = false
+		} else {
+			log.Info("source-cir validation result",
+				zap.Int("tables", vr.TotalTables), zap.Int("failed", vr.FailedTables))
+			if !vr.AllPassed {
+				validateSuccess = false
+				for _, tv := range vr.Tables {
+					if !tv.Passed {
+						log.Warn("row count mismatch",
+							zap.String("table", tv.Name),
+							zap.Int64("source", tv.SourceRows),
+							zap.Int64("target", tv.TargetRows))
+					}
+				}
+			}
+		}
+	}
+
 	if o.cpMgr != nil {
 		_ = o.cpMgr.SetPhaseWithReload("completed")
 	}
@@ -235,6 +265,7 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	return []PipelineResult{
 		{Phase: PhaseSchema, Success: true},
 		{Phase: PhaseData, Success: true},
+		{Phase: PhaseValidate, Success: validateSuccess},
 	}, nil
 }
 
