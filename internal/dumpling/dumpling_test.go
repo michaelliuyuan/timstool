@@ -1,6 +1,8 @@
 package dumpling
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -79,4 +81,58 @@ func containsArg(args []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestCountExportedRows locks in the row-counting the dumpling fast-path needs
+// to report real rows to the progress layer. Guards the regression where the
+// orchestrator's dumpling branch hard-coded 0 and the UI showed "0 rows
+// migrated" despite Lightning loading all data. See #t83.
+func TestCountExportedRows(t *testing.T) {
+	dir := t.TempDir()
+	db := "mydb"
+
+	// t_users: single shard, 3 rows (trailing newline).
+	mustWrite(t, filepath.Join(dir, "mydb.t_users.000000000000.csv"),
+		"1\talice\n2\tbob\n3\tcarol\n")
+	// t_orders: sharded across two files (4 + 6 = 10 rows).
+	mustWrite(t, filepath.Join(dir, "mydb.t_orders.000000000000.csv"),
+		"1\t100\n2\t100\n3\t100\n4\t100\n")
+	mustWrite(t, filepath.Join(dir, "mydb.t_orders.000000000001.csv"),
+		"5\t100\n6\t100\n7\t100\n8\t100\n9\t100\n10\t100\n")
+	// t_empty: one shard, zero rows (empty file).
+	mustWrite(t, filepath.Join(dir, "mydb.t_empty.000000000000.csv"), "")
+	// t_notrail: final record with NO trailing newline (1 row, must still count).
+	mustWrite(t, filepath.Join(dir, "mydb.t_notrail.000000000000.csv"),
+		"1\tsolo")
+	// Distractor files that must be ignored: schema SQL + a different table
+	// whose name starts with the same prefix as t_orders (t_orders_archive).
+	mustWrite(t, filepath.Join(dir, "mydb.t_users-schema.sql"), "CREATE TABLE...\n")
+	mustWrite(t, filepath.Join(dir, "mydb.t_orders_archive.000000000000.csv"),
+		"99\t999\n")
+
+	counts := CountExportedRows(dir, db, []string{"t_users", "t_orders", "t_empty", "t_notrail", "missing"})
+
+	cases := map[string]int64{
+		"t_users":   3,
+		"t_orders":  10, // summed across shards
+		"t_empty":   0,
+		"t_notrail": 1, // no trailing newline, still counted
+		"missing":   0, // no files -> 0, zero-value entry present
+	}
+	for table, want := range cases {
+		if got := counts[table]; got != want {
+			t.Errorf("CountExportedRows[%q] = %d, want %d", table, got, want)
+		}
+	}
+	// t_orders_archive must NOT leak into t_orders (prefix "." boundary).
+	if _, leaked := counts["t_orders_archive"]; leaked {
+		t.Errorf("t_orders_archive leaked into counts; tables arg should scope counting")
+	}
+}
+
+func mustWrite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
 }

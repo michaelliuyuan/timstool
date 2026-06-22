@@ -253,13 +253,24 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 			return nil, fmt.Errorf("source-cir: load data: %w", err)
 		}
 	} else {
-		// Dumpling produced CSVs directly; still run lightning import via LoadData's
-		// import step (CSVs already in tempDir from dumpling). Mark tables done.
+		// Dumpling produced CSVs directly; run lightning import (CSVs already in
+		// tempDir). Report real per-table row counts from the dumped CSVs so the
+		// progress layer/UI shows the true figure — the stream path gets counts
+		// from exportTableCSV's callback, but dumpling writes files directly and
+		// bypasses it, so without this the UI reports "0 rows migrated" even
+		// though Lightning loaded everything. See #t83.
+		bareTables := make([]string, len(cir.Tables))
+		for i, t := range cir.Tables {
+			bareTables[i] = t.Name
+		}
+		rowCounts := dumpling.CountExportedRows(tempDir, o.cfg.Source.Database, bareTables)
 		for _, t := range cir.Tables {
+			rows := rowCounts[t.Name]
 			if o.cpMgr != nil {
-				o.cpMgr.GetOrCreateTable(t.Name, 0)
-				_ = o.cpMgr.MarkTableCompleted(t.Name, 0)
+				o.cpMgr.GetOrCreateTable(t.Name, rows)
+				_ = o.cpMgr.MarkTableCompleted(t.Name, rows)
 			}
+			log.Info("source-cir: dumpling exported table", zap.String("table", t.Name), zap.Int64("rows", rows))
 		}
 		if err := target.RunLightningImport(ctx, tempDir, o.cfg.Target); err != nil {
 			return nil, fmt.Errorf("source-cir: lightning import (dumpling): %w", err)

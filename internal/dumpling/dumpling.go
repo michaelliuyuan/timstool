@@ -8,8 +8,10 @@ package dumpling
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
@@ -132,6 +134,81 @@ func DumpFromConfig(src config.SourceConfig, outputDir, binaryPath string, table
 		TablesList: strings.Join(tables, ","),
 		OutputDir:  outputDir,
 	}
+}
+
+// CountExportedRows counts the data rows dumpling wrote to dir for each table,
+// keyed by bare table name. It sums record lines across every matching CSV file
+// ({db}.{table}.*.csv — dumpling shards large tables into .000000000000.csv
+// etc.). Used so the dumpling fast-path can report real row counts to the
+// progress layer: the stream path gets counts from exportTableCSV's callback,
+// but dumpling writes files directly and bypasses that, so without this the UI
+// shows "0 rows migrated" even though Lightning loaded everything.
+//
+// Each row is exactly one line: csv-separator is a real TAB and backslash-
+// escape is on, so any newline inside a field is escaped (\n) and never appears
+// as a raw line break in the file.
+func CountExportedRows(dir, database string, tables []string) map[string]int64 {
+	counts := make(map[string]int64, len(tables))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return counts
+	}
+	// Bare table name -> filename prefix "{db}.{table}.".
+	prefix := make(map[string]string, len(tables))
+	for _, t := range tables {
+		prefix[t] = database + "." + t + "."
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".csv") {
+			continue
+		}
+		for table, p := range prefix {
+			if strings.HasPrefix(e.Name(), p) {
+				counts[table] += countCSVRecords(filepath.Join(dir, e.Name()))
+				break
+			}
+		}
+	}
+	return counts
+}
+
+// countCSVRecords returns the number of newline-terminated records in path.
+// dumpling terminates every row with '\n'; if the final record lacks one (non-
+// empty file not ending in '\n'), it is still counted.
+func countCSVRecords(path string) int64 {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	var count int64
+	var total int64
+	var last byte
+	buf := make([]byte, 64*1024)
+	for {
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			total += int64(n)
+			last = buf[n-1]
+			for i := 0; i < n; i++ {
+				if buf[i] == '\n' {
+					count++
+				}
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return count
+		}
+	}
+	// Non-empty file whose last record had no trailing newline.
+	if total > 0 && last != '\n' {
+		count++
+	}
+	return count
 }
 
 func firstNonEmpty(vals ...string) string {
