@@ -47,6 +47,12 @@ type CompareConfig struct {
 	// SampleRatio for sample mode: fraction of rows to sample (0.0-1.0).
 	SampleRatio float64 `yaml:"sample_ratio" json:"sampleRatio"`
 
+	// SampleRows is the absolute per-table row count value-compared in sample
+	// mode (NOT a ratio — value-level sampling scans N rows via ORDER BY 1
+	// LIMIT N, so a small fixed N is right even for huge tables). 0 → default.
+	// Used by the CIR path's value-level validator (#t82 wiring).
+	SampleRows int `yaml:"sample_rows" json:"sampleRows"`
+
 	// ChunkSize for checksum mode: number of rows per chunk.
 	ChecksumChunkSize int64 `yaml:"checksum_chunk_size" json:"checksumChunkSize"`
 
@@ -243,6 +249,7 @@ func DefaultConfig() *Config {
 		Compare: CompareConfig{
 			CompareMode:        "sample",
 			SampleRatio:        0.01,
+			SampleRows:         20,
 			NoPKStrategy:       "auto",
 			NoPKBucketCount:    100,
 			NoPKTableThreshold: 1000000,

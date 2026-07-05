@@ -141,12 +141,11 @@ func (o *Orchestrator) Run(ctx context.Context, pipelineCfg PipelineConfig) ([]P
 	return results, nil
 }
 
-// runSourceCIR executes the non-PG Source+CIR path (#t81). Step 1 (ApplyDDL):
-// open the source adapter, read its schema into CIR, and create the tables on
-// the TiDB target — source-agnostic (the target only sees CIR). Data load
-// (Step 2) and validate (Step 3) are pending; until then this returns an honest
-// "schema applied, data pending" so a non-PG migration is never reported
-// complete without data. PG is unaffected (it takes the COPY->Lightning path).
+// runSourceCIR executes the non-PG Source+CIR path (#t81). Steps:
+//  1. ApplyDDL — open the source adapter, read schema into CIR, CREATE TABLE on TiDB.
+//  2. LoadData — dumpling fast-path (or stream fallback) → Lightning import.
+//  3. Validate — row-count + value-level sample comparison (#t82, wired here).
+// Source-agnostic: the target only sees CIR. PG is unaffected (COPY→Lightning path).
 func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, error) {
 	log := zap.L()
 	srcType := o.cfg.Source.SourceType()
@@ -278,21 +277,32 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	}
 	log.Info("source-cir data loaded", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)), zap.String("export", exportMode))
 
-	// Phase: validate (#t81 Step 3 — row-count parity source vs target).
+	// Phase: validate (#t81 Step 3 + #t82 value-level). CompareMode "quick" →
+	// row-count only; otherwise value-level sample comparison (closes the
+	// "row-count green but values corrupt" hole — e.g. a bad CSV separator
+	// corrupts every value while row counts still match).
 	if o.cpMgr != nil {
 		_ = o.cpMgr.SetPhase("validate")
 	}
 	log.Info("Phase: 数据验证", zap.String("source", srcType))
+	sampleSize := 0
+	if o.cfg.Compare.CompareMode != "quick" { // "" / "sample" / "checksum" → value-level
+		sampleSize = o.cfg.Compare.SampleRows
+		if sampleSize <= 0 {
+			sampleSize = 20
+		}
+	}
 	validateSuccess := true
 	type dbConn interface{ DB() *sql.DB }
 	if dc, ok := src.(dbConn); ok {
-		vr, verr := target.ValidateRowCounts(ctx, dc.DB(), tidb, cir)
+		vr, verr := target.ValidateMigration(ctx, dc.DB(), tidb, cir, sampleSize)
 		if verr != nil {
 			log.Warn("source-cir: validation error", zap.Error(verr))
 			validateSuccess = false
 		} else {
 			log.Info("source-cir validation result",
-				zap.Int("tables", vr.TotalTables), zap.Int("failed", vr.FailedTables))
+				zap.Int("tables", vr.TotalTables), zap.Int("failed", vr.FailedTables),
+				zap.Int("sample_size", sampleSize))
 			if !vr.AllPassed {
 				validateSuccess = false
 				for _, tv := range vr.Tables {
@@ -300,7 +310,9 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 						log.Warn("validation mismatch",
 							zap.String("table", tv.Name),
 							zap.Int64("source", tv.SourceRows),
-							zap.Int64("target", tv.TargetRows))
+							zap.Int64("target", tv.TargetRows),
+							zap.Int("sample_checked", tv.SampleChecked),
+							zap.Int("sample_mismatches", tv.SampleMismatches))
 					}
 				}
 			}

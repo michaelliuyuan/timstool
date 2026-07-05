@@ -102,13 +102,20 @@ func compareSample(ctx context.Context, sourceDB, tidbDB *sql.DB, table string, 
 	if err != nil {
 		return 0, 0, err
 	}
-	mismatches := 0
+	checked, mismatches := compareNormalized(srcRows, tgtRows)
+	return checked, mismatches, nil
+}
+
+// compareNormalized compares two normalized row sets positionally and returns
+// (rowsChecked, mismatches). Pure — extracted from compareSample so a negative
+// test (injected value diff → detected) can run without a live DB (#t82 gate ①).
+func compareNormalized(srcRows, tgtRows [][]string) (checked, mismatches int) {
 	for i := 0; i < len(srcRows) && i < len(tgtRows); i++ {
 		if !normalizedRowsEqual(srcRows[i], tgtRows[i]) {
 			mismatches++
 		}
 	}
-	return len(srcRows), mismatches, nil
+	return len(srcRows), mismatches
 }
 
 func queryNormalizedRows(ctx context.Context, db *sql.DB, table string, limit int) ([][]string, error) {
@@ -122,6 +129,12 @@ func queryNormalizedRows(ctx context.Context, db *sql.DB, table string, limit in
 	if len(cols) == 0 {
 		return nil, fmt.Errorf("no columns")
 	}
+	// Snapshot the column DB type names once (e.g. TIMESTAMP vs DATETIME) so
+	// normalizeForCompare can branch time semantics per column (#t82 gap A).
+	dbTypes := make([]string, len(cols))
+	for i, c := range cols {
+		dbTypes[i] = c.DatabaseTypeName()
+	}
 	var result [][]string
 	for rows.Next() {
 		vals := make([]interface{}, len(cols))
@@ -134,7 +147,7 @@ func queryNormalizedRows(ctx context.Context, db *sql.DB, table string, limit in
 		}
 		row := make([]string, len(cols))
 		for i, v := range vals {
-			row[i] = normalizeForCompare(v)
+			row[i] = normalizeForCompare(v, dbTypes[i])
 		}
 		result = append(result, row)
 	}
@@ -154,11 +167,20 @@ func normalizedRowsEqual(a, b []string) bool {
 }
 
 // normalizeForCompare converts a scanned Go value to a normalized string for
-// cross-DB comparison. nil → "\N" (NULL marker); time → UTC; numeric → string;
-// []byte → string. This is intentionally simpler than the full PG validator's
-// normalizeValue (which handles PG arrays/UUID/JSON) — for MySQL→TiDB (both
-// MySQL-family), type representations are largely aligned.
-func normalizeForCompare(v interface{}) string {
+// cross-DB comparison. dbType is the column's database type name (from
+// rows.ColumnTypes().DatabaseTypeName), used to branch time semantics.
+//
+// Time-type branch (架构师 spec, #t82 gap A):
+//   - TIMESTAMP has instant semantics → .UTC() so the same instant read in
+//     different session/loc zones compares equal (the c_ts case).
+//   - DATETIME/DATE/TIME/YEAR are wall-clock / TZ-naive → formatted as-is.
+//     .UTC() here would shift by the local offset and fabricate a mismatch
+//     that doesn't exist (the c_dt trap). Correctness gate: c_ts + c_dt both pass.
+//
+// nil → "\N" (NULL marker); []byte → string; numeric → string. Intentionally
+// simpler than the full PG validator's normalizeValue (PG arrays/UUID/JSON) —
+// MySQL→TiDB (both MySQL-family) type representations are largely aligned.
+func normalizeForCompare(v interface{}, dbType string) string {
 	if v == nil {
 		return "\\N"
 	}
@@ -173,6 +195,9 @@ func normalizeForCompare(v interface{}) string {
 	case string:
 		return x
 	case time.Time:
+		if strings.EqualFold(dbType, "TIMESTAMP") {
+			x = x.UTC() // instant semantics — compare the same moment across zones
+		}
 		return x.Format("2006-01-02 15:04:05.999999")
 	case float64:
 		return strconv.FormatFloat(x, 'f', -1, 64)
