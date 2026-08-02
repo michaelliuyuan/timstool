@@ -154,7 +154,7 @@ func (c *Checker) checkDiskSpace(ctx context.Context) CheckItem {
 
 	tempDir := c.cfg.Migration.TempDir
 	if tempDir == "" {
-		tempDir = "/tmp/pg2tidb"
+		tempDir = "/tmp/timstool"
 	}
 
 	var availGB float64

@@ -16,7 +16,7 @@ func TestNewStore(t *testing.T) {
 	}
 	defer s.Close()
 
-	dbPath := filepath.Join(dir, "pg2tidb.db")
+	dbPath := filepath.Join(dir, "timstool.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		t.Error("database file not created")
 	}

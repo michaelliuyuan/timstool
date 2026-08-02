@@ -66,5 +66,5 @@ func init() {
 	dataCmd.Flags().StringSlice("exclude-tables", nil, "tables to exclude")
 	dataCmd.Flags().Bool("use-lightning", true, "use TiDB Lightning for import")
 	dataCmd.Flags().String("lightning-config", "", "custom TiDB Lightning config file")
-	dataCmd.Flags().String("temp-dir", "/tmp/pg2tidb", "temporary directory for data files")
+	dataCmd.Flags().String("temp-dir", "/tmp/timstool", "temporary directory for data files")
 }

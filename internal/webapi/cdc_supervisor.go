@@ -15,7 +15,7 @@ import (
 )
 
 // CDCSupervisor implements the CONTROL channel (#t55): the Web server spawns,
-// supervises, restarts, and stops the CDC child process (`pg2tidb cdc`) on
+// supervises, restarts, and stops the CDC child process (`timstool cdc`) on
 // behalf of the UI, complementing the existing READ channel (status file →
 // dashboard). The CDC sync internals (internal/cdc/) are unchanged — only the
 // process lifecycle is managed here. Design: docs/cdc-web-control-design.md.
@@ -105,7 +105,7 @@ type CDCSupervisor struct {
 	mu sync.Mutex
 
 	cfg        config.CDCConfig
-	binaryPath string // os.Executable(): the pg2tidb binary to re-exec as `cdc`
+	binaryPath string // os.Executable(): the timstool binary to re-exec as `cdc`
 	cfgFile    string // -c passed to the spawned cdc so it loads the same config
 	statusFile string // --status-file (must match the web's READ path)
 	log        *zap.Logger
@@ -127,7 +127,7 @@ type CDCSupervisor struct {
 }
 
 // NewCDCSupervisor builds a supervisor. binaryPath/cfgFile/statusFile configure
-// the spawned `pg2tidb cdc` child; statusFile must equal the path the web reads.
+// the spawned `timstool cdc` child; statusFile must equal the path the web reads.
 func NewCDCSupervisor(cfg config.CDCConfig, binaryPath, cfgFile, statusFile string, log *zap.Logger) *CDCSupervisor {
 	s := &CDCSupervisor{
 		cfg:        cfg,
@@ -148,7 +148,7 @@ func (s *CDCSupervisor) SetFactory(f func() (supervisedProcess, error)) { s.fact
 // SetBackoff overrides the restart backoff (tests speed it up).
 func (s *CDCSupervisor) SetBackoff(b func(int) time.Duration) { s.backoff = b }
 
-// spawnExec is the default factory: re-execs this binary as `pg2tidb cdc`,
+// spawnExec is the default factory: re-execs this binary as `timstool cdc`,
 // forcing enable (the user clicked Start) and pinning the shared status file.
 func (s *CDCSupervisor) spawnExec() (supervisedProcess, error) {
 	if s.binaryPath == "" {

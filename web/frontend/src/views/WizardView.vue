@@ -38,6 +38,7 @@ const form = reactive({
   opts: {
     parallel: 4,
     batch_size: 100000,
+    temp_dir: '/tmp/timstool',
     tables: [] as string[],
     exclude_tables: [] as string[],
     use_lightning: false,
@@ -63,7 +64,7 @@ const saveConnName = ref('')
 const saveConnDialogVisible = ref(false)
 const loadConnDialogVisible = ref(false)
 
-const STORAGE_KEY = 'pg2tidb_saved_connections'
+const STORAGE_KEY = 'timstool_saved_connections'
 
 function loadSavedConnections() {
   try {
@@ -259,7 +260,7 @@ function toggleSelectAll() {
 async function submit() {
   loading.value = true
   try {
-    localStorage.setItem('pg2tidb_last_connection', JSON.stringify({ source: form.source, target: form.target, sourceType: sourceType.value }))
+    localStorage.setItem('timstool_last_connection', JSON.stringify({ source: form.source, target: form.target, sourceType: sourceType.value }))
 
     const { data } = await apiClient.createTask({
       name: form.name || `Migration ${new Date().toLocaleString()}`,
@@ -268,6 +269,7 @@ async function submit() {
       opts: {
         parallel: form.opts.parallel,
         batch_size: form.opts.batch_size,
+        temp_dir: form.opts.temp_dir,
         tables: selectedTables.value,
         exclude_tables: [],
         use_lightning: form.opts.use_lightning,
@@ -449,6 +451,12 @@ function prevStep() {
           <el-form-item label="使用 Lightning">
             <el-switch v-model="form.opts.use_lightning" />
           </el-form-item>
+          <el-form-item label="数据临时目录">
+            <el-input v-model="form.opts.temp_dir" placeholder="/tmp/timstool" style="width: 350px;" />
+            <div style="color: #909399; font-size: 12px; margin-top: 4px;">
+              源端数据导出为 CSV 的临时存储目录，需确保磁盘空间充足（至少能容纳全部待迁移数据）。
+            </div>
+          </el-form-item>
           <el-divider>目标数据处理策略</el-divider>
           <el-form-item label="数据冲突策略">
             <el-radio-group v-model="form.opts.target_policy">
@@ -516,6 +524,7 @@ function prevStep() {
             <el-descriptions-item label="迁移表数">{{ selectedTables.length > 0 ? selectedTables.length : '全部 (' + availableTables.length + ')' }}</el-descriptions-item>
             <el-descriptions-item label="对比模式">{{ compareModes.find(m => m.value === form.opts.compare_mode)?.label }}</el-descriptions-item>
             <el-descriptions-item label="使用 Lightning">{{ form.opts.use_lightning ? '是' : '否' }}</el-descriptions-item>
+            <el-descriptions-item label="数据临时目录">{{ form.opts.temp_dir }}</el-descriptions-item>
             <el-descriptions-item label="数据冲突策略">
               {{ form.opts.target_policy === 'truncate' ? '先清空表' : form.opts.target_policy === 'drop' ? '先删除表' : '直接插入' }}
             </el-descriptions-item>

@@ -68,7 +68,7 @@ type ReportStats struct {
 
 func NewReport(phase string) *Report {
 	return &Report{
-		Tool:      "pg2tidb-migrator",
+		Tool:      "timstool-migrator",
 		Version:   "0.1.0",
 		Phase:     phase,
 		StartTime: time.Now(),

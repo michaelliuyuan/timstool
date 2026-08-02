@@ -110,7 +110,7 @@ func cdcMessage(v cdcStatusView) string {
 	case string(cdc.LivenessStale):
 		return "CDC status is stale — the process may have crashed; showing last-known state. Check the process/logs."
 	default:
-		return "CDC not running. Start with: pg2tidb cdc"
+		return "CDC not running. Start with: timstool cdc"
 	}
 }
 

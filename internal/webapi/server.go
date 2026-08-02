@@ -436,6 +436,7 @@ type CreateTaskRequest struct {
 type MigrationOptsBody struct {
 	Parallel          int      `json:"parallel"`
 	BatchSize         int      `json:"batch_size"`
+	TempDir           string   `json:"temp_dir"`
 	Tables            []string `json:"tables"`
 	ExcludeTables     []string `json:"exclude_tables"`
 	UseLightning      bool     `json:"use_lightning"`
@@ -479,7 +480,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 			Tables:        req.Opts.Tables,
 			ExcludeTables: req.Opts.ExcludeTables,
 			UseLightning:  req.Opts.UseLightning,
-			TempDir:       "/tmp/pg2tidb",
+			TempDir:       req.Opts.TempDir,
 			CheckpointDir: fmt.Sprintf(".checkpoint/%s", task.ID),
 			OnError:       "abort",
 			TargetPolicy:  req.Opts.TargetPolicy,
@@ -501,6 +502,9 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if cfg.Migration.BatchSize <= 0 {
 		cfg.Migration.BatchSize = 100000
+	}
+	if cfg.Migration.TempDir == "" {
+		cfg.Migration.TempDir = "/tmp/timstool"
 	}
 
 	cfgBytes, _ := json.Marshal(cfg)

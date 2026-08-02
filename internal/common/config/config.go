@@ -155,7 +155,7 @@ type WebConfig struct {
 
 // CDCConfig controls the OPTIONAL CDC (Change Data Capture) incremental sync
 // module: PostgreSQL logical replication → TiDB. It is an optional module and
-// is DISABLED by default (Enable=false) — pg2tidb ships as a pure full-migration
+// is DISABLED by default (Enable=false) — timstool ships as a pure full-migration
 // tool; opt in explicitly when you need zero-downtime incremental sync. This
 // mirrors the existing WebConfig.Enable pattern. The parameters were previously
 // scattered as flags in cmd/cdc.go; collecting them here lets the whole module
@@ -236,7 +236,7 @@ func DefaultConfig() *Config {
 		Migration: MigrationConfig{
 			Parallel:            4,
 			BatchSize:           100000,
-			TempDir:             "/tmp/pg2tidb",
+			TempDir:             "/tmp/timstool",
 			UseLightning:        true,
 			OnError:             "abort",
 			CheckpointDir:       ".checkpoint",

@@ -149,7 +149,7 @@ const indexHTML = `<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>pg2tidb Migration Monitor</title>
+    <title>timstool Migration Monitor</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; padding: 20px; }
@@ -174,7 +174,7 @@ const indexHTML = `<!DOCTYPE html>
 </head>
 <body>
     <div class="container">
-        <h1>pg2tidb Migration Monitor</h1>
+        <h1>timstool Migration Monitor</h1>
         <div class="status-bar" id="status-bar">
             <div class="status-item"><div class="value" id="phase">-</div><div class="label">Phase</div></div>
             <div class="status-item"><div class="value" id="total">-</div><div class="label">Total Tables</div></div>

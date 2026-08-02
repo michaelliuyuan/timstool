@@ -150,7 +150,7 @@ h1 { text-align: center; color: #1a1a2e; margin-bottom: 8px; font-size: 28px; }
   </table>
   {{end}}
 
-  <div class="footer">由 pg2tidb 兼容性评估引擎自动生成</div>
+  <div class="footer">由 timstool 兼容性评估引擎自动生成</div>
 </div>
 
   <!-- DDL Modal -->
