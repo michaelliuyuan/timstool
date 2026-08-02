@@ -266,7 +266,7 @@ func DefaultConfig() *Config {
 			Host:   "0.0.0.0",
 		},
 		CDC: CDCConfig{
-			Enable:           false, // optional module: OFF by default
+			Enable:           true, // enabled by default
 			Mode:             "full_incr",
 			SlotName:         "pg2tidb_cdc",
 			Publication:      "pg2tidb_pub",

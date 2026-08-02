@@ -46,11 +46,10 @@ web:
   host: "0.0.0.0"
 
 # CDC incremental sync (PostgreSQL logical replication → TiDB).
-# OPTIONAL module — disabled by default. timstool ships as a pure full-migration
-# tool; set enable: true only when you need zero-downtime incremental sync.
+# Enabled by default. Set enable: false if you only need full migration.
 # When disabled, `timstool cdc` prints an enable hint instead of running (see D2).
 cdc:
-  enable: false                 # master switch — off by default
+  enable: true                  # master switch — on by default
   mode: "full_incr"             # full_incr (full + incremental, default) / incr_only (needs pre-migrated schema)
   slot_name: "pg2tidb_cdc"      # PostgreSQL logical replication slot
   publication_name: "pg2tidb_pub"  # PostgreSQL publication
