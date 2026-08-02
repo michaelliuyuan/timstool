@@ -33,7 +33,7 @@ Default URL: http://localhost:8080`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dataDir := webData
 		if dataDir == "" {
-			dataDir = ".pg2tidb"
+			dataDir = ".timstool"
 		}
 
 		s, err := store.NewStore(dataDir)
@@ -66,7 +66,7 @@ Default URL: http://localhost:8080`,
 		cdcSup := webapi.NewCDCSupervisor(cfg.CDC, bin, cfgFile, statusFile, zap.L())
 		srv := webapi.NewServer(s, webHost, webPort, dataDir, StaticFS, cdcSup, statusFile, time.Duration(cdcStaleSec)*time.Second)
 		srv.SetCDCStatusProvider(webapi.NewFileCDCStatusProvider(statusFile, time.Duration(cdcStaleSec)*time.Second))
-		fmt.Fprintf(os.Stderr, "pg2tidb web UI: http://%s:%d\n", webHost, webPort)
+		fmt.Fprintf(os.Stderr, "timstool web UI: http://%s:%d\n", webHost, webPort)
 		return srv.Start()
 	},
 }
@@ -75,7 +75,7 @@ func init() {
 	rootCmd.AddCommand(webCmd)
 	webCmd.Flags().IntVarP(&webPort, "port", "p", 8080, "web server port")
 	webCmd.Flags().StringVar(&webHost, "host", "0.0.0.0", "web server host")
-	webCmd.Flags().StringVar(&webData, "data", ".pg2tidb", "data directory for SQLite store")
+	webCmd.Flags().StringVar(&webData, "data", ".timstool", "data directory for SQLite store")
 	webCmd.Flags().StringVar(&cdcStatusFile, "cdc-status-file", "", "CDC status JSON the dashboard reads (defaults to <data>/cdc/status.json; must match the CDC process --status-file — #t48 B)")
 	webCmd.Flags().IntVar(&cdcStaleSec, "cdc-stale-threshold", 30, "seconds before CDC status is considered stale (~2-3x the CDC status write cadence)")
 }

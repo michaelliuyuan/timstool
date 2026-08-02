@@ -4,13 +4,24 @@
 
 覆盖兼容性评估、Schema 迁移、全量数据迁移、数据校验四大能力，并含**可选的 CDC 增量同步**（实时增量 + DDL 复制，默认关闭）。支持 CLI 和 Web 管理界面两种使用方式。
 
+## 数据源支持状态
+
+| 数据源 | 状态 | 说明 |
+|--------|------|------|
+| PostgreSQL | ✅ 生产可用 | PG COPY 导出 + Lightning 导入 + CDC 增量 |
+| MySQL | 🔧 开发中 | Dumpling 导出 → Lightning 导入 |
+| Oracle | 📋 Stub | 接口已注册，实现待规划 |
+| SQL Server | 📋 Stub | 接口已注册，实现待规划 |
+| DB2 | 📋 Stub | 接口已注册，实现待规划 |
+
 ## 特性
 
-- **兼容性评估** — 迁移前扫描不兼容对象（Trigger、Stored Function、特殊索引等），输出风险报告
+- **多源异构架构** — 统一 Source 抽象层，支持 PostgreSQL（生产可用）、MySQL（开发中）、Oracle/SqlServer/DB2（Stub 规划中）→ TiDB
+- **兼容性评估** — 迁移前扫描不兼容对象（Trigger、Stored Function、特殊索引等），输出风险报告（`assess` 命令，支持 terminal/json 输出）
 - **Schema Migration** — 自动采集 PG schema，类型映射 + DDL AST 转换，生成 TiDB 兼容 DDL，支持 `--dry-run` 预览
-- **Data Migration** — 基于 PG COPY 协议导出 + TiDB Lightning CLI 导入，实现高性能并行数据迁移
-- **Data Validation** — 三种校验模式（quick 行数对比 / sample 抽样验证 / checksum 分块哈希）确保数据一致性
-- **Web 管理界面** — 可视化配置向导、交互式表选择、实时进度监控、日志流查看、迁移历史、HTML 报告下载
+- **Data Migration** — 基于 PG COPY 协议导出 + TiDB Lightning CLI 导入，实现高性能并行数据迁移；MySQL 源使用 Dumpling 导出；支持大表分片拆分
+- **Data Validation** — 四种校验模式（quick 行数对比 / sample 抽样验证 / checksum 分块哈希 / full 全量校验）确保数据一致性
+- **Web 管理界面** — 可视化配置向导（含数据源选择器）、交互式表选择、实时进度监控、日志流查看、CDC 仪表盘、迁移历史、HTML 报告下载
 - **断点续传** — Checkpoint 机制支持中断后从断点恢复
 - **单二进制部署** — 前端通过 `go:embed` 嵌入，零外部依赖，Docker 一键启动
 
@@ -18,9 +29,10 @@
 
 | 组件 | 要求 |
 |------|------|
-| Go | 1.22+ |
+| Go | 1.25+ |
 | PostgreSQL | 10+ |
 | TiDB | 7.1+ |
+| MySQL Client + Dumpling | MySQL→TiDB 迁移时需要 `mysql` 客户端和 `dumpling` 二进制 |
 | TiDB Lightning | 使用 Lightning 导入时需要安装 `tidb-lightning` 二进制 |
 | Node.js | 20+（仅前端开发构建时需要） |
 
@@ -30,42 +42,42 @@
 
 ### 方式一：下载预编译二进制（推荐，最简单）
 
-从 [GitHub Releases](https://github.com/michaelliuyuan/pg2tidbtool/releases) 下载对应平台的二进制文件。
+从 [GitHub Releases](https://github.com/michaelliuyuan/timstool/releases) 下载对应平台的二进制文件。
 
 **Linux（最常见的服务器环境）：**
 
 ```bash
 # 1. 下载（以 Linux amd64 为例）
-wget https://github.com/michaelliuyuan/pg2tidbtool/releases/latest/download/pg2tidb-linux-amd64 -O pg2tidb
+wget https://github.com/michaelliuyuan/timstool/releases/latest/download/timstool-linux-amd64 -O timstool
 
 # 2. 添加执行权限
-chmod +x pg2tidb
+chmod +x timstool
 
 # 3. 移到系统路径（可选）
-sudo mv pg2tidb /usr/local/bin/
+sudo mv timstool /usr/local/bin/
 
 # 4. 验证安装
-./pg2tidb version
+./timstool --help
 ```
 
 **Windows：**
 
 ```powershell
-# 下载 pg2tidb-windows-amd64.exe，重命名
-Rename-Item pg2tidb-windows-amd64.exe pg2tidb.exe
+# 下载 timstool-windows-amd64.exe，重命名
+Rename-Item timstool-windows-amd64.exe timstool.exe
 
 # 验证安装
-.\pg2tidb.exe version
+.\timstool.exe --help
 ```
 
 ### 方式二：从源码构建（适合开发者）
 
-**前置条件：** 安装 [Go 1.22+](https://go.dev/dl/)，如果需要 Web UI 还需要 [Node.js 20+](https://nodejs.org/)
+**前置条件：** 安装 [Go 1.25+](https://go.dev/dl/)，如果需要 Web UI 还需要 [Node.js 20+](https://nodejs.org/)
 
 ```bash
 # 克隆仓库
-git clone https://github.com/michaelliuyuan/pg2tidbtool.git
-cd pg2tidbtool
+git clone https://github.com/michaelliuyuan/timstool.git
+cd timstool
 
 # 仅 CLI 版本（不含 Web UI）
 make build
@@ -74,27 +86,30 @@ make build
 make build-web
 
 # 构建产物在 build/ 目录
-ls build/pg2tidb
+ls build/timstool
 ```
 
 **交叉编译（在 Mac/Windows 上编译 Linux 版本）：**
 
 ```bash
 # Linux amd64
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o pg2tidb .
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o timstool .
 
 # Linux arm64
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o pg2tidb .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o timstool .
+
+# Linux arm64
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o timstool .
 ```
 
 ### 方式三：Docker（适合容器化部署）
 
 ```bash
 # 构建镜像（自动包含前端 + 内置 tidb-lightning）
-docker build -t pg2tidb .
+docker build -t timstool .
 
 # 启动 Web 服务
-docker run -d -p 8080:8080 --name pg2tidb pg2tidb
+docker run -d -p 8080:8080 --name timstool timstool
 
 # 浏览器访问 http://localhost:8080
 ```
@@ -107,10 +122,10 @@ docker run -d -p 8080:8080 --name pg2tidb pg2tidb
 
 ```bash
 # 启动 Web 管理界面
-./pg2tidb web
+./timstool web
 
 # 自定义端口和数据目录
-./pg2tidb web --port 8080 --data /data/pg2tidb
+./timstool web --port 8080 --data /data/timstool
 ```
 
 浏览器访问 `http://localhost:8080`，通过向导完成：
@@ -132,6 +147,7 @@ cp configs/config.yaml config.yaml
 
 ```yaml
 source:
+  type: "postgres"             # postgres (默认) | mysql | oracle | mssql | db2
   host: "pg-host"
   port: 5432
   user: "postgres"
@@ -152,7 +168,7 @@ target:
 #### 2. 一键迁移
 
 ```bash
-./pg2tidb all --config config.yaml
+./timstool all --config config.yaml
 ```
 
 执行流程：Pre-check → Schema Migration → Data Migration → Data Validation → Summary Report
@@ -161,19 +177,23 @@ target:
 
 ```bash
 # 预检（不执行迁移）
-./pg2tidb precheck --config config.yaml
+./timstool precheck --config config.yaml
 
 # 仅迁移 Schema（支持 --dry-run 预览）
-./pg2tidb schema --config config.yaml
-./pg2tidb schema --config config.yaml --dry-run --output schema.sql
+./timstool schema --config config.yaml
+./timstool schema --config config.yaml --dry-run --output schema.sql
 
 # 仅迁移数据
-./pg2tidb data --config config.yaml
+./timstool data --config config.yaml
 
 # 仅数据校验
-./pg2tidb validate --config config.yaml
-./pg2tidb validate --config config.yaml --level L2 --sample-ratio 0.05  # L2 抽样
-./pg2tidb validate --config config.yaml --level L3                       # L3 全量 Checksum
+./timstool validate --config config.yaml
+./timstool validate --config config.yaml --level L2 --sample-ratio 0.05  # L2 抽样
+./timstool validate --config config.yaml --level L3                       # L3 全量 Checksum
+
+# 兼容性评估（迁移前风险评估）
+./timstool assess --config config.yaml                    # 终端报告
+./timstool assess --config config.yaml --format json -o report.json  # JSON 报告
 ```
 
 ---
@@ -181,27 +201,28 @@ target:
 ## 命令参考
 
 ```
-pg2tidb [command]
+timstool [command]
 
 Commands:
   all                一键执行完整迁移流程（precheck → schema → data → validate）
+  assess             兼容性评估（迁移前扫描不兼容对象，输出风险报告）
   precheck           预检与兼容性评估
   schema             Schema 迁移（--dry-run 仅预览 DDL）
   data               全量数据迁移
   validate           数据校验（L1/L2/L3）
   web                启动 Web 管理界面
   cdc                CDC 增量同步（可选模块，默认关闭；见下文「CDC 增量同步」节）
-  version            显示版本信息
 
 Global Flags:
   -c, --config string     配置文件路径 (默认 "configs/config.yaml")
+      --source string     数据源类型: postgres (默认) | mysql | oracle | mssql | db2
       --log-level string  日志级别: debug, info, warn, error (默认 "info")
       --log-format string 日志格式: console, json (默认 "console")
 
 Web Command Flags:
   -p, --port int     Web 服务端口 (默认 8080)
       --host string  Web 服务监听地址 (默认 "0.0.0.0")
-      --data string  数据存储目录 (默认 ".pg2tidb")
+      --data string  数据存储目录 (默认 ".timstool")
 ```
 
 ---
@@ -211,8 +232,9 @@ Web Command Flags:
 ### 完整配置示例
 
 ```yaml
-# PostgreSQL 源端配置
+# 数据源端配置
 source:
+  type: "postgres"             # postgres (默认) | mysql | oracle | mssql | db2
   host: "localhost"
   port: 5432
   user: "postgres"
@@ -234,7 +256,7 @@ target:
 migration:
   parallel: 4                  # 同时迁移的表数量
   batch_size: 100000           # 批量大小（行数）
-  temp_dir: "/tmp/pg2tidb"     # CSV 临时文件目录
+  temp_dir: "/tmp/timstool"     # CSV 临时文件目录
   tables: []                   # 空=全部表，支持正则匹配
   exclude_tables: []           # 排除表，支持正则匹配
   use_lightning: true          # 使用 TiDB Lightning 加速导入
@@ -252,11 +274,12 @@ logging:
 
 # 数据校验配置
 compare:
-  compare_mode: "sample"       # quick(行数) | sample(抽样,默认) | checksum(分块哈希)
-  sample_ratio: 0.01           # sample 模式抽样比例
+  no_pk_strategy: "auto"       # 无PK表策略: auto | hash_group | bucket | aggregate
+  no_pk_bucket_count: 100      # bucket 策略桶数
+  no_pk_table_threshold: 1000000  # auto 模式下超过此行数使用 aggregate/bucket
+  compare_mode: "sample"       # quick(行数) | sample(抽样,默认) | checksum(分块哈希) | full(全量)
   checksum_chunk_size: 50000   # checksum 模式每块行数
   checksum_parallel: 4         # checksum 模式并发数
-  no_pk_strategy: "auto"       # 无PK表策略: auto | hash_group | bucket | aggregate
 
 # Web 监控面板（CLI 模式可选）
 web:
@@ -292,7 +315,7 @@ cdc:
 | `target.status_port` | TiDB Status 端口（Lightning 使用） | 10080 |
 | `migration.target_policy` | 目标表冲突策略: `insert` / `truncate` / `drop` | insert |
 | `migration.on_error` | 单表失败时 `skip` 继续或 `abort` 中止 | abort |
-| `migration.temp_dir` | CSV 导出临时目录 | /tmp/pg2tidb |
+| `migration.temp_dir` | CSV 导出临时目录 | /tmp/timstool |
 | `logging.level` | 日志级别 | info |
 | `web.enable` | CLI 模式下启用 Web 监控面板 | false |
 | `cdc.enable` | CDC 增量同步（可选模块）总开关 | false |
@@ -309,16 +332,16 @@ cdc:
 
 ## CDC 增量同步（可选模块）
 
-CDC（Change Data Capture，PostgreSQL logical replication → TiDB 实时增量同步）是**可选模块，默认关闭**。pg2tidb 出厂形态是纯全量迁移工具；仅当需要零停机增量同步时才显式开启。
+CDC（Change Data Capture，PostgreSQL logical replication → TiDB 实时增量同步）是**可选模块，默认关闭**。timstool 出厂形态是纯全量迁移工具；仅当需要零停机增量同步时才显式开启。
 
 **开启方式（任选其一）：**
 - 配置文件：`cdc.enable: true`（持久）
-- CLI 一次性：`pg2tidb cdc --enable-cdc`（本次运行）
+- CLI 一次性：`timstool cdc --enable-cdc`（本次运行）
 - 环境变量：`PG2TIDB_CDC_FORCE=1`（本次运行，适合容器化）
 
 默认关闭（`cdc.enable: false`）时：
-- `pg2tidb all`（全量流水线）行为**完全不变**，不含 CDC。
-- `pg2tidb cdc` 打印开启提示并退出（非硬阻断），加 `--enable-cdc` 或 `PG2TIDB_CDC_FORCE=1` 即放行。
+- `timstool all`（全量流水线）行为**完全不变**，不含 CDC。
+- `timstool cdc` 打印开启提示并退出（非硬阻断），加 `--enable-cdc` 或 `PG2TIDB_CDC_FORCE=1` 即放行。
 - Web 界面隐藏 CDC 导航入口；`GET /api/v1/features` 返回 `{"cdc":{"enabled":false}}`，`/cdc/status` 返回稳定禁用态。
 
 **Web 一键启停（`cdc.enable: true` 后）**：CDC 仪表盘点「启动 CDC / 停止 CDC」按钮即可启停增量同步，无需 SSH/CLI——CDC 进程由 Web supervisor 管理（崩溃指数退避自动重启、SIGTERM→SIGKILL 优雅停止、Web 重启领养在跑的 CDC）。`/cdc/status` 返回 supervisor 控制态（running/starting/stopping/failed/adopted + PID/重启次数）。设计见 [docs/cdc-web-control-design.md](docs/cdc-web-control-design.md)。
@@ -333,7 +356,7 @@ CDC 功能细节（INSERT/UPDATE/DELETE、事务顺序性、checkpoint-on-failur
 
 ## TiDB Lightning 集成
 
-pg2tidb 使用 TiDB Lightning 作为数据导入引擎，提供两种后端模式：
+timstool 使用 TiDB Lightning 作为数据导入引擎，提供两种后端模式：
 
 | 模式 | 配置 | 速度 | 要求 |
 |------|------|------|------|
@@ -342,9 +365,9 @@ pg2tidb 使用 TiDB Lightning 作为数据导入引擎，提供两种后端模�
 
 ### Lightning 使用前提
 
-pg2tidb 支持两种方式获取 tidb-lightning：
+timstool 支持两种方式获取 tidb-lightning：
 
-1. **内置模式（推荐）**：构建时将 tidb-lightning 二进制嵌入 pg2tidb，运行时自动释放到数据目录，无需手动安装
+1. **内置模式（推荐）**：构建时将 tidb-lightning 二进制嵌入 timstool，运行时自动释放到数据目录，无需手动安装
    ```bash
    # 构建 Web UI + 内置 Lightning
    LIGHTNING_BIN=/path/to/tidb-lightning bash build-web.sh
@@ -353,7 +376,7 @@ pg2tidb 支持两种方式获取 tidb-lightning：
    make build-all LIGHTNING_BIN=/path/to/tidb-lightning
    ```
 
-2. **系统 PATH**：如果 pg2tidb 未内置 tidb-lightning，运行时会从系统 PATH 查找。如果都找不到，自动回退到流式 INSERT 模式
+2. **系统 PATH**：如果 timstool 未内置 tidb-lightning，运行时会从系统 PATH 查找。如果都找不到，自动回退到流式 INSERT 模式
 
 > **优先级**：系统 PATH tidb-lightning > 内置 tidb-lightning > 流式 INSERT 回退
 
@@ -368,7 +391,7 @@ PG COPY 导出 CSV → 生成 lightning.toml → 调用 tidb-lightning CLI → �
 ### 数据迁移流程
 
 ```
-PostgreSQL                    pg2tidb                     TiDB
+PostgreSQL                    timstool                     TiDB
 ─────────                    ───────                     ─────
     │                            │                           │
     │◄─── PG COPY TO STDOUT ────┤                           │
@@ -427,21 +450,23 @@ PostgreSQL                    pg2tidb                     TiDB
 
 ```bash
 # 默认端口 8080
-./pg2tidb web
+./timstool web
 
 # 自定义配置
-./pg2tidb web --port 9090 --host 0.0.0.0 --data /data/pg2tidb
+./timstool web --port 9090 --host 0.0.0.0 --data /data/timstool
 
 # Docker
-docker run -p 8080:8080 -v /data/pg2tidb:/data pg2tidb
+docker run -p 8080:8080 -v /data/timstool:/data timstool
 ```
 
 ### 功能页面
 
 | 页面 | 功能说明 |
 |------|----------|
-| **配置向导** | 5 步向导：源端配置 → 目标端配置 → 选择表（支持搜索/全选） → 迁移选项 → 确认执行 |
+| **配置向导** | 5 步向导：数据源选择（PG/MySQL/...）→ 源端配置 → 目标端配置 → 选择表（支持搜索/全选） → 迁移选项 → 确认执行 |
+| **兼容性评估** | 迁移前风险评估，展示不兼容对象清单和迁移建议 |
 | **任务监控** | 实时进度、表级详情（导出/导入行数、百分比）、吞吐量指标 |
+| **CDC 仪表盘** | CDC 增量同步监控（LSN、吞吐、延迟），一键启停 |
 | **日志查看** | 实时日志流，按级别过滤（info/warn/error） |
 | **迁移历史** | 历史任务列表、详情查看、重新执行 |
 | **报告下载** | 生成 HTML 格式完整迁移报告，包含各阶段执行结果 |
@@ -539,16 +564,16 @@ web:
 **第二步：启动服务**
 
 ```bash
-# 上传 pg2tidb 二进制和 config.yaml 到服务器
-scp pg2tidb config.yaml user@your-server:/home/user/pg2tidb/
+# 上传 timstool 二进制和 config.yaml 到服务器
+scp timstool config.yaml user@your-server:/home/user/timstool/
 
 # SSH 登录服务器
 ssh user@your-server
 
 # 启动 Web 服务
-cd /home/user/pg2tidb
-chmod +x pg2tidb
-nohup ./pg2tidb web -c config.yaml -p 8080 > pg2tidb.log 2>&1 &
+cd /home/user/timstool
+chmod +x timstool
+nohup ./timstool web -c config.yaml -p 8080 > timstool.log 2>&1 &
 ```
 
 **第三步：浏览器操作**
@@ -561,7 +586,7 @@ nohup ./pg2tidb web -c config.yaml -p 8080 > pg2tidb.log 2>&1 &
 
 ```bash
 # 检查进程是否在运行
-ps aux | grep pg2tidb
+ps aux | grep timstool
 
 # 检查 HTTP 服务是否响应
 curl http://localhost:8080/api/v1/health
@@ -571,7 +596,7 @@ curl http://localhost:8080/api/v1/health
 
 ```bash
 # 找到进程并停止
-kill $(lsof -ti:8081)
+kill $(lsof -ti:8080)
 ```
 
 ### 方式二：CLI 命令行模式
@@ -580,32 +605,32 @@ kill $(lsof -ti:8081)
 
 ```bash
 # 一键完整迁移（precheck → schema → data → validate）
-./pg2tidb all --config config.yaml
+./timstool all --config config.yaml
 
 # 分步执行
-./pg2tidb precheck --config config.yaml   # 第1步：预检
-./pg2tidb schema --config config.yaml     # 第2步：Schema 迁移
-./pg2tidb data --config config.yaml       # 第3步：数据迁移
-./pg2tidb validate --config config.yaml   # 第4步：数据校验
+./timstool precheck --config config.yaml   # 第1步：预检
+./timstool schema --config config.yaml     # 第2步：Schema 迁移
+./timstool data --config config.yaml       # 第3步：数据迁移
+./timstool validate --config config.yaml   # 第4步：数据校验
 ```
 
 ### 方式三：Docker 部署
 
 ```bash
 # 构建镜像
-docker build -t pg2tidb .
+docker build -t timstool .
 
 # 运行（Web 模式，默认启动 8080 端口）
 docker run -d \
-  --name pg2tidb \
+  --name timstool \
   -p 8080:8080 \
-  -v /data/pg2tidb:/data \
-  pg2tidb
+  -v /data/timstool:/data \
+  timstool
 
 # 运行（CLI 模式）
 docker run --rm \
-  -v $(pwd)/config.yaml:/etc/pg2tidb/config.yaml \
-  pg2tidb all --config /etc/pg2tidb/config.yaml
+  -v $(pwd)/config.yaml:/etc/timstool/config.yaml \
+  timstool all --config /etc/timstool/config.yaml
 ```
 
 ### Docker Compose（含 PG + TiDB 测试环境）
@@ -613,12 +638,12 @@ docker run --rm \
 ```yaml
 version: '3.8'
 services:
-  pg2tidb:
+  timstool:
     build: .
     ports:
       - "8080:8080"
     volumes:
-      - pg2tidb-data:/data
+      - timstool-data:/data
     depends_on:
       - postgres
       - tidb
@@ -639,7 +664,7 @@ services:
       - "10080:10080"
 
 volumes:
-  pg2tidb-data:
+  timstool-data:
 ```
 
 ---
@@ -647,15 +672,17 @@ volumes:
 ## 项目结构
 
 ```
-pg2tidbtool/
+timstool/
 ├── cmd/                        # CLI 命令
-│   ├── root.go                 # 根命令 + 全局 flags
+│   ├── root.go                 # 根命令 + 全局 flags（含 --source 数据源选择）
 │   ├── all.go                  # all — 一键完整流程
+│   ├── assess.go               # assess — 兼容性评估
 │   ├── precheck.go             # precheck — 预检
 │   ├── schema.go               # schema — Schema 迁移
 │   ├── data.go                 # data — 数据迁移
 │   ├── validate.go             # validate — 数据校验
 │   ├── web.go                  # web — Web 管理界面
+│   ├── cdc.go                  # cdc — CDC 增量同步
 │   └── static/                 # 嵌入式前端资源（go:embed）
 ├── web/
 │   └── frontend/               # Vue 3 前端源码
@@ -666,6 +693,18 @@ pg2tidbtool/
 │       ├── package.json
 │       └── vite.config.ts
 ├── internal/
+│   ├── source/                 # 多源抽象层（Source interface）
+│   │   ├── registry.go         # 数据源注册（postgres/mysql/oracle/mssql/db2）
+│   │   ├── postgres/           # PostgreSQL adapter
+│   │   │   ├── schema_reader.go
+│   │   │   ├── data_reader.go
+│   │   │   └── incremental/    # PG 逻辑复制（CDC）
+│   │   └── mysql/              # MySQL adapter（开发中）
+│   │       ├── schema_reader.go
+│   │       ├── data_reader.go
+│   │       └── defaults.go
+│   ├── target/                 # 目标端抽象（TiDB adapter）
+│   ├── assess/                 # 兼容性评估模块（增强版 precheck）
 │   ├── schema/                 # Schema 迁移模块
 │   │   ├── reader.go           # PG schema 读取
 │   │   ├── converter.go        # DDL 转换
@@ -673,13 +712,15 @@ pg2tidbtool/
 │   │   └── applier.go          # DDL 执行
 │   ├── data/                   # 数据迁移模块
 │   │   ├── exporter.go         # PG COPY 导出 CSV
-│   │   ├── importer.go         # TiDB Lightning 导入 + 流式 INSERT 兜底
-│   │   ├── scheduler.go        # 并发调度器
-│   │   └── migrator.go         # 迁移编排
+│   │   ├── migrator.go         # 迁移编排
+│   │   └── scheduler.go        # 并发调度器（含大表分片）
+│   ├── lightning/              # TiDB Lightning 集成（独立模块）
+│   ├── dumpling/               # MySQL Dumpling 导出（MySQL→TiDB）
+│   ├── cdc/                    # CDC 增量同步模块
 │   ├── validator/              # 数据校验模块
-│   │   ├── validator.go        # L1/L2/L3 校验引擎
+│   │   ├── validator.go        # L1/L2/L3/full 校验引擎
 │   │   └── reporter.go         # 报告生成
-│   ├── precheck/               # 兼容性评估
+│   ├── precheck/               # 兼容性预检
 │   │   └── checker.go          # 预检检查器
 │   ├── orchestrator/           # 任务编排器
 │   │   └── orchestrator.go     # 4 阶段管道编排
@@ -699,6 +740,15 @@ pg2tidbtool/
 │       ├── checkpoint/         # Checkpoint 管理
 │       ├── reporter/           # 报告类型定义
 │       └── errors/             # 错误类型
+├── docs/                       # 设计文档
+│   ├── cdc-architecture.md
+│   ├── cdc-optional-module-design.md
+│   ├── cdc-web-monitoring-contract.md
+│   ├── cdc-web-control-design.md
+│   ├── cdc-ddl-replication-design.md
+│   ├── multi-source-execution-engine-design.md
+│   ├── multi-source-web-form-design.md
+│   └── large-table-chunking-design.md
 ├── configs/
 │   └── config.yaml             # 配置文件模板
 ├── main.go                     # 程序入口
@@ -818,8 +868,17 @@ cd web/frontend && npm run dev
 **Q: 支持哪些 PG 版本？**
 A: PostgreSQL 10+ 版本。
 
+**Q: 支持哪些数据源？**
+A: 当前 PostgreSQL 为生产可用状态，MySQL 正在开发中（Dumpling 导出），Oracle/SqlServer/DB2 已注册 Stub 接口，后续逐步实现。通过 `--source` 全局 flag 选择数据源类型。
+
+**Q: 什么是 assess（兼容性评估）？**
+A: `timstool assess` 命令在迁移前扫描源端数据库，检查不兼容对象（Trigger、Stored Function、特殊索引、枚举类型等），输出风险报告。支持 `--format terminal|json` 选择输出格式。
+
+**Q: 大表迁移如何优化？**
+A: timstool 支持大表分片拆分（见 `docs/large-table-chunking-design.md`），将大表按主键范围拆分为多个分片并行导出，提升迁移效率。
+
 **Q: 支持增量同步吗？**
-A: 支持，但 CDC 增量同步是**可选模块、默认关闭**（`cdc.enable: false`）；需零停机增量同步时显式开启（`cdc.enable: true` / `--enable-cdc` / `PG2TIDB_CDC_FORCE=1`，见 [CDC 增量同步（可选模块）](#cdc-增量同步可选模块)）。开启后通过 `pg2tidb cdc` 运行（或 Web 仪表盘「启动 CDC」一键启停），覆盖 INSERT/UPDATE/DELETE、事务顺序性、NULL/特殊字符/TOAST；`sync_ddl: true`（默认）同时复制源端 DDL（CREATE/ALTER/DROP TABLE + 类型映射）；带 checkpoint-on-failure 防丢数据（at-least-once 重启重读）+ 无 PK 表结构性 halt。Web 端有 CDC 监控仪表盘（`pg2tidb web`，一键启停 + 实时状态/LSN/吞吐，见 [docs/cdc-web-monitoring-contract.md](docs/cdc-web-monitoring-contract.md)）。
+A: 支持，但 CDC 增量同步是**可选模块、默认关闭**（`cdc.enable: false`）；需零停机增量同步时显式开启（`cdc.enable: true` / `--enable-cdc` / `PG2TIDB_CDC_FORCE=1`，见 [CDC 增量同步（可选模块）](#cdc-增量同步可选模块)）。开启后通过 `timstool cdc` 运行（或 Web 仪表盘「启动 CDC」一键启停），覆盖 INSERT/UPDATE/DELETE、事务顺序性、NULL/特殊字符/TOAST；`sync_ddl: true`（默认）同时复制源端 DDL（CREATE/ALTER/DROP TABLE + 类型映射）；带 checkpoint-on-failure 防丢数据（at-least-once 重启重读）+ 无 PK 表结构性 halt。Web 端有 CDC 监控仪表盘（`timstool web`，一键启停 + 实时状态/LSN/吞吐，见 [docs/cdc-web-monitoring-contract.md](docs/cdc-web-monitoring-contract.md)）。
 
 **Q: 大表迁移性能如何？**
 A: PG 导出通常 50-200 MB/s，TiDB Lightning 导入 200-500 MB/s，整体瓶颈通常在 PG 导出端。
@@ -837,7 +896,7 @@ A: 配置 `on_error: skip` 跳过失败表继续迁移，最终报告汇总所�
 A: 通过 `target_policy` 配置：`insert`（直接插入，遇主键冲突失败）、`truncate`（先清空目标表再插入）、`drop`（先 DROP 再重建）。
 
 **Q: Web 模式的数据存在哪里？**
-A: 任务数据存储在 SQLite 数据库中（默认 `.pg2tidb/tasks.db`），可通过 `--data` 参数指定目录。
+A: 任务数据存储在 SQLite 数据库中（默认 `.timstool/tasks.db`），可通过 `--data` 参数指定目录。
 
 ---
 

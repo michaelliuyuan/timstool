@@ -35,14 +35,14 @@ Prerequisites:
 
 		// CDC is an OPTIONAL module (cdc.enable defaults to false). Resolve the
 		// effective enable state with priority flag > env > yaml, then gate the
-		// subcommand. An explicit `pg2tidb cdc` invocation is treated as opt-in
+		// subcommand. An explicit `timstool cdc` invocation is treated as opt-in
 		// intent: we do not hard-refuse, but print a clear enable hint and exit
 		// unless the user opts in via --enable-cdc or PG2TIDB_CDC_FORCE=1.
 		enabled := resolveCDCEnableFromCmd(cfg.CDC.Enable, cmd)
 		forced := os.Getenv("PG2TIDB_CDC_FORCE") == "1"
 		if !enabled && !forced {
 			fmt.Fprintln(os.Stderr, "CDC 模块当前未启用（cdc.enable=false）。")
-			fmt.Fprintln(os.Stderr, "  本次运行: pg2tidb cdc --enable-cdc  （或设环境变量 PG2TIDB_CDC_FORCE=1）")
+			fmt.Fprintln(os.Stderr, "  本次运行: timstool cdc --enable-cdc  （或设环境变量 PG2TIDB_CDC_FORCE=1）")
 			fmt.Fprintln(os.Stderr, "  持久开启: 在 config.yaml 设置 cdc.enable: true")
 			return fmt.Errorf("cdc module disabled (use --enable-cdc, PG2TIDB_CDC_FORCE=1, or set cdc.enable: true)")
 		}
@@ -76,7 +76,7 @@ Prerequisites:
 		}
 		dataDir, _ := cmd.Flags().GetString("data-dir")
 		if dataDir == "" {
-			dataDir = ".pg2tidb"
+			dataDir = ".timstool"
 		}
 		statusFile, _ := cmd.Flags().GetString("status-file")
 		if statusFile == "" {
@@ -201,7 +201,7 @@ func init() {
 	cdcCmd.Flags().String("slot", "pg2tidb_cdc", "replication slot name")
 	cdcCmd.Flags().String("publication", "pg2tidb_pub", "publication name")
 	cdcCmd.Flags().String("checkpoint-file", ".cdc_checkpoint.json", "LSN checkpoint file path")
-	cdcCmd.Flags().String("data-dir", ".pg2tidb", "data directory shared with the web UI (CDC status file lives under <data-dir>/cdc/)")
+	cdcCmd.Flags().String("data-dir", ".timstool", "data directory shared with the web UI (CDC status file lives under <data-dir>/cdc/)")
 	cdcCmd.Flags().String("status-file", "", "CDC→Web status JSON path (defaults to <data-dir>/cdc/status.json; the web server must read the same path — #t48 B)")
 	cdcCmd.Flags().Int("batch-size", 1000, "max events per apply batch")
 	cdcCmd.Flags().Int("parallel", 1, "parallel apply workers (default 1=serial, correctness-first; >1 routes per-table but does NOT guarantee cross-table FK order / multi-table txn atomicity — see #t48 Bug#8)")
