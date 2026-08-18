@@ -56,10 +56,10 @@ func NewSource(cfg SourceConfig) *Source {
 		cfg.OutputPlugin = "pgoutput"
 	}
 	if cfg.SlotName == "" {
-		cfg.SlotName = "pg2tidb_cdc"
+		cfg.SlotName = "timstool_cdc"
 	}
 	if cfg.Publication == "" {
-		cfg.Publication = "pg2tidb_pub"
+		cfg.Publication = "timstool_pub"
 	}
 	if cfg.SSLMode == "" {
 		cfg.SSLMode = "disable"

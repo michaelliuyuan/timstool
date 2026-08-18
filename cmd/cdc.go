@@ -39,15 +39,15 @@ Prerequisites:
 		// intent: we do not hard-refuse, but print a clear enable hint and exit
 		// unless the user opts in via --enable-cdc or PG2TIDB_CDC_FORCE=1.
 		enabled := resolveCDCEnableFromCmd(cfg.CDC.Enable, cmd)
-		forced := os.Getenv("PG2TIDB_CDC_FORCE") == "1"
+		forced := os.Getenv("TIMSTOOL_CDC_FORCE") == "1"
 		if !enabled && !forced {
 			fmt.Fprintln(os.Stderr, "CDC 模块当前未启用（cdc.enable=false）。")
-			fmt.Fprintln(os.Stderr, "  本次运行: timstool cdc --enable-cdc  （或设环境变量 PG2TIDB_CDC_FORCE=1）")
+			fmt.Fprintln(os.Stderr, "  本次运行: timstool cdc --enable-cdc  （或设环境变量 TIMSTOOL_CDC_FORCE=1）")
 			fmt.Fprintln(os.Stderr, "  持久开启: 在 config.yaml 设置 cdc.enable: true")
-			return fmt.Errorf("cdc module disabled (use --enable-cdc, PG2TIDB_CDC_FORCE=1, or set cdc.enable: true)")
+			return fmt.Errorf("cdc module disabled (use --enable-cdc, TIMSTOOL_CDC_FORCE=1, or set cdc.enable: true)")
 		}
 		if forced && !enabled {
-			fmt.Fprintln(os.Stderr, "note: CDC forced on via PG2TIDB_CDC_FORCE=1 (cdc.enable=false in config).")
+			fmt.Fprintln(os.Stderr, "note: CDC forced on via TIMSTOOL_CDC_FORCE=1 (cdc.enable=false in config).")
 		}
 
 		// Build CDC source config from main config
@@ -198,8 +198,8 @@ func init() {
 	cdcCmd.Flags().Bool("disable-cdc", false, "disable the CDC module for this run (overrides cdc.enable=true)")
 
 	// CDC-specific flags
-	cdcCmd.Flags().String("slot", "pg2tidb_cdc", "replication slot name")
-	cdcCmd.Flags().String("publication", "pg2tidb_pub", "publication name")
+	cdcCmd.Flags().String("slot", "timstool_cdc", "replication slot name")
+	cdcCmd.Flags().String("publication", "timstool_pub", "publication name")
 	cdcCmd.Flags().String("checkpoint-file", ".cdc_checkpoint.json", "LSN checkpoint file path")
 	cdcCmd.Flags().String("data-dir", ".timstool", "data directory shared with the web UI (CDC status file lives under <data-dir>/cdc/)")
 	cdcCmd.Flags().String("status-file", "", "CDC→Web status JSON path (defaults to <data-dir>/cdc/status.json; the web server must read the same path — #t48 B)")

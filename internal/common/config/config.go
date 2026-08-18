@@ -268,8 +268,8 @@ func DefaultConfig() *Config {
 		CDC: CDCConfig{
 			Enable:           true, // enabled by default
 			Mode:             "full_incr",
-			SlotName:         "pg2tidb_cdc",
-			Publication:      "pg2tidb_pub",
+			SlotName:         "timstool_cdc",
+			Publication:      "timstool_pub",
 			BatchSize:        1000,
 			Parallel:         1, // serial by default — correctness-first (see #t48 Bug#8)
 			ConflictStrategy: "replace",

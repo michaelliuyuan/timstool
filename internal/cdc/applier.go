@@ -335,7 +335,7 @@ func (a *Applier) worker(ctx context.Context, workCh <-chan *CDCEvent, id int) {
 // applyEvent applies a single event to TiDB.
 func (a *Applier) applyEvent(ctx context.Context, event *CDCEvent) error {
 	// Never replicate CDC's own internal tables (e.g. the DDLTracker's
-	// pg2tidb_ddl_log). A `FOR ALL TABLES` publication streams their writes as
+	// timstool_ddl_log). A `FOR ALL TABLES` publication streams their writes as
 	// DML, but they don't exist on the target — applying them would 1146-halt
 	// the pipeline on every DDL. #t61 production fix.
 	if isCDCInternalTable(event.Table) {
@@ -491,9 +491,9 @@ func tableKey(schema, table string) string {
 // publication streams their writes, but they don't exist on the target, so
 // applying them would 1146-halt the pipeline (a self-capture loop). This is a
 // hard-coded default blacklist independent of user config (#t61 production fix).
-// pg2tidb_ddl_log is the DDLTracker's capture log (#t59).
+// timstool_ddl_log is the DDLTracker's capture log (#t59).
 var cdcInternalTables = map[string]bool{
-	"pg2tidb_ddl_log": true,
+	"timstool_ddl_log": true,
 }
 
 // isCDCInternalTable reports whether a table is CDC's own infrastructure (matched

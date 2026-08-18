@@ -47,7 +47,7 @@ type Checkpoint struct {
 	LSN       pglogrepl.LSN `json:"lsn"`
 	Timestamp time.Time     `json:"timestamp"`
 	SlotName  string        `json:"slot_name"`
-	// LastDDLID is the last applied pg2tidb_ddl_log.id (DDL replication resume,
+	// LastDDLID is the last applied timstool_ddl_log.id (DDL replication resume,
 	// #t59). At-least-once: on restart, DDL poll resumes from here so already-
 	// applied DDL isn't replayed.
 	LastDDLID int64 `json:"last_ddl_id,omitempty"`
@@ -80,8 +80,8 @@ type SourceConfig struct {
 func DefaultSourceConfig() SourceConfig {
 	return SourceConfig{
 		SSLMode:        "disable",
-		SlotName:       "pg2tidb_cdc",
-		Publication:    "pg2tidb_pub",
+		SlotName:       "timstool_cdc",
+		Publication:    "timstool_pub",
 		OutputPlugin:   "pgoutput",
 		CheckpointFile: ".cdc_checkpoint.json",
 	}

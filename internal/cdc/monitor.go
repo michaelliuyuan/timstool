@@ -154,33 +154,33 @@ func (mc *MetricsCollector) Snapshot() *Metrics {
 func (mc *MetricsCollector) PrometheusText() string {
 	m := mc.Snapshot()
 
-	return fmt.Sprintf(`# HELP pg2tidb_cdc_source_events_total Total events received from PG source
-# TYPE pg2tidb_cdc_source_events_total counter
-pg2tidb_cdc_source_events_total %d
-# HELP pg2tidb_cdc_applier_events_applied Total events applied to TiDB
-# TYPE pg2tidb_cdc_applier_events_applied counter
-pg2tidb_cdc_applier_events_applied %d
-# HELP pg2tidb_cdc_applier_events_failed Total events failed to apply
-# TYPE pg2tidb_cdc_applier_events_failed counter
-pg2tidb_cdc_applier_events_failed %d
-# HELP pg2tidb_cdc_applier_events_skipped Total events skipped
-# TYPE pg2tidb_cdc_applier_events_skipped counter
-pg2tidb_cdc_applier_events_skipped %d
-# HELP pg2tidb_cdc_applier_batches_flushed Total batches flushed
-# TYPE pg2tidb_cdc_applier_batches_flushed counter
-pg2tidb_cdc_applier_batches_flushed %d
-# HELP pg2tidb_cdc_lag_events Event lag (source - applied)
-# TYPE pg2tidb_cdc_lag_events gauge
-pg2tidb_cdc_lag_events %d
-# HELP pg2tidb_cdc_events_per_second Current throughput
-# TYPE pg2tidb_cdc_events_per_second gauge
-pg2tidb_cdc_events_per_second %.2f
-# HELP pg2tidb_cdc_uptime_seconds Uptime in seconds
-# TYPE pg2tidb_cdc_uptime_seconds gauge
-pg2tidb_cdc_uptime_seconds %.2f
-# HELP pg2tidb_cdc_source_running Whether source is running (1=yes)
-# TYPE pg2tidb_cdc_source_running gauge
-pg2tidb_cdc_source_running %d
+	return fmt.Sprintf(`# HELP timstool_cdc_source_events_total Total events received from PG source
+# TYPE timstool_cdc_source_events_total counter
+timstool_cdc_source_events_total %d
+# HELP timstool_cdc_applier_events_applied Total events applied to TiDB
+# TYPE timstool_cdc_applier_events_applied counter
+timstool_cdc_applier_events_applied %d
+# HELP timstool_cdc_applier_events_failed Total events failed to apply
+# TYPE timstool_cdc_applier_events_failed counter
+timstool_cdc_applier_events_failed %d
+# HELP timstool_cdc_applier_events_skipped Total events skipped
+# TYPE timstool_cdc_applier_events_skipped counter
+timstool_cdc_applier_events_skipped %d
+# HELP timstool_cdc_applier_batches_flushed Total batches flushed
+# TYPE timstool_cdc_applier_batches_flushed counter
+timstool_cdc_applier_batches_flushed %d
+# HELP timstool_cdc_lag_events Event lag (source - applied)
+# TYPE timstool_cdc_lag_events gauge
+timstool_cdc_lag_events %d
+# HELP timstool_cdc_events_per_second Current throughput
+# TYPE timstool_cdc_events_per_second gauge
+timstool_cdc_events_per_second %.2f
+# HELP timstool_cdc_uptime_seconds Uptime in seconds
+# TYPE timstool_cdc_uptime_seconds gauge
+timstool_cdc_uptime_seconds %.2f
+# HELP timstool_cdc_source_running Whether source is running (1=yes)
+# TYPE timstool_cdc_source_running gauge
+timstool_cdc_source_running %d
 `,
 		m.SourceEventsTotal,
 		m.ApplierEventsApplied,

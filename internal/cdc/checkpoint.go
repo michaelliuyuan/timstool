@@ -27,7 +27,7 @@ func NewCheckpointManager(filePath string) *CheckpointManager {
 		filePath: filePath,
 		log:      zap.NewNop(),
 		checkpoint: Checkpoint{
-			SlotName: "pg2tidb_cdc",
+			SlotName: "timstool_cdc",
 		},
 	}
 }

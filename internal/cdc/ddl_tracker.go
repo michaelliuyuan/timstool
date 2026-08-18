@@ -25,7 +25,7 @@ type DDLTracker struct {
 
 // DDLEntry records a captured DDL statement.
 type DDLEntry struct {
-	ID         int64  `json:"id"` // pg2tidb_ddl_log.id (DDL checkpoint cursor, #t59)
+	ID         int64  `json:"id"` // timstool_ddl_log.id (DDL checkpoint cursor, #t59)
 	LSN        string `json:"lsn"`
 	Schema     string `json:"schema"`
 	ObjectName string `json:"object_name"`
@@ -65,7 +65,7 @@ func (t *DDLTracker) SetLogger(log *zap.Logger) {
 func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 	// Create the event trigger function
 	_, err := t.db.ExecContext(ctx, `
-		CREATE OR REPLACE FUNCTION pg2tidb_ddl_capture()
+		CREATE OR REPLACE FUNCTION timstool_ddl_capture()
 		RETURNS event_trigger
 		LANGUAGE plpgsql AS $$
 		DECLARE
@@ -73,7 +73,7 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 		BEGIN
 			FOR r IN SELECT * FROM pg_event_trigger_ddl_commands()
 			LOOP
-				INSERT INTO pg2tidb_ddl_log (ddl_time, schema_name, object_name,
+				INSERT INTO timstool_ddl_log (ddl_time, schema_name, object_name,
 					object_type, ddl_command, txid)
 				VALUES (now(), r.schema_name, r.object_identity,
 					r.object_type, current_query(), txid_current());
@@ -87,7 +87,7 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 
 	// Create the DDL log table
 	_, err = t.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS pg2tidb_ddl_log (
+		CREATE TABLE IF NOT EXISTS timstool_ddl_log (
 			id SERIAL PRIMARY KEY,
 			ddl_time TIMESTAMPTZ DEFAULT now(),
 			schema_name TEXT,
@@ -104,10 +104,10 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 
 	// Create the event trigger (ddl_command_end captures CREATE/ALTER).
 	_, err = t.db.ExecContext(ctx, `
-		DROP EVENT TRIGGER IF EXISTS pg2tidb_ddl_trigger;
-		CREATE EVENT TRIGGER pg2tidb_ddl_trigger
+		DROP EVENT TRIGGER IF EXISTS timstool_ddl_trigger;
+		CREATE EVENT TRIGGER timstool_ddl_trigger
 		ON ddl_command_end
-		EXECUTE FUNCTION pg2tidb_ddl_capture();
+		EXECUTE FUNCTION timstool_ddl_capture();
 	`)
 	if err != nil {
 		return fmt.Errorf("create event trigger: %w", err)
@@ -121,7 +121,7 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 	// sequences/indexes/constraints — are not logged; the table DROP cascades
 	// on the target). shouldApplyDDL routes DROP TABLE → table → apply.
 	_, err = t.db.ExecContext(ctx, `
-		CREATE OR REPLACE FUNCTION pg2tidb_ddl_drop_capture()
+		CREATE OR REPLACE FUNCTION timstool_ddl_drop_capture()
 		RETURNS event_trigger
 		LANGUAGE plpgsql AS $$
 		DECLARE
@@ -130,7 +130,7 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 			FOR r IN SELECT * FROM pg_event_trigger_dropped_objects()
 			LOOP
 				IF r.object_type = 'table' THEN
-					INSERT INTO pg2tidb_ddl_log (ddl_time, schema_name, object_name,
+					INSERT INTO timstool_ddl_log (ddl_time, schema_name, object_name,
 						object_type, ddl_command, txid)
 					VALUES (now(), r.schema_name, r.object_name, r.object_type,
 						'DROP TABLE ' || quote_ident(r.object_name),
@@ -144,10 +144,10 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 		return fmt.Errorf("create ddl drop capture function: %w", err)
 	}
 	_, err = t.db.ExecContext(ctx, `
-		DROP EVENT TRIGGER IF EXISTS pg2tidb_ddl_drop_trigger;
-		CREATE EVENT TRIGGER pg2tidb_ddl_drop_trigger
+		DROP EVENT TRIGGER IF EXISTS timstool_ddl_drop_trigger;
+		CREATE EVENT TRIGGER timstool_ddl_drop_trigger
 		ON sql_drop
-		EXECUTE FUNCTION pg2tidb_ddl_drop_capture();
+		EXECUTE FUNCTION timstool_ddl_drop_capture();
 	`)
 	if err != nil {
 		return fmt.Errorf("create sql_drop event trigger: %w", err)
@@ -159,19 +159,19 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 
 // TeardownEventTrigger removes the event triggers and capture functions.
 func (t *DDLTracker) TeardownEventTrigger(ctx context.Context) error {
-	_, err := t.db.ExecContext(ctx, `DROP EVENT TRIGGER IF EXISTS pg2tidb_ddl_trigger;`)
+	_, err := t.db.ExecContext(ctx, `DROP EVENT TRIGGER IF EXISTS timstool_ddl_trigger;`)
 	if err != nil {
 		t.log.Warn("drop event trigger", zap.Error(err))
 	}
-	_, err = t.db.ExecContext(ctx, `DROP EVENT TRIGGER IF EXISTS pg2tidb_ddl_drop_trigger;`)
+	_, err = t.db.ExecContext(ctx, `DROP EVENT TRIGGER IF EXISTS timstool_ddl_drop_trigger;`)
 	if err != nil {
 		t.log.Warn("drop sql_drop event trigger", zap.Error(err))
 	}
-	_, err = t.db.ExecContext(ctx, `DROP FUNCTION IF EXISTS pg2tidb_ddl_capture();`)
+	_, err = t.db.ExecContext(ctx, `DROP FUNCTION IF EXISTS timstool_ddl_capture();`)
 	if err != nil {
 		t.log.Warn("drop event trigger function", zap.Error(err))
 	}
-	_, err = t.db.ExecContext(ctx, `DROP FUNCTION IF EXISTS pg2tidb_ddl_drop_capture();`)
+	_, err = t.db.ExecContext(ctx, `DROP FUNCTION IF EXISTS timstool_ddl_drop_capture();`)
 	if err != nil {
 		t.log.Warn("drop sql_drop event trigger function", zap.Error(err))
 	}
@@ -182,7 +182,7 @@ func (t *DDLTracker) TeardownEventTrigger(ctx context.Context) error {
 func (t *DDLTracker) FetchNewDDL(ctx context.Context, sinceID int64) ([]DDLEntry, error) {
 	rows, err := t.db.QueryContext(ctx, `
 		SELECT id, ddl_time, schema_name, object_name, object_type, ddl_command
-		FROM pg2tidb_ddl_log
+		FROM timstool_ddl_log
 		WHERE id > $1
 		ORDER BY id ASC
 	`, sinceID)
