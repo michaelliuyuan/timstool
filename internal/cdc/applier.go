@@ -72,7 +72,8 @@ func DefaultBatchConfig() BatchConfig {
 	}
 }
 
-// ApplierStats tracks apply progress.
+// ApplierStats tracks apply progress. It is guarded by mu and must never be
+// copied (mu is a sync.Mutex); read it via Snapshot.
 type ApplierStats struct {
 	mu sync.Mutex
 
@@ -86,11 +87,34 @@ type ApplierStats struct {
 	LastError      string
 }
 
-// Snapshot returns a copy of the current stats.
-func (s *ApplierStats) Snapshot() ApplierStats {
+// ApplierStatsSnapshot is a lock-free, copy-safe DTO of ApplierStats for
+// cross-goroutine reads and JSON serialization (e.g. CDCState.Stats).
+type ApplierStatsSnapshot struct {
+	EventsReceived int64     `json:"events_received"`
+	EventsApplied  int64     `json:"events_applied"`
+	EventsFailed   int64     `json:"events_failed"`
+	EventsSkipped  int64     `json:"events_skipped"`
+	BatchesFlushed int64     `json:"batches_flushed"`
+	LastLSN        string    `json:"last_lsn"`
+	LastFlushTime  time.Time `json:"last_flush_time"`
+	LastError      string    `json:"last_error"`
+}
+
+// Snapshot returns a lock-free copy of the current stats. Copying ApplierStats
+// itself would copy the embedded sync.Mutex and break mutual exclusion.
+func (s *ApplierStats) Snapshot() ApplierStatsSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return *s
+	return ApplierStatsSnapshot{
+		EventsReceived: s.EventsReceived,
+		EventsApplied:  s.EventsApplied,
+		EventsFailed:   s.EventsFailed,
+		EventsSkipped:  s.EventsSkipped,
+		BatchesFlushed: s.BatchesFlushed,
+		LastLSN:        s.LastLSN,
+		LastFlushTime:  s.LastFlushTime,
+		LastError:      s.LastError,
+	}
 }
 
 // Applier receives CDCEvents and applies them to the TiDB target in batches.
@@ -214,7 +238,9 @@ func (a *Applier) Start(ctx context.Context, events <-chan *CDCEvent) error {
 				return nil
 			}
 
+			a.stats.mu.Lock()
 			a.stats.EventsReceived++
+			a.stats.mu.Unlock()
 
 			// Buffer the event (per-table, preserves arrival order within a table)
 			a.bufferEvent(event)
@@ -453,8 +479,8 @@ func (a *Applier) Fatal() error {
 	return a.fatalErr
 }
 
-// Stats returns the current apply statistics.
-func (a *Applier) Stats() ApplierStats {
+// Stats returns the current apply statistics as a lock-free snapshot.
+func (a *Applier) Stats() ApplierStatsSnapshot {
 	return a.stats.Snapshot()
 }
 

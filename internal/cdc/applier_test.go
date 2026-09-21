@@ -2,6 +2,7 @@ package cdc
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -212,4 +213,31 @@ func TestApplierStats_Snapshot(t *testing.T) {
 	if snap.EventsApplied != 95 {
 		t.Errorf("EventsApplied = %d", snap.EventsApplied)
 	}
+}
+
+// TestApplierStats_ConcurrentSnapshotRace: concurrent Snapshot() reads while
+// writers mutate the stats must be race-free (run with -race). Snapshot must
+// return a lock-free DTO, never a copy of the mutex-guarded ApplierStats.
+func TestApplierStats_ConcurrentSnapshotRace(t *testing.T) {
+	s := &ApplierStats{}
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		for i := 0; i < 10000; i++ {
+			s.mu.Lock()
+			s.EventsReceived++
+			s.EventsApplied++
+			s.BatchesFlushed++
+			s.LastLSN = fmt.Sprintf("LSN/%d", i)
+			s.LastError = ""
+			s.mu.Unlock()
+		}
+	}()
+
+	for i := 0; i < 10000; i++ {
+		snap := s.Snapshot()
+		_ = snap.EventsReceived + snap.EventsApplied + snap.BatchesFlushed
+	}
+	<-done
 }

@@ -12,7 +12,7 @@ type CDCState struct {
 	Running    bool              `json:"running"`
 	SourceLSN  string            `json:"source_lsn"`
 	Checkpoint Checkpoint        `json:"checkpoint"`
-	Stats      ApplierStats      `json:"stats"`
+	Stats      ApplierStatsSnapshot `json:"stats"`
 	Filter     TableFilterConfig `json:"filter"`
 	Config     CDCConfigSummary  `json:"config"`
 }
