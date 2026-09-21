@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -253,14 +254,16 @@ func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request) {
 }
 
 type TestConnectionRequest struct {
-	Type     string `json:"type"` // "source" or "target"
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	User     string `json:"user"`
-	Password string `json:"password"`
-	Database string `json:"database"`
-	Schema   string `json:"schema,omitempty"`
-	SSLMode  string `json:"sslmode,omitempty"`
+	Type       string `json:"type"` // "source" or "target"
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	User       string `json:"user"`
+	Password   string `json:"password"`
+	Database   string `json:"database"`
+	Schema     string `json:"schema,omitempty"`
+	SSLMode    string `json:"sslmode,omitempty"`
+	PDAddr     string `json:"pd_addr,omitempty"`
+	StatusPort int    `json:"status_port,omitempty"`
 }
 
 func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
@@ -329,11 +332,13 @@ func (s *Server) testPGConnection(ctx context.Context, req *TestConnectionReques
 
 func (s *Server) testTiDBConnection(ctx context.Context, req *TestConnectionRequest) map[string]interface{} {
 	cfg := config.TargetConfig{
-		Host:     req.Host,
-		Port:     req.Port,
-		User:     req.User,
-		Password: req.Password,
-		Database: req.Database,
+		Host:       req.Host,
+		Port:       req.Port,
+		User:       req.User,
+		Password:   req.Password,
+		Database:   req.Database,
+		PDAddr:     req.PDAddr,
+		StatusPort: req.StatusPort,
 	}
 
 	start := time.Now()
@@ -346,6 +351,7 @@ func (s *Server) testTiDBConnection(ctx context.Context, req *TestConnectionRequ
 		"port":     cfg.Port,
 		"database": cfg.Database,
 		"elapsed":  elapsed.String(),
+		"mysql_ok": false, // explicit: the field is always present in the response
 	}
 
 	if err != nil {
@@ -357,9 +363,147 @@ func (s *Server) testTiDBConnection(ctx context.Context, req *TestConnectionRequ
 
 	var version string
 	mysqlConn.QueryRowContext(ctx, "SELECT tidb_version()").Scan(&version)
-	result["ok"] = true
+	result["mysql_ok"] = true
+
+	// PD / Status probes: only when the user provided the values — providing
+	// them signals Lightning import, so a wrong value must fail the test HERE
+	// (at config time) instead of surfacing at import time as
+	// "[pd] failed to get cluster id". Probes run in parallel, 3s cap each.
+	pd, st := s.probeTargetExtras(ctx, req.Host, req.PDAddr, req.StatusPort)
+	if pd.provided {
+		if pd.ok {
+			result["pd_ok"] = true
+			if pd.clusterID != "" {
+				result["pd_cluster_id"] = pd.clusterID
+			}
+		} else {
+			result["pd_ok"] = false
+			result["pd_error"] = pd.errMsg
+		}
+	}
+	if st.provided {
+		if st.ok {
+			result["status_ok"] = true
+		} else {
+			result["status_ok"] = false
+			result["status_error"] = st.errMsg
+		}
+	}
+
+	// Aggregate: MySQL ok + (provided ⇒ probe ok) for each of PD/Status.
+	ok := true
+	var reasons []string
+	if pd.provided && !pd.ok {
+		ok = false
+		reasons = append(reasons, "PD 探活失败："+pd.errMsg)
+	}
+	if st.provided && !st.ok {
+		ok = false
+		reasons = append(reasons, "Status 端口探活失败："+st.errMsg)
+	}
+	result["ok"] = ok
+	if len(reasons) > 0 {
+		result["error"] = strings.Join(reasons, "；")
+	}
 	result["version"] = version
 	return result
+}
+
+// probeOutcome describes one optional PD/Status probe result.
+type probeOutcome struct {
+	provided  bool
+	ok        bool
+	errMsg    string
+	clusterID string
+}
+
+// probeTargetExtras runs the optional PD and TiDB-status probes in parallel
+// (3s cap each) for the target connection test. Extracted from
+// testTiDBConnection so the aggregation semantics are unit-testable without a
+// live MySQL target.
+func (s *Server) probeTargetExtras(ctx context.Context, host, pdAddr string, statusPort int) (pd, st probeOutcome) {
+	var wg sync.WaitGroup
+	if pdAddr != "" {
+		pd.provided = true
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cid, perr := probePD(ctx, pdAddr)
+			pd.ok = perr == nil
+			pd.clusterID = cid
+			if perr != nil {
+				pd.errMsg = perr.Error()
+			}
+		}()
+	}
+	if statusPort > 0 {
+		st.provided = true
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			serr := probeTiDBStatus(ctx, host, statusPort)
+			st.ok = serr == nil
+			if serr != nil {
+				st.errMsg = serr.Error()
+			}
+		}()
+	}
+	wg.Wait()
+	return pd, st
+}
+
+// probePD checks PD reachability via its HTTP API and returns the cluster id
+// so the user can confirm they pointed at the right cluster.
+func probePD(ctx context.Context, pdAddr string) (string, error) {
+	// Tolerate user input like "http://host:2379/" or "host:2379/": strip any
+	// scheme and trailing slashes so the http:// prefix below is never doubled
+	// and the path stays exact.
+	pdAddr = strings.TrimRight(pdAddr, "/")
+	if i := strings.Index(pdAddr, "://"); i >= 0 {
+		pdAddr = pdAddr[i+3:]
+		pdAddr = strings.TrimRight(pdAddr, "/")
+	}
+	if pdAddr == "" {
+		return "", fmt.Errorf("PD 地址为空")
+	}
+	c := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+pdAddr+"/pd/api/v1/cluster", nil)
+	if err != nil {
+		return "", fmt.Errorf("构造 PD 请求失败: %w", err)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("%w（确认 PD 地址 host:port 正确，经代理时填真实 PD 端口而非 SQL 端口）", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 399 {
+		return "", fmt.Errorf("PD 返回 HTTP %d", resp.StatusCode)
+	}
+	var body struct {
+		ClusterID uint64 `json:"cluster_id"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&body) == nil && body.ClusterID != 0 {
+		return fmt.Sprintf("%d", body.ClusterID), nil
+	}
+	return "", nil // reachable; older PD may not return the field
+}
+
+// probeTiDBStatus checks the TiDB status port (default 10080) via /status.
+func probeTiDBStatus(ctx context.Context, host string, port int) error {
+	c := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s:%d/status", host, port), nil)
+	if err != nil {
+		return fmt.Errorf("构造 Status 请求失败: %w", err)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w（确认 Status 端口正确，默认 10080，本环境可能为 10081）", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 399 {
+		return fmt.Errorf("Status 返回 HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {

@@ -33,7 +33,7 @@ const form = reactive({
     password: '',
     database: '',
     pd_addr: '',
-    status_port: 10080,
+    status_port: 0, // 0 = not provided: PD/Status probes are skipped unless the user sets them (Lightning only)
   },
   opts: {
     parallel: 4,
@@ -233,6 +233,8 @@ async function testConnection(type: 'source' | 'target') {
       user: form.target.user,
       password: form.target.password,
       database: form.target.database,
+      pd_addr: form.target.pd_addr || undefined,
+      status_port: form.target.status_port || undefined,
     })
     targetTestResult.value = data
     if (data.ok) ElMessage.success('TiDB 连接成功')
@@ -426,7 +428,8 @@ function prevStep() {
             <el-input v-model="form.target.database" />
           </el-form-item>
           <el-form-item label="PD 地址">
-            <el-input v-model="form.target.pd_addr" placeholder="host:2379，留空则自动推断" />
+            <el-input v-model="form.target.pd_addr" placeholder="host:2379（PD 对外端口，经代理时填真实 PD 端口），留空则自动推断；仅 Lightning 需要" />
+            <div class="form-hint">PD 地址与 Status 端口仅在使用 Lightning 导入时才需要填写：不使用 Lightning 请保持留空/0（不会检测、不影响连接测试）；需要时填真实 PD/Status 端口（SQL 端口经代理（如 haproxy 5000）时不能填 SQL 端口）</div>
           </el-form-item>
           <el-form-item label="Status 端口">
             <el-input-number v-model="form.target.status_port" :min="0" :max="65535" placeholder="10080" />
@@ -435,9 +438,17 @@ function prevStep() {
             <el-button type="primary" :loading="testingTarget" @click="testConnection('target')">
               测试 TiDB 连接
             </el-button>
-            <el-tag v-if="targetTestResult" :type="targetTestResult.ok ? 'success' : 'danger'" style="margin-left: 12px;">
-              {{ targetTestResult.ok ? `连接成功 (${targetTestResult.version?.substring(0, 50)})` : targetTestResult.error }}
-            </el-tag>
+            <template v-if="targetTestResult">
+              <el-tag :type="targetTestResult.mysql_ok === false || (!targetTestResult.mysql_ok && !targetTestResult.ok) ? 'danger' : 'success'" style="margin-left: 12px;">
+                MySQL {{ (targetTestResult.mysql_ok ?? targetTestResult.ok) ? `连接成功 (${targetTestResult.version?.substring(0, 50)})` : targetTestResult.error }}
+              </el-tag>
+              <el-tag v-if="targetTestResult.pd_ok !== undefined" :type="targetTestResult.pd_ok ? 'success' : 'danger'" style="margin-left: 4px;">
+                PD {{ targetTestResult.pd_ok ? `通过${targetTestResult.pd_cluster_id ? ' (cluster ' + targetTestResult.pd_cluster_id + ')' : ''}` : targetTestResult.pd_error }}
+              </el-tag>
+              <el-tag v-if="targetTestResult.status_ok !== undefined" :type="targetTestResult.status_ok ? 'success' : 'danger'" style="margin-left: 4px;">
+                Status {{ targetTestResult.status_ok ? '通过' : targetTestResult.status_error }}
+              </el-tag>
+            </template>
           </el-form-item>
         </div>
 
@@ -648,3 +659,12 @@ function prevStep() {
     </el-dialog>
   </div>
 </template>
+
+<style scoped>
+.form-hint {
+  color: #909399;
+  font-size: 12px;
+  line-height: 1.4;
+  margin-top: 4px;
+}
+</style>

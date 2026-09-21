@@ -73,6 +73,9 @@ export interface ConnectionTestRequest {
   database: string
   schema?: string
   sslmode?: string
+  /** Target-only extras; empty/0 = probe skipped (non-Lightning flow). */
+  pd_addr?: string
+  status_port?: number
 }
 
 export interface ConnectionTestResult {
@@ -84,6 +87,13 @@ export interface ConnectionTestResult {
   version?: string
   error?: string
   elapsed: string
+  /** PD/Status probe outcomes (present only when the fields were provided). */
+  mysql_ok?: boolean
+  pd_ok?: boolean
+  pd_error?: string
+  pd_cluster_id?: string
+  status_ok?: boolean
+  status_error?: string
 }
 
 export interface CreateTaskRequest {
