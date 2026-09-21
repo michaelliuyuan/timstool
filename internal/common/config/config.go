@@ -111,6 +111,7 @@ type MigrationConfig struct {
 	Tables              []string `yaml:"tables"`
 	ExcludeTables       []string `yaml:"exclude_tables"`
 	UseLightning        bool     `yaml:"use_lightning"`
+	LightningPath       string   `yaml:"lightning_path" json:"lightning_path"` // explicit tidb-lightning binary; empty = auto-discover (PATH → embedded)
 	OnError             string   `yaml:"on_error"`
 	CheckpointDir       string   `yaml:"checkpoint_dir"`
 	ReadTimeout         string   `yaml:"read_timeout"`

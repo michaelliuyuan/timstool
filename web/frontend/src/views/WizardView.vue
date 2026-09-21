@@ -42,6 +42,7 @@ const form = reactive({
     tables: [] as string[],
     exclude_tables: [] as string[],
     use_lightning: false,
+    lightning_path: '',
     skip_precheck: false,
     skip_schema: false,
     skip_data: false,
@@ -58,6 +59,40 @@ const sourceTestResult = ref<any>(null)
 const targetTestResult = ref<any>(null)
 const testingSource = ref(false)
 const testingTarget = ref(false)
+
+// Lightning path gate (迁移选项页门禁): must validate successfully (explicit
+// path OR auto-discovery probe) before the wizard may advance past step 3.
+const lightningValidated = ref(false)
+const lightningResolvedPath = ref('')
+const validatingLightning = ref(false)
+
+async function validateLightning() {
+  validatingLightning.value = true
+  try {
+    const { data } = await apiClient.validateLightning(form.opts.lightning_path.trim())
+    lightningValidated.value = data.success
+    lightningResolvedPath.value = data.success ? data.resolved_path : ''
+    if (data.success) ElMessage.success(data.message)
+    else ElMessage.error(data.message)
+  } catch (e: any) {
+    lightningValidated.value = false
+    lightningResolvedPath.value = ''
+    ElMessage.error(`Lightning 路径验证失败: ${e.response?.data?.error || e.message}`)
+  } finally {
+    validatingLightning.value = false
+  }
+}
+
+// Editing the path or toggling the switch invalidates a previous validation.
+function onLightningPathChanged() {
+  lightningValidated.value = false
+  lightningResolvedPath.value = ''
+}
+function onLightningSwitchChanged(val: boolean) {
+  lightningValidated.value = false
+  lightningResolvedPath.value = ''
+  if (!val) form.opts.lightning_path = ''
+}
 
 const savedConnections = ref<Array<{ name: string; sourceType?: string; source: any; target: any }>>([])
 const saveConnName = ref('')
@@ -273,6 +308,7 @@ async function submit() {
         tables: selectedTables.value,
         exclude_tables: [],
         use_lightning: form.opts.use_lightning,
+        lightning_path: form.opts.use_lightning ? (lightningResolvedPath.value || form.opts.lightning_path.trim()) : '',
         skip_precheck: form.opts.skip_precheck,
         skip_schema: form.opts.skip_schema,
         skip_data: form.opts.skip_data,
@@ -305,6 +341,12 @@ function nextStep() {
   }
   if (activeStep.value === 1) {
     loadTables()
+  }
+  // Lightning gate (step 3 迁移选项): enabled Lightning requires a successful
+  // path validation (explicit path or auto-discovery) before advancing.
+  if (activeStep.value === 3 && form.opts.use_lightning && !lightningValidated.value) {
+    ElMessage.error('已开启 Lightning：请先配置并验证 tidb-lightning 可执行文件路径（或留空点验证走自动发现），验证通过才能进入下一步')
+    return
   }
   activeStep.value++
 }
@@ -449,7 +491,22 @@ function prevStep() {
             <el-input-number v-model="form.opts.batch_size" :min="1000" :step="10000" />
           </el-form-item>
           <el-form-item label="使用 Lightning">
-            <el-switch v-model="form.opts.use_lightning" />
+            <el-switch v-model="form.opts.use_lightning" @change="onLightningSwitchChanged" />
+          </el-form-item>
+          <el-form-item v-if="form.opts.use_lightning" label="Lightning 路径">
+            <div style="display: flex; gap: 8px; width: 100%;">
+              <el-input
+                v-model="form.opts.lightning_path"
+                placeholder="tidb-lightning 可执行文件路径，留空则自动发现（PATH/内嵌）"
+                style="width: 350px;"
+                @input="onLightningPathChanged"
+              />
+              <el-button :loading="validatingLightning" @click="validateLightning">验证</el-button>
+            </div>
+            <div :style="{ color: lightningValidated ? '#67c23a' : '#e6a23c', fontSize: '12px', marginTop: '4px' }">
+              <template v-if="lightningValidated">✅ 验证通过：{{ lightningResolvedPath }}</template>
+              <template v-else>开启 Lightning 后必须点击「验证」且通过（远端 Linux 将校验执行权限），才能进入下一步</template>
+            </div>
           </el-form-item>
           <el-form-item label="数据临时目录">
             <el-input v-model="form.opts.temp_dir" placeholder="/tmp/timstool" style="width: 350px;" />
@@ -524,6 +581,9 @@ function prevStep() {
             <el-descriptions-item label="迁移表数">{{ selectedTables.length > 0 ? selectedTables.length : '全部 (' + availableTables.length + ')' }}</el-descriptions-item>
             <el-descriptions-item label="对比模式">{{ compareModes.find(m => m.value === form.opts.compare_mode)?.label }}</el-descriptions-item>
             <el-descriptions-item label="使用 Lightning">{{ form.opts.use_lightning ? '是' : '否' }}</el-descriptions-item>
+            <el-descriptions-item v-if="form.opts.use_lightning" label="Lightning 路径" :span="2">
+              {{ lightningResolvedPath || form.opts.lightning_path || '自动发现' }}
+            </el-descriptions-item>
             <el-descriptions-item label="数据临时目录">{{ form.opts.temp_dir }}</el-descriptions-item>
             <el-descriptions-item label="数据冲突策略">
               {{ form.opts.target_policy === 'truncate' ? '先清空表' : form.opts.target_policy === 'drop' ? '先删除表' : '直接插入' }}

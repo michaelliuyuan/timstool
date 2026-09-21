@@ -101,9 +101,11 @@ export interface CreateTaskRequest {
   opts: {
     parallel: number
     batch_size: number
+    temp_dir: string
     tables: string[]
     exclude_tables: string[]
     use_lightning: boolean
+    lightning_path: string
     skip_precheck: boolean
     skip_schema: boolean
     skip_data: boolean
@@ -142,6 +144,11 @@ export const apiClient = {
 
   listTables: (req: ConnectionTestRequest) =>
     api.post<{ tables: { name: string; row_estimate: number }[]; count: number }>('/config/list-tables', { ...req, type: 'source' }),
+
+  // Lightning path gate for the wizard (doc: 迁移选项页门禁). Empty path probes
+  // auto-discovery server-side; non-empty must exist and (on Linux) be executable.
+  validateLightning: (path: string) =>
+    api.post<{ success: boolean; message: string; resolved_path: string }>('/validate-lightning', { path }),
 
   createTask: (req: CreateTaskRequest) =>
     api.post<Task>('/tasks', req),

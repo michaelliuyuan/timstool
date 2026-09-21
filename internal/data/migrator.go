@@ -32,10 +32,10 @@ import (
 var chunkFileIndexRegexp = regexp.MustCompile(`^(.+)\.(\d+)$`)
 
 type Migrator struct {
-	cfg       config.Config
-	pgDB      *sql.DB
-	cpMgr     *checkpoint.Manager
-	display   *progress.Display
+	cfg     config.Config
+	pgDB    *sql.DB
+	cpMgr   *checkpoint.Manager
+	display *progress.Display
 }
 
 func NewMigrator(cfg config.Config) *Migrator {
@@ -382,7 +382,7 @@ func (m *Migrator) importViaLightning(ctx context.Context, opts common.DataOpts,
 		return nil
 	}
 
-// Clean up stale Lightning checkpoint to avoid conflicts from previous failed runs
+	// Clean up stale Lightning checkpoint to avoid conflicts from previous failed runs
 	checkpointPath := filepath.Join(opts.TempDir, "tidb_lightning_checkpoint.pb")
 	if _, err := os.Stat(checkpointPath); err == nil {
 		logger.Info("removing stale Lightning checkpoint", zap.String("path", checkpointPath))
@@ -442,7 +442,23 @@ func (m *Migrator) importViaLightning(ctx context.Context, opts common.DataOpts,
 		}
 	}
 
-	lightningBin := lightningpkg.FindBinary(m.cfg.Migration.TempDir)
+	// Lightning binary resolution: an explicitly configured path wins (and is
+	// validated here — same semantics as the wizard's /validate-lightning gate);
+	// empty keeps the auto-discovery chain (PATH → embedded). Runtime backstop
+	// for API/CLI callers that bypass the web gate.
+	lightningBin := ""
+	if p := m.cfg.Migration.LightningPath; strings.TrimSpace(p) != "" {
+		fi, err := os.Stat(p)
+		if err != nil {
+			return fmt.Errorf("lightning_path %q: %w (检查路径是否存在)", p, err)
+		}
+		if fi.IsDir() {
+			return fmt.Errorf("lightning_path %q 是目录，需要指向可执行文件", p)
+		}
+		lightningBin = p
+	} else {
+		lightningBin = lightningpkg.FindBinary(m.cfg.Migration.TempDir)
+	}
 	if lightningBin == "" {
 		return fmt.Errorf("tidb-lightning not found: install tidb-lightning or use a build with embedded binary")
 	}
@@ -1216,7 +1232,7 @@ func convertValue(val interface{}) string {
 			return "1"
 		}
 		return "0"
-case []byte:
+	case []byte:
 		return convertStringValue(string(v))
 	case string:
 		return convertStringValue(v)

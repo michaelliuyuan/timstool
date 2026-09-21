@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/common/logger"
 	"github.com/michaelliuyuan/timstool/internal/common/reporter"
+	"github.com/michaelliuyuan/timstool/internal/lightning"
 	"github.com/michaelliuyuan/timstool/internal/orchestrator"
 	"github.com/michaelliuyuan/timstool/internal/store"
 	"go.uber.org/zap"
@@ -138,6 +140,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		r.Post("/test-connection", s.handleTestConnectionMulti)
 		r.Post("/config/test-connection", s.handleTestConnection)
 		r.Post("/config/list-tables", s.handleListTables)
+		r.Post("/validate-lightning", s.handleValidateLightning)
 		r.Post("/tasks", s.handleCreateTask)
 		r.Get("/tasks", s.handleListTasks)
 		r.Route("/tasks/{taskID}", func(r chi.Router) {
@@ -440,6 +443,7 @@ type MigrationOptsBody struct {
 	Tables            []string `json:"tables"`
 	ExcludeTables     []string `json:"exclude_tables"`
 	UseLightning      bool     `json:"use_lightning"`
+	LightningPath     string   `json:"lightning_path"`
 	SkipPrecheck      bool     `json:"skip_precheck"`
 	SkipSchema        bool     `json:"skip_schema"`
 	SkipData          bool     `json:"skip_data"`
@@ -449,6 +453,65 @@ type MigrationOptsBody struct {
 	SampleRatio       float64  `json:"sample_ratio"`
 	ChecksumChunkSize int64    `json:"checksum_chunk_size"`
 	ChecksumParallel  int      `json:"checksum_parallel"`
+}
+
+// validateLightningRequest is the body for POST /api/validate-lightning.
+// Lightning path gate for the web wizard: an empty path probes auto-discovery
+// (PATH → embedded), a non-empty path must exist, be a regular file, and be
+// executable (x-bit checked on unix; the deployment target is Linux — on
+// Windows dev machines the x-bit is meaningless, so only existence applies).
+type validateLightningRequest struct {
+	Path string `json:"path"`
+}
+
+type validateLightningResponse struct {
+	Success      bool   `json:"success"`
+	Message      string `json:"message"`
+	ResolvedPath string `json:"resolved_path"`
+}
+
+func (s *Server) handleValidateLightning(w http.ResponseWriter, r *http.Request) {
+	var req validateLightningRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if strings.TrimSpace(req.Path) == "" {
+		resolved := lightning.FindBinary(s.dataDir)
+		if resolved == "" {
+			s.writeJSON(w, http.StatusOK, validateLightningResponse{
+				Success: false,
+				Message: "未配置 lightning 路径，且自动发现失败：PATH 中无 tidb-lightning，内嵌二进制不可用",
+			})
+			return
+		}
+		s.writeJSON(w, http.StatusOK, validateLightningResponse{
+			Success:      true,
+			Message:      fmt.Sprintf("未配置路径，将使用自动发现的 tidb-lightning：%s", resolved),
+			ResolvedPath: resolved,
+		})
+		return
+	}
+
+	fi, err := os.Stat(req.Path)
+	if err != nil {
+		s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: fmt.Sprintf("路径不存在：%s", req.Path)})
+		return
+	}
+	if fi.IsDir() {
+		s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: "路径是目录，需要指向 tidb-lightning 可执行文件"})
+		return
+	}
+	if runtime.GOOS != "windows" && fi.Mode()&0111 == 0 {
+		s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: "文件存在但没有执行权限（需要 x 位，Linux 上 chmod +x）"})
+		return
+	}
+	s.writeJSON(w, http.StatusOK, validateLightningResponse{
+		Success:      true,
+		Message:      "tidb-lightning 路径验证通过",
+		ResolvedPath: req.Path,
+	})
 }
 
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
@@ -480,6 +543,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 			Tables:        req.Opts.Tables,
 			ExcludeTables: req.Opts.ExcludeTables,
 			UseLightning:  req.Opts.UseLightning,
+			LightningPath: req.Opts.LightningPath,
 			TempDir:       req.Opts.TempDir,
 			CheckpointDir: fmt.Sprintf(".checkpoint/%s", task.ID),
 			OnError:       "abort",
