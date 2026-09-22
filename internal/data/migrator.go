@@ -613,7 +613,7 @@ analyze = "off"
 	}
 
 	configPath := filepath.Join(absDir, "lightning.toml")
-	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
 		return fmt.Errorf("write lightning config: %w", err)
 	}
 	defer os.Remove(configPath)
@@ -637,27 +637,63 @@ analyze = "off"
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start tidb-lightning: %w", err)
 	}
+
+	// Full lightning log file: tee every RAW stdout line (before filtering)
+	// to <temp_dir>/tidb-lightning.log. The CLI flag --log-file=- (stdout)
+	// overrides the config [lightning] file setting, so a Go-side tee is the
+	// only way to keep both the streamed parsing and a complete standalone
+	// log file (incl. WARN lines filtered out of the migration log).
+	// O_TRUNC: each run starts a fresh file (no unbounded growth across
+	// migrations in the same temp_dir); 0600 because the config dump inside
+	// contains host/user/pd-addr in clear text. Cleanup follows temp_dir.
+	lightningLogPath := filepath.Join(absDir, "tidb-lightning.log")
+	lightningLogFile, logFileErr := os.OpenFile(lightningLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if logFileErr != nil {
+		logger.Warn("cannot create lightning log file, continuing without it",
+			zap.String("file", lightningLogPath), zap.Error(logFileErr))
+	} else {
+		defer lightningLogFile.Close()
+		logger.Info("lightning log file", zap.String("file", lightningLogPath))
+	}
+
 	var srcPathRe = regexp.MustCompile(`\([^)]*\.go:\d+\)`)
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	logWriteFailed := false
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		raw := scanner.Text()
+		if lightningLogFile != nil && !logWriteFailed {
+			if _, werr := lightningLogFile.WriteString(raw + "\n"); werr != nil {
+				// Disk full / file gone: warn ONCE, then stop writing instead
+				// of silently truncating a file we already announced.
+				logger.Warn("writing lightning log file failed, tee disabled for the rest of this run",
+					zap.String("file", lightningLogPath), zap.Error(werr))
+				logWriteFailed = true
+			}
+		}
 
+		line := strings.TrimSpace(raw)
 		line = srcPathRe.ReplaceAllString(line, "")
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		if strings.Contains(line, "[ERROR]") || strings.Contains(line, "[FATAL]") {
+		switch filterLightningLine(line) {
+		case logDrop:
+			// filtered out
+		case logError:
 			logger.Error("lightning: " + line)
-		} else if strings.Contains(line, "[WARN]") {
-			// Filter out all Lightning WARN logs - not useful for users viewing migration logs
-		} else if strings.Contains(line, "restore table `") ||
-			strings.Contains(line, "checksum for table") ||
-			strings.Contains(line, "the whole procedure") ||
-			strings.Contains(line, "tidb lightning exit") {
+		case logWarn:
+			logger.Warn("lightning: " + line)
+		default:
 			logger.Info("lightning: " + line)
 		}
+	}
+	if serr := scanner.Err(); serr != nil {
+		// Stream broke (over-long line / pipe error): lightning output may be
+		// truncated, but the process result below is still authoritative.
+		logger.Warn("reading lightning stdout ended with error, captured log may be incomplete",
+			zap.Error(serr))
 	}
 
 	if err := cmd.Wait(); err != nil {
@@ -666,6 +702,47 @@ analyze = "off"
 
 	logger.Info("TiDB Lightning import completed successfully")
 	return nil
+}
+
+type lightningLogLevel int
+
+const (
+	logDrop lightningLogLevel = iota
+	logInfo
+	logWarn
+	logError
+)
+
+// filterLightningLine decides whether a (already trimmed, caller-stripped)
+// tidb-lightning stdout line should surface in the migration log, and at what
+// severity. Per-table visibility, EXACTLY ONE line per table: only the
+// "restore file completed" line passes (it fires once per source file, and
+// each table exports to one CSV, carrying table=`db`.`tbl`); restore-table /
+// engine lifecycle lines and per-chunk counters stay filtered to keep the
+// task log concise. WARN is dropped EXCEPT checksum-related warnings —
+// checksum = "optional" means a failed checksum only warns, and hiding it
+// would report a corrupt import as success. The complete unfiltered log
+// remains in tidb-lightning.log.
+func filterLightningLine(line string) lightningLogLevel {
+	if strings.Contains(line, "[ERROR]") || strings.Contains(line, "[FATAL]") {
+		return logError
+	}
+	if strings.Contains(line, "[WARN]") {
+		if strings.Contains(line, "checksum") {
+			return logWarn
+		}
+		return logDrop
+	}
+	if strings.Contains(line, "the whole procedure") ||
+		strings.Contains(line, "tidb lightning exit") {
+		return logInfo
+	}
+	if strings.Contains(line, "[INFO]") && !strings.Contains(line, "[cfg]") {
+		if strings.Contains(line, "restore file completed") {
+			return logInfo
+		}
+	}
+	return logDrop
 }
 
 func isBadConnection(err error) bool {
