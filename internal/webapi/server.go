@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -142,6 +143,11 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		r.Post("/config/test-connection", s.handleTestConnection)
 		r.Post("/config/list-tables", s.handleListTables)
 		r.Post("/validate-lightning", s.handleValidateLightning)
+		// Migration options persistence (迁移选项记忆): server-side single
+		// source of truth so the wizard can prefill last-used Lightning path /
+		// temp dir across sessions, browsers, and service restarts.
+		r.Get("/migration-options", s.handleGetMigrationOptions)
+		r.Put("/migration-options", s.handlePutMigrationOptions)
 		r.Post("/tasks", s.handleCreateTask)
 		r.Get("/tasks", s.handleListTasks)
 		r.Route("/tasks/{taskID}", func(r chi.Router) {
@@ -656,6 +662,127 @@ func (s *Server) handleValidateLightning(w http.ResponseWriter, r *http.Request)
 		Message:      "tidb-lightning 路径验证通过",
 		ResolvedPath: req.Path,
 	})
+}
+
+// migrationOptionsBody is the persisted shape of the wizard's migration
+// options step (temp_dir / use_lightning / lightning_path only — connection
+// and table selections stay per-task).
+type migrationOptionsBody struct {
+	TempDir       string `json:"temp_dir"`
+	UseLightning  bool   `json:"use_lightning"`
+	LightningPath string `json:"lightning_path"`
+}
+
+func (s *Server) migrationOptionsFile() string {
+	return filepath.Join(s.dataDir, "migration-options.json")
+}
+
+func (s *Server) handleGetMigrationOptions(w http.ResponseWriter, r *http.Request) {
+	raw, err := os.ReadFile(s.migrationOptionsFile())
+	if err != nil {
+		// No saved options yet: return empty values; the frontend keeps its
+		// defaults (temp_dir=/tmp/timstool, lightning off).
+		s.writeJSON(w, http.StatusOK, migrationOptionsBody{})
+		return
+	}
+	var opts migrationOptionsBody
+	if err := json.Unmarshal(raw, &opts); err != nil {
+		// Corrupted persistence file: log it, fall back to defaults rather
+		// than breaking the wizard (the next successful PUT rewrites it).
+		zap.L().Warn("migration-options.json corrupted, ignoring saved options",
+			zap.String("file", s.migrationOptionsFile()), zap.Error(err))
+		s.writeJSON(w, http.StatusOK, migrationOptionsBody{})
+		return
+	}
+	s.writeJSON(w, http.StatusOK, opts)
+}
+
+func (s *Server) handlePutMigrationOptions(w http.ResponseWriter, r *http.Request) {
+	var req migrationOptionsBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Normalize once, then validate and persist the SAME trimmed values, so a
+	// whitespace-only temp_dir cannot slip past validation and be stored raw.
+	req.TempDir = strings.TrimSpace(req.TempDir)
+	req.LightningPath = strings.TrimSpace(req.LightningPath)
+
+	// Validate before persisting: temp_dir must be creatable; an explicit
+	// lightning path must exist, be a regular file and (on Linux) executable.
+	// An empty lightning path is allowed and means auto-discovery at run time.
+	// UNC paths (\\server\share) are rejected: this is a local tool and temp
+	// dirs on remote shares are neither intended nor tested.
+	if req.TempDir != "" {
+		if strings.HasPrefix(req.TempDir, `\\`) || strings.HasPrefix(req.TempDir, "//") {
+			s.writeError(w, http.StatusBadRequest, "临时目录不支持 UNC/网络共享路径，请使用本地目录")
+			return
+		}
+		if err := os.MkdirAll(req.TempDir, 0o755); err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("临时目录不可用：%v", err))
+			return
+		}
+	}
+	if req.UseLightning && req.LightningPath != "" {
+		fi, err := os.Stat(req.LightningPath)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("lightning 路径不存在：%s", req.LightningPath))
+			return
+		}
+		if fi.IsDir() {
+			s.writeError(w, http.StatusBadRequest, "lightning 路径是目录，需要指向 tidb-lightning 可执行文件")
+			return
+		}
+		if runtime.GOOS != "windows" && fi.Mode()&0111 == 0 {
+			s.writeError(w, http.StatusBadRequest, "lightning 文件存在但没有执行权限（需要 x 位，Linux 上 chmod +x）")
+			return
+		}
+	}
+
+	if err := s.writeMigrationOptions(&req); err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存失败：%v", err))
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+}
+
+// writeMigrationOptions persists the options atomically (write temp file in
+// dataDir, then rename over the target) so a crash mid-write can never leave a
+// truncated JSON behind, and logs corruption instead of failing silently.
+func (s *Server) writeMigrationOptions(opts *migrationOptionsBody) error {
+	if err := os.MkdirAll(s.dataDir, 0o755); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
+	raw, err := json.MarshalIndent(opts, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(s.dataDir, "migration-options-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(raw); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, s.migrationOptionsFile()); err != nil {
+		// Rename can fail (e.g. target locked on Windows); clean up the temp
+		// file so failed saves never accumulate .tmp leftovers.
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {

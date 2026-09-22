@@ -160,6 +160,14 @@ export const apiClient = {
   validateLightning: (path: string) =>
     api.post<{ success: boolean; message: string; resolved_path: string }>('/validate-lightning', { path }),
 
+  // Migration options persistence (server-side memory of temp_dir / lightning
+  // settings). GET prefill on entering the options step, PUT on advancing.
+  getMigrationOptions: () =>
+    api.get<{ temp_dir: string; use_lightning: boolean; lightning_path: string }>('/migration-options'),
+
+  saveMigrationOptions: (opts: { temp_dir: string; use_lightning: boolean; lightning_path: string }) =>
+    api.put<{ success: boolean }>('/migration-options', opts),
+
   createTask: (req: CreateTaskRequest) =>
     api.post<Task>('/tasks', req),
 

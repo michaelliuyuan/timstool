@@ -332,7 +332,39 @@ async function submit() {
   }
 }
 
-function nextStep() {
+// Migration options memory (迁移选项记忆): prefill from server when the user
+// first enters step 3, persist on advancing past it. Server is the single
+// source of truth (survives refresh / restart / other browsers). The prefill
+// is AWAITED before step 3 becomes visible, so a late GET response can never
+// overwrite values the user has already edited (H1 race).
+const optionsLoaded = ref(false)
+
+async function loadMigrationOptions() {
+  if (optionsLoaded.value) return
+  optionsLoaded.value = true
+  try {
+    const { data } = await apiClient.getMigrationOptions()
+    if (data.temp_dir) form.opts.temp_dir = data.temp_dir
+    if (data.use_lightning) {
+      form.opts.use_lightning = true
+      form.opts.lightning_path = data.lightning_path || ''
+    }
+  } catch {}
+}
+
+async function saveMigrationOptions() {
+  try {
+    await apiClient.saveMigrationOptions({
+      temp_dir: form.opts.temp_dir.trim(),
+      use_lightning: form.opts.use_lightning,
+      lightning_path: form.opts.use_lightning ? form.opts.lightning_path.trim() : '',
+    })
+  } catch (e: any) {
+    ElMessage.warning(`迁移选项保存失败：${e.response?.data?.error || e.message}（不影响本次迁移）`)
+  }
+}
+
+async function nextStep() {
   if (activeStep.value === 0 && !sourceTestResult.value?.success) {
     ElMessage.warning('请先测试源数据库连接')
     return
@@ -344,11 +376,20 @@ function nextStep() {
   if (activeStep.value === 1) {
     loadTables()
   }
+  // Entering step 3 (迁移选项): await last-saved options prefill BEFORE the
+  // step becomes editable, so the user never races the GET response.
+  if (activeStep.value === 2) {
+    await loadMigrationOptions()
+  }
   // Lightning gate (step 3 迁移选项): enabled Lightning requires a successful
   // path validation (explicit path or auto-discovery) before advancing.
   if (activeStep.value === 3 && form.opts.use_lightning && !lightningValidated.value) {
     ElMessage.error('已开启 Lightning：请先配置并验证 tidb-lightning 可执行文件路径（或留空点验证走自动发现），验证通过才能进入下一步')
     return
+  }
+  if (activeStep.value === 3) {
+    // Persist options so the next migration prefills them.
+    saveMigrationOptions()
   }
   activeStep.value++
 }
