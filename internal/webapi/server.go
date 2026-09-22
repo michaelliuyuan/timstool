@@ -57,6 +57,9 @@ type Server struct {
 	// running tasks
 	runningTasks map[string]context.CancelFunc
 
+	// standalone compare tasks (独立数据比对): single-run invariant + state
+	compare compareState
+
 	// log collection
 	logCollector *LogCollector
 	logCores     map[string]*TaskLogCore
@@ -120,6 +123,10 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		cdcSupervisor.Adopt(cdcStatusFile, cdcStale, pidAlive)
 	}
 
+	// Compare tasks: a persisted "running" state means the previous process
+	// died mid-run; fail them so the UI is not stuck (M3).
+	s.recoverStaleCompares()
+
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -165,6 +172,16 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		})
 		r.Get("/ws", s.handleWebSocket)
 		r.Post("/assess", s.handleAssess)
+		// Standalone comparison (独立数据比对): run the validator against
+		// explicit connections without migrating; own task namespace.
+		r.Post("/compare/tasks", s.handleCreateCompare)
+		r.Get("/compare/tasks", s.handleListCompares)
+		r.Route("/compare/tasks/{compareID}", func(r chi.Router) {
+			r.Get("/", s.handleGetCompare)
+			r.Get("/report", s.handleCompareReport)
+			r.Post("/cancel", s.handleCancelCompare)
+			r.Delete("/", s.handleDeleteCompare)
+		})
 		// CDC endpoints (#t48 B: read CDC process status file)
 		r.Get("/cdc/status", s.handleCDCStatus)
 		r.Get("/cdc/stats", s.handleCDCStats)

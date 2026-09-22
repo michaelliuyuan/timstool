@@ -129,6 +129,69 @@ export interface CreateTaskRequest {
   }
 }
 
+export interface CompareTableReport {
+  table_name: string
+  status: 'pass' | 'fail' | 'warn' | 'skip'
+  duration?: string
+  source_rows?: number
+  target_rows?: number
+  diff_rows?: number
+  error?: string
+  suggestion?: string
+}
+
+export interface CompareReport {
+  overall_status: string
+  start_time: string
+  end_time: string
+  duration: string
+  summary?: string
+  tables: CompareTableReport[]
+  stats: {
+    total_tables: number
+    pass_tables: number
+    fail_tables: number
+    warn_tables: number
+    skip_tables: number
+    total_source_rows: number
+    total_target_rows: number
+    total_diff_rows: number
+  }
+}
+
+export interface CompareTask {
+  id: string
+  name: string
+  status: 'running' | 'completed' | 'failed' | 'cancelled'
+  source: Record<string, any>
+  target: Record<string, any>
+  mode: string
+  sample_ratio: number
+  checksum_chunk_size: number
+  checksum_parallel: number
+  parallel: number
+  tables: string[]
+  tables_done: number
+  tables_total: number
+  current_table?: string
+  error?: string
+  created_at: string
+  started_at?: string
+  finished_at?: string
+}
+
+export interface CreateCompareRequest {
+  name: string
+  source: Record<string, any>
+  target: Record<string, any>
+  mode: string
+  sample_ratio: number
+  checksum_chunk_size: number
+  checksum_parallel: number
+  parallel: number
+  tables: string[]
+}
+
 export const apiClient = {
   health: () => api.get('/health'),
 
@@ -207,6 +270,25 @@ export const apiClient = {
 
   getTaskPhases: (id: string) =>
     api.get<TaskPhasesResponse>(`/tasks/${id}/phases`),
+
+  // Standalone comparison (独立数据比对): create-and-run, list/history, report.
+  createCompare: (req: CreateCompareRequest) =>
+    api.post<CompareTask>('/compare/tasks', req),
+
+  listCompares: () =>
+    api.get<CompareTask[]>('/compare/tasks'),
+
+  getCompare: (id: string) =>
+    api.get<CompareTask>(`/compare/tasks/${id}`),
+
+  getCompareReport: (id: string) =>
+    api.get<CompareReport>(`/compare/tasks/${id}/report`),
+
+  cancelCompare: (id: string) =>
+    api.post(`/compare/tasks/${id}/cancel`),
+
+  deleteCompare: (id: string) =>
+    api.delete(`/compare/tasks/${id}`),
 }
 
 export default apiClient

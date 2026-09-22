@@ -28,6 +28,11 @@ const router = createRouter({
       component: () => import('../views/HistoryView.vue'),
     },
     {
+      path: '/compare',
+      name: 'Compare',
+      component: () => import('../views/CompareView.vue'),
+    },
+    {
       path: '/assess',
       name: 'Assess',
       component: () => import('../views/AssessView.vue'),

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -56,11 +57,11 @@ type Report struct {
 }
 
 type ReportStats struct {
-	TotalTables   int   `json:"total_tables"`
-	PassTables    int   `json:"pass_tables"`
-	FailTables    int   `json:"fail_tables"`
-	WarnTables    int   `json:"warn_tables"`
-	SkipTables    int   `json:"skip_tables"`
+	TotalTables     int   `json:"total_tables"`
+	PassTables      int   `json:"pass_tables"`
+	FailTables      int   `json:"fail_tables"`
+	WarnTables      int   `json:"warn_tables"`
+	SkipTables      int   `json:"skip_tables"`
 	TotalSourceRows int64 `json:"total_source_rows"`
 	TotalTargetRows int64 `json:"total_target_rows"`
 	TotalDiffRows   int64 `json:"total_diff_rows"`
@@ -144,7 +145,24 @@ func (r *Report) SaveJSON(path string) error {
 	if err != nil {
 		return fmt.Errorf("marshal report: %w", err)
 	}
-	return os.WriteFile(path, data, 0644)
+	// Atomic write (temp + rename): a crash mid-write must not leave a
+	// truncated report.json behind for readers (compare /report endpoint).
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "report-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func (r *Report) SaveText(path string) error {

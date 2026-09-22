@@ -11,10 +11,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/michaelliuyuan/timstool/internal/common"
 	"github.com/michaelliuyuan/timstool/internal/common/config"
@@ -25,10 +26,87 @@ import (
 
 type Validator struct {
 	cfg config.Config
+
+	// Standalone-comparison overrides (webapi compare tasks). Zero values
+	// fall back to cfg so Run() behavior is unchanged for orchestrator/CLI.
+	pgDSNOverride    string
+	tidbDSNOverride  string
+	schemaOverride   string
+	compareOverride  *config.CompareConfig
+	parallelOverride int
+
+	// onTableDone is an optional per-table progress callback (tables done so
+	// far, total tables, latest table report). Called from worker goroutines;
+	// implementations must be safe for concurrent use.
+	onTableDone func(done, total int, tr reporter.TableReport)
 }
 
 func NewValidator(cfg config.Config) *Validator {
 	return &Validator{cfg: cfg}
+}
+
+// sourceDSN returns the PostgreSQL DSN to connect to (override first).
+func (v *Validator) sourceDSN() string {
+	if v.pgDSNOverride != "" {
+		return v.pgDSNOverride
+	}
+	return v.cfg.Source.DSN()
+}
+
+// targetDSN returns the TiDB DSN to connect to (override first).
+func (v *Validator) targetDSN() string {
+	if v.tidbDSNOverride != "" {
+		return v.tidbDSNOverride
+	}
+	return v.cfg.Target.DSN()
+}
+
+// sourceSchema returns the source schema name (override first, may be "").
+func (v *Validator) sourceSchema() string {
+	if v.schemaOverride != "" {
+		return v.schemaOverride
+	}
+	return v.cfg.Source.Schema
+}
+
+// compareCfg returns the effective compare configuration (override first).
+func (v *Validator) compareCfg() config.CompareConfig {
+	if v.compareOverride != nil {
+		return *v.compareOverride
+	}
+	return v.cfg.Compare
+}
+
+// parallelism returns the effective table-level parallelism (override first).
+func (v *Validator) parallelism() int {
+	if v.parallelOverride > 0 {
+		return v.parallelOverride
+	}
+	return v.cfg.Migration.Parallel
+}
+
+// OnTableDone registers a per-table progress callback used by Run (and thus
+// RunWithDSNs). Safe to call before starting a run.
+func (v *Validator) OnTableDone(fn func(done, total int, tr reporter.TableReport)) {
+	v.onTableDone = fn
+}
+
+// RunWithDSNs runs a standalone comparison against explicit DSNs instead of
+// the validator's config file. pgDSN/tidbDSN are used verbatim; schema,
+// compare and parallel override the corresponding config values when non-zero
+// (schema non-empty). Behavior is otherwise identical to Run.
+func (v *Validator) RunWithDSNs(ctx context.Context, pgDSN, tidbDSN, schema string, compare config.CompareConfig, parallel int, opts common.ValidateOpts) (*reporter.Report, error) {
+	clone := *v
+	clone.pgDSNOverride = pgDSN
+	clone.tidbDSNOverride = tidbDSN
+	if schema != "" {
+		clone.schemaOverride = schema
+	}
+	clone.compareOverride = &compare
+	if parallel > 0 {
+		clone.parallelOverride = parallel
+	}
+	return clone.Run(ctx, opts)
 }
 
 // getTiDBConn gets a dedicated connection from the TiDB connection pool and
@@ -54,7 +132,7 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 	// Resolve effective mode: CLI flag > config default
 	mode := opts.Mode
 	if mode == "" {
-		mode = v.cfg.Compare.CompareMode
+		mode = v.compareCfg().CompareMode
 	}
 	if mode == "" {
 		mode = "sample"
@@ -62,13 +140,13 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 
 	rpt := reporter.NewReport("data-validation")
 
-	pgDB, err := sql.Open("pgx", v.cfg.Source.DSN())
+	pgDB, err := sql.Open("pgx", v.sourceDSN())
 	if err != nil {
 		return nil, cerrors.Wrap(cerrors.ErrSourceConnect, "connect to PostgreSQL", err)
 	}
 	defer pgDB.Close()
 
-	tidbDB, err := sql.Open("mysql", v.cfg.Target.DSN())
+	tidbDB, err := sql.Open("mysql", v.targetDSN())
 	if err != nil {
 		return nil, cerrors.Wrap(cerrors.ErrTargetConnect, "connect to TiDB", err)
 	}
@@ -84,7 +162,7 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 		return nil, cerrors.Wrap(cerrors.ErrValidateRowCount, "get table list", err)
 	}
 
-	parallel := v.cfg.Migration.Parallel
+	parallel := v.parallelism()
 	if parallel <= 0 {
 		parallel = 4
 	}
@@ -92,6 +170,7 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 	var mu sync.Mutex
 	sem := make(chan struct{}, parallel)
 	var wg sync.WaitGroup
+	var tablesDone int32
 
 	for _, table := range tables {
 		wg.Add(1)
@@ -123,7 +202,10 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 			case "sample":
 				tr = v.validateSampling(ctx, pgDB, tidbConn, tidbDB, tableName, opts.SampleRatio)
 			case "checksum":
-				tr = v.validateChecksum(ctx, pgDB, tidbConn, tableName)
+				// L2: use the chunked parallel hash comparison (honors
+				// ChecksumChunkSize / ChecksumParallel); it falls back to
+				// hash_group for keyless tables internally.
+				tr = v.validateChecksumChunked(ctx, pgDB, tidbDB, tableName)
 			default:
 				tr = reporter.TableReport{
 					TableName: tableName,
@@ -135,6 +217,11 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 			mu.Lock()
 			rpt.AddTableReport(tr)
 			mu.Unlock()
+
+			if v.onTableDone != nil {
+				done := int(atomic.AddInt32(&tablesDone, 1))
+				v.onTableDone(done, len(tables), tr)
+			}
 
 			logger.Info("table validation result",
 				zap.String("table", tableName),
@@ -173,7 +260,7 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string) reporter.TableReport {
 	tr := reporter.TableReport{TableName: table, Status: reporter.StatusPass}
 
-	schema := v.cfg.Source.Schema
+	schema := v.sourceSchema()
 	if schema == "" {
 		schema = "public"
 	}
@@ -219,7 +306,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		return tr
 	}
 
-	schema := v.cfg.Source.Schema
+	schema := v.sourceSchema()
 	if schema == "" {
 		schema = "public"
 	}
@@ -235,14 +322,14 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 
 	// For no-PK tables, decide which strategy to use
 	if needsNoPKStrategy {
-		strategy := v.cfg.Compare.NoPKStrategy
+		strategy := v.compareCfg().NoPKStrategy
 		if strategy == "" {
 			strategy = "auto"
 		}
 
 		// Auto-select strategy based on table size
 		if strategy == "auto" {
-			threshold := v.cfg.Compare.NoPKTableThreshold
+			threshold := v.compareCfg().NoPKTableThreshold
 			if threshold <= 0 {
 				threshold = 1000000
 			}
@@ -300,7 +387,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 	for i, c := range pgCols {
 		dt := strings.ToLower(c.DatabaseTypeName())
 		if isApproximateFloatType(dt) ||
-				strings.Contains(dt, "json") {
+			strings.Contains(dt, "json") {
 			skipCols[i] = true
 		}
 		if dt == "character" || dt == "char" || dt == "bpchar" || dt == "character varying" || dt == "varchar" || dt == "text" {
@@ -328,7 +415,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		pgData = append(pgData, row)
 	}
 
-// The Go code below should be inserted at the right indentation level.
+	// The Go code below should be inserted at the right indentation level.
 	// Determine key columns for matching.
 	// If the table has a PK (single or composite), use ALL PK columns as the key.
 	var keyColIndices []int
@@ -701,7 +788,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, ratio float64, tr reporter.TableReport, schema string) reporter.TableReport {
 	logger := zap.L()
 
-	// Hash group is an exact strategy — query the full PG table, not a sample.
+	// Hash group is an exact strategy 鈥?query the full PG table, not a sample.
 	// Sampling would cause mismatches because TiDB is also queried in full.
 	pgQuery := fmt.Sprintf("SELECT * FROM %s.%s",
 		quotePG(schema), quotePG(table))
@@ -855,51 +942,12 @@ func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, ti
 	return v.validateBucketCompare(ctx, pgDB, tidbConn, table, tr, pgCols, pgData, skipCols)
 }
 
-func (v *Validator) validateChecksum(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string) reporter.TableReport {
-	tr := v.validateRowCount(ctx, pgDB, tidbConn, table)
-	if tr.Status == reporter.StatusFail && tr.DiffRows != 0 {
-		return tr
-	}
-
-	schema := v.cfg.Source.Schema
-	if schema == "" {
-		schema = "public"
-	}
-
-	var pgChecksum sql.NullString
-	err := pgDB.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT md5(string_agg(t::text, ',' ORDER BY id)) FROM (SELECT * FROM %s.%s ORDER BY 1) t",
-			quotePG(schema), quotePG(table))).Scan(&pgChecksum)
-	if err != nil {
-		tr.Status = reporter.StatusWarn
-		tr.Error = fmt.Sprintf("checksum source: %v", err)
-		return tr
-	}
-
-	var tidbChecksum sql.NullString
-	err = tidbConn.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT MD5(GROUP_CONCAT(t ORDER BY id SEPARATOR ',')) FROM (SELECT * FROM %s ORDER BY 1) t",
-			quoteMySQL(table))).Scan(&tidbChecksum)
-	if err != nil {
-		tr.Status = reporter.StatusWarn
-		tr.Error = fmt.Sprintf("checksum target: %v", err)
-		return tr
-	}
-
-	if pgChecksum.String != tidbChecksum.String {
-		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("checksum mismatch: pg=%s tidb=%s", pgChecksum.String, tidbChecksum.String)
-	}
-
-	return tr
-}
-
 func (v *Validator) getTables(ctx context.Context, pgDB *sql.DB, include []string) ([]string, error) {
 	if len(include) > 0 {
 		return include, nil
 	}
 
-	schema := v.cfg.Source.Schema
+	schema := v.sourceSchema()
 	if schema == "" {
 		schema = "public"
 	}
@@ -1003,7 +1051,7 @@ func normalizeTimestampString(s string) string {
 }
 
 func normalizeString(s string) string {
-	// Normalize line endings: \r\n → \n, then standalone \r → \n.
+	// Normalize line endings: \r\n 鈫?\n, then standalone \r 鈫?\n.
 	// MySQL/TiDB may strip or normalize carriage returns differently than PG.
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
@@ -1053,7 +1101,7 @@ func pgArrayToJSON(s string) string {
 		} else if elem == "f" {
 			parts = append(parts, "false")
 		} else if len(elem) >= 2 && elem[0] == '"' && elem[len(elem)-1] == '"' {
-			// Already quoted in PG syntax — unescape PG "" → JSON \"
+			// Already quoted in PG syntax 鈥?unescape PG "" 鈫?JSON \"
 			unquoted := elem[1 : len(elem)-1]
 			unquoted = strings.ReplaceAll(unquoted, `""`, `"`)
 			b, _ := json.Marshal(unquoted)
@@ -1216,9 +1264,13 @@ func diagnoseRowDiff(
 
 			// Show hex of bytes starting from diff position
 			pgHex := fmt.Sprintf("%x", []byte(pgVal[diffPos:]))
-			if len(pgHex) > 80 { pgHex = pgHex[:80] + "..." }
+			if len(pgHex) > 80 {
+				pgHex = pgHex[:80] + "..."
+			}
 			tidbHex := fmt.Sprintf("%x", []byte(tidbVal[diffPos:]))
-			if len(tidbHex) > 80 { tidbHex = tidbHex[:80] + "..." }
+			if len(tidbHex) > 80 {
+				tidbHex = tidbHex[:80] + "..."
+			}
 
 			diffs = append(diffs, fmt.Sprintf("%s PG(%s)[len=%d] TiDB(%s)[len=%d] diff@byte%d pg_hex_after=%s tidb_hex_after=%s",
 				pgHC.name, pgType, len(pgVal), tidbType, len(tidbVal), diffPos,
@@ -1230,4 +1282,3 @@ func diagnoseRowDiff(
 	}
 	return " diff=[" + strings.Join(diffs, "; ") + "]"
 }
-

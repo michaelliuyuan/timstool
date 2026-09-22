@@ -44,6 +44,10 @@ onMounted(async () => {
           <el-icon><Clock /></el-icon>
           <span>迁移历史</span>
         </el-menu-item>
+        <el-menu-item index="/compare">
+          <el-icon><Grid /></el-icon>
+          <span>数据比对</span>
+        </el-menu-item>
         <el-menu-item index="/assess">
           <el-icon><DataAnalysis /></el-icon>
           <span>兼容性评估</span>

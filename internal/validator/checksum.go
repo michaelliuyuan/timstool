@@ -38,7 +38,7 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 		return tr
 	}
 
-	schema := v.cfg.Source.Schema
+	schema := v.sourceSchema()
 	if schema == "" {
 		schema = "public"
 	}
@@ -51,17 +51,17 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	} else if keyInfo != nil && keyInfo.HasUniqueIndex {
 		orderByCols = strings.Join(keyInfo.UniqueColumns, ", ")
 	} else {
-		// No key — fall back to hash_group comparison (already implemented)
+		// No key 鈥?fall back to hash_group comparison (already implemented)
 		logger := zap.L()
 		logger.Info("checksum mode: no PK/unique for chunking, falling back to hash_group", zap.String("table", table))
 		return v.validateSamplingWithHashGroup(ctx, pgDB, tidbConn, table, 1.0, tr, schema)
 	}
 
-	chunkSize := v.cfg.Compare.ChecksumChunkSize
+	chunkSize := v.compareCfg().ChecksumChunkSize
 	if chunkSize <= 0 {
 		chunkSize = 50000
 	}
-	parallel := v.cfg.Compare.ChecksumParallel
+	parallel := v.compareCfg().ChecksumParallel
 	if parallel <= 0 {
 		parallel = 4
 	}
@@ -146,7 +146,7 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 		tr.Status = reporter.StatusPass
 	}
 
-	tr.Suggestion = fmt.Sprintf("checksum mode: %d chunks × %d rows, %d mismatches",
+	tr.Suggestion = fmt.Sprintf("checksum mode: %d chunks 脳 %d rows, %d mismatches",
 		numChunks, chunkSize, len(mismatchDetails))
 
 	return tr
