@@ -180,6 +180,11 @@ func (m *Manager) MarkTableRunning(tableName string) error {
 func (m *Manager) MarkTableCompleted(tableName string, rowsDone int64) error {
 	return m.UpdateTable(tableName, func(tc *TableCheckpoint) {
 		tc.State = StateCompleted
+		// Raise the denominator if more rows were actually exported than the
+		// registered estimate, so aggregated progress never exceeds 100%.
+		if rowsDone > tc.RowsTotal {
+			tc.RowsTotal = rowsDone
+		}
 		tc.RowsDone = rowsDone
 		tc.FinishedAt = time.Now()
 	})
@@ -195,6 +200,10 @@ func (m *Manager) MarkTableFailed(tableName string, errStr string) error {
 
 func (m *Manager) UpdateTableProgress(tableName string, rowsDone int64, bytesDone int64) error {
 	return m.UpdateTable(tableName, func(tc *TableCheckpoint) {
+		// Keep the denominator >= rowsDone so progress stays <= 100%.
+		if rowsDone > tc.RowsTotal {
+			tc.RowsTotal = rowsDone
+		}
 		tc.RowsDone = rowsDone
 		tc.BytesDone = bytesDone
 	})

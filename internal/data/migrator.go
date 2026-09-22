@@ -36,6 +36,13 @@ type Migrator struct {
 	pgDB    *sql.DB
 	cpMgr   *checkpoint.Manager
 	display *progress.Display
+	// preRegistered guards one-time upfront table registration so progress
+	// denominators are stable from the start of the export loop.
+	preRegistered bool
+	// estimates caches the row estimates from the first preRegisterTables
+	// call so later entry points (importViaSQL, lightning fallback) reuse
+	// them instead of nil.
+	estimates map[string]int64
 }
 
 func NewMigrator(cfg config.Config) *Migrator {
@@ -84,6 +91,11 @@ func (m *Migrator) Run(ctx context.Context, opts common.DataOpts) (*common.DataR
 
 	logger.Info("migrating tables", zap.Int("count", len(tables)))
 
+	// Register every selected table upfront (with zero-scan row estimates) so
+	// the progress denominators are full-size from the first poll instead of
+	// growing as the export loop walks the table list.
+	estimates := m.preRegisterTables(ctx, tables)
+
 	var totalRows atomic.Int64
 	var totalBytes atomic.Int64
 
@@ -110,8 +122,11 @@ func (m *Migrator) Run(ctx context.Context, opts common.DataOpts) (*common.DataR
 
 			rowCount, err := m.getRowCount(ctx, table)
 			if err != nil {
-				logger.Warn("failed to get row count", zap.String("table", table), zap.Error(err))
-				rowCount = 0
+				logger.Warn("failed to get row count, keeping estimate", zap.String("table", table), zap.Error(err))
+				rowCount = estimates[table]
+			} else {
+				// Converge the denominator to the exact count; never below RowsDone.
+				m.setExactRowsTotal(table, rowCount)
 			}
 
 			m.cpMgr.GetOrCreateTable(table, rowCount)
@@ -256,6 +271,168 @@ func (m *Migrator) getRowCount(ctx context.Context, table string) (int64, error)
 	err := m.pgDB.QueryRowContext(ctx,
 		fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", quotePG(schema), quotePG(table))).Scan(&count)
 	return count, err
+}
+
+// pgQuoteLiteral quotes s as a PostgreSQL string literal (single quotes).
+// quotePG is NOT suitable here: it emits double quotes, which PostgreSQL
+// parses as an identifier reference, making schema/table comparisons in
+// catalog queries fail with "column does not exist" and silently disabling
+// the estimate query.
+func pgQuoteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// setExactRowsTotal overwrites the estimated RowsTotal with the exact COUNT
+// taken at dispatch time. The denominator never drops below RowsDone and is
+// only lowered while no rows have been exported yet, so live progress can
+// never jump backwards past what has already been done.
+func (m *Migrator) setExactRowsTotal(table string, exact int64) {
+	if err := m.cpMgr.UpdateTable(table, func(tc *checkpoint.TableCheckpoint) {
+		if exact < tc.RowsDone {
+			exact = tc.RowsDone
+		}
+		tc.RowsTotal = exact
+	}); err != nil {
+		zap.L().Warn("failed to set exact row total",
+			zap.String("table", table), zap.Error(err))
+	}
+}
+
+// estimateRowCounts returns a zero-scan row-count estimate per table using
+// planner statistics (pg_class.reltuples) and live-tuple counters
+// (pg_stat_all_tables.n_live_tup), taking the larger of the two. Partitioned
+// parents (relkind='p', whose reltuples is empty) fall back to a recursive
+// pg_inherits sum over leaf partitions. Failure of any query is non-fatal:
+// missing tables simply get estimate 0 and rely on the exact COUNT at
+// dispatch time.
+func (m *Migrator) estimateRowCounts(ctx context.Context, tables []string) map[string]int64 {
+	estimates := make(map[string]int64, len(tables))
+	schema := m.cfg.Source.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	logger := zap.L()
+
+	literals := make([]string, 0, len(tables))
+	for _, t := range tables {
+		literals = append(literals, pgQuoteLiteral(t))
+	}
+	query := fmt.Sprintf(`
+		SELECT c.relname, c.relkind,
+		       GREATEST(COALESCE(c.reltuples, 0)::bigint, COALESCE(s.n_live_tup, 0)) AS est_rows
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid
+		WHERE n.nspname = %s AND c.relname IN (%s) AND c.relkind IN ('r', 'p')`,
+		pgQuoteLiteral(schema), strings.Join(literals, ", "))
+
+	rows, err := m.pgDB.QueryContext(ctx, query)
+	if err != nil {
+		logger.Warn("row estimate query failed, falling back to dispatch-time counts", zap.Error(err))
+		return estimates
+	}
+	defer rows.Close()
+
+	var partitionParents []string
+	for rows.Next() {
+		var name, relkind string
+		var est int64
+		if err := rows.Scan(&name, &relkind, &est); err != nil {
+			logger.Warn("row estimate scan failed", zap.Error(err))
+			continue
+		}
+		if est < 0 {
+			est = 0
+		}
+		estimates[name] = est
+		// Only partitioned parents need the recursive fallback; plain empty
+		// or never-analyzed tables keep estimate 0 and converge at dispatch.
+		if relkind == "p" {
+			partitionParents = append(partitionParents, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		logger.Warn("row estimate iteration failed", zap.Error(err))
+	}
+
+	// Partitioned parents carry no reltuples; sum their leaf partitions.
+	for _, table := range partitionParents {
+		if est := m.estimatePartitionRows(ctx, schema, table); est > 0 {
+			estimates[table] = est
+		}
+	}
+
+	total := int64(0)
+	for _, t := range tables {
+		total += estimates[t]
+	}
+	logger.Info("estimated source row counts",
+		zap.Int("tables", len(tables)), zap.Int64("estimated_rows", total))
+
+	return estimates
+}
+
+// estimatePartitionRows sums planner/live-tuple estimates over the leaf
+// partitions (relkind='r') of a (possibly partitioned) table via a recursive
+// pg_inherits walk. Returns 0 on failure.
+func (m *Migrator) estimatePartitionRows(ctx context.Context, schema, table string) int64 {
+	query := fmt.Sprintf(`
+		WITH RECURSIVE tree AS (
+			SELECT c.oid FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = %s AND c.relname = %s
+			UNION ALL
+			SELECT cl.oid FROM pg_class cl
+			JOIN pg_inherits i ON i.inhrelid = cl.oid
+			JOIN tree t ON i.inhparent = t.oid
+		)
+		SELECT COALESCE(SUM(GREATEST(COALESCE(c.reltuples, 0), COALESCE(s.n_live_tup, 0))), 0)
+		FROM tree x
+		JOIN pg_class c ON c.oid = x.oid
+		LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid
+		WHERE c.relkind = 'r'`,
+		pgQuoteLiteral(schema), pgQuoteLiteral(table))
+
+	var sum int64
+	if err := m.pgDB.QueryRowContext(ctx, query).Scan(&sum); err != nil {
+		zap.L().Warn("partition row estimate failed",
+			zap.String("table", table), zap.Error(err))
+		return 0
+	}
+	return sum
+}
+
+// preRegisterTables registers all selected tables in the checkpoint with
+// estimated row counts before the export/import loop starts, so progress
+// denominators (tables_total / rows_total) are full-size from the first
+// poll. Idempotent per Migrator instance; completed or already-registered
+// tables are left untouched (resume semantics preserved). Returns the
+// estimates for callers to use as a COUNT-failure fallback.
+func (m *Migrator) preRegisterTables(ctx context.Context, tables []string) map[string]int64 {
+	if len(tables) == 0 || m.cpMgr == nil {
+		return m.estimates
+	}
+	if m.preRegistered {
+		return m.estimates
+	}
+	m.preRegistered = true
+
+	m.estimates = m.estimateRowCounts(ctx, tables)
+	estimates := m.estimates
+	registered := 0
+	for _, table := range tables {
+		if m.cpMgr.IsTableCompleted(table) {
+			continue
+		}
+		if _, ok := m.cpMgr.GetTable(table); ok {
+			continue
+		}
+		m.cpMgr.GetOrCreateTable(table, estimates[table])
+		registered++
+	}
+	zap.L().Info("pre-registered tables for stable progress denominators",
+		zap.Int("selected", len(tables)), zap.Int("newly_registered", registered))
+	return estimates
 }
 
 func (m *Migrator) exportTable(ctx context.Context, table string, opts common.DataOpts) (int64, int64, error) {
@@ -934,6 +1111,9 @@ func (m *Migrator) importViaSQL(ctx context.Context, opts common.DataOpts) error
 		return fmt.Errorf("get table list: %w", err)
 	}
 
+	// No-op when Run already pre-registered; guards direct entry points.
+	estimates := m.preRegisterTables(ctx, tables)
+
 	tidbDB, err := sql.Open("mysql", m.cfg.Target.DSN())
 	if err != nil {
 		return err
@@ -968,8 +1148,14 @@ func (m *Migrator) importViaSQL(ctx context.Context, opts common.DataOpts) error
 	for _, table := range tables {
 		rowCount, err := m.getRowCount(ctx, table)
 		if err != nil {
-			logger.Warn("failed to get row count", zap.String("table", table), zap.Error(err))
-			rowCount = 0
+			logger.Warn("failed to get row count, keeping estimate", zap.String("table", table), zap.Error(err))
+			if estimates != nil {
+				rowCount = estimates[table]
+			} else {
+				rowCount = 0
+			}
+		} else {
+			m.setExactRowsTotal(table, rowCount)
 		}
 		m.cpMgr.GetOrCreateTable(table, rowCount)
 		m.cpMgr.MarkTableRunning(table)
