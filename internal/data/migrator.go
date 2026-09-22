@@ -189,15 +189,23 @@ func (m *Migrator) Run(ctx context.Context, opts common.DataOpts) (*common.DataR
 			return nil, firstErr
 		}
 
+		// Record the mode BEFORE the phase flip so the poller never sees
+		// phase=data-import with an empty/stale mode (importViaSQL /
+		// importViaLightning re-set it on their own entry as a fallback
+		// override). Paired with SetImportedTables(0) below.
+		m.cpMgr.SetImportMode(checkpoint.ImportModeLightning)
+		m.cpMgr.SetImportedTables(0)
 		m.cpMgr.SetPhase("data-import")
 		m.cpMgr.Flush()
 
 		if err := m.importViaLightning(ctx, opts, tables); err != nil {
 			logger.Warn("LOAD DATA import failed, falling back to streaming INSERT", zap.Error(err))
+			m.cpMgr.SetImportedTables(0)
 			if err := m.importViaSQL(ctx, opts); err != nil {
 				return nil, cerrors.Wrap(cerrors.ErrDataImport, "sql import", err)
 			}
 		} else {
+			m.cpMgr.SetImportedTables(len(tables))
 			for _, table := range tables {
 				tc := m.cpMgr.GetOrCreateTable(table, 0)
 				m.cpMgr.MarkTableCompleted(table, tc.RowsTotal)
@@ -539,6 +547,15 @@ func (m *Migrator) importViaLightning(ctx context.Context, opts common.DataOpts,
 	logger := zap.L()
 	logger.Info("TiDB Lightning import starting", zap.String("dir", opts.TempDir))
 
+	// Record the import mode before the lightning process (and its scanner
+	// loop) starts, so progress polls during the import use the
+	// table-count formula instead of the streaming rows formula.
+	if m.cpMgr != nil {
+		if err := m.cpMgr.SetImportMode(checkpoint.ImportModeLightning); err != nil {
+			logger.Warn("failed to record import mode", zap.Error(err))
+		}
+	}
+
 	entries, err := os.ReadDir(opts.TempDir)
 	if err != nil {
 		return err
@@ -834,6 +851,7 @@ analyze = "off"
 	}
 
 	var srcPathRe = regexp.MustCompile(`\([^)]*\.go:\d+\)`)
+	var importCounter importTableCounter
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	logWriteFailed := false
@@ -864,6 +882,17 @@ analyze = "off"
 			logger.Warn("lightning: " + line)
 		default:
 			logger.Info("lightning: " + line)
+			// The "restore file completed" line fires once per source CSV and
+			// carries [table=`db`.`tbl`]; count distinct tables into the
+			// checkpoint so the web UI can show import progress.
+			if table, ok := parseImportedTable(line); ok {
+				if n, isNew := importCounter.add(table); isNew {
+					if err := m.cpMgr.SetImportedTables(n); err != nil {
+						logger.Warn("failed to record imported table count",
+							zap.Int("count", n), zap.Error(err))
+					}
+				}
+			}
 		}
 	}
 	if serr := scanner.Err(); serr != nil {
@@ -920,6 +949,45 @@ func filterLightningLine(line string) lightningLogLevel {
 		}
 	}
 	return logDrop
+}
+
+// importedTableRegexp extracts the table name from a lightning
+// "restore file completed" line: [table=`db`.`tbl`].
+var importedTableRegexp = regexp.MustCompile("\\[table=`([^`]*)`\\.`([^`]*)`\\]")
+
+// parseImportedTable returns the qualified table name (`db`.`tbl` → db.tbl)
+// from a lightning log line that reports a completed file restore. ok is
+// false for lines without a [table=`db`.`tbl`] marker.
+func parseImportedTable(line string) (table string, ok bool) {
+	m := importedTableRegexp.FindStringSubmatch(line)
+	if m == nil {
+		return "", false
+	}
+	return m[1] + "." + m[2], true
+}
+
+// importTableCounter counts DISTINCT tables whose files finished importing
+// (chunked tables emit one "restore file completed" per CSV chunk).
+type importTableCounter struct {
+	mu   sync.Mutex
+	seen map[string]bool
+	n    int
+}
+
+// add records table and returns the total distinct count so far and whether
+// this table was newly seen.
+func (c *importTableCounter) add(table string) (n int, isNew bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.seen == nil {
+		c.seen = make(map[string]bool)
+	}
+	if c.seen[table] {
+		return c.n, false
+	}
+	c.seen[table] = true
+	c.n++
+	return c.n, true
 }
 
 func isBadConnection(err error) bool {
@@ -1113,6 +1181,42 @@ func (m *Migrator) importViaSQL(ctx context.Context, opts common.DataOpts) error
 
 	// No-op when Run already pre-registered; guards direct entry points.
 	estimates := m.preRegisterTables(ctx, tables)
+
+	// This entry is also the lightning→stream fallback: at that point each
+	// table's RowsDone still holds its CSV-export final value
+	// (rowsDone==rowsTotal) — including tables whose state is already
+	// completed, because the export loop marked them so. Keeping those
+	// values would make the stream progress formula report 100% on the first
+	// poll after fallback. Reset RowsDone to 0 for EVERY table (RowsTotal is
+	// untouched, so denominators stay intact): importViaSQL re-streams all
+	// tables and rewrites RowsDone per batch, so "RowsDone = rows imported
+	// into TiDB" holds from the start. On the pure-stream path RowsDone
+	// starts at 0 anyway, making the reset a no-op there.
+	//
+	// IMPORTANT: this reset must complete BEFORE SetImportMode(stream) below
+	// is persisted. Between those two points a poll would otherwise see
+	// mode=stream together with rowsDone==rowsTotal and flash 100% for one
+	// frame; while the reset is still in progress the poller keeps the
+	// lightning formula (mode=lightning, imported=0 → 0.525), and once the
+	// mode flips the rows-based formula already reads rowsDone=0 → 0.525.
+	for _, t := range tables {
+		if err := m.cpMgr.UpdateTable(t, func(tc *checkpoint.TableCheckpoint) {
+			tc.RowsDone = 0
+		}); err != nil {
+			logger.Warn("failed to reset rows done for stream import",
+				zap.String("table", t), zap.Error(err))
+		}
+	}
+
+	// Entry point for BOTH direct streaming runs and the lightning→stream
+	// fallback: switch the poller to the rows-based formula only after the
+	// RowsDone reset above has been persisted, overwriting the earlier
+	// "lightning" value.
+	if m.cpMgr != nil {
+		if err := m.cpMgr.SetImportMode(checkpoint.ImportModeStream); err != nil {
+			logger.Warn("failed to record import mode", zap.Error(err))
+		}
+	}
 
 	tidbDB, err := sql.Open("mysql", m.cfg.Target.DSN())
 	if err != nil {

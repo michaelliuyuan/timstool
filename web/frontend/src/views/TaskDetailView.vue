@@ -60,6 +60,15 @@ const progressPercent = computed(() => {
   return Math.round(task.value.progress * 100)
 })
 
+const importSubText = computed(() => {
+  const p = wsProgress.value
+  if (!p || !task.value || task.value.phase !== 'data') return ''
+  const imported = p.imported_tables
+  if (typeof imported !== 'number' || imported <= 0) return ''
+  const total = p.tables_total ?? task.value.tables_total
+  return `数据导入中（${imported}/${total} 表）`
+})
+
 const elapsed = computed(() => {
   if (!task.value?.started_at) return '-'
   const end = task.value.finished_at ? new Date(task.value.finished_at) : new Date()
@@ -149,6 +158,7 @@ function connectWS() {
         if (data.tables_total !== undefined) task.value.tables_total = data.tables_total
         if (data.rows_done !== undefined) task.value.rows_done = data.rows_done
         if (data.rows_total !== undefined) task.value.rows_total = data.rows_total
+        if (data.imported_tables !== undefined) task.value.imported_tables = data.imported_tables
         if (data.status) task.value.status = data.status
       }
     } catch {}
@@ -307,6 +317,7 @@ function logLevelClass(level: string): string {
         </el-row>
         <el-progress :percentage="progressPercent" :stroke-width="20" style="margin-top: 16px;"
           :status="task.status === 'completed' ? 'success' : task.status === 'failed' ? 'exception' : undefined" />
+        <div v-if="importSubText" style="margin-top: 6px; font-size: 13px; color: #909399;">{{ importSubText }}</div>
       </el-card>
 
       <!-- Actions -->

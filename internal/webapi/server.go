@@ -6,6 +6,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -665,12 +666,15 @@ func (s *Server) handleValidateLightning(w http.ResponseWriter, r *http.Request)
 }
 
 // migrationOptionsBody is the persisted shape of the wizard's migration
-// options step (temp_dir / use_lightning / lightning_path only — connection
-// and table selections stay per-task).
+// options step (temp_dir / use_lightning / lightning_path, plus the
+// target-cluster-only extras pd_addr / status_port — host/port/user/
+// password stay per-task and are never persisted).
 type migrationOptionsBody struct {
 	TempDir       string `json:"temp_dir"`
 	UseLightning  bool   `json:"use_lightning"`
 	LightningPath string `json:"lightning_path"`
+	PDAddr        string `json:"pd_addr,omitempty"`
+	StatusPort    int    `json:"status_port,omitempty"`
 }
 
 func (s *Server) migrationOptionsFile() string {
@@ -698,16 +702,39 @@ func (s *Server) handleGetMigrationOptions(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handlePutMigrationOptions(w http.ResponseWriter, r *http.Request) {
-	var req migrationOptionsBody
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	var req migrationOptionsBody
+	if err := json.Unmarshal(raw, &req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// R1 merge semantics: PUT is a partial update, not a whole-object
+	// replace. Fields explicitly present in the body override the saved
+	// values; fields absent from the body keep their saved values (so a
+	// client sending only pd_addr cannot wipe the temp_dir/lightning memory).
+	var presence map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &presence); err != nil {
+		presence = nil
 	}
 
 	// Normalize once, then validate and persist the SAME trimmed values, so a
 	// whitespace-only temp_dir cannot slip past validation and be stored raw.
 	req.TempDir = strings.TrimSpace(req.TempDir)
 	req.LightningPath = strings.TrimSpace(req.LightningPath)
+	// Empty pd_addr means "clear the remembered address"; status_port must be
+	// a valid port number (0 = not provided / skip probing).
+	// A1: strip an optional scheme prefix and trailing slash so the stored
+	// value matches what probePD accepts and the lightning toml consumes.
+	req.PDAddr = normalizePDAddr(req.PDAddr)
+	if req.StatusPort < 0 || req.StatusPort > 65535 {
+		s.writeError(w, http.StatusBadRequest, "status_port 必须在 0-65535 之间（0 表示不探测）")
+		return
+	}
 
 	// Validate before persisting: temp_dir must be creatable; an explicit
 	// lightning path must exist, be a regular file and (on Linux) executable.
@@ -740,11 +767,56 @@ func (s *Server) handlePutMigrationOptions(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	if err := s.writeMigrationOptions(&req); err != nil {
+	// Merge with the previously saved options: only fields explicitly present
+	// in the request body are applied; absent fields keep their saved values.
+	merged := s.loadMigrationOptions()
+	if _, ok := presence["temp_dir"]; ok {
+		merged.TempDir = req.TempDir
+	}
+	if _, ok := presence["use_lightning"]; ok {
+		merged.UseLightning = req.UseLightning
+	}
+	if _, ok := presence["lightning_path"]; ok {
+		merged.LightningPath = req.LightningPath
+	}
+	if _, ok := presence["pd_addr"]; ok {
+		merged.PDAddr = req.PDAddr
+	}
+	if _, ok := presence["status_port"]; ok {
+		merged.StatusPort = req.StatusPort
+	}
+
+	if err := s.writeMigrationOptions(&merged); err != nil {
 		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存失败：%v", err))
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+}
+
+// loadMigrationOptions returns the currently persisted options, or the zero
+// value when nothing has been saved yet (or the file is corrupted — the next
+// successful PUT rewrites it).
+func (s *Server) loadMigrationOptions() migrationOptionsBody {
+	raw, err := os.ReadFile(s.migrationOptionsFile())
+	if err != nil {
+		return migrationOptionsBody{}
+	}
+	var opts migrationOptionsBody
+	if err := json.Unmarshal(raw, &opts); err != nil {
+		return migrationOptionsBody{}
+	}
+	return opts
+}
+
+// normalizePDAddr strips an optional URL scheme and trailing slash so a
+// remembered pd_addr is stored in the same form probePD accepts and the
+// lightning toml consumes (e.g. "http://host:2389/" → "host:2389").
+func normalizePDAddr(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if i := strings.Index(addr, "://"); i >= 0 {
+		addr = addr[i+3:]
+	}
+	return strings.TrimRight(addr, "/")
 }
 
 // writeMigrationOptions persists the options atomically (write temp file in
@@ -987,15 +1059,7 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 			zap.Int("tables_done", tDone),
 			zap.Int64("rows_total", rTotal),
 			zap.Int64("rows_done", rDone))
-		var prog float64
-		if rTotal > 0 {
-			prog = float64(rDone) / float64(rTotal)
-			if prog > 1.0 {
-				prog = 1.0
-			}
-		} else if tTotal > 0 {
-			prog = float64(tDone) / float64(tTotal)
-		}
+		prog := computeTaskProgress(cpPhase, tDone, tTotal, rDone, rTotal, cpMgr.GetImportedTables(), cpMgr.GetImportMode())
 		_ = s.store.UpdateTaskProgress(taskID, cpPhase, prog, tDone, tTotal, rDone, rTotal)
 		s.BroadcastProgress(taskID, map[string]interface{}{
 			"phase":        cpPhase,
@@ -1040,7 +1104,8 @@ func (s *Server) pollProgress(ctx context.Context, taskID string, checkpointDir 
 				continue
 			}
 
-			phase := cpMgr.GetPhase()
+			rawPhase := cpMgr.GetPhase()
+			phase := rawPhase
 			if phase == "data-migration" || phase == "data-export" || phase == "data-import" {
 				phase = "data"
 			}
@@ -1057,28 +1122,110 @@ func (s *Server) pollProgress(ctx context.Context, taskID string, checkpointDir 
 				}
 			}
 
-			var progress float64
-			if rowsTotal > 0 {
-				progress = float64(rowsDone) / float64(rowsTotal)
-				if progress > 1.0 {
-					progress = 1.0
-				}
-			} else if tablesTotal > 0 {
-				progress = float64(tablesDone) / float64(tablesTotal)
-			}
+			importedTables := cpMgr.GetImportedTables()
+			importMode := cpMgr.GetImportMode()
+			progress := computeTaskProgress(rawPhase, tablesDone, tablesTotal, rowsDone, rowsTotal, importedTables, importMode)
 
 			_ = s.store.UpdateTaskProgress(taskID, phase, progress, tablesDone, tablesTotal, rowsDone, rowsTotal)
 
-			s.BroadcastProgress(taskID, map[string]interface{}{
+			msg := map[string]interface{}{
 				"phase":        phase,
 				"progress":     progress,
 				"tables_done":  tablesDone,
 				"tables_total": tablesTotal,
 				"rows_done":    rowsDone,
 				"rows_total":   rowsTotal,
-			})
+			}
+			if rawPhase == "data-import" {
+				msg["imported_tables"] = importedTables
+			}
+			s.BroadcastProgress(taskID, msg)
 		}
 	}
+}
+
+// weightedProgress combines the three migration stages into one total
+// progress value.
+//
+// 权重定死，不做配置：schema 5%，导出 47.5%，导入 47.5%。
+func weightedProgress(schemaDone, exportFrac, importFrac float64) float64 {
+	const (
+		wSchema = 0.05
+		wExport = 0.475
+		wImport = 0.475
+	)
+	p := wSchema*schemaDone + wExport*exportFrac + wImport*importFrac
+	if p > 1.0 {
+		p = 1.0
+	}
+	return p
+}
+
+// computeTaskProgress derives the weighted total progress for a checkpoint
+// phase. validate and later stages report 100%; schema (and precheck) keep
+// the coarse table-based ratio; data phases use the fixed 5/47.5/47.5
+// weighting with the import fraction chosen by the recorded import mode:
+//
+//   - lightning: importFrac = importedTables/tablesTotal (0 while no table
+//     has finished restoring — never the rows ratio), exportFrac = rows ratio.
+//   - stream:    export counts as complete, importFrac = rows ratio.
+//   - "" (historical checkpoint): imported_tables>0 selects the lightning
+//     formula, otherwise the stream formula.
+func computeTaskProgress(rawPhase string, tablesDone, tablesTotal int, rowsDone, rowsTotal int64, importedTables int, importMode string) float64 {
+	rowsFrac := func() float64 {
+		if rowsTotal <= 0 {
+			return 0
+		}
+		return float64(rowsDone) / float64(rowsTotal)
+	}
+	tablesFrac := func() float64 {
+		if tablesTotal <= 0 {
+			return 0
+		}
+		return float64(importedTables) / float64(tablesTotal)
+	}
+
+	switch rawPhase {
+	case "validate", "completed":
+		return 1.0
+	case "schema", "precheck", "":
+		if tablesTotal > 0 {
+			p := float64(tablesDone) / float64(tablesTotal)
+			if p > 1.0 {
+				p = 1.0
+			}
+			return p
+		}
+		return 0
+	}
+
+	// Data phases ("data", "data-migration", "data-export", "data-import").
+	schemaDone := 1.0
+	exportFrac := rowsFrac()
+	importFrac := 0.0
+	if rawPhase == "data-import" {
+		mode := importMode
+		if mode == "" && importedTables > 0 {
+			// Historical-checkpoint compatibility only: checkpoints written
+			// before import_mode existed. New checkpoints always carry a
+			// mode — the migrator sets it before flipping the phase to
+			// data-import, so the mode=="" && imported==0 window below is
+			// unreachable for fresh runs.
+			mode = checkpoint.ImportModeLightning
+		}
+		if mode == checkpoint.ImportModeLightning {
+			exportFrac = rowsFrac()
+			importFrac = tablesFrac()
+		} else {
+			// stream (explicit or inferred): rows double as the import
+			// signal; the CSV export stage never ran (or is irrelevant).
+			// With R1 the stream entry point zeroes RowsDone, so the rows
+			// ratio starts at 0 and this branch reports 0.525 upward.
+			exportFrac = 1.0
+			importFrac = rowsFrac()
+		}
+	}
+	return weightedProgress(schemaDone, exportFrac, importFrac)
 }
 
 func (s *Server) handlePauseTask(w http.ResponseWriter, r *http.Request) {

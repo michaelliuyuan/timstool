@@ -54,12 +54,22 @@ func (tc *TableCheckpoint) Progress() float64 {
 }
 
 type Checkpoint struct {
-	Version   string                      `json:"version"`
-	CreatedAt time.Time                   `json:"created_at"`
-	UpdatedAt time.Time                   `json:"updated_at"`
-	Phase     string                      `json:"phase"`
-	Tables    map[string]*TableCheckpoint `json:"tables"`
+	Version        string                      `json:"version"`
+	CreatedAt      time.Time                   `json:"created_at"`
+	UpdatedAt      time.Time                   `json:"updated_at"`
+	Phase          string                      `json:"phase"`
+	Tables         map[string]*TableCheckpoint `json:"tables"`
+	ImportedTables int                         `json:"imported_tables"`
+	ImportMode     string                      `json:"import_mode"`
 }
+
+// Import modes recorded in the checkpoint so progress consumers (webapi)
+// can pick the correct import-fraction formula. Exported to avoid raw
+// string constants scattered across packages.
+const (
+	ImportModeLightning = "lightning"
+	ImportModeStream    = "stream"
+)
 
 type Manager struct {
 	mu       sync.Mutex
@@ -207,6 +217,42 @@ func (m *Manager) UpdateTableProgress(tableName string, rowsDone int64, bytesDon
 		tc.RowsDone = rowsDone
 		tc.BytesDone = bytesDone
 	})
+}
+
+// SetImportedTables records the number of tables already imported by
+// tidb-lightning (deduplicated count) and persists it.
+func (m *Manager) SetImportedTables(n int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data.ImportedTables = n
+	m.save()
+	return nil
+}
+
+// GetImportedTables returns the recorded number of imported tables.
+func (m *Manager) GetImportedTables() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.data.ImportedTables
+}
+
+// SetImportMode records the active data-import mode (lightning / stream)
+// and persists it, so the progress poller picks the matching formula even
+// across process restarts and the lightning→stream fallback chain.
+func (m *Manager) SetImportMode(mode string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data.ImportMode = mode
+	m.save()
+	return nil
+}
+
+// GetImportMode returns the recorded import mode ("" for historical
+// checkpoints written before the field existed).
+func (m *Manager) GetImportMode() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.data.ImportMode
 }
 
 func (m *Manager) GetPhase() string {

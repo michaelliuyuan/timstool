@@ -237,7 +237,12 @@ async function testConnection(type: 'source' | 'target') {
       status_port: form.target.status_port || undefined,
     })
     targetTestResult.value = data
-    if (data.ok) ElMessage.success('TiDB 连接成功')
+    if (data.ok) {
+      ElMessage.success('TiDB 连接成功')
+      // A successful target test is a good moment to persist the
+      // Lightning-only extras (pd_addr / status_port) for the next task.
+      saveMigrationOptions()
+    }
     else ElMessage.error(`连接失败: ${data.error}`)
   } catch (e: any) {
     ElMessage.error(`连接测试失败: ${e.message}`)
@@ -349,6 +354,13 @@ async function loadMigrationOptions() {
       form.opts.use_lightning = true
       form.opts.lightning_path = data.lightning_path || ''
     }
+    // Lightning-only target extras: prefill here as well so the PUT issued
+    // when leaving step 2 (目标库) carries the REMEMBERED option values
+    // instead of form defaults — otherwise that save would clobber the
+    // remembered temp_dir / lightning settings with defaults. Empty
+    // pd_addr / status_port 0 mean "not remembered" and never overwrite.
+    if (data.pd_addr) form.target.pd_addr = data.pd_addr
+    if (data.status_port && data.status_port > 0) form.target.status_port = data.status_port
   } catch {}
 }
 
@@ -358,6 +370,8 @@ async function saveMigrationOptions() {
       temp_dir: form.opts.temp_dir.trim(),
       use_lightning: form.opts.use_lightning,
       lightning_path: form.opts.use_lightning ? form.opts.lightning_path.trim() : '',
+      pd_addr: form.target.pd_addr.trim(),
+      status_port: form.target.status_port,
     })
   } catch (e: any) {
     ElMessage.warning(`迁移选项保存失败：${e.response?.data?.error || e.message}（不影响本次迁移）`)
@@ -373,8 +387,18 @@ async function nextStep() {
     ElMessage.warning('请先测试目标数据库连接')
     return
   }
+  // Entering step 2 (目标库): await the remembered options prefill (which
+  // includes pd_addr / status_port) BEFORE the step becomes editable —
+  // same H1-race guard as step 3, and it guarantees the save issued when
+  // leaving step 2 preserves previously remembered option values.
+  if (activeStep.value === 0) {
+    await loadMigrationOptions()
+  }
   if (activeStep.value === 1) {
     loadTables()
+    // Leaving step 2: persist the Lightning-only target extras along with
+    // the other remembered options so the next task prefills them.
+    saveMigrationOptions()
   }
   // Entering step 3 (迁移选项): await last-saved options prefill BEFORE the
   // step becomes editable, so the user never races the GET response.
@@ -472,7 +496,7 @@ function prevStep() {
             <el-input v-model="form.target.pd_addr" placeholder="host:2379（PD 对外端口，经代理时填真实 PD 端口），留空则自动推断；仅 Lightning 需要" />
             <div class="form-hint">PD 地址与 Status 端口仅在使用 Lightning 导入时才需要填写：不使用 Lightning 请保持留空/0（不会检测、不影响连接测试）；需要时填真实 PD/Status 端口（SQL 端口经代理（如 haproxy 5000）时不能填 SQL 端口）</div>
           </el-form-item>
-          <el-form-item label="Status 端口">
+            <el-form-item label="TiDB 状态端口">
             <el-input-number v-model="form.target.status_port" :min="0" :max="65535" placeholder="10080" />
           </el-form-item>
           <el-form-item>

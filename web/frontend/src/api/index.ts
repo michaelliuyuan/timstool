@@ -17,6 +17,7 @@ export interface Task {
   tables_done: number
   rows_total: number
   rows_done: number
+  imported_tables?: number
   error: string
   result_json: string
   created_at: string
@@ -161,11 +162,14 @@ export const apiClient = {
     api.post<{ success: boolean; message: string; resolved_path: string }>('/validate-lightning', { path }),
 
   // Migration options persistence (server-side memory of temp_dir / lightning
-  // settings). GET prefill on entering the options step, PUT on advancing.
+  // settings + the Lightning-only target extras pd_addr / status_port).
+  // GET prefill on entering the options/target steps, PUT on advancing or a
+  // successful target connection test. pd_addr empty and status_port 0 mean
+  // "not remembered" and never overwrite the form defaults.
   getMigrationOptions: () =>
-    api.get<{ temp_dir: string; use_lightning: boolean; lightning_path: string }>('/migration-options'),
+    api.get<{ temp_dir: string; use_lightning: boolean; lightning_path: string; pd_addr?: string; status_port?: number }>('/migration-options'),
 
-  saveMigrationOptions: (opts: { temp_dir: string; use_lightning: boolean; lightning_path: string }) =>
+  saveMigrationOptions: (opts: { temp_dir: string; use_lightning: boolean; lightning_path: string; pd_addr?: string; status_port?: number }) =>
     api.put<{ success: boolean }>('/migration-options', opts),
 
   createTask: (req: CreateTaskRequest) =>
