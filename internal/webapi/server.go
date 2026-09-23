@@ -1033,8 +1033,12 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.Migration.ChainStartLSN = lsn
 		if cfgBytes, mErr := json.Marshal(&cfg); mErr == nil {
-			_ = s.store.UpdateTaskConfig(taskID, string(cfgBytes))
-			task.ConfigJSON = string(cfgBytes)
+			if uErr := s.store.UpdateTaskConfig(taskID, string(cfgBytes)); uErr != nil {
+				zap.L().Warn("cdc chain: persist ChainStartLSN failed (task continues, LSN recorded in log only)",
+					zap.String("task", taskID), zap.Error(uErr))
+			} else {
+				task.ConfigJSON = string(cfgBytes)
+			}
 		}
 		s.logCollector.Append(taskID, "INFO",
 			fmt.Sprintf("CDC chain 预建完成：slot=%s（%s，起点 LSN=%s）；全量期间源端 WAL 将被保留，注意 max_slot_wal_keep_size 不要设置过小",

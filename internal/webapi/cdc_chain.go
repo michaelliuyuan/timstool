@@ -30,6 +30,9 @@ type cdcChainProber interface {
 type realCDCChainProber struct{}
 
 func (realCDCChainProber) EnsurePublication(cfg *config.Config, name string) (bool, error) {
+	if err := validateIdentName(name); err != nil {
+		return false, err
+	}
 	db, err := pgDB(cfg)
 	if err != nil {
 		return false, err
@@ -47,6 +50,9 @@ func (realCDCChainProber) EnsurePublication(cfg *config.Config, name string) (bo
 }
 
 func (realCDCChainProber) EnsureSlot(cfg *config.Config, name string) (string, bool, error) {
+	if err := validateIdentName(name); err != nil {
+		return "", false, err
+	}
 	db, err := pgDB(cfg)
 	if err != nil {
 		return "", false, err
@@ -138,4 +144,14 @@ func chainConflictStrategy(cfg *config.Config) string {
 		return cfg.CDC.ConflictStrategy
 	}
 	return "replace"
+}
+
+// validateIdentName defends the sprintf'd DDL: publication/slot names come
+// from config.yaml (trusted operator input) but are still checked against the
+// plain-identifier whitelist for defense in depth.
+func validateIdentName(name string) error {
+	if name == "" || !identRe.MatchString(name) {
+		return fmt.Errorf("非法名称 %q（仅支持普通标识符）", name)
+	}
+	return nil
 }
