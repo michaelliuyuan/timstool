@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { ElMessage } from 'element-plus'
+import PageHeader from '../components/PageHeader.vue'
 
 interface Finding {
   dimension: string
@@ -192,7 +193,8 @@ function copyDDL() {
 </script>
 
 <template>
-  <div style="max-width: 1100px; margin: 0 auto;">
+  <div class="tims-page">
+    <PageHeader title="兼容评估" subtitle="扫描 PostgreSQL → TiDB 迁移兼容性风险" />
     <!-- Connection Form -->
     <el-card shadow="never" style="margin-bottom: 20px;">
       <template #header>

@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import apiClient from '../api'
 import type { Task } from '../api'
+import PageHeader from '../components/PageHeader.vue'
 
 const router = useRouter()
 const tasks = ref<Task[]>([])
@@ -42,8 +43,8 @@ onMounted(fetchHistory)
 </script>
 
 <template>
-  <div style="max-width: 1200px; margin: 0 auto;">
-    <h2 style="margin-bottom: 20px;">迁移历史</h2>
+  <div class="tims-page">
+    <PageHeader title="迁移历史" />
     <el-card v-loading="loading">
       <el-table :data="tasks" style="width: 100%;">
         <el-table-column prop="name" label="任务名称" min-width="200" />

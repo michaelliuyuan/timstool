@@ -47,6 +47,7 @@ withDefaults(
   align-items: center;
   gap: 10px;
   width: 100%;
+  box-sizing: border-box; /* width:100% + padding/border must not overflow the page card grid */
   padding: 14px 16px;
   border-radius: var(--tims-radius);
   border: 1px solid var(--tims-border);

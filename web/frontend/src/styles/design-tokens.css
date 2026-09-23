@@ -56,6 +56,7 @@
   /* Shape & depth */
   --tims-radius: 12px;
   --tims-radius-s: 8px;
+  --tims-content-width: 1200px; /* unified main-module container width */
   --tims-shadow: 0 1px 2px rgba(12, 18, 34, 0.04), 0 4px 14px rgba(12, 18, 34, 0.06);
   --tims-shadow-lift: 0 2px 4px rgba(12, 18, 34, 0.06), 0 10px 28px rgba(12, 18, 34, 0.10);
 
@@ -175,6 +176,12 @@ body {
 .tims-terminal .t-info .t-tag { color: var(--tims-teal); }
 .tims-terminal .t-warn .t-tag { color: var(--tims-amber); }
 .tims-terminal .t-error .t-tag { color: var(--tims-brand); }
+
+/* Unified main-module page container */
+.tims-page {
+  max-width: var(--tims-content-width);
+  margin: 0 auto;
+}
 
 /* Phase status dot (timeline, replaces emoji markers) */
 .phase-dot {

@@ -4,6 +4,7 @@ import { ElMessage } from 'element-plus'
 import apiClient from '../api'
 import type { CompareTask, CompareReport, CompareOptions } from '../api'
 import ConnectionForm from '../components/ConnectionForm.vue'
+import PageHeader from '../components/PageHeader.vue'
 import { useSourceSchema } from '../composables/useSourceSchema'
 import { reconcileModel } from '../composables/reconcileModel'
 
@@ -374,7 +375,8 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div style="max-width: 1200px; margin: 0 auto;">
+  <div class="tims-page">
+    <PageHeader title="数据比对" subtitle="独立配置源/目标连接，不依赖迁移任务" />
     <el-card shadow="never" style="margin-bottom: 20px;">
       <template #header>
         <div style="display: flex; align-items: center; gap: 8px;">

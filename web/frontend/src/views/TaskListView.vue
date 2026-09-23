@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import apiClient from '../api'
 import type { Task } from '../api'
+import PageHeader from '../components/PageHeader.vue'
 
 const router = useRouter()
 const tasks = ref<Task[]>([])
@@ -44,13 +45,14 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div style="max-width: 1200px; margin: 0 auto;">
-    <div style="display: flex; justify-content: space-between; margin-bottom: 20px;">
-      <h2>任务监控</h2>
-      <el-button type="primary" @click="router.push('/wizard')">
-        <el-icon><Plus /></el-icon> 新建迁移
-      </el-button>
-    </div>
+  <div class="tims-page">
+    <PageHeader title="任务监控">
+      <template #actions>
+        <el-button type="primary" @click="router.push('/wizard')">
+          <el-icon><Plus /></el-icon> 新建迁移
+        </el-button>
+      </template>
+    </PageHeader>
 
     <el-card v-loading="loading">
       <el-table :data="tasks" style="width: 100%;" @row-click="(row: Task) => goToTask(row.id)" cursor: pointer>

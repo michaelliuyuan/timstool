@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage, type FormRules } from 'element-plus'
 import apiClient from '../api'
 import ConnectionForm from '../components/ConnectionForm.vue'
+import PageHeader from '../components/PageHeader.vue'
 import { useSourceSchema } from '../composables/useSourceSchema'
 import { reconcileModel } from '../composables/reconcileModel'
 
@@ -425,7 +426,8 @@ function prevStep() {
 </script>
 
 <template>
-  <div style="max-width: 900px; margin: 0 auto;">
+  <div class="tims-page">
+    <PageHeader title="新建迁移" subtitle="配置源端 PostgreSQL 与目标端 TiDB，生成迁移任务" />
     <el-card>
       <template #header>
         <div style="display: flex; align-items: center; justify-content: space-between;">

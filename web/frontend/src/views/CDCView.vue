@@ -1,7 +1,6 @@
 <template>
-  <div class="cdc-container">
-    <h1>CDC 增量同步</h1>
-    <p class="subtitle">PostgreSQL → TiDB 实时增量同步监控</p>
+  <div class="cdc-container tims-page">
+    <PageHeader title="CDC 增量同步" subtitle="PostgreSQL → TiDB 实时增量同步监控" />
 
     <!-- Module disabled (cdc.enable=false) -->
     <div class="disabled-card" v-if="disabled">
@@ -231,6 +230,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import DataPipelineStrip from '../components/DataPipelineStrip.vue'
 import SparkLine from '../components/SparkLine.vue'
+import PageHeader from '../components/PageHeader.vue'
 
 const API_BASE = '/api/v1/cdc'
 
@@ -664,11 +664,8 @@ onUnmounted(() => {
 
 <style scoped>
 .cdc-container {
-  max-width: 1000px;
-  margin: 0 auto;
+  /* width & centering come from the shared .tims-page class */
 }
-h1 { font-size: 24px; color: var(--tims-text); margin-bottom: 4px; }
-.subtitle { color: var(--tims-text-2); font-size: 14px; margin-bottom: 24px; }
 
 .status-card {
   border-radius: var(--tims-radius); padding: 24px; margin-bottom: 24px;
