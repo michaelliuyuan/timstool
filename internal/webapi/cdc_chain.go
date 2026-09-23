@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 
+	"github.com/jackc/pglogrepl"
+	"github.com/michaelliuyuan/timstool/internal/cdc"
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 )
 
@@ -111,6 +114,13 @@ func (s *Server) prepareCDCChain(cfg *config.Config) (lsn string, reusedSlot boo
 // chained migration. Failure is loud (task log ERROR + broadcast) but does not
 // flip the completed task to failed — the slot retains WAL, the operator can
 // start CDC manually with zero loss.
+//
+// Before Start, the chain seeds the CDC checkpoint file with the recorded
+// ChainStartLSN so the child replays the migration window deterministically:
+// runner loads the checkpoint and passes that LSN to StartReplication. Under
+// either PG semantics for the requested LSN (hint vs max(requested,
+// confirmed_flush)), seeding makes the consistent point the effective start.
+// An existing checkpoint (≥ our LSN by construction) is never clobbered.
 func (s *Server) startCDCChainAfterSuccess(taskID string, cfg *config.Config) {
 	msg := ""
 	ok := true
@@ -119,12 +129,25 @@ func (s *Server) startCDCChainAfterSuccess(taskID string, cfg *config.Config) {
 		ok = false
 		msg = "CDC 自动衔接失败：本服务未接入 CDC 控制（supervisor 未接线），请手动启动 CDC（slot 已保留 WAL，无数据丢失）"
 	default:
+		if st := s.cdcSupervisor.Status(); st.State == StateRunning || st.State == StateStarting || st.State == StateAdopted {
+			msg = "CDC 已在运行，跳过自动衔接（现有 checkpoint/slot 点位优先）"
+			break
+		}
+		if seedErr := s.seedChainCheckpoint(taskID, cfg); seedErr != nil {
+			ok = false
+			msg = fmt.Sprintf("CDC 自动衔接失败（预置 checkpoint 出错）：%v；slot 已保留 WAL，请手动启动 CDC 并核对起点", seedErr)
+			break
+		}
 		if _, err := s.cdcSupervisor.Start(context.Background()); err != nil {
 			ok = false
 			msg = fmt.Sprintf("CDC 自动衔接失败：%v（slot 已保留 WAL，请手动启动 CDC，无数据丢失）", err)
 		} else {
-			msg = fmt.Sprintf("增量已自动衔接，起点 LSN=%s（slot=%s，publication=%s）；conflict_strategy=%s 幂等重放",
-				cfg.Migration.ChainStartLSN, chainSlotName(cfg), chainPublicationName(cfg), chainConflictStrategy(cfg))
+			lsn := cfg.Migration.ChainStartLSN
+			if lsn == "" {
+				lsn = "slot 创建点位（见任务日志）"
+			}
+			msg = fmt.Sprintf("增量已自动衔接：已按记录 LSN=%s 预置 checkpoint，CDC 将从该点位重放迁移窗口的变更（slot=%s，publication=%s；conflict_strategy=%s 幂等去重）",
+				lsn, chainSlotName(cfg), chainPublicationName(cfg), chainConflictStrategy(cfg))
 		}
 	}
 	if ok {
@@ -137,6 +160,40 @@ func (s *Server) startCDCChainAfterSuccess(taskID string, cfg *config.Config) {
 		"message": msg,
 		"ok":      ok,
 	})
+}
+
+// seedChainCheckpoint writes ChainStartLSN into the CDC checkpoint file the
+// child will load — unless a checkpoint already exists (resume semantics: an
+// existing checkpoint is always ≥ the chain point and wins).
+func (s *Server) seedChainCheckpoint(taskID string, cfg *config.Config) error {
+	if cfg.Migration.ChainStartLSN == "" {
+		return nil // nothing recorded (e.g. slot reused pre-chain); child falls back to slot semantics
+	}
+	lsn, err := pglogrepl.ParseLSN(cfg.Migration.ChainStartLSN)
+	if err != nil {
+		return fmt.Errorf("解析 ChainStartLSN %q: %w", cfg.Migration.ChainStartLSN, err)
+	}
+	cdcCfg, err := func() (*config.Config, error) {
+		cdcCfgMu.Lock()
+		defer cdcCfgMu.Unlock()
+		return s.loadCDCConfig()
+	}()
+	if err != nil {
+		return fmt.Errorf("读取 CDC 配置: %w", err)
+	}
+	path := cdcCfg.CDC.CheckpointFile
+	if path == "" {
+		path = ".cdc_checkpoint.json"
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		s.logCollector.Append(taskID, "WARN",
+			"CDC chain: checkpoint 文件已存在，保留现有断点不覆盖（现有点位优先）", "")
+		return nil
+	}
+	mgr := cdc.NewCheckpointManager(path)
+	mgr.SetSlotName(chainSlotName(cfg))
+	mgr.Update(lsn)
+	return mgr.Save()
 }
 
 func chainConflictStrategy(cfg *config.Config) string {

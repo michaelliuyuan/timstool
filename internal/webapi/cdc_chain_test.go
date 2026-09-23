@@ -3,10 +3,12 @@ package webapi
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/michaelliuyuan/timstool/internal/cdc"
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"go.uber.org/zap"
 )
@@ -119,6 +121,69 @@ func TestCDCChain_ConflictStrategyDefault(t *testing.T) {
 	if cs := chainConflictStrategy(cfg); cs != "upsert" {
 		t.Fatalf("override = %q", cs)
 	}
+}
+
+func TestCDCChain_SeedCheckpoint(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	cfg := &config.Config{}
+	cfg.Migration.ChainStartLSN = "0/3D0000A0"
+
+	if err := s.seedChainCheckpoint("taskX", cfg); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// File written with the numeric LSN + slot name; the child runner will
+	// load it and replay from that exact point.
+	cp, err := cdc.NewCheckpointManager(chainCheckpointPathForTest(s)).Load()
+	if err != nil || cp == nil {
+		t.Fatalf("load: %v %v", cp, err)
+	}
+	if cp.LSN.String() != "0/3D0000A0" {
+		t.Fatalf("lsn = %s", cp.LSN.String())
+	}
+
+	// Existing checkpoint wins: content unchanged after a re-seed attempt.
+	cfg.Migration.ChainStartLSN = "0/AAAAAAAA"
+	if err := s.seedChainCheckpoint("taskX", cfg); err != nil {
+		t.Fatalf("re-seed: %v", err)
+	}
+	cp2, _ := cdc.NewCheckpointManager(chainCheckpointPathForTest(s)).Load()
+	if cp2.LSN.String() != "0/3D0000A0" {
+		t.Fatalf("existing checkpoint clobbered: %s", cp2.LSN.String())
+	}
+}
+
+func TestCDCChain_SeedCheckpointEdgeCases(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+
+	// empty LSN: no-op, no file created
+	cfg := &config.Config{}
+	if err := s.seedChainCheckpoint("t", cfg); err != nil {
+		t.Fatalf("empty lsn: %v", err)
+	}
+	if _, err := os.Stat(chainCheckpointPathForTest(s)); !os.IsNotExist(err) {
+		t.Fatal("file must not be created for empty LSN")
+	}
+	// bad LSN: error
+	cfg.Migration.ChainStartLSN = "not-a-lsn"
+	if err := s.seedChainCheckpoint("t", cfg); err == nil {
+		t.Fatal("bad lsn must error")
+	}
+}
+
+// chainCheckpointPathForTest resolves the CDC config's checkpoint file path.
+func chainCheckpointPathForTest(s *Server) string {
+	cfg, err := func() (*config.Config, error) {
+		cdcCfgMu.Lock()
+		defer cdcCfgMu.Unlock()
+		return s.loadCDCConfig()
+	}()
+	if err != nil {
+		return ""
+	}
+	if cfg.CDC.CheckpointFile != "" {
+		return cfg.CDC.CheckpointFile
+	}
+	return ".cdc_checkpoint.json"
 }
 
 // --- REPLICA IDENTITY FULL (P1 task 2) ---
