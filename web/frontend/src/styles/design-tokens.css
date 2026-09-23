@@ -6,28 +6,28 @@
 /* --- Self-hosted fonts (offline-safe, ~91KB) --- */
 @font-face {
   font-family: 'TiMS Inter';
-  src: url('../assets/fonts/inter-400.woff2') format('woff2');
+  src: url('/fonts/inter-400.woff2') format('woff2');
   font-weight: 400;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
   font-family: 'TiMS Inter';
-  src: url('../assets/fonts/inter-600.woff2') format('woff2');
+  src: url('/fonts/inter-600.woff2') format('woff2');
   font-weight: 600;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
   font-family: 'TiMS Mono';
-  src: url('../assets/fonts/jetbrains-mono-400.woff2') format('woff2');
+  src: url('/fonts/jetbrains-mono-400.woff2') format('woff2');
   font-weight: 400;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
   font-family: 'TiMS Mono';
-  src: url('../assets/fonts/jetbrains-mono-500.woff2') format('woff2');
+  src: url('/fonts/jetbrains-mono-500.woff2') format('woff2');
   font-weight: 500;
   font-style: normal;
   font-display: swap;
@@ -175,6 +175,25 @@ body {
 .tims-terminal .t-info .t-tag { color: var(--tims-teal); }
 .tims-terminal .t-warn .t-tag { color: var(--tims-amber); }
 .tims-terminal .t-error .t-tag { color: var(--tims-brand); }
+
+/* Phase status dot (timeline, replaces emoji markers) */
+.phase-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+  background: #c0c4cc;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+}
+.phase-dot--completed { background: var(--tims-teal); }
+.phase-dot--running { background: var(--tims-amber); animation: tims-pulse 1.2s ease-in-out infinite; }
+.phase-dot--failed { background: var(--tims-brand); }
+.phase-dot--pending { background: transparent; border: 1.5px solid #c0c4cc; }
+
+@keyframes tims-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

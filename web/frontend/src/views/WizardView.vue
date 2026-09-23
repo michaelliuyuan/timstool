@@ -582,7 +582,7 @@ function prevStep() {
               <el-button :loading="validatingLightning" @click="validateLightning">验证</el-button>
             </div>
             <div :style="{ color: lightningValidated ? '#67c23a' : '#e6a23c', fontSize: '12px', marginTop: '4px' }">
-              <template v-if="lightningValidated">✅ 验证通过：{{ lightningResolvedPath }}</template>
+              <template v-if="lightningValidated">验证通过：{{ lightningResolvedPath }}</template>
               <template v-else>开启 Lightning 后必须点击「验证」且通过（远端 Linux 将校验执行权限），才能进入下一步</template>
             </div>
           </el-form-item>

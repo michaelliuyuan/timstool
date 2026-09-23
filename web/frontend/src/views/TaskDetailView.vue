@@ -360,7 +360,7 @@ function logLevelClass(level: string): string {
                 placement="top"
               >
                 <div style="display: flex; align-items: center; gap: 8px;">
-                  <span>{{ phase.status === 'completed' ? '✅' : phase.status === 'running' ? '⏳' : phase.status === 'failed' ? '❌' : '⬜' }}</span>
+                  <span :class="['phase-dot', `phase-dot--${phase.status}`]" aria-hidden="true"></span>
                   <el-tag :type="phase.status === 'completed' ? 'success' : phase.status === 'running' ? '' : phase.status === 'failed' ? 'danger' : 'info'" size="small">
                     {{ phase.status === 'completed' ? '已完成' : phase.status === 'running' ? '进行中' : phase.status === 'failed' ? '失败' : '等待中' }}
                   </el-tag>
