@@ -238,7 +238,7 @@ async function refreshTasks() {
 }
 
 function connectWS() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   ws = new WebSocket(`${proto}//${location.host}/api/v1/ws`)
   ws.onmessage = async (event) => {
     try {
