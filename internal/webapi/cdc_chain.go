@@ -186,15 +186,22 @@ func (s *Server) seedChainCheckpoint(taskID string, cfg *config.Config) error {
 	}
 	mgr := cdc.NewCheckpointManager(path)
 	if existing, lErr := mgr.Load(); lErr == nil && existing != nil {
-		if existing.LSN >= lsn {
-			// Already at or past the chain point (a prior CDC run advanced
-			// beyond it): keep the newer position, never rewind.
+		trusted := existing.SlotName == "" || existing.SlotName == chainSlotName(cfg)
+		if trusted && existing.LSN >= lsn {
+			// Same-slot checkpoint already at or past the chain point (a prior
+			// CDC run advanced beyond it): keep the newer position, never rewind.
 			s.logCollector.Append(taskID, "WARN",
 				fmt.Sprintf("CDC chain: 现有 checkpoint LSN=%s ≥ 链点位 %s，沿用现有断点不倒退", existing.LSN.String(), lsn.String()), "")
 			return nil
 		}
-		s.logCollector.Append(taskID, "INFO",
-			fmt.Sprintf("CDC chain: 现有 checkpoint LSN=%s 落后于链点位 %s，预置为链点位（覆盖旧值）", existing.LSN.String(), lsn.String()), "")
+		if !trusted {
+			s.logCollector.Append(taskID, "INFO",
+				fmt.Sprintf("CDC chain: 现有 checkpoint 属其它 slot（%q ≠ %q），其 LSN 不作为本链起点，预置为链点位",
+					existing.SlotName, chainSlotName(cfg)), "")
+		} else {
+			s.logCollector.Append(taskID, "INFO",
+				fmt.Sprintf("CDC chain: 现有 checkpoint LSN=%s 落后于链点位 %s，预置为链点位（覆盖旧值）", existing.LSN.String(), lsn.String()), "")
+		}
 	} else if lErr != nil {
 		return fmt.Errorf("读取现有 checkpoint: %w", lErr)
 	}
