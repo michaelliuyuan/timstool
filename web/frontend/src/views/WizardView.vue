@@ -47,6 +47,7 @@ const form = reactive({
     skip_schema: false,
     skip_data: false,
     skip_validate: false,
+    cdc_chain: false,
     target_policy: 'insert',
 		compare_mode: 'sample',
 		sample_ratio: 0.01,
@@ -320,6 +321,7 @@ async function submit() {
         skip_schema: form.opts.skip_schema,
         skip_data: form.opts.skip_data,
         skip_validate: form.opts.skip_validate,
+        cdc_chain: form.opts.cdc_chain && sourceType.value === 'postgres',
         target_policy: form.opts.target_policy,
         compare_mode: form.opts.compare_mode,
         sample_ratio: form.opts.sample_ratio,
@@ -590,6 +592,16 @@ function prevStep() {
               源端数据导出为 CSV 的临时存储目录，需确保磁盘空间充足（至少能容纳全部待迁移数据）。
             </div>
           </el-form-item>
+          <el-divider>增量同步衔接</el-divider>
+          <el-form-item label="全量+增量衔接">
+            <el-switch v-model="form.opts.cdc_chain" :disabled="sourceType !== 'postgres'" />
+            <div style="color: #909399; font-size: 12px; margin-top: 4px;">
+              仅 PostgreSQL 源端可用。开启后任务启动前会自动预建 CDC 的 publication + replication
+              slot，全量期间源端 WAL 被保留；全量成功后自动启动 CDC 增量同步，从预建点位重放，实现零丢失衔接
+              （重放与全量重叠的数据按 conflict_strategy=replace 幂等去重）。注意：全量期间源端
+              WAL 会持续累积，max_slot_wal_keep_size 不要设置过小。
+            </div>
+          </el-form-item>
           <el-divider>目标数据处理策略</el-divider>
           <el-form-item label="数据冲突策略">
             <el-radio-group v-model="form.opts.target_policy">
@@ -661,6 +673,10 @@ function prevStep() {
               {{ lightningResolvedPath || form.opts.lightning_path || '自动发现' }}
             </el-descriptions-item>
             <el-descriptions-item label="数据临时目录">{{ form.opts.temp_dir }}</el-descriptions-item>
+            <el-descriptions-item label="全量+增量衔接">
+              <el-tag v-if="form.opts.cdc_chain && sourceType === 'postgres'" type="success">已开启（预建 slot，零丢失）</el-tag>
+              <template v-else>否</template>
+            </el-descriptions-item>
             <el-descriptions-item label="数据冲突策略">
               {{ form.opts.target_policy === 'truncate' ? '先清空表' : form.opts.target_policy === 'drop' ? '先删除表' : '直接插入' }}
             </el-descriptions-item>

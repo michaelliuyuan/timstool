@@ -213,6 +213,17 @@ func (s *Store) SetTaskResult(id string, result interface{}) error {
 	return err
 }
 
+// UpdateTaskConfig persists an updated config JSON for a task (used by the
+// CDC chain to record the slot consistent-point LSN after task start).
+func (s *Store) UpdateTaskConfig(id string, configJSON string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`UPDATE tasks SET config_json=?, updated_at=? WHERE id=?`,
+		configJSON, time.Now(), id)
+	return err
+}
+
 func (s *Store) ListTasks(limit, offset int) ([]*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

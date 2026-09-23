@@ -48,7 +48,10 @@ type cdcPrecheckResponse struct {
 	Slot       cdcSlotInfo       `json:"slot"`
 	Conclusion string            `json:"conclusion"`
 	WarnOnly   bool              `json:"warn_only"` // true when no item failed
-	CheckedAt  time.Time         `json:"checked_at"`
+	// NoPKTables is the structured no-PK table list (schema.table, annotation
+	// stripped) so the UI can build REPLICA IDENTITY FULL fixes (P1 task 2).
+	NoPKTables []string  `json:"no_pk_tables_list,omitempty"`
+	CheckedAt  time.Time `json:"checked_at"`
 }
 
 // cdcDBProber abstracts the live DB probes so handler tests can mock them.
@@ -322,6 +325,7 @@ func (s *Server) handleCDCPrecheck(w http.ResponseWriter, r *http.Request) {
 		resp.Items = append(resp.Items, cdcPrecheckItem{"no_pk_tables", "无主键表预警", "ok",
 			"范围内所有表均有主键"})
 	} else {
+		resp.NoPKTables = stripNoPKAnnotations(tables)
 		resp.Items = append(resp.Items, cdcPrecheckItem{"no_pk_tables", "无主键表预警", "warn",
 			fmt.Sprintf("%d 张表无主键/REPLICA IDENTITY，UPDATE/DELETE 将无法同步：%s",
 				len(tables), joinLimit(tables, 10))})
@@ -391,6 +395,21 @@ func sHasBase(resp *cdcPrecheckResponse) bool {
 		}
 	}
 	return false
+}
+
+// stripNoPKAnnotations turns prober entries like "public.t1 (无主键)" /
+// "public.t2 (REPLICA IDENTITY d)" into plain "public.t1" refs.
+func stripNoPKAnnotations(entries []string) []string {
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		for i := 0; i < len(e); i++ {
+			if e[i] == ' ' {
+				out = append(out, e[:i])
+				break
+			}
+		}
+	}
+	return out
 }
 
 func joinLimit(items []string, n int) string {

@@ -61,6 +61,14 @@ type Server struct {
 	// cdcProbe overrides the live DB prober for /cdc/precheck (tests).
 	cdcProbe cdcDBProber
 
+	// cdcChainProbe overrides the publication/slot provisioner used by the
+	// 全量+增量衔接 chain (tests).
+	cdcChainProbe cdcChainProber
+
+	// replicaIdentityExec overrides the ALTER TABLE ... REPLICA IDENTITY FULL
+	// executor (tests).
+	replicaIdentityExec replicaIdentityExecutor
+
 	// running tasks
 	runningTasks map[string]context.CancelFunc
 
@@ -204,6 +212,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		r.Get("/cdc/precheck", s.handleCDCPrecheck)
 		r.Get("/cdc/slot", s.handleCDCSlot)
 		r.Post("/cdc/checkpoint/reset", s.handleCDCResetCheckpoint)
+		r.Post("/cdc/replica-identity", s.handleCDCReplicaIdentity)
 	})
 
 	if staticFS != (embed.FS{}) {
@@ -632,6 +641,7 @@ type MigrationOptsBody struct {
 	SkipSchema        bool     `json:"skip_schema"`
 	SkipData          bool     `json:"skip_data"`
 	SkipValidate      bool     `json:"skip_validate"`
+	CDCChain          bool     `json:"cdc_chain"`
 	TargetPolicy      string   `json:"target_policy"`
 	CompareMode       string   `json:"compare_mode"`
 	SampleRatio       float64  `json:"sample_ratio"`
@@ -928,6 +938,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 			SkipSchema:    req.Opts.SkipSchema,
 			SkipData:      req.Opts.SkipData,
 			SkipValidate:  req.Opts.SkipValidate,
+			CDCChain:      req.Opts.CDCChain,
 		},
 		Logging: config.LoggingConfig{Level: "info", Format: "console"},
 		Compare: config.CompareConfig{
@@ -1004,6 +1015,30 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal([]byte(task.ConfigJSON), &cfg); err != nil {
 		s.writeError(w, http.StatusInternalServerError, "invalid task config")
 		return
+	}
+
+	// 全量+增量衔接 (P1): provision publication + slot BEFORE the migration
+	// starts so the migration window's WAL is retained. Any failure aborts the
+	// start — better not to run than to silently lose the window.
+	if cfg.Migration.CDCChain {
+		if cfg.Source.SourceType() != "postgres" {
+			s.writeError(w, http.StatusBadRequest, "cdc_chain 仅支持 PostgreSQL 源端")
+			return
+		}
+		lsn, reused, err := s.prepareCDCChain(&cfg)
+		if err != nil {
+			s.store.SetTaskError(taskID, err.Error())
+			s.writeError(w, http.StatusConflict, "全量+增量衔接预建失败，任务未启动："+err.Error())
+			return
+		}
+		cfg.Migration.ChainStartLSN = lsn
+		if cfgBytes, mErr := json.Marshal(&cfg); mErr == nil {
+			_ = s.store.UpdateTaskConfig(taskID, string(cfgBytes))
+			task.ConfigJSON = string(cfgBytes)
+		}
+		s.logCollector.Append(taskID, "INFO",
+			fmt.Sprintf("CDC chain 预建完成：slot=%s（%s，起点 LSN=%s）；全量期间源端 WAL 将被保留，注意 max_slot_wal_keep_size 不要设置过小",
+				chainSlotName(&cfg), map[bool]string{true: "复用已有", false: "新建"}[reused], lsn), "")
 	}
 
 	if err := s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning); err != nil {
@@ -1117,6 +1152,11 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 	if allSuccess {
 		s.logCollector.Append(taskID, "INFO", "Migration completed successfully", "")
 		s.store.UpdateTaskStatus(taskID, store.TaskStatusCompleted)
+		// 全量+增量衔接 (P1): auto-start CDC from the pre-created slot. The
+		// message (success or loud failure) lands in the task log + broadcast.
+		if cfg.Migration.CDCChain {
+			s.startCDCChainAfterSuccess(taskID, &cfg)
+		}
 	} else {
 		s.logCollector.Append(taskID, "WARN", "Migration completed with errors", "")
 		s.store.UpdateTaskStatus(taskID, store.TaskStatusFailed)

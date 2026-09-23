@@ -1,0 +1,272 @@
+package webapi
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"go.uber.org/zap"
+)
+
+// CDC chain (P1 task 1) + REPLICA IDENTITY FULL assist (P1 task 2) tests.
+// All DB access is mocked (cdcChainProbe / replicaIdentityExec fakes).
+
+type fakeChainProber struct {
+	pubErr     error
+	pubCreated bool
+	slotLSN    string
+	slotReused bool
+	slotErr    error
+}
+
+func (f *fakeChainProber) EnsurePublication(cfg *config.Config, name string) (bool, error) {
+	return f.pubCreated, f.pubErr
+}
+
+func (f *fakeChainProber) EnsureSlot(cfg *config.Config, name string) (string, bool, error) {
+	if f.slotErr != nil {
+		return "", false, f.slotErr
+	}
+	return f.slotLSN, f.slotReused, nil
+}
+
+func TestCDCChain_PrepareSuccessAndDefaults(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	s.cdcChainProbe = &fakeChainProber{slotLSN: "0/3D0000A0"}
+
+	cfg := &config.Config{}
+	cfg.Source.Type = "postgres"
+	lsn, reused, err := s.prepareCDCChain(cfg)
+	if err != nil || lsn != "0/3D0000A0" || reused {
+		t.Fatalf("prepare = %q,%v,%v", lsn, reused, err)
+	}
+	if sn := chainSlotName(cfg); sn != "pg2tidb_cdc" {
+		t.Fatalf("default slot name = %q", sn)
+	}
+	if pn := chainPublicationName(cfg); pn != "pg2tidb_pub" {
+		t.Fatalf("default publication name = %q", pn)
+	}
+}
+
+func TestCDCChain_PrepareSlotFailureAborts(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	s.cdcChainProbe = &fakeChainProber{slotErr: fmt.Errorf("wal_level != logical")}
+
+	if _, _, err := s.prepareCDCChain(&config.Config{}); err == nil ||
+		!strings.Contains(err.Error(), "预建 replication slot 失败") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestCDCChain_StartTaskAbortsWhenPrepareFails(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	s.cdcChainProbe = &fakeChainProber{slotErr: fmt.Errorf("boom")}
+
+	// Create a chained task via the API, then start it: the 409 must abort
+	// before any migration goroutine is spawned.
+	body := `{"name":"chain1","source":{"host":"pg","port":5432,"user":"u","password":"p","database":"d"},
+		"target":{"host":"t","port":4000,"user":"u","password":"p","database":"d"},
+		"opts":{"cdc_chain":true}}`
+	w, req := doReq("POST", "/api/v1/tasks", body)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", w.Code, w.Body.String())
+	}
+	taskID := ExtractTaskID(t, w.Body.String())
+
+	w, req = doReq("POST", "/api/v1/tasks/"+taskID+"/start", "")
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("start status = %d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "预建失败") {
+		t.Fatalf("body = %s", w.Body.String())
+	}
+	// Task must not be running.
+	task := GetTaskForTest(t, s, taskID)
+	if task.Status == "running" {
+		t.Fatal("task must not be running after chain prepare failure")
+	}
+	if task.Error == "" {
+		t.Fatal("task error must be recorded")
+	}
+}
+
+func TestCDCChain_StartAfterSuccessFailedSupervisorIsLoud(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	// nil supervisor → loud failure path: log entry + broadcast, no panic.
+	cfg := &config.Config{}
+	cfg.Migration.ChainStartLSN = "0/1"
+	s.startCDCChainAfterSuccess("taskX", cfg)
+	var logText string
+	for _, e := range s.logCollector.GetBuffer("taskX").GetAll() {
+		logText += e.Message + "\n"
+	}
+	if !strings.Contains(logText, "CDC 自动衔接失败") {
+		t.Fatalf("log = %s", logText)
+	}
+}
+
+func TestCDCChain_ConflictStrategyDefault(t *testing.T) {
+	if cs := chainConflictStrategy(&config.Config{}); cs != "replace" {
+		t.Fatalf("default = %q", cs)
+	}
+	cfg := &config.Config{}
+	cfg.CDC.ConflictStrategy = "upsert"
+	if cs := chainConflictStrategy(cfg); cs != "upsert" {
+		t.Fatalf("override = %q", cs)
+	}
+}
+
+// --- REPLICA IDENTITY FULL (P1 task 2) ---
+
+type fakeReplicaExec struct {
+	canAlter map[string]bool
+	alterErr map[string]error
+	alterLog []string
+}
+
+func (f *fakeReplicaExec) CanAlter(cfg *config.Config, schema, table string) (bool, error) {
+	ok, exists := f.canAlter[schema+"."+table]
+	if !exists {
+		return false, fmt.Errorf("表 %s.%s 不存在", schema, table)
+	}
+	return ok, nil
+}
+
+func (f *fakeReplicaExec) AlterFull(cfg *config.Config, schema, table string) error {
+	f.alterLog = append(f.alterLog, schema+"."+table)
+	if err, ok := f.alterErr[schema+"."+table]; ok {
+		return err
+	}
+	return nil
+}
+
+func TestCDCReplicaIdentity_ConfirmAndValidation(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	s.replicaIdentityExec = &fakeReplicaExec{}
+
+	// wrong confirm
+	w, req := doReq("POST", "/api/v1/cdc/replica-identity", `{"confirm":"NO","tables":["a.b"]}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", w.Code)
+	}
+	// empty tables
+	w, req = doReq("POST", "/api/v1/cdc/replica-identity", `{"confirm":"ALTER","tables":[]}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", w.Code)
+	}
+}
+
+func TestCDCReplicaIdentity_PerTableResults(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	fe := &fakeReplicaExec{canAlter: map[string]bool{
+		"public.ok1":    true,
+		"public.locked": false,
+	}}
+	s.replicaIdentityExec = fe
+
+	body := `{"confirm":"ALTER","tables":["public.ok1","public.locked","public.bad name","ghost"]}`
+	w, req := doReq("POST", "/api/v1/cdc/replica-identity", body)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	out := w.Body.String()
+	// ok1 executed
+	if !strings.Contains(out, `"table":"public.ok1"`) || !strings.Contains(fe.alterLog[0], "public.ok1") {
+		t.Fatalf("ok1 not executed: %s / %v", out, fe.alterLog)
+	}
+	// locked: no privilege, SQL still returned for manual exec
+	if !strings.Contains(out, "无权执行") || !strings.Contains(out, `ALTER TABLE public.locked REPLICA IDENTITY FULL;`) {
+		t.Fatalf("locked handling wrong: %s", out)
+	}
+	// illegal identifier refused
+	if !strings.Contains(out, "非法表名") {
+		t.Fatalf("illegal ident not refused: %s", out)
+	}
+	// non-existent table (ghost → public.ghost) reports error
+	if !strings.Contains(out, "不存在") {
+		t.Fatalf("missing table not reported: %s", out)
+	}
+	if !strings.Contains(out, `"ok":false`) {
+		t.Fatalf("aggregate ok must be false: %s", out)
+	}
+}
+
+func TestCDCReplicaIdentity_AllOK(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	fe := &fakeReplicaExec{canAlter: map[string]bool{"public.a": true, "public.b": true}}
+	s.replicaIdentityExec = fe
+
+	w, req := doReq("POST", "/api/v1/cdc/replica-identity", `{"confirm":"ALTER","tables":["a","b"]}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"ok":true`) {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if len(fe.alterLog) != 2 {
+		t.Fatalf("alterLog = %v", fe.alterLog)
+	}
+	// bare names default to public schema
+	for _, x := range fe.alterLog {
+		if !strings.HasPrefix(x, "public.") {
+			t.Fatalf("schema default wrong: %v", fe.alterLog)
+		}
+	}
+}
+
+func TestCDCPrecheck_NoPKStructuredList(t *testing.T) {
+	s, p, _ := newCDCServer(t)
+	p.noPK = []string{"public.t1 (无主键)", "public.t2 (REPLICA IDENTITY d)"}
+
+	w, req := doReq("GET", "/api/v1/cdc/precheck", "")
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{`"no_pk_tables_list":["public.t1","public.t2"]`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("structured list missing (%s): %s", want, body)
+		}
+	}
+}
+
+// --- helpers ---
+
+func ExtractTaskID(t *testing.T, body string) string {
+	t.Helper()
+	// body is {"id":"xxxxxxxx",...}
+	i := strings.Index(body, `"id":"`)
+	if i < 0 {
+		t.Fatalf("no id in %s", body)
+	}
+	rest := body[i+6:]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		t.Fatalf("bad id in %s", body)
+	}
+	return rest[:j]
+}
+
+func GetTaskForTest(t *testing.T, s *Server, id string) (t0 *taskView) {
+	t.Helper()
+	task, err := s.store.GetTask(id)
+	if err != nil || task == nil {
+		t.Fatalf("get task: %v %v", task, err)
+	}
+	return &taskView{Status: string(task.Status), Error: task.Error}
+}
+
+type taskView struct {
+	Status string
+	Error  string
+}
+
+var _ = time.Second
+var _ = zap.NewNop()

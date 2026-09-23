@@ -124,6 +124,16 @@ type MigrationConfig struct {
 	SkipSchema          bool     `yaml:"skip_schema" json:"skipSchema"`
 	SkipData            bool     `yaml:"skip_data" json:"skipData"`
 	SkipValidate        bool     `yaml:"skip_validate" json:"skipValidate"`
+
+	// CDCChain (Full+Incremental Chaining): when true, the task pre-creates the
+	// CDC publication + replication slot BEFORE the full migration starts (so
+	// WAL during the migration window is retained) and auto-starts the CDC
+	// supervisor after the migration succeeds. PostgreSQL sources only.
+	CDCChain bool `yaml:"cdc_chain" json:"cdcChain"`
+
+	// ChainStartLSN records the slot consistent point captured at task start
+	// (in-memory bookkeeping persisted in the task's config JSON; not user-set).
+	ChainStartLSN string `yaml:"-" json:"chain_start_lsn,omitempty"`
 }
 
 func (m MigrationConfig) ReadTimeoutDuration() time.Duration {

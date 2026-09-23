@@ -121,6 +121,7 @@ export interface CreateTaskRequest {
     skip_schema: boolean
     skip_data: boolean
     skip_validate: boolean
+    cdc_chain: boolean
     target_policy: string
     compare_mode: string
     sample_ratio: number
@@ -310,6 +311,16 @@ export const apiClient = {
 
   saveCompareOptions: (opts: CompareOptions) =>
     api.put<{ success: boolean }>('/compare/options', opts),
+
+  // No-PK table assist (P1): execute ALTER TABLE ... REPLICA IDENTITY FULL on
+  // the source for the given "schema.table" refs. Per-table results include
+  // the SQL so the UI can fall back to copy-for-manual-execution.
+  runReplicaIdentity: (tables: string[]) =>
+    api.post<{
+      ok: boolean
+      results: { table: string; sql: string; ok: boolean; error?: string; can_alter: boolean }[]
+      hint: string
+    }>('/cdc/replica-identity', { confirm: 'ALTER', tables }),
 }
 
 export default apiClient

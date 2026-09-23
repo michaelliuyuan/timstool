@@ -68,6 +68,9 @@
         <span class="precheck-dot">{{ it.level === 'ok' ? '✓' : it.level === 'warn' ? '!' : '✗' }}</span>
         <span class="precheck-label">{{ it.label }}</span>
         <span class="precheck-detail">{{ it.detail }}</span>
+        <button v-if="it.item === 'no_pk_tables' && it.level === 'warn' && noPKTables.length"
+          class="btn-refresh" style="margin-left: auto; padding: 2px 10px; font-size: 12px; flex: none;"
+          @click="openNoPKFix">修复（REPLICA IDENTITY FULL）</button>
       </div>
       <div class="resume-box">
         <strong>断点/起点：</strong>{{ precheck.conclusion }}
@@ -280,6 +283,7 @@ interface CDCPrecheck {
   slot: { exists: boolean; active?: boolean; restart_lsn?: string; lag_bytes?: number; current_lsn?: string }
   conclusion: string
   warn_only: boolean
+  no_pk_tables_list?: string[]
 }
 
 interface CDCSlotView {
@@ -389,6 +393,61 @@ async function refreshSlot() {
     const r = await fetch(API_BASE + '/slot')
     if (r.ok) slotView.value = await r.json()
   } catch {}
+}
+
+// No-PK assist (P1): generate / copy / execute ALTER TABLE ... REPLICA IDENTITY
+// FULL so UPDATE/DELETE can sync for tables without a primary key.
+const noPKTables = computed(() => precheck.value?.no_pk_tables_list || [])
+const noPKBusy = ref(false)
+
+function noPKStatements(tables: string[]): string {
+  return tables.map(t => `ALTER TABLE ${t} REPLICA IDENTITY FULL;`).join('\n')
+}
+
+async function copyNoPKSQL() {
+  try {
+    await navigator.clipboard.writeText(noPKStatements(noPKTables.value))
+    alert('ALTER 语句已复制，请在源端以表 owner / superuser 手动执行')
+  } catch {
+    alert('复制失败，请手动复制：\n' + noPKStatements(noPKTables.value))
+  }
+}
+
+async function openNoPKFix() {
+  const tables = noPKTables.value
+  if (!tables.length) return
+  const stmts = noPKStatements(tables)
+  const answer = confirm(
+    `将对 ${tables.length} 张无主键表启用整行复制：\n\n${stmts}\n\n` +
+    '执行需要当前用户是表 owner 或 superuser。\n确定执行？（取消则改为复制 SQL 手动执行）',
+  )
+  if (answer) return executeNoPKFix(tables)
+  await copyNoPKSQL()
+}
+
+async function executeNoPKFix(tables: string[]) {
+  noPKBusy.value = true
+  try {
+    const r = await fetch(API_BASE + '/replica-identity', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: 'ALTER', tables }),
+    })
+    const j = await r.json().catch(() => ({}))
+    if (!r.ok) {
+      alert('执行失败：' + (j.error || r.status))
+      return
+    }
+    const lines: string[] = []
+    for (const res of j.results || []) {
+      lines.push(res.ok ? `✓ ${res.table}` : `✗ ${res.table}：${res.error}（SQL：${res.sql}）`)
+    }
+    alert(lines.join('\n') + '\n\n' + (j.ok ? '全部成功，正在重新预检…' : '部分失败，失败的表请复制 SQL 手动执行'))
+    if (j.ok || (j.results || []).some((x: any) => x.ok)) await runPrecheck()
+  } catch (e: any) {
+    alert('请求失败: ' + e)
+  } finally {
+    noPKBusy.value = false
+  }
 }
 
 async function resetCheckpoint() {
