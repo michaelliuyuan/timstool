@@ -141,8 +141,9 @@ func TestCDCChain_SeedCheckpoint(t *testing.T) {
 		t.Fatalf("lsn = %s", cp.LSN.String())
 	}
 
-	// Existing checkpoint at/past the chain point wins: content unchanged.
-	cfg.Migration.ChainStartLSN = "0/AAAAAAAA"
+	// Existing checkpoint at/past the chain point wins: content unchanged
+	// (chain LSN 0/1000000 < existing 0/3D0000A0).
+	cfg.Migration.ChainStartLSN = "0/1000000"
 	if err := s.seedChainCheckpoint("taskX", cfg); err != nil {
 		t.Fatalf("re-seed: %v", err)
 	}
