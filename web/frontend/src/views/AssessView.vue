@@ -61,10 +61,10 @@ function clearSourceConfig() {
 }
 
 const levelEmoji: Record<string, string> = {
-  compatible: '✅',
-  convertible: '⚠️',
-  manual_needed: '🟡',
-  incompatible: '❌'
+  compatible: '●',
+  convertible: '▲',
+  manual_needed: '◆',
+  incompatible: '✕'
 }
 
 const levelName: Record<string, string> = {
@@ -196,7 +196,7 @@ function copyDDL() {
     <!-- Connection Form -->
     <el-card shadow="never" style="margin-bottom: 20px;">
       <template #header>
-        <span style="font-weight: 600;">🔗 数据源配置</span>
+        <span style="font-weight: 600;">数据源配置</span>
       </template>
       <el-form :model="sourceForm" label-width="80px" size="default" inline>
         <el-form-item label="主机">
@@ -219,9 +219,9 @@ function copyDDL() {
         </el-form-item>
         <el-form-item>
           <el-button type="primary" @click="runAssess" :loading="loading">
-            {{ loading ? '评估中...' : '🔍 开始评估' }}
+            {{ loading ? '评估中...' : '开始评估' }}
           </el-button>
-          <el-button @click="saveSourceConfig">💾 保存配置</el-button>
+          <el-button @click="saveSourceConfig">保存配置</el-button>
           <el-button @click="clearSourceConfig" text type="info">清除</el-button>
         </el-form-item>
       </el-form>
@@ -254,7 +254,7 @@ function copyDDL() {
               {{ report.summary[key] || 0 }}
             </div>
             <div style="font-size: 13px; color: #666; margin-top: 4px;">
-              {{ ['✅ 兼容', '⚠️ 可转换', '🟡 需手动', '❌ 不兼容'][idx] }}
+              {{ ['兼容', '可转换', '需手动', '不兼容'][idx] }}
             </div>
           </el-card>
         </el-col>
@@ -263,7 +263,7 @@ function copyDDL() {
       <!-- Dimension Scores -->
       <el-card shadow="never" style="margin-bottom: 20px;">
         <template #header>
-          <span style="font-weight: 600;">📊 维度评分</span>
+            <span style="font-weight: 600;">维度评分</span>
         </template>
         <el-table :data="report.dimension_results" stripe size="default">
           <el-table-column label="维度" width="140">
@@ -293,8 +293,8 @@ function copyDDL() {
       <el-card shadow="never" v-if="problems.length > 0">
         <template #header>
           <div style="display: flex; justify-content: space-between; align-items: center;">
-            <span style="font-weight: 600;">⚠️ 需要处理的项目（{{ problems.length }} 项）</span>
-            <el-button size="small" @click="downloadHTML" :loading="loading">📥 下载 HTML 报告</el-button>
+            <span style="font-weight: 600;">需要处理的项目（{{ problems.length }} 项）</span>
+            <el-button size="small" @click="downloadHTML" :loading="loading">下载 HTML 报告</el-button>
           </div>
         </template>
         <el-table :data="problems" stripe size="small" max-height="500">
@@ -325,7 +325,7 @@ function copyDDL() {
     <el-dialog v-model="ddlDialogVisible" :title="ddlDialogTitle" width="700px">
       <el-input type="textarea" :model-value="ddlDialogContent" :rows="18" readonly style="font-family: monospace;" />
       <template #footer>
-        <el-button @click="copyDDL">📋 复制</el-button>
+        <el-button @click="copyDDL">复制</el-button>
         <el-button @click="ddlDialogVisible = false">关闭</el-button>
       </template>
     </el-dialog>

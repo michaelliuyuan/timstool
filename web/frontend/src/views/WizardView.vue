@@ -593,13 +593,18 @@ function prevStep() {
             </div>
           </el-form-item>
           <el-divider>增量同步衔接</el-divider>
-          <el-form-item label="全量+增量衔接">
-            <el-switch v-model="form.opts.cdc_chain" :disabled="sourceType !== 'postgres'" />
-            <div style="color: #909399; font-size: 12px; margin-top: 4px;">
-              仅 PostgreSQL 源端可用。开启后任务启动前会自动预建 CDC 的 publication + replication
-              slot，全量期间源端 WAL 被保留；全量成功后自动启动 CDC 增量同步，从预建点位重放，实现零丢失衔接
-              （重放与全量重叠的数据按 conflict_strategy=replace 幂等去重）。注意：全量期间源端
-              WAL 会持续累积，max_slot_wal_keep_size 不要设置过小。
+          <el-form-item>
+            <template #label>
+              <span style="color: var(--tims-brand); font-weight: 600;">全量+增量衔接</span>
+            </template>
+            <div class="chain-emphasis" style="width: 100%;">
+              <el-switch v-model="form.opts.cdc_chain" :disabled="sourceType !== 'postgres'" />
+              <div style="color: var(--tims-text-2); font-size: 12px; margin-top: 4px;">
+                仅 PostgreSQL 源端可用。开启后任务启动前会自动预建 CDC 的 publication + replication
+                slot，全量期间源端 WAL 被保留；全量成功后自动启动 CDC 增量同步，从预建点位重放，实现零丢失衔接
+                （重放与全量重叠的数据按 conflict_strategy=replace 幂等去重）。注意：全量期间源端
+                WAL 会持续累积，max_slot_wal_keep_size 不要设置过小。
+              </div>
             </div>
           </el-form-item>
           <el-divider>目标数据处理策略</el-divider>
@@ -743,9 +748,37 @@ function prevStep() {
 
 <style scoped>
 .form-hint {
-  color: #909399;
+  color: var(--tims-text-2);
   font-size: 12px;
   line-height: 1.4;
   margin-top: 4px;
+}
+
+/* Step bar: brand-red repaint + check pop on finish */
+:deep(.el-step__head.is-process) { color: var(--tims-brand); border-color: var(--tims-brand); }
+:deep(.el-step__head.is-process .el-step__icon) {
+  background: var(--tims-brand);
+  color: #fff;
+  border-color: var(--tims-brand);
+  box-shadow: 0 0 0 4px var(--tims-brand-soft);
+}
+:deep(.el-step__title.is-process) { color: var(--tims-brand); font-weight: 600; }
+:deep(.el-step__head.is-finish) { color: var(--tims-teal); border-color: var(--tims-teal); }
+:deep(.el-step__title.is-finish) { color: var(--tims-teal); }
+:deep(.el-step__head.is-finish .el-step__icon) {
+  animation: step-check 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@keyframes step-check {
+  0% { transform: scale(0.6); }
+  60% { transform: scale(1.15); }
+  100% { transform: scale(1); }
+}
+
+/* Chain option: brand emphasis while the wizard is on the options step */
+:deep(.chain-emphasis) {
+  border: 1px solid rgba(225, 60, 60, 0.35);
+  border-radius: var(--tims-radius-s);
+  padding: 10px 12px;
+  background: var(--tims-brand-soft);
 }
 </style>

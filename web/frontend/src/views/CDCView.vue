@@ -5,15 +5,21 @@
 
     <!-- Module disabled (cdc.enable=false) -->
     <div class="disabled-card" v-if="disabled">
-      <h3>🚫 CDC 模块未启用</h3>
+      <h3>CDC 模块未启用</h3>
       <p>当前部署未开启 CDC 增量同步（<code>cdc.enable: false</code>）。</p>
       <p class="hint">如需使用：在 config.yaml 设置 <code>cdc.enable: true</code>，或用 <code>pg2tidb cdc --enable-cdc</code> 启动。</p>
     </div>
 
     <template v-else>
+    <!-- Signature pipeline strip -->
+    <DataPipelineStrip
+      :status="pipelineStatus"
+      :badges="pipelineBadges"
+    />
+
     <!-- Connection card (A1): the live config.yaml the CDC child uses -->
     <div class="detail-card" v-if="connCfg">
-      <h3>🔌 连接信息（CDC 实际使用）</h3>
+      <h3>连接信息（CDC 实际使用）</h3>
       <div class="detail-row">
         <span class="detail-label">配置文件:</span>
         <code>{{ connCfg.cfg_file }}</code>
@@ -63,7 +69,7 @@
 
     <!-- Precheck panel (A2): run before Start; fail items block -->
     <div class="detail-card" v-if="precheck">
-      <h3>🩺 启动预检 <button class="btn-refresh" style="margin-left: 8px; padding: 2px 10px; font-size: 12px;" @click="runPrecheck" :disabled="checking">{{ checking ? '检查中…' : '重新检查' }}</button></h3>
+      <h3>启动预检 <button class="btn-refresh" style="margin-left: 8px; padding: 2px 10px; font-size: 12px;" @click="runPrecheck" :disabled="checking">{{ checking ? '检查中…' : '重新检查' }}</button></h3>
       <div v-for="it in precheck.items" :key="it.item" class="precheck-row" :class="it.level">
         <span class="precheck-dot">{{ it.level === 'ok' ? '✓' : it.level === 'warn' ? '!' : '✗' }}</span>
         <span class="precheck-label">{{ it.label }}</span>
@@ -131,6 +137,7 @@
       <div class="stat-item">
         <div class="stat-value">{{ stats.throughput_rps?.toFixed(1) || '0' }}/s</div>
         <div class="stat-label">吞吐量</div>
+        <SparkLine v-if="throughputHistory.length > 1" :data="throughputHistory" :height="34" />
       </div>
       <div class="stat-item">
         <div class="stat-value">{{ stats.lag_seconds?.toFixed(1) || '0' }}s</div>
@@ -148,7 +155,7 @@
 
     <!-- Checkpoint Card -->
     <div class="detail-card" v-if="checkpoint && checkpoint.lsn">
-      <h3>📌 检查点</h3>
+      <h3>检查点</h3>
       <div class="detail-row">
         <span class="detail-label">LSN:</span>
         <code>{{ checkpoint.lsn }}</code>
@@ -165,7 +172,7 @@
 
     <!-- Config Card (from status: slot/publication/pid) -->
     <div class="detail-card" v-if="status.slot || status.publication">
-      <h3>⚙️ 配置</h3>
+      <h3>配置</h3>
       <div class="detail-row" v-if="status.slot">
         <span class="detail-label">Slot:</span>
         <code>{{ status.slot }}</code>
@@ -186,7 +193,7 @@
 
     <!-- Live slot / lag card (A3): restart_lsn + retained WAL + checkpoint age -->
     <div class="detail-card" v-if="slotView && slotView.slot.exists">
-      <h3>📡 Slot 与延迟</h3>
+      <h3>Slot 与延迟</h3>
       <div class="detail-row">
         <span class="detail-label">restart_lsn:</span>
         <code>{{ slotView.slot.restart_lsn }}</code>
@@ -207,13 +214,13 @@
 
     <!-- Error display -->
     <div class="error-card" v-if="stats && stats.last_error">
-      <h3>⚠️ 最近错误</h3>
+      <h3>最近错误</h3>
       <pre>{{ stats.last_error }}</pre>
     </div>
 
     <!-- Refresh button -->
     <div class="actions">
-      <button @click="refresh" class="btn-refresh">🔄 刷新</button>
+      <button @click="refresh" class="btn-refresh">刷新</button>
       <span class="auto-refresh">自动刷新: {{ refreshInterval }}s</span>
     </div>
     </template>
@@ -222,6 +229,8 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
+import DataPipelineStrip from '../components/DataPipelineStrip.vue'
+import SparkLine from '../components/SparkLine.vue'
 
 const API_BASE = '/api/v1/cdc'
 
@@ -482,6 +491,28 @@ const checkpoint = ref<CDCCheckpoint | null>(null)
 const refreshInterval = ref(5)
 let timer: ReturnType<typeof setInterval> | null = null
 
+// Throughput sparkline history (capped ring buffer)
+const throughputHistory = ref<number[]>([])
+function pushThroughput(v: number | undefined) {
+  throughputHistory.value.push(v ?? 0)
+  if (throughputHistory.value.length > 60) throughputHistory.value.shift()
+}
+
+const pipelineStatus = computed<'running' | 'warn' | 'stopped'>(() => {
+  if (isActive.value) return stats.value && stats.value.failed > 0 ? 'warn' : 'running'
+  return 'stopped'
+})
+const pipelineBadges = computed(() => {
+  const b: { label: string; value: string }[] = []
+  if (status.value.lsn) b.push({ label: 'LSN', value: status.value.lsn })
+  if (stats.value) {
+    b.push({ label: '吞吐', value: (stats.value.throughput_rps?.toFixed(1) || '0') + '/s' })
+    b.push({ label: '延迟', value: (stats.value.lag_seconds?.toFixed(1) || '0') + 's' })
+    b.push({ label: '已应用', value: String(stats.value.applied ?? 0) })
+  }
+  return b
+})
+
 const statusState = computed(() => {
   switch (status.value.state) {
     case 'running': return 'running'
@@ -590,7 +621,10 @@ async function refresh() {
       fetch(API_BASE + '/stats').then(r => r.json()).catch(() => null),
       fetch(API_BASE + '/checkpoint').then(r => r.json()).catch(() => null),
     ])
-    if (statsRes && statsRes.source_events !== undefined) stats.value = statsRes
+    if (statsRes && statsRes.source_events !== undefined) {
+      stats.value = statsRes
+      pushThroughput(statsRes.throughput_rps)
+    }
     if (cpRes && cpRes.lsn) checkpoint.value = cpRes
     // A3: live slot lag alongside business stats.
     await refreshSlot()
@@ -632,21 +666,19 @@ onUnmounted(() => {
 .cdc-container {
   max-width: 1000px;
   margin: 0 auto;
-  padding: 24px;
-  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
 }
-h1 { font-size: 24px; color: #1a1a2e; margin-bottom: 4px; }
-.subtitle { color: #666; font-size: 14px; margin-bottom: 24px; }
+h1 { font-size: 24px; color: var(--tims-text); margin-bottom: 4px; }
+.subtitle { color: var(--tims-text-2); font-size: 14px; margin-bottom: 24px; }
 
 .status-card {
-  border-radius: 12px; padding: 24px; margin-bottom: 24px;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  border-radius: var(--tims-radius); padding: 24px; margin-bottom: 24px;
+  box-shadow: var(--tims-shadow);
 }
-.status-card.running { background: linear-gradient(135deg, #52c41a, #73d13d); color: #fff; }
-.status-card.starting { background: linear-gradient(135deg, #1890ff, #69b1ff); color: #fff; }
-.status-card.stopped { background: #f5f5f5; color: #666; }
-.status-card.halted { background: linear-gradient(135deg, #f5222d, #ff7875); color: #fff; }
-.status-card.stale { background: linear-gradient(135deg, #faad14, #ffc53d); color: #fff; }
+.status-card.running { background: linear-gradient(135deg, #0fa3a3, #2cb4ad); color: #fff; }
+.status-card.starting { background: linear-gradient(135deg, #2c4a8f, #4b6cb3); color: #fff; }
+.status-card.stopped { background: #eef0f6; color: var(--tims-text-2); }
+.status-card.halted { background: linear-gradient(135deg, #e13c3c, #ee6a6a); color: #fff; }
+.status-card.stale { background: linear-gradient(135deg, #d97e00, #e8a548); color: #fff; }
 .status-indicator { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .status-dot { width: 12px; height: 12px; border-radius: 50%; background: #d9d9d9; }
 .status-dot.active { background: #fff; animation: pulse 2s infinite; }
@@ -663,16 +695,21 @@ h1 { font-size: 24px; color: #1a1a2e; margin-bottom: 4px; }
   margin-bottom: 24px;
 }
 .stat-item {
-  background: #fff; border-radius: 12px; padding: 20px; text-align: center;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  background: var(--tims-card); border-radius: var(--tims-radius); padding: 16px 18px; text-align: left;
+  border: 1px solid var(--tims-border);
+  box-shadow: var(--tims-shadow);
 }
-.stat-value { font-size: 28px; font-weight: 700; color: #1a1a2e; }
-.stat-value.error { color: #f5222d; }
-.stat-label { font-size: 13px; color: #666; margin-top: 4px; }
+.stat-value {
+  font-family: var(--tims-font-mono); font-weight: 500; font-size: 26px;
+  letter-spacing: -0.5px; color: var(--tims-text);
+}
+.stat-value.error { color: var(--tims-brand); }
+.stat-label { font-size: 12px; color: var(--tims-text-2); margin-top: 4px; letter-spacing: 0.4px; }
 
 .detail-card {
-  background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 16px;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  background: var(--tims-card); border-radius: var(--tims-radius); padding: 20px; margin-bottom: 16px;
+  border: 1px solid var(--tims-border);
+  box-shadow: var(--tims-shadow);
 }
 .detail-card h3 { font-size: 16px; margin-bottom: 12px; color: #1a1a2e; }
 .detail-row { display: flex; align-items: center; padding: 6px 0; font-size: 14px; }

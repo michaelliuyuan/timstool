@@ -32,9 +32,9 @@ const form = reactive({
 })
 
 const compareModes = [
-  { value: 'quick', label: '⚡ 快速', color: '#67c23a', desc: '仅行数估算，最快' },
-  { value: 'sample', label: '🗑 采样', color: '#409eff', desc: '行数+随机采样（推荐）' },
-  { value: 'checksum', label: '🟡 校验', color: '#e6a23c', desc: '行数+分块Hash' },
+  { value: 'quick', label: '快速', color: '#0fa3a3', desc: '仅行数估算，最快' },
+  { value: 'sample', label: '采样', color: '#2c4a8f', desc: '行数+随机采样（推荐）' },
+  { value: 'checksum', label: '校验', color: '#d97e00', desc: '行数+分块Hash' },
 ]
 
 // ---- table selection ----
@@ -345,6 +345,14 @@ function tableStatusTag(s: string) {
   return { pass: 'success', fail: 'danger', warn: 'warning', skip: 'info' }[s] || 'info'
 }
 
+// Diff-count heat scale: 0 → teal, small → amber, large → brand red.
+function diffHeat(n: number | undefined): string {
+  const d = n ?? 0
+  if (d === 0) return 'diff-zero'
+  if (d < 100) return 'diff-low'
+  return 'diff-high'
+}
+
 onMounted(async () => {
   await loadSources()
   const meta = getSource(sourceType.value)
@@ -509,22 +517,38 @@ onUnmounted(() => {
       <el-alert v-if="activeTask.error" type="error" :closable="false" :title="activeTask.error" style="margin-bottom: 12px;" />
 
       <template v-if="activeReport">
-        <el-descriptions :column="4" border size="small" style="margin-bottom: 12px;">
-          <el-descriptions-item label="总表数">{{ activeReport.stats.total_tables }}</el-descriptions-item>
-          <el-descriptions-item label="通过"><span style="color: #67c23a;">{{ activeReport.stats.pass_tables }}</span></el-descriptions-item>
-          <el-descriptions-item label="失败"><span style="color: #f56c6c;">{{ activeReport.stats.fail_tables }}</span></el-descriptions-item>
-          <el-descriptions-item label="耗时">{{ activeReport.duration }}</el-descriptions-item>
-        </el-descriptions>
-        <el-table :data="activeReport.tables" max-height="400" size="small">
+        <div class="tims-gauge-row">
+          <div class="tims-gauge">
+            <span class="tims-gauge-label">总表数</span>
+            <span class="tims-gauge-value tims-num">{{ activeReport.stats.total_tables }}</span>
+          </div>
+          <div class="tims-gauge">
+            <span class="tims-gauge-label">通过</span>
+            <span class="tims-gauge-value tims-num is-teal">{{ activeReport.stats.pass_tables }}</span>
+          </div>
+          <div class="tims-gauge">
+            <span class="tims-gauge-label">失败</span>
+            <span class="tims-gauge-value tims-num is-brand">{{ activeReport.stats.fail_tables }}</span>
+          </div>
+          <div class="tims-gauge">
+            <span class="tims-gauge-label">耗时</span>
+            <span class="tims-gauge-value tims-num">{{ activeReport.duration }}</span>
+          </div>
+        </div>
+        <el-table :data="activeReport.tables" max-height="400" size="small" style="margin-bottom: 12px;">
           <el-table-column prop="table_name" label="表名" min-width="140" />
           <el-table-column label="状态" width="90">
             <template #default="{ row }">
               <el-tag :type="tableStatusTag(row.status)" size="small">{{ row.status }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="source_rows" label="源行数" width="110" align="right" />
-          <el-table-column prop="target_rows" label="目标行数" width="110" align="right" />
-          <el-table-column prop="diff_rows" label="差异行数" width="100" align="right" />
+          <el-table-column prop="source_rows" label="源行数" width="110" align="right" class-name="tims-num-col" />
+          <el-table-column prop="target_rows" label="目标行数" width="110" align="right" class-name="tims-num-col" />
+          <el-table-column label="差异行数" width="100" align="right">
+            <template #default="{ row }">
+              <span class="tims-num" :class="diffHeat(row.diff_rows)">{{ row.diff_rows }}</span>
+            </template>
+          </el-table-column>
           <el-table-column prop="duration" label="耗时" width="90" />
           <el-table-column prop="error" label="错误/建议" min-width="200" show-overflow-tooltip />
         </el-table>
@@ -559,3 +583,20 @@ onUnmounted(() => {
     </el-card>
   </div>
 </template>
+
+<style scoped>
+.tims-gauge-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.diff-zero { color: var(--tims-teal); }
+.diff-low { color: var(--tims-amber); }
+.diff-high { color: var(--tims-brand); font-weight: 500; }
+:deep(.tims-num-col .cell) { font-family: var(--tims-font-mono); }
+
+@media (max-width: 900px) {
+  .tims-gauge-row { grid-template-columns: repeat(2, 1fr); }
+}
+</style>

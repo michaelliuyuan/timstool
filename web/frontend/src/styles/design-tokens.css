@@ -1,0 +1,185 @@
+﻿/* ============================================================
+   TiMS Design Tokens — V2.2 UI revamp
+   墨蓝 #0C1222 · 工作区 #F6F7FB · 品牌红 #E13C3C · 数据青 #0FA3A3
+   ============================================================ */
+
+/* --- Self-hosted fonts (offline-safe, ~91KB) --- */
+@font-face {
+  font-family: 'TiMS Inter';
+  src: url('../assets/fonts/inter-400.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TiMS Inter';
+  src: url('../assets/fonts/inter-600.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TiMS Mono';
+  src: url('../assets/fonts/jetbrains-mono-400.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TiMS Mono';
+  src: url('../assets/fonts/jetbrains-mono-500.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  /* Palette */
+  --tims-ink: #0c1222;        /* 墨蓝：顶栏/侧栏/终端底 */
+  --tims-ink-2: #131b30;      /* 墨蓝亮阶 */
+  --tims-ink-3: #1c2742;      /* 墨蓝 hover */
+  --tims-work: #f6f7fb;       /* 工作区底 */
+  --tims-card: #ffffff;       /* 卡片底 */
+  --tims-brand: #e13c3c;      /* 品牌红 */
+  --tims-brand-soft: rgba(225, 60, 60, 0.09);
+  --tims-teal: #0fa3a3;       /* 数据青：运行/成功 */
+  --tims-teal-soft: rgba(15, 163, 163, 0.10);
+  --tims-amber: #d97e00;      /* 琥珀：warn */
+  --tims-amber-soft: rgba(217, 126, 0, 0.10);
+  --tims-text: #2a3040;       /* 主文字 */
+  --tims-text-2: #6b7280;     /* 次文字 */
+  --tims-text-inv: #eef1f8;   /* 深底文字 */
+  --tims-text-inv-2: #97a0b5; /* 深底次文字 */
+  --tims-border: #e6e8f0;
+  --tims-border-ink: #263154;
+
+  /* Shape & depth */
+  --tims-radius: 12px;
+  --tims-radius-s: 8px;
+  --tims-shadow: 0 1px 2px rgba(12, 18, 34, 0.04), 0 4px 14px rgba(12, 18, 34, 0.06);
+  --tims-shadow-lift: 0 2px 4px rgba(12, 18, 34, 0.06), 0 10px 28px rgba(12, 18, 34, 0.10);
+
+  /* Type */
+  --tims-font-ui: 'TiMS Inter', 'HarmonyOS Sans SC', 'MiSans', 'Segoe UI', system-ui, sans-serif;
+  --tims-font-mono: 'TiMS Mono', 'JetBrains Mono', Consolas, ui-monospace, monospace;
+
+  /* --- Element Plus re-skin --- */
+  --el-color-primary: var(--tims-brand);
+  --el-color-primary-light-3: #ea6a6a;
+  --el-color-primary-light-5: #f19c9c;
+  --el-color-primary-light-7: #f8cfcf;
+  --el-color-primary-light-8: #fbe2e2;
+  --el-color-primary-light-9: #fdf1f1;
+  --el-color-primary-dark-2: #b43030;
+  --el-color-success: var(--tims-teal);
+  --el-color-success-light-3: #4fb5b5;
+  --el-color-success-light-5: #86cfcf;
+  --el-color-success-light-7: #bde7e7;
+  --el-color-success-light-8: #dbf1f1;
+  --el-color-success-light-9: #eef8f8;
+  --el-color-success-dark-2: #0b8282;
+  --el-color-warning: var(--tims-amber);
+  --el-color-warning-light-9: #faf1e3;
+  --el-color-danger: var(--tims-brand);
+  --el-color-info: #6b7280;
+  --el-border-radius-base: 8px;
+  --el-border-color: var(--tims-border);
+  --el-border-color-light: var(--tims-border);
+  --el-text-color-primary: var(--tims-text);
+  --el-text-color-regular: var(--tims-text);
+  --el-text-color-secondary: var(--tims-text-2);
+  --el-font-family: var(--tims-font-ui);
+  --el-box-shadow-light: var(--tims-shadow);
+}
+
+html, body, #app { height: 100%; }
+
+body {
+  margin: 0;
+  font-family: var(--tims-font-ui);
+  color: var(--tims-text);
+  background: var(--tims-work);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* --- Global card look (EP cards adopt tokens) --- */
+.el-card {
+  border-radius: var(--tims-radius);
+  border: 1px solid var(--tims-border);
+  box-shadow: var(--tims-shadow);
+}
+.el-card__header { font-weight: 600; }
+
+/* Focus visibility (a11y) */
+:focus-visible {
+  outline: 2px solid var(--tims-brand);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* --- Shared utilities --- */
+.tims-mono { font-family: var(--tims-font-mono); font-variant-ligatures: none; }
+.tims-num {
+  font-family: var(--tims-font-mono);
+  font-weight: 500;
+  letter-spacing: -0.5px;
+}
+
+/* Gauge stat (CDC / Compare / Assess pages) */
+.tims-gauge {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 14px 18px;
+  background: var(--tims-card);
+  border: 1px solid var(--tims-border);
+  border-radius: var(--tims-radius);
+  box-shadow: var(--tims-shadow);
+}
+.tims-gauge .tims-gauge-label {
+  font-size: 12px;
+  color: var(--tims-text-2);
+  letter-spacing: 0.4px;
+}
+.tims-gauge .tims-gauge-value {
+  font-family: var(--tims-font-mono);
+  font-weight: 500;
+  font-size: 26px;
+  line-height: 1.15;
+  color: var(--tims-text);
+}
+.tims-gauge .tims-gauge-value.is-teal { color: var(--tims-teal); }
+.tims-gauge .tims-gauge-value.is-brand { color: var(--tims-brand); }
+.tims-gauge .tims-gauge-value.is-amber { color: var(--tims-amber); }
+.tims-gauge .tims-gauge-sub {
+  font-size: 12px;
+  color: var(--tims-text-2);
+  font-family: var(--tims-font-mono);
+}
+
+/* Terminal-style log panel */
+.tims-terminal {
+  background: var(--tims-ink);
+  border-radius: var(--tims-radius);
+  border: 1px solid var(--tims-border-ink);
+  padding: 14px 16px;
+  font-family: var(--tims-font-mono);
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--tims-text-inv);
+  overflow: auto;
+}
+.tims-terminal .t-log-line { white-space: pre-wrap; word-break: break-all; }
+.tims-terminal .t-ts { color: var(--tims-text-inv-2); }
+.tims-terminal .t-info .t-tag { color: var(--tims-teal); }
+.tims-terminal .t-warn .t-tag { color: var(--tims-amber); }
+.tims-terminal .t-error .t-tag { color: var(--tims-brand); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001s !important;
+  }
+}

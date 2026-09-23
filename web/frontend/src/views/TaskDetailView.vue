@@ -498,58 +498,62 @@ function logLevelClass(level: string): string {
 
 <style scoped>
 .log-container {
-  background: #1e1e1e;
-  color: #d4d4d4;
-  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-  font-size: 13px;
-  line-height: 1.6;
-  padding: 12px;
-  border-radius: 6px;
+  background: var(--tims-ink);
+  border: 1px solid var(--tims-border-ink);
+  color: var(--tims-text-inv);
+  font-family: var(--tims-font-mono);
+  font-size: 12.5px;
+  line-height: 1.7;
+  padding: 14px 16px;
+  border-radius: var(--tims-radius);
   height: calc(100vh - 240px);
   overflow-y: auto;
 }
 
 .phase-log-container {
-  background: #1e1e1e;
-  color: #d4d4d4;
-  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-  font-size: 13px;
-  line-height: 1.6;
-  padding: 12px;
-  border-radius: 6px;
+  background: var(--tims-ink);
+  border: 1px solid var(--tims-border-ink);
+  color: var(--tims-text-inv);
+  font-family: var(--tims-font-mono);
+  font-size: 12.5px;
+  line-height: 1.7;
+  padding: 14px 16px;
+  border-radius: var(--tims-radius);
   max-height: 400px;
   overflow-y: auto;
 }
 
 .log-line {
   padding: 2px 0;
-  border-bottom: 1px solid rgba(255,255,255,0.05);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .log-time {
-  color: #6a9955;
+  color: var(--tims-text-inv-2);
   margin-right: 8px;
 }
 
 .log-level {
-  font-weight: bold;
+  font-weight: 500;
   margin-right: 8px;
 }
 
 .log-msg {
-  color: #d4d4d4;
+  color: var(--tims-text-inv);
 }
 
 .log-caller {
-  color: #608b4e;
+  color: var(--tims-text-inv-2);
   margin-left: 8px;
-  font-size: 12px;
+  font-size: 11.5px;
 }
 
-.log-info .log-level { color: #4ec9b0; }
-.log-warn .log-level { color: #dcdcaa; }
-.log-error .log-level { color: #f44747; }
-.log-debug .log-level { color: #608b4e; }
-.log-error { background: rgba(244, 71, 71, 0.1); }
-.log-warn { background: rgba(220, 220, 170, 0.08); }
+.log-info .log-level { color: var(--tims-teal); }
+.log-warn .log-level { color: var(--tims-amber); }
+.log-error .log-level { color: var(--tims-brand); }
+.log-debug .log-level { color: #7fb069; }
+.log-error { background: rgba(225, 60, 60, 0.10); }
+.log-warn { background: rgba(217, 126, 0, 0.08); }
 </style>
