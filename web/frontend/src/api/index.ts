@@ -192,6 +192,19 @@ export interface CreateCompareRequest {
   tables: string[]
 }
 
+// Saved compare-page connection profile. Passwords round-trip as empty:
+// the server never stores or returns them.
+export interface CompareOptions {
+  source_type?: string
+  source?: Record<string, any>
+  target?: Record<string, any>
+  mode?: string
+  sample_ratio?: number
+  checksum_chunk_size?: number
+  checksum_parallel?: number
+  parallel?: number
+}
+
 export const apiClient = {
   health: () => api.get('/health'),
 
@@ -289,6 +302,14 @@ export const apiClient = {
 
   deleteCompare: (id: string) =>
     api.delete(`/compare/tasks/${id}`),
+
+  // Saved compare-page connection profile (passwords are never persisted
+  // server-side; the fields exist so a round-trip response can be typed).
+  getCompareOptions: () =>
+    api.get<CompareOptions>('/compare/options'),
+
+  saveCompareOptions: (opts: CompareOptions) =>
+    api.put<{ success: boolean }>('/compare/options', opts),
 }
 
 export default apiClient

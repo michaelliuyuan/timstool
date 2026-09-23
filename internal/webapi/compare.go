@@ -3,10 +3,13 @@ package webapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,11 +69,14 @@ type CompareTask struct {
 	FinishedAt        *time.Time          `json:"finished_at,omitempty"`
 }
 
-// compareState guards the single-running-compare invariant.
+// compareState guards the single-running-compare invariant and serializes
+// compare-options saves (read→merge→write must not interleave, or two
+// concurrent PUTs can lose each other's update).
 type compareState struct {
 	mu        sync.Mutex
 	cancel    context.CancelFunc // non-nil while a compare task is running
 	runningID string
+	optionsMu sync.Mutex // serializes compare-options load→merge→write
 }
 
 func (s *Server) compareDir(id string) string {
@@ -132,6 +138,178 @@ func (s *Server) persistCompareTask(task *CompareTask) error {
 		return err
 	}
 	return os.Rename(tmpName, filepath.Join(dir, "task.json"))
+}
+
+// compareOptionsBody is the persisted shape of the compare page's saved
+// connection profile (dataDir/compare-options.json). Passwords are NEVER
+// persisted nor returned: PUT ignores them, GET always returns them empty.
+type compareOptionsBody struct {
+	SourceType        string              `json:"source_type"`
+	Source            config.SourceConfig `json:"source"` // password never stored
+	Target            config.TargetConfig `json:"target"` // password never stored
+	Mode              string              `json:"mode"`
+	SampleRatio       float64             `json:"sample_ratio"`
+	ChecksumChunkSize int64               `json:"checksum_chunk_size"`
+	ChecksumParallel  int                 `json:"checksum_parallel"`
+	Parallel          int                 `json:"parallel"`
+}
+
+func (s *Server) compareOptionsFile() string {
+	return filepath.Join(s.dataDir, "compare-options.json")
+}
+
+func (s *Server) handleGetCompareOptions(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, http.StatusOK, s.loadCompareOptions())
+}
+
+func (s *Server) handlePutCompareOptions(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	var req compareOptionsBody
+	if err := json.Unmarshal(raw, &req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	// Partial-merge semantics (same as migration-options R1): fields
+	// explicitly present in the body override saved values; absent fields
+	// keep their saved values.
+	var presence map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &presence); err != nil {
+		presence = nil
+	}
+	if req.Mode != "" {
+		switch req.Mode {
+		case "quick", "sample", "checksum":
+		default:
+			s.writeError(w, http.StatusBadRequest, "mode must be one of quick/sample/checksum")
+			return
+		}
+	}
+	if req.SampleRatio < 0 || req.SampleRatio > 1 {
+		s.writeError(w, http.StatusBadRequest, "sample_ratio must be within [0,1]")
+		return
+	}
+
+	// Serialize load→merge→write so concurrent PUTs cannot lose updates.
+	s.compare.optionsMu.Lock()
+	defer s.compare.optionsMu.Unlock()
+
+	merged := s.loadCompareOptions()
+	apply := func(key string, set func()) {
+		if _, ok := presence[key]; ok {
+			set()
+		}
+	}
+	apply("source_type", func() { merged.SourceType = strings.TrimSpace(req.SourceType) })
+	// source/target merge field-by-field too: a body containing only
+	// {"source":{"host":"x"}} must not wipe the remembered port/user/etc.
+	apply("source", func() {
+		var srcPresence map[string]json.RawMessage
+		if raw, ok := presence["source"]; ok {
+			_ = json.Unmarshal(raw, &srcPresence)
+		}
+		for _, f := range []struct {
+			key string
+			set func()
+		}{
+			{"type", func() { merged.Source.Type = req.Source.Type }},
+			{"host", func() { merged.Source.Host = req.Source.Host }},
+			{"port", func() { merged.Source.Port = req.Source.Port }},
+			{"user", func() { merged.Source.User = req.Source.User }},
+			{"database", func() { merged.Source.Database = req.Source.Database }},
+			{"schema", func() { merged.Source.Schema = req.Source.Schema }},
+			{"sslmode", func() { merged.Source.SSLMode = req.Source.SSLMode }},
+		} {
+			if _, ok := srcPresence[f.key]; ok {
+				f.set()
+			}
+		}
+	})
+	apply("target", func() {
+		var tgtPresence map[string]json.RawMessage
+		if raw, ok := presence["target"]; ok {
+			_ = json.Unmarshal(raw, &tgtPresence)
+		}
+		for _, f := range []struct {
+			key string
+			set func()
+		}{
+			{"host", func() { merged.Target.Host = req.Target.Host }},
+			{"port", func() { merged.Target.Port = req.Target.Port }},
+			{"user", func() { merged.Target.User = req.Target.User }},
+			{"database", func() { merged.Target.Database = req.Target.Database }},
+		} {
+			if _, ok := tgtPresence[f.key]; ok {
+				f.set()
+			}
+		}
+	})
+	apply("mode", func() { merged.Mode = req.Mode })
+	apply("sample_ratio", func() { merged.SampleRatio = req.SampleRatio })
+	apply("checksum_chunk_size", func() { merged.ChecksumChunkSize = req.ChecksumChunkSize })
+	apply("checksum_parallel", func() { merged.ChecksumParallel = req.ChecksumParallel })
+	apply("parallel", func() { merged.Parallel = req.Parallel })
+	// Passwords never survive a save, regardless of what was sent.
+	merged.Source.Password = ""
+	merged.Target.Password = ""
+
+	if err := s.writeCompareOptions(&merged); err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存失败：%v", err))
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+}
+
+// loadCompareOptions returns the persisted options or the zero value when
+// nothing is saved yet or the file is corrupted (next PUT rewrites it).
+func (s *Server) loadCompareOptions() compareOptionsBody {
+	raw, err := os.ReadFile(s.compareOptionsFile())
+	if err != nil {
+		return compareOptionsBody{}
+	}
+	var opts compareOptionsBody
+	if err := json.Unmarshal(raw, &opts); err != nil {
+		zap.L().Warn("compare-options.json corrupted, ignoring saved options",
+			zap.String("file", s.compareOptionsFile()), zap.Error(err))
+		return compareOptionsBody{}
+	}
+	opts.Source.Password = ""
+	opts.Target.Password = ""
+	return opts
+}
+
+// writeCompareOptions persists the options atomically (temp + rename, same
+// pattern as writeMigrationOptions).
+func (s *Server) writeCompareOptions(opts *compareOptionsBody) error {
+	if err := os.MkdirAll(s.dataDir, 0o755); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
+	raw, err := json.MarshalIndent(opts, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(s.dataDir, "compare-options-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(raw); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, s.compareOptionsFile()); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {

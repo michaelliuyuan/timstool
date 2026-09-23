@@ -16,6 +16,7 @@
 
 ## 近期更新
 
+- **独立数据比对（数据对比）**（`0067a13`）— Web 新增「数据比对」页面：独立配置源端/目标端连接（不依赖迁移任务），支持 quick / sample / checksum 三种比对模式、表级选择（含预估行数与搜索）、实时进度与 WebSocket 推送、比对历史与表级差异报告（源/目标行数、差异行数、耗时）；连接信息可「保存连接 / 加载连接」复用（密码永不落盘，需重新输入）。
 - **迁移进度优化**（`35358f1`）— 数据迁移进度按阶段加权（导出 5% / Lightning 导入 47.5% / 流式导入 47.5%），Lightning 导入阶段显示"数据导入中（x/N 表）"；导入失败自动回退流式写入时进度从 50% 平滑续走，不再异常跳变。
 - **目标库配置记忆**（`35358f1`）— 向导中的 PD 地址（自动归一化，去掉 `http://` 前缀与尾部 `/`）与 TiDB 状态端口在任务间记忆复用，新建任务自动回填；"状态端口"文案更正为"TiDB 状态端口"；增量更新不会误清已有的临时目录 / Lightning 配置记忆。
 - **进度分母恒定**（`b0706ca`）— 迁移开始即预登记全部表，进度分母全程恒定，修复进度长期挂在 100% 附近不动或回退跳变的问题；恢复任务时已完成表进度归零重算，避免虚高。
@@ -29,7 +30,8 @@
 - **Schema Migration** — 自动采集 PG schema，类型映射 + DDL AST 转换，生成 TiDB 兼容 DDL，支持 `--dry-run` 预览
 - **Data Migration** — 基于 PG COPY 协议导出 + TiDB Lightning CLI 导入，实现高性能并行数据迁移；MySQL 源使用 Dumpling 导出；支持大表分片拆分
 - **Data Validation** — 四种校验模式（quick 行数对比 / sample 抽样验证 / checksum 分块哈希 / full 全量校验）确保数据一致性
-- **Web 管理界面** — 可视化配置向导（含数据源选择器）、交互式表选择、实时进度监控、日志流查看、CDC 仪表盘、迁移历史、HTML 报告下载
+- **独立数据比对** — Web「数据比对」页面，脱离迁移流水线手工比对任意源/目标：三种模式（quick / sample / checksum）、表级选择、连接配置保存/加载（密码不落盘）、比对历史与差异报告
+- **Web 管理界面** — 可视化配置向导（含数据源选择器）、独立数据比对、交互式表选择、实时进度监控、日志流查看、CDC 仪表盘、迁移历史、HTML 报告下载
 - **断点续传** — Checkpoint 机制支持中断后从断点恢复
 - **单二进制部署** — 前端通过 `go:embed` 嵌入，零外部依赖，Docker 一键启动
 
@@ -472,6 +474,7 @@ docker run -p 8080:8080 -v /data/timstool:/data timstool
 | 页面 | 功能说明 |
 |------|----------|
 | **配置向导** | 5 步向导：数据源选择（PG/MySQL/...）→ 源端配置 → 目标端配置 → 选择表（支持搜索/全选） → 迁移选项 → 确认执行 |
+| **数据比对** | 独立数据比对（不执行迁移）：配置源/目标连接并测试，三种模式（快速行数 / 采样 / 分块校验）+ 表级选择；「保存连接 / 加载连接」复用连接配置（密码永不保存）；实时进度（WebSocket + 轮询）、取消、比对历史与表级差异报告（源/目标行数、差异行数、耗时、错误建议） |
 | **兼容性评估** | 迁移前风险评估，展示不兼容对象清单和迁移建议 |
 | **任务监控** | 实时进度、表级详情（导出/导入行数、百分比）、吞吐量指标 |
 | **CDC 仪表盘** | CDC 增量同步监控（LSN、吞吐、延迟），一键启停 |
@@ -505,6 +508,21 @@ GET  /api/v1/tasks/{id}/logs             # 获取任务日志
 GET  /api/v1/tasks/{id}/report           # 获取迁移报告
 GET  /api/v1/ws                          # WebSocket 实时推送（进度+日志）
 ```
+
+#### 独立数据比对
+
+```
+POST   /api/v1/compare/tasks                   # 创建并启动比对任务（源/目标连接 + 模式 + 表清单）
+GET    /api/v1/compare/tasks                   # 比对历史列表
+GET    /api/v1/compare/tasks/{compareID}       # 比对任务详情（状态、表进度、当前表）
+GET    /api/v1/compare/tasks/{compareID}/report  # 比对报告（表级 pass/fail、行数、差异行数）
+POST   /api/v1/compare/tasks/{compareID}/cancel  # 取消进行中的比对
+DELETE /api/v1/compare/tasks/{compareID}       # 删除比对记录
+GET    /api/v1/compare/options                 # 读取已保存的连接配置（密码恒为空）
+PUT    /api/v1/compare/options                 # 保存连接配置（部分合并；密码永不落盘）
+```
+
+> 比对模式：`quick`（行数估算，最快）/ `sample`（行数+随机采样，推荐）/ `checksum`（行数+分块哈希校验，支持分块大小与并行数）。表清单留空表示比对全部表。任务数据持久化在 `<dataDir>/compare/{id}/`，与迁移任务存储隔离；同一时刻仅允许一个比对任务运行，进程重启后遗留的 running 任务自动标记为失败。
 
 #### 健康检查
 
@@ -734,6 +752,7 @@ timstool/
 │   │   └── orchestrator.go     # 4 阶段管道编排
 │   ├── webapi/                 # Web API 服务
 │   │   ├── server.go           # HTTP + WebSocket 服务（chi 路由）
+│   │   ├── compare.go          # 独立数据比对任务（/api/v1/compare/*）
 │   │   ├── dbconn.go           # 数据库连接测试
 │   │   ├── logbuffer.go        # 日志缓冲（支持实时订阅）
 │   │   └── logcore.go          # Zap 日志采集 Core
@@ -881,6 +900,9 @@ A: 当前 PostgreSQL 为生产可用状态，MySQL 正在开发中（Dumpling �
 
 **Q: 什么是 assess（兼容性评估）？**
 A: `timstool assess` 命令在迁移前扫描源端数据库，检查不兼容对象（Trigger、Stored Function、特殊索引、枚举类型等），输出风险报告。支持 `--format terminal|json` 选择输出格式。
+
+**Q: 「数据比对」页面和迁移流水线里的数据校验有什么区别？**
+A: 数据校验（validate）是迁移流水线的第 4 阶段，依赖迁移任务上下文；「数据比对」页面是**独立比对**能力——手工填写源端/目标端连接即可对任意两端数据比对，无需创建迁移任务。支持 quick / sample / checksum 三种模式、表级选择、比对历史与差异报告；连接配置可保存/加载复用（密码永不落盘）。同一时刻仅允许一个比对任务运行。API 见「独立数据比对」端点一节。
 
 **Q: 大表迁移如何优化？**
 A: timstool 支持大表分片拆分（见 `docs/large-table-chunking-design.md`），将大表按主键范围拆分为多个分片并行导出，提升迁移效率。

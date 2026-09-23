@@ -182,6 +182,8 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		// Standalone comparison (独立数据比对): run the validator against
 		// explicit connections without migrating; own task namespace.
 		r.Post("/compare/tasks", s.handleCreateCompare)
+		r.Get("/compare/options", s.handleGetCompareOptions)
+		r.Put("/compare/options", s.handlePutCompareOptions)
 		r.Get("/compare/tasks", s.handleListCompares)
 		r.Route("/compare/tasks/{compareID}", func(r chi.Router) {
 			r.Get("/", s.handleGetCompare)

@@ -18,6 +18,113 @@ import (
 
 func compareURL(id string) string { return "/api/v1/compare/tasks/" + id }
 
+func TestCompareOptions_RoundtripAndRedaction(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	// PUT a full profile including passwords; they must be ignored.
+	w, req := doReq("PUT", "/api/v1/compare/options",
+		`{"source_type":"postgres","source":{"host":"pg","port":5433,"user":"u","password":"secret1","database":"d","schema":"public","sslmode":"disable"},
+		  "target":{"host":"tidb","port":4000,"user":"root","password":"secret2","database":"d"},
+		  "mode":"checksum","sample_ratio":0.1,"checksum_chunk_size":20000,"checksum_parallel":4,"parallel":2}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("put status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	// On-disk file must not contain either password.
+	raw, err := os.ReadFile(s.compareOptionsFile())
+	if err != nil {
+		t.Fatalf("compare-options.json missing: %v", err)
+	}
+	if strings.Contains(string(raw), "secret1") || strings.Contains(string(raw), "secret2") {
+		t.Fatalf("password persisted in compare-options.json: %s", raw)
+	}
+
+	// GET returns the saved profile with empty passwords.
+	w, req = doReq("GET", "/api/v1/compare/options", "")
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get status = %d", w.Code)
+	}
+	var opts compareOptionsBody
+	if err := json.Unmarshal(w.Body.Bytes(), &opts); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if opts.Source.Host != "pg" || opts.Source.Port != 5433 || opts.Source.Password != "" {
+		t.Fatalf("bad source roundtrip: %+v", opts.Source)
+	}
+	if opts.Target.Host != "tidb" || opts.Target.Password != "" {
+		t.Fatalf("bad target roundtrip: %+v", opts.Target)
+	}
+	if opts.SourceType != "postgres" || opts.Mode != "checksum" || opts.SampleRatio != 0.1 ||
+		opts.ChecksumChunkSize != 20000 || opts.ChecksumParallel != 4 || opts.Parallel != 2 {
+		t.Fatalf("bad prefs roundtrip: %+v", opts)
+	}
+	if strings.Contains(w.Body.String(), "secret1") || strings.Contains(w.Body.String(), "secret2") {
+		t.Fatalf("password leaked in GET response: %s", w.Body.String())
+	}
+}
+
+func TestCompareOptions_PartialMerge(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	w, req := doReq("PUT", "/api/v1/compare/options",
+		`{"source":{"host":"pg","port":5432},"target":{"host":"tidb","port":4000},"mode":"sample"}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("put1 status = %d", w.Code)
+	}
+
+	// Partial PUT: only source.host present; everything else keeps saved value.
+	w, req = doReq("PUT", "/api/v1/compare/options", `{"source":{"host":"pg2"}}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("put2 status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	opts := s.loadCompareOptions()
+	if opts.Source.Host != "pg2" {
+		t.Fatalf("present field not applied: %+v", opts.Source)
+	}
+	if opts.Source.Port != 5432 || opts.Target.Host != "tidb" || opts.Mode != "sample" {
+		t.Fatalf("absent fields not preserved: %+v", opts)
+	}
+}
+
+func TestCompareOptions_LegacyFileAndValidation(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	// Old/partial file (e.g. only source) loads fine.
+	if err := os.WriteFile(s.compareOptionsFile(), []byte(`{"source":{"host":"old"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts := s.loadCompareOptions()
+	if opts.Source.Host != "old" {
+		t.Fatalf("legacy file not loaded: %+v", opts)
+	}
+
+	// Corrupted file falls back to zero value (next PUT rewrites it).
+	if err := os.WriteFile(s.compareOptionsFile(), []byte(`{not json`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.loadCompareOptions().Source.Host; got != "" {
+		t.Fatalf("corrupted file not ignored: %q", got)
+	}
+
+	// Invalid mode / sample_ratio rejected.
+	cases := []struct{ name, body string }{
+		{"bad mode", `{"mode":"full"}`},
+		{"bad ratio", `{"sample_ratio":1.5}`},
+	}
+	for _, c := range cases {
+		w, req := doReq("PUT", "/api/v1/compare/options", c.body)
+		s.router.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d body=%s", c.name, w.Code, w.Body.String())
+		}
+	}
+}
+
 func TestCompareTask_Validation(t *testing.T) {
 	s, _ := newTestServer(t)
 

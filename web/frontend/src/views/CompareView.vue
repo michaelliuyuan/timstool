@@ -2,7 +2,7 @@
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import apiClient from '../api'
-import type { CompareTask, CompareReport } from '../api'
+import type { CompareTask, CompareReport, CompareOptions } from '../api'
 import ConnectionForm from '../components/ConnectionForm.vue'
 import { useSourceSchema } from '../composables/useSourceSchema'
 import { reconcileModel } from '../composables/reconcileModel'
@@ -131,6 +131,82 @@ function onSourceTypeChange(name: string) {
   Object.assign(form.source, reconciled)
   sourceType.value = name
   sourceTestResult.value = null
+}
+
+// ---- saved connection profile (保存/加载连接) ----
+// optionsLoaded guards against the auto-fill racing user input: the form is
+// read-only until the saved options (if any) are applied on mount.
+const optionsLoaded = ref(false)
+const savingOptions = ref(false)
+const loadingOptions = ref(false)
+
+function applyCompareOptions(opts: CompareOptions) {
+  if (!opts) return
+  if (opts.source_type && getSource(opts.source_type)) {
+    const newMeta = getSource(opts.source_type)!
+    if (sourceType.value !== opts.source_type) {
+      const reconciled = reconcileModel(form.source, getSource(sourceType.value) ?? newMeta, newMeta)
+      Object.keys(form.source).forEach(k => { delete form.source[k] })
+      Object.assign(form.source, reconciled)
+      sourceType.value = opts.source_type
+    }
+    // Non-empty fields only: never wipe form defaults with blanks, and keep
+    // whatever password the user already typed (saved ones are always empty).
+    Object.entries(opts.source || {}).forEach(([k, v]) => {
+      if (k === 'password') return
+      if (v !== '' && v !== null && v !== undefined) (form.source as any)[k] = v
+    })
+  }
+  const tgt = opts.target || {}
+  ;(['host', 'user', 'database'] as const).forEach(k => {
+    if (tgt[k]) form.target[k] = tgt[k]
+  })
+  if (tgt.port) form.target.port = tgt.port
+  if (opts.mode && ['quick', 'sample', 'checksum'].includes(opts.mode)) form.mode = opts.mode
+  const num = (v: number | undefined) => (v !== undefined && v !== null ? v : null)
+  const sr = num(opts.sample_ratio); if (sr !== null) form.sample_ratio = sr
+  const cs = num(opts.checksum_chunk_size); if (cs !== null) form.checksum_chunk_size = cs
+  const cp = num(opts.checksum_parallel); if (cp !== null) form.checksum_parallel = cp
+  const p = num(opts.parallel); if (p !== null) form.parallel = p
+}
+
+async function loadSavedConnection(silent = false) {
+  loadingOptions.value = true
+  try {
+    const { data } = await apiClient.getCompareOptions()
+    applyCompareOptions(data)
+    if (!silent) ElMessage.success('已加载保存的连接配置')
+  } catch (e: any) {
+    if (!silent) ElMessage.error(`加载连接失败: ${e.response?.data?.error || e.message}`)
+  } finally {
+    loadingOptions.value = false
+    optionsLoaded.value = true
+  }
+}
+
+async function saveConnection() {
+  savingOptions.value = true
+  try {
+    // Defense in depth: strip passwords before they travel over the wire
+    // (the server ignores them anyway; proxies/access logs never see them).
+    const { password: _sp, ...source } = form.source as Record<string, any>
+    const { password: _tp, ...target } = form.target
+    await apiClient.saveCompareOptions({
+      source_type: sourceType.value,
+      source,
+      target,
+      mode: form.mode,
+      sample_ratio: form.sample_ratio,
+      checksum_chunk_size: form.checksum_chunk_size,
+      checksum_parallel: form.checksum_parallel,
+      parallel: form.parallel,
+    })
+    ElMessage.success('连接配置已保存（密码不会被保存）')
+  } catch (e: any) {
+    ElMessage.error(`保存连接失败: ${e.response?.data?.error || e.message}`)
+  } finally {
+    savingOptions.value = false
+  }
 }
 
 // ---- run + progress ----
@@ -273,6 +349,9 @@ onMounted(async () => {
   await loadSources()
   const meta = getSource(sourceType.value)
   if (meta) Object.assign(form.source, reconcileModel({}, meta, meta))
+  // Auto-fill the last saved connection (password stays empty); the form is
+  // disabled until this completes so the fill can't race user input.
+  await loadSavedConnection(true)
   await refreshTasks()
   connectWS()
   pollTimer = window.setInterval(() => {
@@ -297,7 +376,12 @@ onUnmounted(() => {
         </div>
       </template>
 
-      <el-form label-width="120px">
+      <el-form label-width="120px" :disabled="!optionsLoaded" v-loading="!optionsLoaded">
+        <el-form-item label="连接配置">
+          <el-button :loading="savingOptions" @click="saveConnection">保存连接</el-button>
+          <el-button :loading="loadingOptions" @click="loadSavedConnection()">加载连接</el-button>
+          <span style="color: #909399; font-size: 12px; margin-left: 8px;">密码不会被保存，下次需重新输入</span>
+        </el-form-item>
         <el-row :gutter="24">
           <el-col :span="12">
             <el-divider content-position="left">源数据库（PostgreSQL）</el-divider>
