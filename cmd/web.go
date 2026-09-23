@@ -66,6 +66,7 @@ Default URL: http://localhost:8080`,
 		cdcSup := webapi.NewCDCSupervisor(cfg.CDC, bin, cfgFile, statusFile, zap.L())
 		srv := webapi.NewServer(s, webHost, webPort, dataDir, StaticFS, cdcSup, statusFile, time.Duration(cdcStaleSec)*time.Second)
 		srv.SetCDCStatusProvider(webapi.NewFileCDCStatusProvider(statusFile, time.Duration(cdcStaleSec)*time.Second))
+		srv.SetCDCConfigFile(cfgFile)
 		fmt.Fprintf(os.Stderr, "timstool web UI: http://%s:%d\n", webHost, webPort)
 		return srv.Start()
 	},

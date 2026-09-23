@@ -54,6 +54,13 @@ type Server struct {
 	// supervise / restart / stop / adopt. nil when CDC control is not wired.
 	cdcSupervisor *CDCSupervisor
 
+	// cdcCfgFilePath is the config.yaml the CDC child loads (-c). Wired by
+	// cmd/web; falls back to the supervisor's copy (A1 connection card).
+	cdcCfgFilePath string
+
+	// cdcProbe overrides the live DB prober for /cdc/precheck (tests).
+	cdcProbe cdcDBProber
+
 	// running tasks
 	runningTasks map[string]context.CancelFunc
 
@@ -188,6 +195,13 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		r.Get("/cdc/checkpoint", s.handleCDCCheckpoint)
 		r.Post("/cdc/start", s.handleCDCStart)
 		r.Post("/cdc/stop", s.handleCDCStop)
+		// CDC connection config + precheck + resume inspection (A1/A2/A3)
+		r.Get("/cdc/config", s.handleGetCDCConfig)
+		r.Put("/cdc/config", s.handlePutCDCConfig)
+		r.Post("/cdc/config/import", s.handleImportCDCConfig)
+		r.Get("/cdc/precheck", s.handleCDCPrecheck)
+		r.Get("/cdc/slot", s.handleCDCSlot)
+		r.Post("/cdc/checkpoint/reset", s.handleCDCResetCheckpoint)
 	})
 
 	if staticFS != (embed.FS{}) {
