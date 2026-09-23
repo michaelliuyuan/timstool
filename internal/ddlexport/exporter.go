@@ -107,6 +107,14 @@ ORDER BY schema_name`)
 
 func qi(ident string) string { return fmt.Sprintf(`"%s"`, strings.ReplaceAll(ident, `"`, `""`)) }
 
+// terminated appends the statement-terminating semicolon that
+// pg_get_functiondef / pg_get_triggerdef output lacks (unlike
+// pg_get_viewdef). Without it, multi-object files concatenate two
+// CREATE statements into one broken statement.
+func terminated(ddl string) string {
+	return strings.TrimRight(ddl, " \t\r\n") + ";\n"
+}
+
 // ValidateSchemaName rejects schema names that could escape the export
 // package layout (zip-slip / path traversal): separators, dot segments.
 // Callers (CLI and webapi) must run it before building an Exporter.
@@ -291,7 +299,7 @@ ORDER BY p.proname`, []interface{}{schemaName}, func(row *sql.Rows) (string, err
 			if !def.Valid || def.String == "" {
 				return "", nil
 			}
-			return def.String + ";\n", nil
+			return terminated(def.String), nil
 		})
 		if err != nil {
 			return nil, err
@@ -313,7 +321,7 @@ ORDER BY p.proname`, []interface{}{schemaName}, func(row *sql.Rows) (string, err
 			if !def.Valid || def.String == "" {
 				return "", nil
 			}
-			return def.String + ";\n", nil
+			return terminated(def.String), nil
 		})
 		if err != nil {
 			return nil, err
@@ -337,7 +345,7 @@ ORDER BY t.tgname`, []interface{}{schemaName}, func(row *sql.Rows) (string, erro
 			if !def.Valid || def.String == "" {
 				return "", nil
 			}
-			return def.String + ";\n", nil
+			return terminated(def.String), nil
 		})
 		if err != nil {
 			return nil, err

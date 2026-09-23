@@ -53,6 +53,21 @@ func TestQiEscapesDoubleQuotes(t *testing.T) {
 	}
 }
 
+// TestTerminatedStatements guards B-F01-4: every function / procedure /
+// trigger DDL written to a multi-object file must end with a semicolon
+// (pg_get_functiondef / pg_get_triggerdef output lacks one).
+func TestTerminatedStatements(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql", "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;\n"},
+		{"CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()\n\n", "CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();\n"},
+		{"CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN END $$  \t", "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN END $$;\n"},
+	} {
+		if got := terminated(c.in); got != c.want {
+			t.Errorf("terminated(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 // TestCatalogQueryAnchors pins every catalog query in exporter.go to the
 // PostgreSQL 16 documented column/view names (regression guard for the
 // pg_sequences.schemaid / minimum_value class of bugs).
