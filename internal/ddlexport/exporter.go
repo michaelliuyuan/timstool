@@ -589,7 +589,7 @@ func ParsePGArray(s string) []string {
 	return out
 }
 
-func readmeFile(schemas []string) string {
+func readmeFile(schema string) string {
 	var b strings.Builder
 	b.WriteString("# DDL Export\n\n")
 	b.WriteString("Recommended apply order per schema (native PG DDL):\n")
@@ -600,8 +600,27 @@ func readmeFile(schemas []string) string {
 	b.WriteString("- Sequences are exported before tables so serial DEFAULT nextval(...) references resolve.\n")
 	b.WriteString("- tidb-tables.sql (if present) is a TiDB-converted reference script, not native PG DDL.\n")
 	b.WriteString("- manifest.json lists exported object counts and any skipped objects (e.g. permission denied).\n\n")
-	b.WriteString("Schemas: " + strings.Join(schemas, ", ") + "\n")
+	b.WriteString("Schema: " + schema + "\n")
 	return b.String()
+}
+
+// manifestFor builds the self-contained per-schema manifest (counts and
+// skipped entries of that schema only), so each schema folder in the
+// export package stands on its own.
+func (e *Exporter) manifestFor(schema string) Manifest {
+	m := Manifest{GeneratedAt: e.manifest.GeneratedAt, Counts: ObjectCounts{}}
+	if c, ok := e.manifest.Counts[schema]; ok {
+		m.Counts[schema] = c
+		for _, n := range c {
+			m.Total += n
+		}
+	}
+	for _, sk := range e.manifest.Skipped {
+		if sk.Schema == schema {
+			m.Skipped = append(m.Skipped, sk)
+		}
+	}
+	return m
 }
 
 // allFiles renders every file for every selected schema, in deterministic order.
@@ -618,12 +637,15 @@ func (e *Exporter) allFiles(ctx context.Context) ([]string, map[string]string, e
 			files[key] = content
 			names = append(names, key)
 		}
+		// Per-schema self-containment: README + manifest live inside the
+		// schema folder (zip and --out directory layouts stay identical).
+		files[s+"/README.txt"] = readmeFile(s)
+		files[s+"/manifest.json"] = marshalManifest(e.manifestFor(s))
+		names = append(names, s+"/README.txt", s+"/manifest.json")
 		if e.manifest.Total > e.opts.MaxObjects {
 			return nil, nil, fmt.Errorf("object count %d exceeds limit %d", e.manifest.Total, e.opts.MaxObjects)
 		}
 	}
-	files["README.txt"] = readmeFile(e.opts.Schemas)
-	names = append(names, "README.txt", "manifest.json")
 	sort.Strings(names)
 	return names, files, nil
 }
@@ -634,7 +656,6 @@ func (e *Exporter) ExportZip(ctx context.Context, w io.Writer) (Manifest, error)
 	if err != nil {
 		return e.manifest, err
 	}
-	files["manifest.json"] = marshalManifest(e.manifest)
 	zw := zip.NewWriter(w)
 	for _, name := range names {
 		fw, err := zw.Create(name)
@@ -657,7 +678,6 @@ func (e *Exporter) ExportDir(ctx context.Context, dir string) (Manifest, error) 
 	if err != nil {
 		return e.manifest, err
 	}
-	files["manifest.json"] = marshalManifest(e.manifest)
 	for _, name := range names {
 		full := filepath.Join(dir, filepath.FromSlash(name))
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
