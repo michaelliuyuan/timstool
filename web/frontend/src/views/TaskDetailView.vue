@@ -283,7 +283,7 @@ function logLevelClass(level: string): string {
 </script>
 
 <template>
-  <div v-loading="loading" style="max-width: 1000px; margin: 0 auto;">
+  <div v-loading="loading" class="tims-page">
     <el-page-header @back="router.push('/tasks')" style="margin-bottom: 20px;">
       <template #content>
         <span>{{ task?.name || '任务详情' }}</span>
