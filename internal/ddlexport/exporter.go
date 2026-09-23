@@ -211,8 +211,8 @@ ORDER BY c.relname`, []interface{}{schemaName}, func(row *sql.Rows) (string, err
 	if t.Sequences {
 		ddl, n, err := e.renderRows(ctx, "sequences", `
 SELECT s.sequencename, s.data_type, s.start_value, s.minimum_value, s.maximum_value, s.increment, s.cycle, s.cache_size
-FROM pg_sequences s JOIN pg_namespace n ON n.oid = s.schemaid
-WHERE n.nspname = $1
+FROM pg_sequences s
+WHERE s.schemaname = $1
 ORDER BY s.sequencename`, []interface{}{schemaName}, func(row *sql.Rows) (string, error) {
 			var name, dataType sql.NullString
 			var start, min, max, inc, cache sql.NullString
