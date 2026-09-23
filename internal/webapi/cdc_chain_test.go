@@ -325,7 +325,7 @@ func TestCDCChain_ValidateErrDemotionInRunMigration(t *testing.T) {
 	}
 }
 
-	// chainCheckpointPathForTest resolves the CDC config's checkpoint file path.
+// chainCheckpointPathForTest resolves the CDC config's checkpoint file path.
 func chainCheckpointPathForTest(s *Server) string {
 	cfg, err := func() (*config.Config, error) {
 		cdcCfgMu.Lock()
