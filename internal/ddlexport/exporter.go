@@ -291,7 +291,7 @@ ORDER BY p.proname`, []interface{}{schemaName}, func(row *sql.Rows) (string, err
 			if !def.Valid || def.String == "" {
 				return "", nil
 			}
-			return def.String + "\n", nil
+			return def.String + ";\n", nil
 		})
 		if err != nil {
 			return nil, err
@@ -313,7 +313,7 @@ ORDER BY p.proname`, []interface{}{schemaName}, func(row *sql.Rows) (string, err
 			if !def.Valid || def.String == "" {
 				return "", nil
 			}
-			return def.String + "\n", nil
+			return def.String + ";\n", nil
 		})
 		if err != nil {
 			return nil, err
@@ -337,7 +337,7 @@ ORDER BY t.tgname`, []interface{}{schemaName}, func(row *sql.Rows) (string, erro
 			if !def.Valid || def.String == "" {
 				return "", nil
 			}
-			return def.String + "\n", nil
+			return def.String + ";\n", nil
 		})
 		if err != nil {
 			return nil, err
