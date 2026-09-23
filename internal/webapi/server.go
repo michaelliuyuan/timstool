@@ -1153,7 +1153,23 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 			break
 		}
 	}
-	if allSuccess {
+	// Chained-mode validation demotion (P1 deviation B): during a chained
+	// migration the source keeps taking writes, so the post-full row-count
+	// validation compares against a moving snapshot and reports false diffs.
+	// When CDCChain is on and ONLY the validate phase failed, demote it: the
+	// task completes, the failure is logged as WARN, and the CDC replay from
+	// the pre-created slot converges the window data. Any other failing phase
+	// keeps the hard failed semantics.
+	onlyValidateFailed := onlyValidateFailed(results, cfg.Migration.CDCChain)
+	if allSuccess || onlyValidateFailed {
+		if onlyValidateFailed {
+			s.logCollector.Append(taskID, "WARN",
+				"校验未通过（全量期间源端持续写入导致的预期差异）：已按「全量+增量衔接」降级为告警，差异将由 CDC 从预建点位重放收敛；增量稳定后可用「数据比对」核验", "")
+			s.BroadcastProgress(taskID, map[string]interface{}{
+				"phase":   "validate_demoted",
+				"message": "校验差异由 CDC 重放收敛（chained 模式降级为告警）",
+			})
+		}
 		s.logCollector.Append(taskID, "INFO", "Migration completed successfully", "")
 		s.store.UpdateTaskStatus(taskID, store.TaskStatusCompleted)
 		// 全量+增量衔接 (P1): auto-start CDC from the pre-created slot. The

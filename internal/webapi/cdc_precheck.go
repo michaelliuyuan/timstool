@@ -137,7 +137,8 @@ func (realCDCProber) NoPKTables(cfg *config.Config) ([]string, error) {
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1 AND c.relkind = 'r'
 		  AND c.relname NOT LIKE 'pg2tidb_%'
-		  AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary)`,
+		  AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary)
+		  AND c.relreplident NOT IN ('f', 'i')`,
 		schema)
 	if err != nil {
 		return nil, err
@@ -149,8 +150,12 @@ func (realCDCProber) NoPKTables(cfg *config.Config) ([]string, error) {
 		if err := rows.Scan(&name, &ident); err != nil {
 			return nil, err
 		}
-		if ident != "f" {
-			out = append(out, fmt.Sprintf("%s.%s (REPLICA IDENTITY %s)", schema, name, ident))
+		// Only tables that can neither locate old rows via PK nor via replica
+		// identity remain (ident 'd' default / 'n' none): UPDATE/DELETE cannot
+		// sync for them. FULL ('f') and INDEX ('i') tables are fine and stay
+		// off this list.
+		if ident == "n" {
+			out = append(out, fmt.Sprintf("%s.%s (无主键且无 REPLICA IDENTITY)", schema, name))
 		} else {
 			out = append(out, fmt.Sprintf("%s.%s (无主键)", schema, name))
 		}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/michaelliuyuan/timstool/internal/cdc"
 	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/orchestrator"
 	"go.uber.org/zap"
 )
 
@@ -190,6 +191,32 @@ func TestCDCChain_SeedCheckpointEdgeCases(t *testing.T) {
 	cfg.Migration.ChainStartLSN = "not-a-lsn"
 	if err := s.seedChainCheckpoint("t", cfg); err == nil {
 		t.Fatal("bad lsn must error")
+	}
+}
+
+func TestCDCChain_OnlyValidateFailedDemotion(t *testing.T) {
+	mk := func(phase orchestrator.Phase, ok bool) orchestrator.PipelineResult {
+		return orchestrator.PipelineResult{Phase: phase, Success: ok}
+	}
+	allOK := []orchestrator.PipelineResult{mk("schema", true), mk("data", true), mk(orchestrator.PhaseValidate, true)}
+	valFail := []orchestrator.PipelineResult{mk("schema", true), mk("data", true), mk(orchestrator.PhaseValidate, false)}
+	dataFail := []orchestrator.PipelineResult{mk("schema", true), mk("data", false), mk(orchestrator.PhaseValidate, false)}
+	bothFail := []orchestrator.PipelineResult{mk("schema", true), mk("data", false), mk(orchestrator.PhaseValidate, true)}
+
+	if onlyValidateFailed(allOK, true) {
+		t.Fatal("all-success must not demote (nothing to demote)")
+	}
+	if !onlyValidateFailed(valFail, true) {
+		t.Fatal("validate-only failure with chain must demote")
+	}
+	if onlyValidateFailed(dataFail, true) {
+		t.Fatal("data failure must never demote")
+	}
+	if onlyValidateFailed(bothFail, true) {
+		t.Fatal("non-validate failure blocks demotion")
+	}
+	if onlyValidateFailed(valFail, false) {
+		t.Fatal("no chain → no demotion")
 	}
 }
 

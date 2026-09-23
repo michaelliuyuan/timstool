@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/michaelliuyuan/timstool/internal/cdc"
 	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/orchestrator"
 )
 
 // CDC chain (P1 task 1): "全量+增量衔接". When a migration task opts in via
@@ -215,6 +216,24 @@ func chainConflictStrategy(cfg *config.Config) string {
 		return cfg.CDC.ConflictStrategy
 	}
 	return "replace"
+}
+
+// onlyValidateFailed reports whether every failing pipeline result is the
+// validate phase and chaining is enabled — the demotion precondition.
+func onlyValidateFailed(results []orchestrator.PipelineResult, chain bool) bool {
+	if !chain {
+		return false
+	}
+	anyFailed := false
+	for _, r := range results {
+		if !r.Success {
+			anyFailed = true
+			if r.Phase != orchestrator.PhaseValidate {
+				return false
+			}
+		}
+	}
+	return anyFailed
 }
 
 // validateIdentName defends the sprintf'd DDL: publication/slot names come
