@@ -489,14 +489,18 @@ func (s *Server) handleCDCResetCheckpoint(w http.ResponseWriter, r *http.Request
 		s.writeError(w, http.StatusNotFound, "checkpoint 文件不存在")
 		return
 	}
-	if err := os.Remove(path); err != nil {
+	// Rename instead of delete: the reset stays reversible (`.bak.<ts>`), the
+	// operator can restore it manually if the reset was a mistake.
+	bak := fmt.Sprintf("%s.bak.%d", path, time.Now().Unix())
+	if err := os.Rename(path, bak); err != nil {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok": true,
-		"message": "checkpoint 已删除。slot 未动：下次启动仍从 slot restart_lsn 重放；" +
+		"message": "checkpoint 已重置（备份为 " + bak + "，可手动恢复）。slot 未动：下次启动仍从 slot restart_lsn 重放；" +
 			"如需彻底重来请手动删除 slot（SELECT pg_drop_replication_slot('" + cfgSlot(cfg) + "')）",
+		"backup": bak,
 	})
 }
 

@@ -107,22 +107,110 @@ func (s *Server) loadCDCConfig() (*config.Config, error) {
 	return config.Load(f)
 }
 
-// writeCDCConfig persists cfg back to config.yaml atomically (structured
-// yaml round-trip; comments are not preserved).
+// writeCDCConfig persists cfg back to config.yaml atomically. The write is a
+// structured yaml round-trip that PRESERVES comments and untouched sections:
+// only the source/target mapping values are edited in place on the parsed
+// document node, so operator comments elsewhere in the file survive saves.
 func (s *Server) writeCDCConfig(cfg *config.Config) error {
 	f := s.cdcCfgFile()
 	if f == "" {
 		return fmt.Errorf("config file not wired on this server")
 	}
-	raw, err := yaml.Marshal(cfg)
+	raw, err := os.ReadFile(f)
+	if err != nil {
+		// Missing file: fall back to a plain marshal of the full config.
+		out, merr := yaml.Marshal(cfg)
+		if merr != nil {
+			return merr
+		}
+		return os.WriteFile(f, out, 0o600)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("parse config.yaml: %w", err)
+	}
+	root := &doc
+	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		root = root.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return fmt.Errorf("config.yaml is not a yaml mapping")
+	}
+	srcMap := mappingValue(root, "source")
+	tgtMap := mappingValue(root, "target")
+	if srcMap == nil || tgtMap == nil {
+		return fmt.Errorf("config.yaml missing source/target section")
+	}
+	setMapFields(srcMap, map[string]interface{}{
+		"type": cfg.Source.Type, "host": cfg.Source.Host, "port": cfg.Source.Port,
+		"user": cfg.Source.User, "password": cfg.Source.Password,
+		"database": cfg.Source.Database, "schema": cfg.Source.Schema,
+		"sslmode": cfg.Source.SSLMode,
+	})
+	setMapFields(tgtMap, map[string]interface{}{
+		"host": cfg.Target.Host, "port": cfg.Target.Port, "user": cfg.Target.User,
+		"password": cfg.Target.Password, "database": cfg.Target.Database,
+	})
+	out, err := yaml.Marshal(&doc)
 	if err != nil {
 		return err
 	}
 	tmp := f + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, f)
+}
+
+// mappingValue returns the mapping node stored under key in a yaml mapping
+// (nil when absent or not a mapping).
+func mappingValue(m *yaml.Node, key string) *yaml.Node {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key && m.Content[i+1].Kind == yaml.MappingNode {
+			return m.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// setMapFields updates/creates scalar fields on a yaml mapping node in place,
+// preserving neighbors, order, and comments. Numeric values are tagged !!int
+// so ports stay ints in the emitted document.
+func setMapFields(m *yaml.Node, fields map[string]interface{}) {
+	for k, v := range fields {
+		var tag string
+		var val string
+		switch n := v.(type) {
+		case int:
+			tag = "!!int"
+			val = fmt.Sprintf("%d", n)
+		default:
+			val = fmt.Sprintf("%v", v)
+		}
+		replaced := false
+		for i := 0; i+1 < len(m.Content); i += 2 {
+			if m.Content[i].Value == k {
+				node := m.Content[i+1]
+				node.Value = val
+				if tag != "" {
+					node.Tag = tag
+				} else {
+					node.Tag = ""
+				}
+				node.Style = 0
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: k}
+			valNode := &yaml.Node{Kind: yaml.ScalarNode, Value: val}
+			if tag != "" {
+				valNode.Tag = tag
+			}
+			m.Content = append(m.Content, keyNode, valNode)
+		}
+	}
 }
 
 func (s *Server) handleGetCDCConfig(w http.ResponseWriter, r *http.Request) {

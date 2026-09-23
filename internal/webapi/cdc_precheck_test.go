@@ -297,7 +297,8 @@ func TestCDCResetCheckpoint(t *testing.T) {
 		t.Fatalf("unconfirmed reset = %d", w.Code)
 	}
 
-	// Confirmed → file gone, guidance mentions the slot.
+	// Confirmed → renamed to a .bak.<ts> backup (reversible reset), guidance
+	// mentions the slot.
 	w, req = doReq("POST", "/api/v1/cdc/checkpoint/reset", `{"confirm":"DELETE"}`)
 	s.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -305,6 +306,16 @@ func TestCDCResetCheckpoint(t *testing.T) {
 	}
 	if _, err := os.Stat(cpPath); !os.IsNotExist(err) {
 		t.Fatalf("checkpoint file still present")
+	}
+	var rr struct {
+		Backup string `json:"backup"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &rr)
+	if rr.Backup == "" {
+		t.Fatalf("backup path missing: %s", w.Body.String())
+	}
+	if _, err := os.Stat(rr.Backup); err != nil {
+		t.Fatalf("backup file missing: %s (%v)", rr.Backup, err)
 	}
 	if !strings.Contains(w.Body.String(), "pg_drop_replication_slot") {
 		t.Fatalf("slot guidance missing: %s", w.Body.String())
@@ -316,6 +327,85 @@ func TestCDCResetCheckpoint(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("second reset = %d", w.Code)
 	}
+}
+
+func TestCDCConfig_WritePreservesComments(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+
+	// Rewrite the temp config with comments + extra keys to prove the save
+	// preserves them.
+	cfgFile := s.cdcCfgFile()
+	doc := `# timstool config
+source:           # source database
+  host: pghost
+  port: 5433
+  user: postgres
+  password: pgsecret
+  database: db
+  schema: public
+target:
+  host: tidbhost
+  port: 4000
+  user: root
+  password: tidbsecret
+  database: db
+migration:
+  parallel: 4   # keep me
+cdc:
+  enable: true
+  slot_name: pg2tidb_cdc
+`
+	if err := os.WriteFile(cfgFile, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, req := doReq("PUT", "/api/v1/cdc/config", `{"source":{"host":"newpg","port":5434}}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("put status = %d body=%s", w.Code, w.Body.String())
+	}
+	raw, _ := os.ReadFile(cfgFile)
+	out := string(raw)
+	for _, want := range []string{"# timstool config", "# keep me", "slot_name: pg2tidb_cdc", "host: newpg", "port: 5434", "pgsecret"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("save lost %q:\n%s", want, out)
+		}
+	}
+	// Numbers must survive the round-trip as ints.
+	cfg, err := config.Load(cfgFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Source.Port != 5434 || cfg.Migration.Parallel != 4 || !cfg.CDC.Enable {
+		t.Fatalf("round-trip corrupted values: %+v", cfg)
+	}
+}
+
+func TestCDCPrecheck_NumericLSNCheckpoint(t *testing.T) {
+	// Checkpoint files persist LSN as a JSON number (pglogrepl.LSN = uint64):
+	// the reader must accept that encoding.
+	s, _, cfgFile := newCDCServer(t)
+	cfg, _ := config.Load(cfgFile)
+	if err := os.WriteFile(cfg.CDC.CheckpointFile,
+		[]byte(`{"lsn":73014444032,"timestamp":"2026-09-23T10:00:00Z","slot_name":"pg2tidb_cdc"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info := loadCheckpointInfo(cfg)
+	if !info.Exists {
+		t.Fatalf("numeric-LSN checkpoint not recognized")
+	}
+	if info.LSN == "" {
+		t.Fatalf("LSN empty")
+	}
+	// And surfaced through precheck's conclusion (resume from checkpoint).
+	p := &fakeProber{version: "16", walLevel: "logical", replRole: true}
+	s.cdcProbe = p
+	w, req := doReq("GET", "/api/v1/cdc/precheck", "")
+	s.router.ServeHTTP(w, req)
+	if !strings.Contains(w.Body.String(), "将从 checkpoint 恢复") {
+		t.Fatalf("resume conclusion missing: %s", w.Body.String())
+	}
+	_ = cfgFile
 }
 
 func TestCDCSlot_Live(t *testing.T) {
