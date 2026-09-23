@@ -179,6 +179,7 @@ func (e *Exporter) schemaFiles(ctx context.Context, schemaName string) (map[stri
 				return nil, err
 			}
 			var b strings.Builder
+			written := 0
 			for _, tbl := range tables {
 				ddl, err := e.tableDDL(ctx, schemaName, tbl.name, tbl.comment)
 				if err != nil {
@@ -186,6 +187,7 @@ func (e *Exporter) schemaFiles(ctx context.Context, schemaName string) (map[stri
 					continue
 				}
 				b.WriteString(ddl)
+				written++
 			}
 			// Foreign keys are appended after every table exists, so circular
 			// references between tables cannot break a fresh rebuild.
@@ -210,7 +212,9 @@ ORDER BY rt.relname, con.conname`, []interface{}{schemaName}, func(row *sql.Rows
 				b.WriteString(fkDDL)
 			}
 			files["tables.sql"] = b.String()
-			e.countN(schemaName, "tables.sql", len(tables))
+			// Count tables actually written (skipped tables are listed in the
+			// manifest's skipped section, not silently inflated here).
+			e.countN(schemaName, "tables.sql", written)
 			e.countN(schemaName, "foreign keys", fkN)
 		}
 	}
@@ -475,10 +479,12 @@ ORDER BY a.attnum`, schemaName, table)
 	}
 
 	cons, err := e.db.QueryContext(ctx, `
-SELECT contype, conname, pg_get_constraintdef(oid)
-FROM pg_constraint
-WHERE conrelid = format('%I.%I', $1, $2)::regclass AND contype IN ('p','u')
-ORDER BY contype, conname`, schemaName, table)
+SELECT con.contype, con.conname, pg_get_constraintdef(con.oid)
+FROM pg_constraint con
+JOIN pg_class c ON c.oid = con.conrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = $1 AND c.relname = $2 AND con.contype IN ('p','u')
+ORDER BY con.contype, con.conname`, schemaName, table)
 	if err != nil {
 		return "", fmt.Errorf("constraints of %s: %w", table, err)
 	}
