@@ -85,7 +85,7 @@ func TestSequencesQueryAnchors(t *testing.T) {
 // (B-F01-2): counts and skipped entries of other schemas must not leak in.
 func TestManifestForPerSchema(t *testing.T) {
 	e := &Exporter{manifest: Manifest{
-		Counts:  ObjectCounts{"public": {"tables.sql": 3}, "sales": {"views.sql": 1}},
+		Counts: ObjectCounts{"public": {"tables.sql": 3}, "sales": {"views.sql": 1}},
 		Skipped: []SkippedObject{
 			{Schema: "public", Type: "table", Object: "t1", Reason: "denied"},
 			{Schema: "sales", Type: "view", Object: "v1", Reason: "denied"},
