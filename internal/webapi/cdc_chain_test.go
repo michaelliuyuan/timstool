@@ -297,9 +297,35 @@ func TestCDCChain_ValidateErrDemotionInRunMigration(t *testing.T) {
 	if task2.Error == "" {
 		t.Fatal("task error must be recorded for data failure")
 	}
+
+	// Case 3: non-chained validate-only failure with err — must stay failed.
+	{
+		body3 := `{"name":"chain-demote3","source":{"host":"pg","port":5432,"user":"u","password":"p","database":"d"},
+			"target":{"host":"t","port":4000,"user":"u","password":"p","database":"d"}}`
+		w3, req3 := doReq("POST", "/api/v1/tasks", body3)
+		s.router.ServeHTTP(w3, req3)
+		if w3.Code != http.StatusCreated {
+			t.Fatalf("create3 status = %d", w3.Code)
+		}
+		taskID3 := ExtractTaskID(t, w3.Body.String())
+		runPipeline = func(ctx context.Context, cfg config.Config, pc orchestrator.PipelineConfig) ([]orchestrator.PipelineResult, error) {
+			rs := []orchestrator.PipelineResult{
+				{Phase: "data", Success: true},
+				{Phase: orchestrator.PhaseValidate, Success: false},
+			}
+			return rs, fmt.Errorf("data validation failed: 1/2 tables failed")
+		}
+		cfg3 := mkCfg()
+		cfg3.Migration.CDCChain = false
+		s.runMigration(context.Background(), taskID3, cfg3)
+		task3 := GetTaskForTest(t, s, taskID3)
+		if task3.Status != "failed" {
+			t.Fatalf("non-chained validate failure must stay failed, got %q", task3.Status)
+		}
+	}
 }
 
-// chainCheckpointPathForTest resolves the CDC config's checkpoint file path.
+	// chainCheckpointPathForTest resolves the CDC config's checkpoint file path.
 func chainCheckpointPathForTest(s *Server) string {
 	cfg, err := func() (*config.Config, error) {
 		cdcCfgMu.Lock()
