@@ -433,7 +433,7 @@ function prevStep() {
         <div style="display: flex; align-items: center; justify-content: space-between;">
           <div style="display: flex; align-items: center;">
             <el-icon size="24" style="margin-right: 8px;"><Connection /></el-icon>
-            <span style="font-size: 18px; font-weight: bold;">新建迁移任务</span>
+            <span style="font-size: 15px; font-weight: 600;">连接与迁移配置</span>
           </div>
           <el-space>
             <el-button size="small" @click="loadConnDialogVisible = true">

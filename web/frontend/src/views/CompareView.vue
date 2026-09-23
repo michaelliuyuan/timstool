@@ -376,13 +376,12 @@ onUnmounted(() => {
 
 <template>
   <div class="tims-page">
-    <PageHeader title="数据比对" subtitle="独立配置源/目标连接，不依赖迁移任务" />
+    <PageHeader title="数据比对" subtitle="配置源/目标连接后手工比对，不执行迁移" />
     <el-card shadow="never" style="margin-bottom: 20px;">
       <template #header>
         <div style="display: flex; align-items: center; gap: 8px;">
           <el-icon size="24"><Grid /></el-icon>
-          <span style="font-size: 18px; font-weight: bold;">独立数据比对</span>
-          <span style="color: #909399; font-size: 13px; margin-left: 8px;">配置源/目标连接后手工比对，不执行迁移</span>
+          <span style="font-size: 15px; font-weight: 600;">连接配置</span>
         </div>
       </template>
 
