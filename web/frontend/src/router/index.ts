@@ -38,6 +38,11 @@ const router = createRouter({
       component: () => import('../views/AssessView.vue'),
     },
     {
+      path: '/ddl-export',
+      name: 'DDLExport',
+      component: () => import('../views/DDLExportView.vue'),
+    },
+    {
       path: '/cdc',
       name: 'CDC',
       component: () => import('../views/CDCView.vue'),

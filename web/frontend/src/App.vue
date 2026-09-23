@@ -46,6 +46,7 @@ const navItems = computed(() => {
     { path: '/history', label: '迁移历史', icon: 'Clock' },
     { path: '/compare', label: '数据比对', icon: 'Grid' },
     { path: '/assess', label: '兼容评估', icon: 'DataAnalysis' },
+    { path: '/ddl-export', label: 'DDL 导出', icon: 'Download' },
   ]
   if (cdcEnabled.value) items.push({ path: '/cdc', label: 'CDC 增量', icon: 'DataLine' })
   return items

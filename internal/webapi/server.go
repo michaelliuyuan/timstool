@@ -187,6 +187,9 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		})
 		r.Get("/ws", s.handleWebSocket)
 		r.Post("/assess", s.handleAssess)
+		// Source DDL export (F-01): schema listing + zip download
+		r.Post("/ddl-export/schemas", s.handleDDLSchemas)
+		r.Post("/ddl-export", s.handleDDLExport)
 		// Standalone comparison (独立数据比对): run the validator against
 		// explicit connections without migrating; own task namespace.
 		r.Post("/compare/tasks", s.handleCreateCompare)
