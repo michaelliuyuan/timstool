@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/michaelliuyuan/timstool/internal/cdc"
@@ -185,12 +184,20 @@ func (s *Server) seedChainCheckpoint(taskID string, cfg *config.Config) error {
 	if path == "" {
 		path = ".cdc_checkpoint.json"
 	}
-	if _, statErr := os.Stat(path); statErr == nil {
-		s.logCollector.Append(taskID, "WARN",
-			"CDC chain: checkpoint 文件已存在，保留现有断点不覆盖（现有点位优先）", "")
-		return nil
-	}
 	mgr := cdc.NewCheckpointManager(path)
+	if existing, lErr := mgr.Load(); lErr == nil && existing != nil {
+		if existing.LSN >= lsn {
+			// Already at or past the chain point (a prior CDC run advanced
+			// beyond it): keep the newer position, never rewind.
+			s.logCollector.Append(taskID, "WARN",
+				fmt.Sprintf("CDC chain: 现有 checkpoint LSN=%s ≥ 链点位 %s，沿用现有断点不倒退", existing.LSN.String(), lsn.String()), "")
+			return nil
+		}
+		s.logCollector.Append(taskID, "INFO",
+			fmt.Sprintf("CDC chain: 现有 checkpoint LSN=%s 落后于链点位 %s，预置为链点位（覆盖旧值）", existing.LSN.String(), lsn.String()), "")
+	} else if lErr != nil {
+		return fmt.Errorf("读取现有 checkpoint: %w", lErr)
+	}
 	mgr.SetSlotName(chainSlotName(cfg))
 	mgr.Update(lsn)
 	return mgr.Save()

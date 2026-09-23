@@ -141,7 +141,7 @@ func TestCDCChain_SeedCheckpoint(t *testing.T) {
 		t.Fatalf("lsn = %s", cp.LSN.String())
 	}
 
-	// Existing checkpoint wins: content unchanged after a re-seed attempt.
+	// Existing checkpoint at/past the chain point wins: content unchanged.
 	cfg.Migration.ChainStartLSN = "0/AAAAAAAA"
 	if err := s.seedChainCheckpoint("taskX", cfg); err != nil {
 		t.Fatalf("re-seed: %v", err)
@@ -149,6 +149,28 @@ func TestCDCChain_SeedCheckpoint(t *testing.T) {
 	cp2, _ := cdc.NewCheckpointManager(chainCheckpointPathForTest(s)).Load()
 	if cp2.LSN.String() != "0/3D0000A0" {
 		t.Fatalf("existing checkpoint clobbered: %s", cp2.LSN.String())
+	}
+}
+
+func TestCDCChain_SeedAdvancesStaleCheckpoint(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	// A stale checkpoint BEHIND the chain point must be advanced to the chain
+	// point (never replay from an unnecessarily early position).
+	mgr := cdc.NewCheckpointManager(chainCheckpointPathForTest(s))
+	mgr.SetSlotName("pg2tidb_cdc")
+	mgr.Update(1) // tiny old LSN
+	if err := mgr.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{}
+	cfg.Migration.ChainStartLSN = "0/3D0000A0"
+	if err := s.seedChainCheckpoint("taskX", cfg); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	cp, _ := cdc.NewCheckpointManager(chainCheckpointPathForTest(s)).Load()
+	if cp.LSN.String() != "0/3D0000A0" {
+		t.Fatalf("stale checkpoint not advanced: %s", cp.LSN.String())
 	}
 }
 
