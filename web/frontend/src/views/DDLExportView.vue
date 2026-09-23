@@ -6,7 +6,16 @@ import PageHeader from '../components/PageHeader.vue'
 const STORAGE_KEY = 'pg2tidb-ddlexport-source'
 
 const savedSource = localStorage.getItem(STORAGE_KEY)
-const sourceForm = ref(savedSource ? JSON.parse(savedSource) : {
+let parsedSource: Record<string, unknown> | null = null
+if (savedSource) {
+  try {
+    parsedSource = JSON.parse(savedSource)
+  } catch {
+    parsedSource = null
+    localStorage.removeItem(STORAGE_KEY)
+  }
+}
+const sourceForm = ref(parsedSource ?? {
   host: '',
   port: 5432,
   user: 'postgres',

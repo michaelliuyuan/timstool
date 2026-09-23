@@ -26,11 +26,12 @@ var ddlExportCmd = &cobra.Command{
 	Short: "Export source PostgreSQL DDL per schema into .sql files",
 	Long: `Export native PostgreSQL DDL for the configured source database.
 
-Each selected schema becomes a folder under --out containing one .sql file
-per object type: tables.sql, indexes.sql, views.sql, sequences.sql,
-functions.sql, procedures.sql, triggers.sql, types.sql. With --tidb an
-additional tidb-tables.sql (TiDB-converted CREATE TABLE reference) is
-written. A manifest.json with object counts and a README.txt are included.
+Each selected schema becomes a self-contained folder under --out containing
+one .sql file per object type: tables.sql, indexes.sql, views.sql,
+sequences.sql, functions.sql, procedures.sql, triggers.sql, types.sql.
+Every schema folder also carries its own README.txt and manifest.json
+(object counts, skipped objects). With --tidb an additional
+tidb-tables.sql (TiDB-converted CREATE TABLE reference) is written.
 
 Examples:
   timstool export-ddl --config config.yaml --out ./ddl
@@ -71,6 +72,9 @@ Examples:
 		if ddlExportSchemas != "" {
 			for _, s := range strings.Split(ddlExportSchemas, ",") {
 				if s = strings.TrimSpace(s); s != "" {
+					if err := ddlexport.ValidateSchemaName(s); err != nil {
+						return err
+					}
 					schemas = append(schemas, s)
 				}
 			}
@@ -121,7 +125,7 @@ func parseDDLTypes(spec string) (ddlexport.TypeSet, error) {
 
 func init() {
 	ddlExportCmd.Flags().StringVarP(&ddlExportOut, "out", "o", "", "Output directory (required)")
-	ddlExportCmd.Flags().StringVar(&ddlExportSchemas, "schemas", "", "Comma-separated schema list (default: source schema from config)")
+	ddlExportCmd.Flags().StringVar(&ddlExportSchemas, "schemas", "", "Comma-separated schema list (default: public)")
 	ddlExportCmd.Flags().StringVar(&ddlExportTypes, "types", "", "Comma-separated object types (default: all)")
 	ddlExportCmd.Flags().BoolVar(&ddlExportTiDB, "tidb", false, "Also export a TiDB-converted tables.sql reference")
 	rootCmd.AddCommand(ddlExportCmd)

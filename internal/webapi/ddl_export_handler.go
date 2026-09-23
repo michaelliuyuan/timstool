@@ -1,6 +1,7 @@
 package webapi
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -108,6 +109,12 @@ func (s *Server) handleDDLExport(w http.ResponseWriter, r *http.Request) {
 	if req.Types != nil {
 		ts = applyTypeSelection(ts, req.Types)
 	}
+	for _, sc := range req.Schemas {
+		if err := ddlexport.ValidateSchemaName(sc); err != nil {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
@@ -118,12 +125,19 @@ func (s *Server) handleDDLExport(w http.ResponseWriter, r *http.Request) {
 		IncludeTiDB: req.TiDB,
 	})
 
-	// The catalog walk happens inside ExportZip; errors after the first byte
-	// surface as a truncated download, which is acceptable at this scale.
+	// Buffer the whole archive first: the catalog walk happens inside
+	// ExportZip and may fail, and a failure after the first byte would
+	// otherwise surface as a truncated (unopenable) zip that looks like a
+	// successful download. Only send headers once the export succeeded.
+	var buf bytes.Buffer
+	if _, err := exporter.ExportZip(ctx, &buf); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "export ddl failed: "+err.Error())
+		return
+	}
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition",
 		fmt.Sprintf("attachment; filename=ddl-export-%s.zip", time.Now().Format("20060102-150405")))
-	_, _ = exporter.ExportZip(ctx, w)
+	w.Write(buf.Bytes())
 }
 
 func applyTypeSelection(ts ddlexport.TypeSet, sel *ddlExportTypes) ddlexport.TypeSet {
