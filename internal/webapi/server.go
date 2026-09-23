@@ -1465,6 +1465,17 @@ func (s *Server) buildTaskReport(task *store.Task) *reporter.Report {
 	if task.ConfigJSON != "" {
 		json.Unmarshal([]byte(task.ConfigJSON), &cfg)
 	}
+	report.TaskID = task.ID
+	report.Source = fmt.Sprintf("%s:%d/%s", cfg.Source.Host, cfg.Source.Port, cfg.Source.Database)
+	report.Target = fmt.Sprintf("%s:%d/%s", cfg.Target.Host, cfg.Target.Port, cfg.Target.Database)
+	switch {
+	case cfg.Migration.CDCChain:
+		report.Mode = "全量+增量衔接（CDC chain）"
+	case cfg.Migration.UseLightning:
+		report.Mode = "Lightning 离线导入"
+	default:
+		report.Mode = "在线迁移"
+	}
 	cpDir := cfg.Migration.CheckpointDir
 	if cpDir == "" {
 		cpDir = fmt.Sprintf(".checkpoint/%s", task.ID)
