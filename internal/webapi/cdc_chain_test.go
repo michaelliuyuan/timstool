@@ -1,6 +1,7 @@
 package webapi
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -217,6 +218,84 @@ func TestCDCChain_OnlyValidateFailedDemotion(t *testing.T) {
 	}
 	if onlyValidateFailed(valFail, false) {
 		t.Fatal("no chain → no demotion")
+	}
+}
+
+// Regression (P1 deviation B BLOCKER): when the orchestrator aborts on a
+// validate-phase failure it returns that failure as err — runMigration must
+// still reach the chained demotion branch instead of failing fast.
+func TestCDCChain_ValidateErrDemotionInRunMigration(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	body := `{"name":"chain-demote","source":{"host":"pg","port":5432,"user":"u","password":"p","database":"d"},
+		"target":{"host":"t","port":4000,"user":"u","password":"p","database":"d"},
+		"opts":{"cdc_chain":true}}`
+	w, req := doReq("POST", "/api/v1/tasks", body)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", w.Code, w.Body.String())
+	}
+	taskID := ExtractTaskID(t, w.Body.String())
+
+	orig := runPipeline
+	defer func() { runPipeline = orig }()
+
+	mkCfg := func() config.Config {
+		cfg := config.Config{}
+		cfg.Migration.CDCChain = true
+		cfg.Migration.ChainStartLSN = "0/1"
+		cfg.Migration.CheckpointDir = t.TempDir()
+		return cfg
+	}
+
+	// Case 1: pipeline aborts on validate-only failure (err non-nil).
+	runPipeline = func(ctx context.Context, cfg config.Config, pc orchestrator.PipelineConfig) ([]orchestrator.PipelineResult, error) {
+		rs := []orchestrator.PipelineResult{
+			{Phase: "schema", Success: true},
+			{Phase: "data", Success: true},
+			{Phase: orchestrator.PhaseValidate, Success: false},
+		}
+		return rs, fmt.Errorf("data validation failed: 1/2 tables failed")
+	}
+	s.runMigration(context.Background(), taskID, mkCfg())
+	task := GetTaskForTest(t, s, taskID)
+	if task.Status != "completed" {
+		t.Fatalf("validate-only failure must demote to completed, got %q (err=%q)", task.Status, task.Error)
+	}
+	var logText string
+	for _, e := range s.logCollector.GetBuffer(taskID).GetAll() {
+		logText += e.Message + "\n"
+	}
+	if !strings.Contains(logText, "降级为告警") || !strings.Contains(logText, "data validation failed") {
+		t.Fatalf("demotion WARN missing or lacks err detail: %s", logText)
+	}
+
+	// Case 2: pipeline aborts on a data-phase failure — must stay failed.
+	taskID2 := taskID
+	{
+		body2 := `{"name":"chain-demote2","source":{"host":"pg","port":5432,"user":"u","password":"p","database":"d"},
+			"target":{"host":"t","port":4000,"user":"u","password":"p","database":"d"},
+			"opts":{"cdc_chain":true}}`
+		w2, req2 := doReq("POST", "/api/v1/tasks", body2)
+		s.router.ServeHTTP(w2, req2)
+		if w2.Code != http.StatusCreated {
+			t.Fatalf("create2 status = %d", w2.Code)
+		}
+		taskID2 = ExtractTaskID(t, w2.Body.String())
+	}
+	runPipeline = func(ctx context.Context, cfg config.Config, pc orchestrator.PipelineConfig) ([]orchestrator.PipelineResult, error) {
+		rs := []orchestrator.PipelineResult{
+			{Phase: "schema", Success: true},
+			{Phase: "data", Success: false},
+		}
+		return rs, fmt.Errorf("data migration failed: boom")
+	}
+	s.runMigration(context.Background(), taskID2, mkCfg())
+	task2 := GetTaskForTest(t, s, taskID2)
+	if task2.Status != "failed" {
+		t.Fatalf("data failure must stay failed, got %q", task2.Status)
+	}
+	if task2.Error == "" {
+		t.Fatal("task error must be recorded for data failure")
 	}
 }
 

@@ -1065,6 +1065,13 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "started", "task_id": taskID})
 }
 
+// runPipeline is the orchestrator seam: tests swap it to drive runMigration
+// without touching real databases.
+var runPipeline = func(ctx context.Context, cfg config.Config, pipeCfg orchestrator.PipelineConfig) ([]orchestrator.PipelineResult, error) {
+	o := orchestrator.NewOrchestrator(cfg)
+	return o.Run(ctx, pipeCfg)
+}
+
 func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Config) {
 	logCore := NewTaskLogCore(s.logCollector, taskID, nil)
 	s.logCores[taskID] = logCore
@@ -1084,15 +1091,13 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 	defer progressCancel()
 	go s.pollProgress(progressCtx, taskID, cfg.Migration.CheckpointDir)
 
-	o := orchestrator.NewOrchestrator(cfg)
 	pipeCfg := orchestrator.PipelineConfig{
 		SkipPrecheck: cfg.Migration.SkipPrecheck,
 		SkipSchema:   cfg.Migration.SkipSchema,
 		SkipData:     cfg.Migration.SkipData,
 		SkipValidate: cfg.Migration.SkipValidate,
 	}
-
-	results, err := o.Run(ctx, pipeCfg)
+	results, err := runPipeline(ctx, cfg, pipeCfg)
 
 	progressCancel()
 
@@ -1102,7 +1107,12 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 		return
 	}
 
-	if err != nil {
+	// Chained-mode validation demotion (P1 deviation B): when the orchestrator
+	// aborts on a validate-phase failure it returns that failure as err AND
+	// records it in results. Re-check onlyValidateFailed here so a chained
+	// task with validate-only failures still reaches the demotion branch
+	// below instead of failing fast at SetTaskError.
+	if err != nil && !onlyValidateFailed(results, cfg.Migration.CDCChain) {
 		s.logCollector.Append(taskID, "ERROR", "Migration failed: "+err.Error(), "")
 		s.store.SetTaskError(taskID, err.Error())
 		return
@@ -1164,7 +1174,7 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 	if allSuccess || onlyValidateFailed {
 		if onlyValidateFailed {
 			s.logCollector.Append(taskID, "WARN",
-				"校验未通过（全量期间源端持续写入导致的预期差异）：已按「全量+增量衔接」降级为告警，差异将由 CDC 从预建点位重放收敛；增量稳定后可用「数据比对」核验", "")
+				fmt.Sprintf("校验未通过（%v；全量期间源端持续写入导致的预期差异）：已按「全量+增量衔接」降级为告警，差异将由 CDC 从预建点位重放收敛；增量稳定后可用「数据比对」核验", err), "")
 			s.BroadcastProgress(taskID, map[string]interface{}{
 				"phase":   "validate_demoted",
 				"message": "校验差异由 CDC 重放收敛（chained 模式降级为告警）",
