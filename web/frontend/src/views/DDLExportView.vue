@@ -27,6 +27,36 @@ const sourceForm = ref({
   database: ''
 })
 
+const testingSource = ref(false)
+const sourceTestResult = ref<{ success: boolean; message: string; version?: string } | null>(null)
+
+// 测试连接（S1-UI-04）：ref 模式服务端解析（/test-connection source_ref），
+// 手动模式走 {source, fields}，与向导/比对页体验一致。
+async function testSourceConn() {
+  testingSource.value = true
+  sourceTestResult.value = null
+  try {
+    const body = sourceRef.value
+      ? { source_ref: sourceRef.value }
+      : { source: 'postgres', fields: { ...sourceForm.value } }
+    const resp = await fetch('/api/v1/test-connection', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+    const data = await resp.json()
+    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+    sourceTestResult.value = data
+    if (data.success) ElMessage.success('连接成功')
+    else ElMessage.error(`连接失败: ${data.message}`)
+  } catch (e: any) {
+    sourceTestResult.value = { success: false, message: e.message }
+    ElMessage.error(`连接测试失败: ${e.message}`)
+  } finally {
+    testingSource.value = false
+  }
+}
+
 const schemas = ref<string[]>([])
 const selectedSchemas = ref<string[]>([])
 const schemasLoading = ref(false)
@@ -129,32 +159,52 @@ async function exportDDL() {
       <template #header>
         <span style="font-weight: 600;">数据源</span>
       </template>
-      <el-form :model="sourceForm" label-width="80px" size="default" inline>
+      <el-form :model="sourceForm" label-width="120px" size="default">
+        <el-form-item label="数据源">
+          <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
+        </el-form-item>
         <template v-if="!sourceRef">
-        <el-form-item label="主机">
-          <el-input v-model="sourceForm.host" placeholder="PG 主机地址" style="width: 160px;" />
-        </el-form-item>
-        <el-form-item label="端口">
-          <el-input-number v-model="sourceForm.port" :min="1" :max="65535" style="width: 120px;" />
-        </el-form-item>
-        <el-form-item label="用户">
-          <el-input v-model="sourceForm.user" style="width: 120px;" />
-        </el-form-item>
-        <el-form-item label="密码">
-          <el-input v-model="sourceForm.password" type="password" show-password style="width: 140px;" />
-        </el-form-item>
-        <el-form-item label="数据库">
-          <el-input v-model="sourceForm.database" placeholder="数据库名" style="width: 140px;" />
-        </el-form-item>
+          <el-divider content-position="left">源数据库（PostgreSQL）</el-divider>
+          <el-row :gutter="24">
+            <el-col :span="12">
+              <el-form-item label="主机">
+                <el-input v-model="sourceForm.host" placeholder="PG 主机地址" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="端口">
+                <el-input-number v-model="sourceForm.port" :min="1" :max="65535" controls-position="right" style="width: 100%;" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="用户">
+                <el-input v-model="sourceForm.user" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="密码">
+                <el-input v-model="sourceForm.password" type="password" show-password />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="数据库">
+                <el-input v-model="sourceForm.database" placeholder="数据库名" />
+              </el-form-item>
+            </el-col>
+          </el-row>
         </template>
-        <el-form-item label="数据源" v-else>
-          <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
-        </el-form-item>
-        <el-form-item v-if="!sourceRef" label=" ">
-          <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
-        </el-form-item>
         <el-form-item>
-          <el-button type="primary" @click="loadSchemas" :loading="schemasLoading">
+          <el-button @click="testSourceConn" :loading="testingSource" :disabled="!sourceRef && !sourceForm.host">
+            测试连接
+          </el-button>
+          <el-tag
+            v-if="sourceTestResult"
+            :type="sourceTestResult.success ? 'success' : 'danger'"
+            style="margin-left: 12px;"
+          >
+            {{ sourceTestResult.success ? (sourceTestResult.version ? `连接成功（${sourceTestResult.version}）` : '连接成功') : sourceTestResult.message }}
+          </el-tag>
+          <el-button type="primary" style="margin-left: 12px;" @click="loadSchemas" :loading="schemasLoading">
             {{ schemasLoading ? '连接中...' : '获取 Schema' }}
           </el-button>
         </el-form-item>
@@ -163,17 +213,25 @@ async function exportDDL() {
 
     <el-card shadow="never" style="margin-bottom: 20px;" v-if="schemas.length > 0">
       <template #header><span style="font-weight: 600;">导出范围</span></template>
-      <el-form label-width="80px">
-        <el-form-item label="Schema">
-          <el-checkbox-group v-model="selectedSchemas">
-            <el-checkbox v-for="s in schemas" :key="s" :value="s">{{ s }}</el-checkbox>
-          </el-checkbox-group>
-        </el-form-item>
-        <el-form-item label="对象类型">
-          <el-checkbox-group v-model="selectedTypes">
-            <el-checkbox v-for="t in typeOptions" :key="t.key" :value="t.key">{{ t.label }}</el-checkbox>
-          </el-checkbox-group>
-        </el-form-item>
+      <el-form label-width="120px">
+        <el-row :gutter="24" style="margin-bottom: 8px;">
+          <el-col :span="8">
+            <div class="pick-panel">
+              <div class="pick-panel-title">Schema</div>
+              <el-checkbox-group v-model="selectedSchemas">
+                <el-checkbox v-for="s in schemas" :key="s" :value="s">{{ s }}</el-checkbox>
+              </el-checkbox-group>
+            </div>
+          </el-col>
+          <el-col :span="16">
+            <div class="pick-panel">
+              <div class="pick-panel-title">对象类型</div>
+              <el-checkbox-group v-model="selectedTypes">
+                <el-checkbox v-for="t in typeOptions" :key="t.key" :value="t.key">{{ t.label }}</el-checkbox>
+              </el-checkbox-group>
+            </div>
+          </el-col>
+        </el-row>
         <el-form-item label="TiDB 版">
           <el-switch v-model="includeTiDB" />
           <span style="margin-left: 12px; font-size: 13px; color: var(--tims-text-2);">
@@ -200,3 +258,21 @@ async function exportDDL() {
     </el-card>
   </div>
 </template>
+
+<style scoped>
+.pick-panel {
+  border: 1px solid var(--el-border-color-light, #ebeef5);
+  border-radius: 8px;
+  padding: 12px 16px;
+  min-height: 100px;
+}
+.pick-panel-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--tims-text-1, #303133);
+  margin-bottom: 8px;
+}
+.pick-panel :deep(.el-checkbox) {
+  margin-right: 16px;
+}
+</style>

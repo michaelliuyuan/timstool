@@ -63,6 +63,36 @@ const sourceForm = ref({
   schema: 'public'
 })
 
+const testingSource = ref(false)
+const sourceTestResult = ref<{ success: boolean; message: string; version?: string } | null>(null)
+
+// 测试连接（S1-UI-04）：ref 模式服务端解析（/test-connection source_ref），
+// 手动模式走 {source, fields}，与向导/比对页体验一致。
+async function testSourceConn() {
+  testingSource.value = true
+  sourceTestResult.value = null
+  try {
+    const body = sourceRef.value
+      ? { source_ref: sourceRef.value }
+      : { source: 'postgres', fields: { ...sourceForm.value } }
+    const resp = await fetch('/api/v1/test-connection', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+    const data = await resp.json()
+    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+    sourceTestResult.value = data
+    if (data.success) ElMessage.success('连接成功')
+    else ElMessage.error(`连接失败: ${data.message}`)
+  } catch (e: any) {
+    sourceTestResult.value = { success: false, message: e.message }
+    ElMessage.error(`连接测试失败: ${e.message}`)
+  } finally {
+    testingSource.value = false
+  }
+}
+
 const levelEmoji: Record<string, string> = {
   compatible: '●',
   convertible: '▲',
@@ -209,35 +239,57 @@ function copyDDL() {
       <template #header>
         <span style="font-weight: 600;">数据源配置</span>
       </template>
-      <el-form :model="sourceForm" label-width="80px" size="default" inline>
+      <el-form :model="sourceForm" label-width="120px" size="default">
+        <el-form-item label="数据源">
+          <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
+        </el-form-item>
         <template v-if="!sourceRef">
-        <el-form-item label="主机">
-          <el-input v-model="sourceForm.host" placeholder="PG 主机地址" style="width: 160px;" />
-        </el-form-item>
-        <el-form-item label="端口">
-          <el-input-number v-model="sourceForm.port" :min="1" :max="65535" style="width: 120px;" />
-        </el-form-item>
-        <el-form-item label="用户">
-          <el-input v-model="sourceForm.user" style="width: 120px;" />
-        </el-form-item>
-        <el-form-item label="密码">
-          <el-input v-model="sourceForm.password" type="password" show-password style="width: 140px;" />
-        </el-form-item>
-        <el-form-item label="数据库">
-          <el-input v-model="sourceForm.database" placeholder="数据库名" style="width: 140px;" />
-        </el-form-item>
-        <el-form-item label="Schema">
-          <el-input v-model="sourceForm.schema" style="width: 100px;" />
-        </el-form-item>
+          <el-divider content-position="left">源数据库（PostgreSQL）</el-divider>
+          <el-row :gutter="24">
+            <el-col :span="12">
+              <el-form-item label="主机">
+                <el-input v-model="sourceForm.host" placeholder="PG 主机地址" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="端口">
+                <el-input-number v-model="sourceForm.port" :min="1" :max="65535" controls-position="right" style="width: 100%;" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="用户">
+                <el-input v-model="sourceForm.user" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="密码">
+                <el-input v-model="sourceForm.password" type="password" show-password />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="数据库">
+                <el-input v-model="sourceForm.database" placeholder="数据库名" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="Schema">
+                <el-input v-model="sourceForm.schema" />
+              </el-form-item>
+            </el-col>
+          </el-row>
         </template>
-        <el-form-item v-else label="数据源" style="min-width: 360px;">
-          <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
-        </el-form-item>
-        <el-form-item v-if="!sourceRef">
-          <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
-        </el-form-item>
         <el-form-item>
-          <el-button type="primary" @click="runAssess" :loading="loading">
+          <el-button @click="testSourceConn" :loading="testingSource" :disabled="!sourceRef && !sourceForm.host">
+            测试连接
+          </el-button>
+          <el-tag
+            v-if="sourceTestResult"
+            :type="sourceTestResult.success ? 'success' : 'danger'"
+            style="margin-left: 12px;"
+          >
+            {{ sourceTestResult.success ? (sourceTestResult.version ? `连接成功（${sourceTestResult.version}）` : '连接成功') : sourceTestResult.message }}
+          </el-tag>
+          <el-button type="primary" style="margin-left: 12px;" @click="runAssess" :loading="loading">
             {{ loading ? '评估中...' : '开始评估' }}
           </el-button>
         </el-form-item>
