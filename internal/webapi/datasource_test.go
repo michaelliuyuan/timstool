@@ -445,17 +445,90 @@ func TestDatasources_TiDBPDAndStatusPort(t *testing.T) {
 	}
 
 	// ④ Validation: out-of-range / non-numeric status_port and malformed
-	// pd_addr are rejected with 400.
+	// pd_addr are rejected with 400 — including the loose SplitHostPort
+	// corner cases (empty port, fractional port, trailing garbage on a
+	// numeric field).
 	for _, body := range []string{
 		`{"name": "bad1", "type": "tidb", "fields": {"host": "h", "port": 4000, "status_port": 70000}}`,
 		`{"name": "bad2", "type": "tidb", "fields": {"host": "h", "port": 4000, "status_port": "abc"}}`,
 		`{"name": "bad3", "type": "tidb", "fields": {"host": "h", "port": 4000, "pd_addr": "no-port-here"}}`,
+		`{"name": "bad4", "type": "tidb", "fields": {"host": "h", "port": 4000, "pd_addr": "host:"}}`,
+		`{"name": "bad5", "type": "tidb", "fields": {"host": "h", "port": 4000, "pd_addr": "host:10080.5"}}`,
+		`{"name": "bad6", "type": "tidb", "fields": {"host": "h", "port": 4000, "pd_addr": "host:0"}}`,
+		`{"name": "bad7", "type": "tidb", "fields": {"host": "h", "port": 4000, "pd_addr": "host:70000"}}`,
+		`{"name": "bad8", "type": "tidb", "fields": {"host": "h", "port": "80x"}}`,
 	} {
 		w, req = doReq("POST", "/api/v1/datasources", body)
 		s.handleCreateDataSource(w, req)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("invalid body accepted: %d %s (%s)", w.Code, w.Body.String(), body)
 		}
+	}
+
+	// ⑤ Scheme/slash-bearing pd_addr values are accepted and stored
+	// normalized to bare host:port (wizard parity).
+	for _, in := range []string{"host:2379/", "http://host:2379"} {
+		w, req = doReq("POST", "/api/v1/datasources",
+			fmt.Sprintf(`{"name": "norm-%d", "type": "tidb", "fields": {"host": "h", "port": 4000, "pd_addr": %q}}`, len(in), in))
+		s.handleCreateDataSource(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("pd_addr %q rejected: %d %s", in, w.Code, w.Body.String())
+		}
+		norm := dsBody(t, w)
+		if got := norm["fields"].(map[string]any)["pd_addr"]; got != "host:2379" {
+			t.Fatalf("pd_addr %q stored as %v, want host:2379", in, got)
+		}
+		e, err := s.resolveDataSourceRef(norm["id"].(string))
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if tc := dataSourceToTargetConfig(e); tc.PDAddr != "host:2379" {
+			t.Fatalf("snapshot pd_addr = %q, want host:2379", tc.PDAddr)
+		}
+	}
+
+	// ⑥ PUT round trip: create with extras → keep (absent keys on a full
+	// replace) → clear (explicit empty drops the keys, snapshot zeroes).
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "rt", "type": "tidb",
+		"fields": {"host": "h", "port": 4000, "pd_addr": "h:2379", "status_port": 10080}
+	}`)
+	s.handleCreateDataSource(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create rt: %d %s", w.Code, w.Body.String())
+	}
+	rtID := dsBody(t, w)["id"].(string)
+
+	// password write-only rule means "keep stored"; other keys replace.
+	w, req = doReq("PUT", "/api/v1/datasources/"+rtID, `{
+		"name": "rt", "type": "tidb",
+		"fields": {"host": "h", "port": 4000, "pd_addr": "h:2380", "status_port": 10081}
+	}`)
+	req = withChiParam(req, "id", rtID)
+	s.handleUpdateDataSource(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update rt: %d %s", w.Code, w.Body.String())
+	}
+	f := dsBody(t, w)["fields"].(map[string]any)
+	if f["pd_addr"] != "h:2380" || f["status_port"] != "10081" {
+		t.Fatalf("update did not persist extras: %v", f)
+	}
+
+	w, req = doReq("PUT", "/api/v1/datasources/"+rtID, `{
+		"name": "rt", "type": "tidb",
+		"fields": {"host": "h", "port": 4000, "pd_addr": "", "status_port": ""}
+	}`)
+	req = withChiParam(req, "id", rtID)
+	s.handleUpdateDataSource(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("clear rt: %d %s", w.Code, w.Body.String())
+	}
+	e, err = s.resolveDataSourceRef(rtID)
+	if err != nil {
+		t.Fatalf("resolve rt: %v", err)
+	}
+	if tc := dataSourceToTargetConfig(e); tc.PDAddr != "" || tc.StatusPort != 0 {
+		t.Fatalf("cleared extras must snapshot to zero: %+v", tc)
 	}
 }
 

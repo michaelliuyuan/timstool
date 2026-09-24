@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -174,6 +175,13 @@ type dsRequestBody struct {
 	Fields map[string]any `json:"fields"`
 }
 
+// dsParsePort strictly parses a whole string as an integer port. Unlike
+// fmt.Sscanf("%d") it rejects trailing garbage ("80x" fails instead of
+// silently meaning 80).
+func dsParsePort(s string) (int, error) {
+	return strconv.Atoi(strings.TrimSpace(s))
+}
+
 func validateDataSourceBody(name, dsType string, fields map[string]any) error {
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("name is required")
@@ -186,20 +194,24 @@ func validateDataSourceBody(name, dsType string, fields map[string]any) error {
 		return fmt.Errorf("host is required")
 	}
 	if p := stringField(fields, "port"); p != "" {
-		var port int
-		if _, err := fmt.Sscanf(p, "%d", &port); err != nil || port < 1 || port > 65535 {
+		port, err := dsParsePort(p)
+		if err != nil || port < 1 || port > 65535 {
 			return fmt.Errorf("port must be 1-65535")
 		}
 	}
 	if sp := stringField(fields, "status_port"); sp != "" {
-		var sport int
-		if _, err := fmt.Sscanf(sp, "%d", &sport); err != nil || sport < 0 || sport > 65535 {
+		sport, err := dsParsePort(sp)
+		if err != nil || sport < 0 || sport > 65535 {
 			return fmt.Errorf("status_port must be an integer in 0-65535")
 		}
 	}
-	if pd := stringField(fields, "pd_addr"); pd != "" {
-		if _, _, err := net.SplitHostPort(pd); err != nil {
+	if pd := normalizePDAddr(stringField(fields, "pd_addr")); pd != "" {
+		_, ps, err := net.SplitHostPort(pd)
+		if err != nil {
 			return fmt.Errorf("pd_addr must be in host:port form (e.g. host:2379)")
+		}
+		if n, err := dsParsePort(ps); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("pd_addr port must be an integer in 1-65535")
 		}
 	}
 	_ = defPort
@@ -334,6 +346,17 @@ func normalizeDSFields(fields, old map[string]any) map[string]any {
 		if v == nil {
 			continue
 		}
+		if k == "pd_addr" {
+			// Stored normalized (scheme/slash stripped, trimmed) so view
+			// echo, re-edit and every consumer see one canonical form; a
+			// normalized-empty value drops the key entirely.
+			if s, ok := v.(string); ok {
+				if n := normalizePDAddr(s); n != "" {
+					out[k] = n
+				}
+			}
+			continue
+		}
 		if k == "password" {
 			if s, ok := v.(string); ok {
 				out[k] = s
@@ -412,13 +435,14 @@ func (s *Server) handleTestDataSource(w http.ResponseWriter, r *http.Request) {
 	if entry.Type == "tidb" {
 		port := 4000
 		if p := stringField(fields, "port"); p != "" {
-			fmt.Sscanf(p, "%d", &port)
+			if n, err := dsParsePort(p); err == nil {
+				port = n
+			}
 		}
 		statusPort := 0
 		if sp := stringField(fields, "status_port"); sp != "" {
-			var sport int
-			if _, err := fmt.Sscanf(sp, "%d", &sport); err == nil && sport > 0 {
-				statusPort = sport
+			if n, err := dsParsePort(sp); err == nil && n > 0 {
+				statusPort = n
 			}
 		}
 		req := &TestConnectionRequest{
@@ -488,7 +512,9 @@ func dsDefaultPort(dsType string) int {
 func dataSourceToSourceConfig(e *dataSourceEntry) (sc config.SourceConfig) {
 	port := dsDefaultPort(e.Type)
 	if p := stringField(e.Fields, "port"); p != "" {
-		fmt.Sscanf(p, "%d", &port)
+		if n, err := dsParsePort(p); err == nil {
+			port = n
+		}
 	}
 	schema := stringField(e.Fields, "schema")
 	if schema == "" {
@@ -514,7 +540,9 @@ func dataSourceToSourceConfig(e *dataSourceEntry) (sc config.SourceConfig) {
 func dataSourceToTargetConfig(e *dataSourceEntry) (tc config.TargetConfig) {
 	port := 4000
 	if p := stringField(e.Fields, "port"); p != "" {
-		fmt.Sscanf(p, "%d", &port)
+		if n, err := dsParsePort(p); err == nil {
+			port = n
+		}
 	}
 	tc.Host = stringField(e.Fields, "host")
 	tc.Port = port
@@ -523,9 +551,8 @@ func dataSourceToTargetConfig(e *dataSourceEntry) (tc config.TargetConfig) {
 	tc.Database = stringField(e.Fields, "database")
 	tc.PDAddr = strings.TrimSpace(stringField(e.Fields, "pd_addr"))
 	if sp := stringField(e.Fields, "status_port"); sp != "" {
-		var sport int
-		if _, err := fmt.Sscanf(sp, "%d", &sport); err == nil && sport > 0 {
-			tc.StatusPort = sport
+		if n, err := dsParsePort(sp); err == nil && n > 0 {
+			tc.StatusPort = n
 		}
 	}
 	return tc
