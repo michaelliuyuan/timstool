@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/michaelliuyuan/timstool/internal/common/version"
 	"github.com/michaelliuyuan/timstool/internal/schema"
 	"github.com/michaelliuyuan/timstool/internal/source"
 
@@ -95,7 +96,8 @@ func (s *Source) Version(ctx context.Context) (string, error) {
 	if err := s.db.QueryRowContext(ctx, "SELECT version()").Scan(&v); err != nil {
 		return "", err
 	}
-	return v, nil
+	// S1-UI-07: compact form for the UI — the raw string carries build details.
+	return version.ShortPostgreSQL(v), nil
 }
 
 // Config exposes the source config for the readers.

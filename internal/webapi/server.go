@@ -26,6 +26,7 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/common/logger"
 	"github.com/michaelliuyuan/timstool/internal/common/reporter"
+	"github.com/michaelliuyuan/timstool/internal/common/version"
 	"github.com/michaelliuyuan/timstool/internal/lightning"
 	"github.com/michaelliuyuan/timstool/internal/orchestrator"
 	"github.com/michaelliuyuan/timstool/internal/store"
@@ -424,10 +425,11 @@ func (s *Server) testPGConnection(ctx context.Context, req *TestConnectionReques
 	}
 	defer pgConn.Close()
 
-	var version string
-	pgConn.QueryRowContext(ctx, "SELECT version()").Scan(&version)
+	var versionRaw string
+	pgConn.QueryRowContext(ctx, "SELECT version()").Scan(&versionRaw)
 	result["ok"] = true
-	result["version"] = version
+	// S1-UI-07: compact form for the UI — the raw string carries build details.
+	result["version"] = version.ShortPostgreSQL(versionRaw)
 	return result
 }
 
@@ -462,10 +464,9 @@ func (s *Server) testTiDBConnection(ctx context.Context, req *TestConnectionRequ
 	}
 	defer mysqlConn.Close()
 
-	var version string
-	mysqlConn.QueryRowContext(ctx, "SELECT tidb_version()").Scan(&version)
+	var versionRaw string
+	mysqlConn.QueryRowContext(ctx, "SELECT tidb_version()").Scan(&versionRaw)
 	result["mysql_ok"] = true
-
 	// PD / Status probes: only when the user provided the values — providing
 	// them signals Lightning import, so a wrong value must fail the test HERE
 	// (at config time) instead of surfacing at import time as
@@ -506,7 +507,8 @@ func (s *Server) testTiDBConnection(ctx context.Context, req *TestConnectionRequ
 	if len(reasons) > 0 {
 		result["error"] = strings.Join(reasons, "；")
 	}
-	result["version"] = version
+	// S1-UI-07: compact form for the UI — tidb_version() is a 15+ line blob.
+	result["version"] = version.ShortTiDB(versionRaw)
 	return result
 }
 
