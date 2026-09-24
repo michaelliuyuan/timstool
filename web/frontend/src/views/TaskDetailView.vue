@@ -366,12 +366,11 @@ function logLevelClass(level: string): string {
                   </el-tag>
                 </div>
                 <div v-if="phase.table_count > 0 && phase.name === 'data'" style="margin-top: 8px; color: #606266; font-size: 13px;">
-                  表: {{ phase.tables_done }}/{{ phase.table_count }} · 行: {{ phase.rows_done.toLocaleString() }}/{{ phase.rows_total.toLocaleString() }}
-                  <el-progress :percentage="phase.rows_total > 0 ? Math.round(phase.rows_done / phase.rows_total * 100) : 0" :stroke-width="6" style="margin-top: 4px;" />
+                  <template v-if="phase.sub_label === '数据导入'">数据导入 · 已导入表: {{ phase.tables_done }}/{{ phase.table_count }}</template>
+                  <template v-else>表: {{ phase.tables_done }}/{{ phase.table_count }} · 行: {{ phase.rows_done.toLocaleString() }}/{{ phase.rows_total.toLocaleString() }}</template>
                 </div>
                 <div v-else-if="phase.table_count > 0 && phase.name === 'schema'" style="margin-top: 8px; color: #606266; font-size: 13px;">
                   表: {{ phase.tables_done }}/{{ phase.table_count }}
-                  <el-progress :percentage="phase.table_count > 0 ? Math.round(phase.tables_done / phase.table_count * 100) : 0" :stroke-width="6" style="margin-top: 4px;" />
                 </div>
                 <div v-if="phaseLogs[phase.name]?.length" style="margin-top: 8px;">
                   <el-tag size="small" type="info" style="cursor: pointer;" @click="logPhaseFilter = phase.name; logDrawerVisible = true">
