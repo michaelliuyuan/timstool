@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/michaelliuyuan/timstool/internal/common/checkpoint"
 	"github.com/michaelliuyuan/timstool/internal/store"
 )
 
@@ -194,4 +195,93 @@ func TestTestTiDBConnection_MySQLFail(t *testing.T) {
 	if res["error"] == "" {
 		t.Errorf("error message missing")
 	}
+}
+
+// TestTaskPhases_ImportedTablesNotTablesDone anchors the S1-UI-05 v2 contract:
+// during the Lightning data-import phase, tables_done stays at its (misleading)
+// export-time value while the phases endpoint additionally reports the real
+// imported-table counter (same source as the top progress bar), so the overview
+// can never disagree with the bar again.
+func TestTaskPhases_ImportedTablesNotTablesDone(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "ph-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "ph-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/tasks", fmt.Sprintf(`{"name": "ph", "source_ref": %q, "target_ref": %q, "opts": {}}`, srcID, tgtID))
+	s.handleCreateTask(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create task: %d %s", w.Code, w.Body.String())
+	}
+	taskID := dsBody(t, w)["id"].(string)
+
+	// handleTaskPhases reads .checkpoint/<taskID> relative to the process
+	// cwd — run from a temp dir and build a checkpoint that mimics the
+	// mid-Lightning state: 3 tables, all export-completed (so tables_done
+	// would saturate at 3/3), but only 2 actually imported.
+	t.Chdir(t.TempDir())
+	cpMgr, err := checkpoint.NewManager(filepath.Join(".checkpoint", taskID))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	for _, tbl := range []string{"t1", "t2", "t3"} {
+		cpMgr.GetOrCreateTable(tbl, 10)
+		if err := cpMgr.MarkTableCompleted(tbl, 10); err != nil {
+			t.Fatalf("MarkTableCompleted(%s): %v", tbl, err)
+		}
+	}
+	if err := cpMgr.SetImportMode(checkpoint.ImportModeLightning); err != nil {
+		t.Fatalf("SetImportMode: %v", err)
+	}
+	if err := cpMgr.SetImportedTables(2); err != nil {
+		t.Fatalf("SetImportedTables: %v", err)
+	}
+	if err := cpMgr.SetPhase("data-import"); err != nil {
+		t.Fatalf("SetPhase: %v", err)
+	}
+	cpMgr.Flush()
+
+	w, req = doReq("GET", "/api/v1/tasks/"+taskID+"/phases", "")
+	req = withChiParam(req, "taskID", taskID)
+	s.handleTaskPhases(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("phases: %d %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Phases []struct {
+			Name           string `json:"name"`
+			SubLabel       string `json:"sub_label"`
+			TableCount     int    `json:"table_count"`
+			TablesDone     int    `json:"tables_done"`
+			ImportedTables int    `json:"imported_tables"`
+		} `json:"phases"`
+	}
+	if err := json.Unmarshal([]byte(w.Body.String()), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, p := range body.Phases {
+		if p.Name != "data" {
+			continue
+		}
+		if p.SubLabel != "数据导入" {
+			t.Fatalf("sub_label = %q, want 数据导入", p.SubLabel)
+		}
+		if p.TablesDone != 3 || p.TableCount != 3 {
+			t.Fatalf("tables_done/table_count = %d/%d, want 3/3 (export-time saturation)", p.TablesDone, p.TableCount)
+		}
+		if p.ImportedTables != 2 {
+			t.Fatalf("imported_tables = %d, want 2 (real Lightning progress, not tables_done)", p.ImportedTables)
+		}
+		return
+	}
+	t.Fatal("data phase missing from response")
 }

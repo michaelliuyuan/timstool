@@ -1731,16 +1731,17 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type PhaseInfo struct {
-		Name       string                   `json:"name"`
-		Label      string                   `json:"label"`
-		Status     string                   `json:"status"`
-		SubLabel   string                   `json:"sub_label,omitempty"`
-		Tables     []map[string]interface{} `json:"tables,omitempty"`
-		TableCount int                      `json:"table_count"`
-		TablesDone int                      `json:"tables_done"`
-		RowsTotal  int64                    `json:"rows_total"`
-		RowsDone   int64                    `json:"rows_done"`
-		Logs       []map[string]interface{} `json:"logs,omitempty"`
+		Name           string                   `json:"name"`
+		Label          string                   `json:"label"`
+		Status         string                   `json:"status"`
+		SubLabel       string                   `json:"sub_label,omitempty"`
+		Tables         []map[string]interface{} `json:"tables,omitempty"`
+		TableCount     int                      `json:"table_count"`
+		TablesDone     int                      `json:"tables_done"`
+		ImportedTables int                      `json:"imported_tables"`
+		RowsTotal      int64                    `json:"rows_total"`
+		RowsDone       int64                    `json:"rows_done"`
+		Logs           []map[string]interface{} `json:"logs,omitempty"`
 	}
 
 	phaseNames := []struct{ name, label string }{
@@ -1788,6 +1789,11 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 					pi.SubLabel = "数据导出"
 				case "data-import":
 					pi.SubLabel = "数据导入"
+					// TablesDone counts export-time completed states,
+					// which stay "completed" through the whole Lightning
+					// import — the real import progress is the checkpoint's
+					// imported-table counter (same source as the top bar).
+					pi.ImportedTables = cpMgr.GetImportedTables()
 				}
 				tables := cpMgr.GetAllTables()
 				if len(tables) > 0 {

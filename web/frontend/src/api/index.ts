@@ -41,6 +41,7 @@ export interface PhaseInfo {
   tables: PhaseTableInfo[]
   table_count: number
   tables_done: number
+  imported_tables: number
   rows_total: number
   rows_done: number
   logs?: { level: string; message: string; timestamp: string }[]

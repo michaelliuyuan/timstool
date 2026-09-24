@@ -366,7 +366,7 @@ function logLevelClass(level: string): string {
                   </el-tag>
                 </div>
                 <div v-if="phase.table_count > 0 && phase.name === 'data'" style="margin-top: 8px; color: #606266; font-size: 13px;">
-                  <template v-if="phase.sub_label === '数据导入'">数据导入 · 已导入表: {{ phase.tables_done }}/{{ phase.table_count }}</template>
+                  <template v-if="phase.sub_label === '数据导入'">数据导入 · 已导入表: {{ phase.imported_tables }}/{{ phase.table_count }}</template>
                   <template v-else>表: {{ phase.tables_done }}/{{ phase.table_count }} · 行: {{ phase.rows_done.toLocaleString() }}/{{ phase.rows_total.toLocaleString() }}</template>
                 </div>
                 <div v-else-if="phase.table_count > 0 && phase.name === 'schema'" style="margin-top: 8px; color: #606266; font-size: 13px;">
