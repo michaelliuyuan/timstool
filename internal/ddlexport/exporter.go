@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/schema"
+	"go.uber.org/zap"
 )
 
 // TypeSet selects which object types are exported.
@@ -139,6 +140,12 @@ func (e *Exporter) countN(schemaName, file string, n int) {
 }
 
 func (e *Exporter) skip(schemaName, typ, obj, reason string) {
+	// Log each skip at the point it happens: the manifest inside the zip is
+	// only seen if the user opens it, but the server log is where an
+	// "empty export" incident gets diagnosed first.
+	zap.L().Warn("ddl export: object skipped",
+		zap.String("schema", schemaName), zap.String("type", typ),
+		zap.String("object", obj), zap.String("reason", reason))
 	e.manifest.Skipped = append(e.manifest.Skipped, SkippedObject{Schema: schemaName, Type: typ, Object: obj, Reason: reason})
 }
 

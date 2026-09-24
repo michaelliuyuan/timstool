@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/ddlexport"
+	"go.uber.org/zap"
 )
 
 // ddlExportRequest is the payload for both /ddl-export/schemas and
@@ -158,9 +160,17 @@ func (s *Server) handleDDLExport(w http.ResponseWriter, r *http.Request) {
 	// otherwise surface as a truncated (unopenable) zip that looks like a
 	// successful download. Only send headers once the export succeeded.
 	var buf bytes.Buffer
-	if _, err := exporter.ExportZip(ctx, &buf); err != nil {
+	manifest, err := exporter.ExportZip(ctx, &buf)
+	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "export ddl failed: "+err.Error())
 		return
+	}
+	if n := len(manifest.Skipped); n > 0 {
+		// Summary Warn server-side (per-object Warns already fired in the
+		// exporter's skip()) + response header so the UI can warn before
+		// consuming the blob.
+		zap.L().Warn("ddl export completed with skipped objects", zap.Int("skipped", n))
+		w.Header().Set("X-Tims-Skipped", strconv.Itoa(n))
 	}
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition",

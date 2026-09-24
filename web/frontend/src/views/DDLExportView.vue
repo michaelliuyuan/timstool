@@ -135,6 +135,7 @@ async function exportDDL() {
       const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }))
       throw new Error(err.error || `HTTP ${resp.status}`)
     }
+    const skipped = parseInt(resp.headers.get('X-Tims-Skipped') || '0', 10)
     const blob = await resp.blob()
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -142,7 +143,11 @@ async function exportDDL() {
     a.download = `ddl-export-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}.zip`
     a.click()
     URL.revokeObjectURL(url)
-    ElMessage.success('DDL 导出完成')
+    if (skipped > 0) {
+      ElMessage.warning(`${skipped} 项对象被跳过，详见 zip 内 manifest.json`)
+    } else {
+      ElMessage.success('DDL 导出完成')
+    }
   } catch (e: any) {
     ElMessage.error(e.message || '导出失败')
   } finally {

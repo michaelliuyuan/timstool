@@ -144,6 +144,64 @@ func TestCatalogQueryAnchors(t *testing.T) {
 	}
 }
 
+// TestSkipWarnsAndRecords anchors the skip() contract: every skip is both
+// recorded in the manifest (zip-visible) and logged at the point it happens
+// (zap.L() is safe to call with the default global logger). The 0-table
+// tidb-tables.sql / per-table-failure behaviors are source-anchored below.
+func TestSkipWarnsAndRecords(t *testing.T) {
+	e := &Exporter{manifest: Manifest{}}
+	e.skip("public", "table", "t1", "permission denied")
+	e.skip("sales", "tidb-table", "t2", "unsupported type")
+	if len(e.manifest.Skipped) != 2 {
+		t.Fatalf("skip must record every entry: %+v", e.manifest.Skipped)
+	}
+	sk := e.manifest.Skipped[0]
+	if sk.Schema != "public" || sk.Type != "table" || sk.Object != "t1" || sk.Reason != "permission denied" {
+		t.Fatalf("skip recorded wrong entry: %+v", sk)
+	}
+}
+
+// TestTiDBSkipFamilyAnchors pins the DDL-export TiDB skip semantics that a
+// source-level regression could silently break (the live-DB end-to-end is
+// covered by the remote acceptance run):
+//   - a successful tidbTables run with 0 tables still writes an (empty)
+//     tidb-tables.sql into the zip — the file's absence must mean error;
+//   - per-table BuildTableDDL failures skip individually and the rest of
+//     the export continues;
+//   - the handler surfaces the skip count via X-Tims-Skipped after a
+//     successful export.
+func TestTiDBSkipFamilyAnchors(t *testing.T) {
+	src, err := os.ReadFile("exporter.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	// Success branch writes the file unconditionally (n may be 0).
+	if !strings.Contains(s, `files["tidb-tables.sql"] = ddl`) {
+		t.Error("exporter must write tidb-tables.sql even when 0 tables convert")
+	}
+	// Collector failure skips the whole file but does not fail the export.
+	if !strings.Contains(s, `e.skip(schemaName, "tidb-tables.sql", schemaName, err.Error())`) {
+		t.Error("exporter must record a tidb-tables.sql skip on collector failure")
+	}
+	// Per-table conversion failure skips that table only.
+	if !strings.Contains(s, `e.skip(schemaName, "tidb-table", t.Name, err.Error())`) {
+		t.Error("exporter must record per-table tidb conversion skips")
+	}
+
+	hsrc, err := os.ReadFile("../webapi/ddl_export_handler.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := string(hsrc)
+	if !strings.Contains(h, "X-Tims-Skipped") {
+		t.Error("handler must set X-Tims-Skipped when objects were skipped")
+	}
+	if !strings.Contains(h, "manifest.Skipped") {
+		t.Error("handler must read the skip count from the export manifest")
+	}
+}
+
 // TestManifestForPerSchema verifies the per-schema self-contained manifest
 // (B-F01-2): counts and skipped entries of other schemas must not leak in.
 func TestManifestForPerSchema(t *testing.T) {
