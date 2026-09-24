@@ -34,6 +34,8 @@ const tidbFields: FieldSpec[] = [
   { key: 'user', label: '用户名', type: 'text', required: true, default: 'root', group: 'common' },
   { key: 'password', label: '密码', type: 'password', group: 'common' },
   { key: 'database', label: '数据库名', type: 'text', required: true, group: 'common' },
+  { key: 'pd_addr', label: 'PD 地址', type: 'text', placeholder: 'host:2379', help: '可选。PD 地址，主要用于 Lightning 物理导入；SQL 端口经代理时务必填真实 PD 端口，留空则导入时按 主机:2379 推断', group: 'common' },
+  { key: 'status_port', label: '状态端口', type: 'number', placeholder: '10080', help: '可选。TiDB 状态端口（默认 10080），主要用于 Lightning 导入与连通探测；留空表示未设置', group: 'common' },
 ]
 
 function fieldsFor(type: string): FieldSpec[] {

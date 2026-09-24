@@ -394,6 +394,71 @@ func TestDatasources_TempFileCleanup(t *testing.T) {
 	}
 }
 
+// F-02c: tidb datasources accept optional pd_addr / status_port — they are
+// echoed back on create, flow into target snapshots (trimmed / parsed), stay
+// zero for legacy entries, and bad values are rejected at validation time.
+func TestDatasources_TiDBPDAndStatusPort(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	// ① Create a tidb source carrying both optional fields.
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "tgt-extras", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db",
+			"pd_addr": " 10.0.0.9:2379 ", "status_port": 10080}
+	}`)
+	s.handleCreateDataSource(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	created := dsBody(t, w)
+	fields := created["fields"].(map[string]any)
+	if fields["pd_addr"] == nil || fields["status_port"] == nil {
+		t.Fatalf("extras not echoed in view: %v", fields)
+	}
+
+	// ② The target snapshot carries PDAddr (trimmed) and StatusPort.
+	e, err := s.resolveDataSourceRef(created["id"].(string))
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	tc := dataSourceToTargetConfig(e)
+	if tc.PDAddr != "10.0.0.9:2379" {
+		t.Fatalf("PDAddr = %q, want trimmed 10.0.0.9:2379", tc.PDAddr)
+	}
+	if tc.StatusPort != 10080 {
+		t.Fatalf("StatusPort = %d, want 10080", tc.StatusPort)
+	}
+
+	// ③ Legacy entries without the fields resolve to zero values.
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "tgt-legacy", "type": "tidb",
+		"fields": {"host": "10.0.0.8", "port": 4000, "user": "root", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create legacy: %d %s", w.Code, w.Body.String())
+	}
+	legacy, _ := s.resolveDataSourceRef(dsBody(t, w)["id"].(string))
+	tcl := dataSourceToTargetConfig(legacy)
+	if tcl.PDAddr != "" || tcl.StatusPort != 0 {
+		t.Fatalf("legacy entry must keep zero extras: %+v", tcl)
+	}
+
+	// ④ Validation: out-of-range / non-numeric status_port and malformed
+	// pd_addr are rejected with 400.
+	for _, body := range []string{
+		`{"name": "bad1", "type": "tidb", "fields": {"host": "h", "port": 4000, "status_port": 70000}}`,
+		`{"name": "bad2", "type": "tidb", "fields": {"host": "h", "port": 4000, "status_port": "abc"}}`,
+		`{"name": "bad3", "type": "tidb", "fields": {"host": "h", "port": 4000, "pd_addr": "no-port-here"}}`,
+	} {
+		w, req = doReq("POST", "/api/v1/datasources", body)
+		s.handleCreateDataSource(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("invalid body accepted: %d %s (%s)", w.Code, w.Body.String(), body)
+		}
+	}
+}
+
 // Missing test ①: GET /tasks must never expose the task ConfigJSON (which
 // holds plaintext passwords at rest) — the json:"-" tag is the only guard, so
 // anchor it with an assertion a regression cannot silently pass.

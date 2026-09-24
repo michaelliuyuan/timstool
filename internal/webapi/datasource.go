@@ -3,6 +3,7 @@ package webapi
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -188,6 +189,17 @@ func validateDataSourceBody(name, dsType string, fields map[string]any) error {
 		var port int
 		if _, err := fmt.Sscanf(p, "%d", &port); err != nil || port < 1 || port > 65535 {
 			return fmt.Errorf("port must be 1-65535")
+		}
+	}
+	if sp := stringField(fields, "status_port"); sp != "" {
+		var sport int
+		if _, err := fmt.Sscanf(sp, "%d", &sport); err != nil || sport < 0 || sport > 65535 {
+			return fmt.Errorf("status_port must be an integer in 0-65535")
+		}
+	}
+	if pd := stringField(fields, "pd_addr"); pd != "" {
+		if _, _, err := net.SplitHostPort(pd); err != nil {
+			return fmt.Errorf("pd_addr must be in host:port form (e.g. host:2379)")
 		}
 	}
 	_ = defPort
@@ -402,10 +414,19 @@ func (s *Server) handleTestDataSource(w http.ResponseWriter, r *http.Request) {
 		if p := stringField(fields, "port"); p != "" {
 			fmt.Sscanf(p, "%d", &port)
 		}
+		statusPort := 0
+		if sp := stringField(fields, "status_port"); sp != "" {
+			var sport int
+			if _, err := fmt.Sscanf(sp, "%d", &sport); err == nil && sport > 0 {
+				statusPort = sport
+			}
+		}
 		req := &TestConnectionRequest{
 			Type: "target", Host: stringField(fields, "host"), Port: port,
 			User: stringField(fields, "user"), Password: stringField(fields, "password"),
-			Database: stringField(fields, "database"),
+			Database:   stringField(fields, "database"),
+			PDAddr:     strings.TrimSpace(stringField(fields, "pd_addr")),
+			StatusPort: statusPort,
 		}
 		raw := s.testTiDBConnection(r.Context(), req)
 		result = map[string]interface{}{
@@ -500,6 +521,13 @@ func dataSourceToTargetConfig(e *dataSourceEntry) (tc config.TargetConfig) {
 	tc.User = stringField(e.Fields, "user")
 	tc.Password = stringField(e.Fields, "password")
 	tc.Database = stringField(e.Fields, "database")
+	tc.PDAddr = strings.TrimSpace(stringField(e.Fields, "pd_addr"))
+	if sp := stringField(e.Fields, "status_port"); sp != "" {
+		var sport int
+		if _, err := fmt.Sscanf(sp, "%d", &sport); err == nil && sport > 0 {
+			tc.StatusPort = sport
+		}
+	}
 	return tc
 }
 
