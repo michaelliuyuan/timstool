@@ -5,7 +5,11 @@ import apiClient from '../api'
 import type { IncrementalJob } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import DataSourcePicker from '../components/DataSourcePicker.vue'
+import SyncCompareCard from '../components/SyncCompareCard.vue'
 import { useDataSources } from '../composables/useDataSources'
+
+// S1-UI-06: renamed 时间戳水位补齐 (was 增量同步) to avoid the CDC naming
+// clash; v1 boundaries stay stated up-front inside the shared compare card.
 
 // F-04 增量同步: pull-based timestamp-watermark jobs. v1 boundaries are
 // stated up-front: deletes are never captured, UPDATEs that don't touch the
@@ -191,11 +195,13 @@ const strategyLabels: Record<string, string> = { replace: 'REPLACE INTO', ignore
 
 <template>
   <div class="tims-page">
-    <PageHeader title="增量同步" subtitle="基于时间戳/整数水位列的拉式增量补齐（手动触发，仅 PostgreSQL 源）" />
+    <PageHeader title="时间戳水位补齐" subtitle="基于更新时间列的拉式批同步，手动触发可重跑，适合无 CDC 权限或定时补齐场景" />
 
-    <el-alert type="info" :closable="false" style="margin-bottom: 16px;">
-      <p>功能边界：① 源端 DELETE 不会被捕获（可用「数据比对」兜底核对）；② 不更新水位列的 UPDATE 会漏同步；③ 默认 ≥ 模式每轮会重读边界时刻的行（保证同秒迟到行不丢，代价极小）。</p>
-    </el-alert>
+    <SyncCompareCard current="watermark">
+      <el-alert type="warning" :closable="false" style="margin-top: 4px;">
+        <p>本模块边界：① 源端 DELETE 不会被捕获（可用「数据比对」兜底核对）；② 不更新水位列的 UPDATE 会漏同步；③ 默认 ≥ 模式每轮会重读边界时刻的行（保证同秒迟到行不丢，代价极小）。</p>
+      </el-alert>
+    </SyncCompareCard>
 
     <el-card shadow="never">
       <template #header>
@@ -204,7 +210,7 @@ const strategyLabels: Record<string, string> = { replace: 'REPLACE INTO', ignore
           <el-button type="primary" @click="openCreate">新建任务</el-button>
         </div>
       </template>
-      <el-table :data="jobs" v-loading="loading" empty-text="暂无增量同步任务">
+      <el-table :data="jobs" v-loading="loading" empty-text="暂无补齐任务">
         <el-table-column prop="name" label="名称" min-width="140" />
         <el-table-column label="表" min-width="200">
           <template #default="{ row }">
@@ -237,10 +243,10 @@ const strategyLabels: Record<string, string> = { replace: 'REPLACE INTO', ignore
       </el-table>
     </el-card>
 
-    <el-dialog v-model="dialogVisible" :title="editing ? '编辑增量同步任务' : '新建增量同步任务'" width="860px">
+    <el-dialog v-model="dialogVisible" :title="editing ? '编辑补齐任务' : '新建补齐任务'" width="860px">
       <el-form label-width="120px">
         <el-form-item label="任务名称">
-          <el-input v-model="form.name" placeholder="例如：订单表增量补齐" style="width: 360px;" />
+          <el-input v-model="form.name" placeholder="例如：订单表水位补齐" style="width: 360px;" />
         </el-form-item>
         <el-divider content-position="left">源数据库（仅 PostgreSQL）</el-divider>
         <el-form-item label="源数据源">

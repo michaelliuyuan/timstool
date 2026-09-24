@@ -39,19 +39,30 @@ onMounted(async () => {
 })
 onUnmounted(() => window.clearInterval(heartbeatTimer))
 
-const navItems = computed(() => {
-  const items = [
-    { path: '/datasources', label: '数据源', icon: 'Coin' },
-    { path: '/wizard', label: '新建迁移', icon: 'Connection' },
-    { path: '/tasks', label: '任务监控', icon: 'Monitor' },
-    { path: '/history', label: '迁移历史', icon: 'Clock' },
-    { path: '/compare', label: '数据比对', icon: 'Grid' },
-    { path: '/assess', label: '兼容评估', icon: 'DataAnalysis' },
-    { path: '/ddl-export', label: 'DDL 导出', icon: 'Download' },
-    { path: '/incremental', label: '增量同步', icon: 'Timer' },
+// S1-UI-06: nav grouped — a "数据同步" section keeps the two sync modules
+// (CDC real-time vs timestamp-watermark backfill) visibly adjacent and named
+// apart. Routes/API untouched.
+const navSections = computed(() => {
+  const syncItems = [
+    { path: '/cdc', label: 'CDC 实时同步', icon: 'DataLine' },
+    { path: '/incremental', label: '时间戳水位补齐', icon: 'Timer' },
   ]
-  if (cdcEnabled.value) items.push({ path: '/cdc', label: 'CDC 增量', icon: 'DataLine' })
-  return items
+  if (!cdcEnabled.value) syncItems.shift()
+  return [
+    {
+      label: '',
+      items: [
+        { path: '/datasources', label: '数据源', icon: 'Coin' },
+        { path: '/wizard', label: '新建迁移', icon: 'Connection' },
+        { path: '/tasks', label: '任务监控', icon: 'Monitor' },
+        { path: '/history', label: '迁移历史', icon: 'Clock' },
+        { path: '/compare', label: '数据比对', icon: 'Grid' },
+        { path: '/assess', label: '兼容评估', icon: 'DataAnalysis' },
+        { path: '/ddl-export', label: 'DDL 导出', icon: 'Download' },
+      ],
+    },
+    { label: '数据同步', items: syncItems },
+  ]
 })
 
 const isActive = (path: string) => route.path === path || route.path.startsWith(path + '/')
@@ -64,16 +75,19 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
         <span class="tims-logo-ti">Ti</span><span class="tims-logo-ms">MS</span>
       </div>
       <nav class="tims-nav">
-        <button
-          v-for="item in navItems"
-          :key="item.path"
-          class="tims-nav-item"
-          :class="{ 'is-active': isActive(item.path) }"
-          @click="router.push(item.path)"
-        >
-          <el-icon :size="18"><component :is="item.icon" /></el-icon>
-          <span class="tims-nav-label">{{ item.label }}</span>
-        </button>
+        <template v-for="section in navSections" :key="section.label || 'main'">
+          <div v-if="section.label" class="tims-nav-group">{{ section.label }}</div>
+          <button
+            v-for="item in section.items"
+            :key="item.path"
+            class="tims-nav-item"
+            :class="{ 'is-active': isActive(item.path) }"
+            @click="router.push(item.path)"
+          >
+            <el-icon :size="18"><component :is="item.icon" /></el-icon>
+            <span class="tims-nav-label">{{ item.label }}</span>
+          </button>
+        </template>
       </nav>
       <div class="tims-sidenav-foot tims-mono">PG → TiDB</div>
     </aside>
@@ -126,6 +140,16 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
 .tims-logo-ms { color: var(--tims-text-inv); }
 
 .tims-nav { display: flex; flex-direction: column; gap: 4px; padding: 0 10px; }
+.tims-nav-group {
+  margin-top: 10px;
+  padding: 2px 0 4px;
+  text-align: center;
+  font-size: 10px;
+  letter-spacing: 1px;
+  color: var(--tims-text-inv-2);
+  opacity: 0.65;
+  border-top: 1px solid var(--tims-border-ink);
+}
 .tims-nav-item {
   position: relative;
   display: flex;
@@ -152,7 +176,7 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
   border-radius: 0 3px 3px 0;
   background: var(--tims-brand);
 }
-.tims-nav-label { font-size: 12px; letter-spacing: 0.2px; }
+.tims-nav-label { font-size: 12px; letter-spacing: 0.2px; line-height: 1.3; text-align: center; }
 
 .tims-sidenav-foot {
   margin-top: auto;

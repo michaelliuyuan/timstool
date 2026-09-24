@@ -1,11 +1,14 @@
 <template>
   <div class="cdc-container tims-page">
-    <PageHeader title="CDC 增量同步" subtitle="PostgreSQL → TiDB 实时增量同步监控" />
+    <PageHeader title="CDC 实时同步" subtitle="基于数据库日志的推式实时管道，自动捕获 INSERT/UPDATE/DELETE，常驻运行" />
+
+    <!-- S1-UI-06: which-one-to-use card (shared with the watermark backfill page) -->
+    <SyncCompareCard current="cdc" />
 
     <!-- Module disabled (cdc.enable=false) -->
     <div class="disabled-card" v-if="disabled">
       <h3>CDC 模块未启用</h3>
-      <p>当前部署未开启 CDC 增量同步（<code>cdc.enable: false</code>）。</p>
+      <p>当前部署未开启 CDC 实时同步（<code>cdc.enable: false</code>）。</p>
       <p class="hint">如需使用：在 config.yaml 设置 <code>cdc.enable: true</code>，或用 <code>pg2tidb cdc --enable-cdc</code> 启动。</p>
     </div>
 
@@ -247,6 +250,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import DataPipelineStrip from '../components/DataPipelineStrip.vue'
 import SparkLine from '../components/SparkLine.vue'
 import PageHeader from '../components/PageHeader.vue'
+import SyncCompareCard from '../components/SyncCompareCard.vue'
 import { useDataSources } from '../composables/useDataSources'
 
 const API_BASE = '/api/v1/cdc'
@@ -651,7 +655,7 @@ function startCDC() {
   return callCDC('start')
 }
 function confirmStopCDC() {
-  if (!confirm('确认停止 CDC 增量同步？进行中的同步将中断。')) return
+  if (!confirm('确认停止 CDC 实时同步？进行中的同步将中断。')) return
   return callCDC('stop')
 }
 
