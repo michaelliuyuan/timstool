@@ -48,6 +48,11 @@ const router = createRouter({
       component: () => import('../views/DDLExportView.vue'),
     },
     {
+      path: '/incremental',
+      name: 'Incremental',
+      component: () => import('../views/IncrementalView.vue'),
+    },
+    {
       path: '/cdc',
       name: 'CDC',
       component: () => import('../views/CDCView.vue'),

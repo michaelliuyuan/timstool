@@ -145,6 +145,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 	// F-02 (P2-6): remove crash-orphaned datasource temp files — they hold the
 	// full plaintext registry.
 	s.cleanupDataSourceTempFiles()
+	s.cleanupIncrementalTempFiles()
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
@@ -231,6 +232,16 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		r.Get("/cdc/slot", s.handleCDCSlot)
 		r.Post("/cdc/checkpoint/reset", s.handleCDCResetCheckpoint)
 		r.Post("/cdc/replica-identity", s.handleCDCReplicaIdentity)
+		// Timestamp-watermark incremental sync (F-04): pull-based table
+		// granularity jobs, manual trigger only, PostgreSQL sources only.
+		r.Get("/incremental/jobs", s.handleListIncrementalJobs)
+		r.Post("/incremental/jobs", s.handleCreateIncrementalJob)
+		r.Route("/incremental/jobs/{id}", func(r chi.Router) {
+			r.Put("/", s.handleUpdateIncrementalJob)
+			r.Delete("/", s.handleDeleteIncrementalJob)
+			r.Post("/run", s.handleRunIncrementalJob)
+		})
+		r.Get("/sources/tables/{table}/columns", s.handleIncrementalColumns)
 	})
 
 	if staticFS != (embed.FS{}) {

@@ -47,6 +47,60 @@ export interface PhaseInfo {
   logs?: { level: string; message: string; timestamp: string }[]
 }
 
+// Timestamp-watermark incremental sync (F-04).
+export interface IncrementalTableConfig {
+  table: string
+  watermark_column: string
+  initial_watermark?: string
+}
+
+export interface IncrementalTableState {
+  last_watermark?: string
+  last_sync_at?: string
+  total_rows: number
+  failed?: string
+}
+
+export interface IncrementalTableResult {
+  table: string
+  from_watermark: string
+  to_watermark: string
+  rows: number
+  error?: string
+}
+
+export interface IncrementalRunRecord {
+  run_id: string
+  started_at: string
+  duration_ms: number
+  tables: IncrementalTableResult[]
+}
+
+export interface IncrementalJob {
+  id: string
+  name: string
+  source_ref: string
+  target_ref: string
+  batch_size: number
+  strict_mode: boolean
+  conflict_strategy: 'replace' | 'ignore' | 'error'
+  tables: IncrementalTableConfig[]
+  states: Record<string, IncrementalTableState>
+  history?: IncrementalRunRecord[]
+  created_at: string
+  updated_at: string
+}
+
+export interface IncrementalJobRequest {
+  name: string
+  source_ref: string
+  target_ref: string
+  batch_size: number
+  strict_mode: boolean
+  conflict_strategy: 'replace' | 'ignore' | 'error'
+  tables: IncrementalTableConfig[]
+}
+
 export interface TaskPhasesResponse {
   task_id: string
   phase: string
@@ -393,6 +447,31 @@ export const apiClient = {
       results: { table: string; sql: string; ok: boolean; error?: string; can_alter: boolean }[]
       hint: string
     }>('/cdc/replica-identity', { confirm: 'ALTER', tables }),
+
+  // Timestamp-watermark incremental sync (F-04): manual-trigger jobs, PG
+  // sources only; passwords stay server-side behind datasource refs.
+  listIncrementalJobs: () =>
+    api.get<IncrementalJob[]>('/incremental/jobs'),
+
+  createIncrementalJob: (req: IncrementalJobRequest) =>
+    api.post<IncrementalJob>('/incremental/jobs', req),
+
+  updateIncrementalJob: (id: string, req: IncrementalJobRequest) =>
+    api.put<IncrementalJob>(`/incremental/jobs/${id}`, req),
+
+  deleteIncrementalJob: (id: string) =>
+    api.delete<{ deleted: boolean }>(`/incremental/jobs/${id}`),
+
+  runIncrementalJob: (id: string, tables?: string[]) =>
+    api.post<IncrementalRunRecord>(`/incremental/jobs/${id}/run`, { tables: tables || [] }),
+
+  // Column listing with watermark eligibility + index flag (F-04): the
+  // watermark dropdown marks comparable types and warns on unindexed columns.
+  getSourceTableColumns: (ref: string, table: string) =>
+    api.get<{ columns: { name: string; data_type: string; comparable: boolean; indexed: boolean }[] }>(
+      `/sources/tables/${encodeURIComponent(table)}/columns`,
+      { params: { source_ref: ref } },
+    ),
 }
 
 export default apiClient
