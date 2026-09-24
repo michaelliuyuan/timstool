@@ -11,7 +11,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"net/url"
 	"strings"
 
 	"github.com/michaelliuyuan/timstool/internal/source"
@@ -116,15 +115,20 @@ func (s *Source) IncrementalCapture() (source.IncrementalCapture, error) {
 }
 
 // dsn builds a MySQL DSN from the source config.
+//
+// B-F02-9: the go-sql-driver DSN is NOT URL syntax — user and password are
+// taken literally, so url.QueryEscape must not be applied (a password like
+// "TiDB@2026" was sent as "TiDB%402026" and failed auth with 1045). The
+// driver splits on the last '@' before the network part, so literal '@' and
+// ':' in credentials are safe.
 func dsn(c source.SourceConfig) string {
 	charset := c.Options["charset"]
 	if charset == "" {
 		charset = "utf8mb4"
 	}
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=true&loc=Local",
-		url.QueryEscape(c.User), url.QueryEscape(c.Password),
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=true&loc=Local",
+		c.User, c.Password,
 		c.Host, c.Port, c.Database, charset)
-	return dsn
 }
 
 // --- Dialect ---

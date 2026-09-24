@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/michaelliuyuan/timstool/internal/source"
 )
 
@@ -151,5 +152,48 @@ func TestMySQLDescribe(t *testing.T) {
 	}
 	if !meta.Capabilities.Data || meta.Capabilities.CDC {
 		t.Errorf("mysql capabilities = %+v, want Data=true CDC=false", meta.Capabilities)
+	}
+}
+
+// TestMySQLDSNPasswordRoundTrip anchors B-F02-9: the DSN is NOT URL syntax,
+// credentials must be embedded literally — a password containing '@' (or
+// other URL-reserved chars) must survive a driver-side parse unchanged.
+// QueryEscape here previously turned "TiDB@2026" into "TiDB%402026" and the
+// driver sent the mangled literal to auth (1045 denied).
+func TestMySQLDSNPasswordRoundTrip(t *testing.T) {
+	cfg := source.SourceConfig{
+		Host: "10.0.0.9", Port: 4000,
+		User:     "root",
+		Password: "TiDB@2026",
+		Database: "db",
+	}
+	dsnStr := dsn(cfg)
+	parsed, err := mysql.ParseDSN(dsnStr)
+	if err != nil {
+		t.Fatalf("ParseDSN(%q) err = %v", dsnStr, err)
+	}
+	if parsed.User != cfg.User {
+		t.Errorf("User = %q, want %q", parsed.User, cfg.User)
+	}
+	if parsed.Passwd != cfg.Password {
+		t.Errorf("Passwd = %q, want %q (QueryEscape regression?)", parsed.Passwd, cfg.Password)
+	}
+	if parsed.Addr != "10.0.0.9:4000" {
+		t.Errorf("Addr = %q, want 10.0.0.9:4000", parsed.Addr)
+	}
+	if parsed.DBName != cfg.Database {
+		t.Errorf("DBName = %q, want %q", parsed.DBName, cfg.Database)
+	}
+
+	// URL-reserved chars across the board must pass through literally.
+	for _, pwd := range []string{"p@ss:word+100%", "a/b?c#d", "正常密码!@#"} {
+		cfg.Password = pwd
+		parsed, err := mysql.ParseDSN(dsn(cfg))
+		if err != nil {
+			t.Fatalf("ParseDSN password %q err = %v", pwd, err)
+		}
+		if parsed.Passwd != pwd {
+			t.Errorf("Passwd = %q, want %q", parsed.Passwd, pwd)
+		}
 	}
 }
