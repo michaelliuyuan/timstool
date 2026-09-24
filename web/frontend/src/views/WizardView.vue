@@ -114,12 +114,31 @@ const saveConnDialogVisible = ref(false)
 const loadConnDialogVisible = ref(false)
 
 const STORAGE_KEY = 'timstool_saved_connections'
+const LAST_CONN_KEY = 'timstool_last_connection'
+const LEGACY_LAST_CONN_KEY = 'pg2tidb_last_connection'
+
+// Passwords live server-side only (F-02): never persist them to localStorage.
+function stripPassword(conn: any) {
+  if (!conn || typeof conn !== 'object') return conn
+  const { password, ...rest } = conn
+  return rest
+}
 
 function loadSavedConnections() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (raw) {
-      savedConnections.value = JSON.parse(raw)
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) {
+        savedConnections.value = parsed.map((c: any) => ({
+          name: c.name,
+          sourceType: c.sourceType,
+          source: stripPassword(c.source),
+          target: stripPassword(c.target),
+        }))
+        // Migrate away any legacy entries that stored plaintext passwords.
+        saveConnectionsToStorage()
+      }
     }
   } catch {}
 }
@@ -137,8 +156,8 @@ function saveCurrentConnection() {
   const entry = {
     name: saveConnName.value.trim(),
     sourceType: sourceType.value,
-    source: { ...form.source },
-    target: { ...form.target },
+    source: stripPassword(form.source),
+    target: stripPassword(form.target),
   }
   if (idx >= 0) {
     savedConnections.value[idx] = entry
@@ -179,16 +198,20 @@ onMounted(async () => {
   if (meta) Object.assign(form.source, reconcileModel({}, meta, meta))
 
   loadSavedConnections()
-  const last = localStorage.getItem('pg2tidb_last_connection')
+  const last = localStorage.getItem(LEGACY_LAST_CONN_KEY)
   if (last) {
     try {
       const c = JSON.parse(last)
       if (c.sourceType && c.sourceType !== sourceType.value) {
         onSourceTypeChange(c.sourceType)
       }
-      if (c.source) Object.assign(form.source, c.source)
-      if (c.target) Object.assign(form.target, c.target)
+      if (c.source) Object.assign(form.source, stripPassword(c.source))
+      if (c.target) Object.assign(form.target, stripPassword(c.target))
     } catch {}
+    // One-shot migration: drop the legacy key so its plaintext password
+    // (if any) can never be read back.
+    localStorage.removeItem(LEGACY_LAST_CONN_KEY)
+    localStorage.removeItem(LAST_CONN_KEY)
   }
 })
 
@@ -351,7 +374,11 @@ function toggleSelectAll() {
 async function submit() {
   loading.value = true
   try {
-    localStorage.setItem('timstool_last_connection', JSON.stringify({ source: form.source, target: form.target, sourceType: sourceType.value }))
+    localStorage.setItem(LAST_CONN_KEY, JSON.stringify({
+      sourceType: sourceType.value,
+      source: stripPassword(form.source),
+      target: stripPassword(form.target),
+    }))
 
     const { data } = await apiClient.createTask({
       name: form.name || `Migration ${new Date().toLocaleString()}`,

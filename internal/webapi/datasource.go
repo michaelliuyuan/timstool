@@ -224,8 +224,9 @@ func (s *Server) handleCreateDataSource(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleUpdateDataSource: PUT with write-only password semantics — a password
-// that is empty or absent keeps the stored one; every other field present in
-// the body replaces the stored value. Absent fields keep their stored values.
+// that is empty or absent keeps the stored one; all other fields are replaced
+// wholesale from the request body (absent ones become zero values), so clients
+// must send the full object (the web UI always does).
 func (s *Server) handleUpdateDataSource(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	var req dsRequestBody
