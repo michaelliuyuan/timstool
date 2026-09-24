@@ -393,3 +393,97 @@ func TestDatasources_TempFileCleanup(t *testing.T) {
 		t.Fatalf("datasources.json must survive cleanup: %v", err)
 	}
 }
+
+// Missing test ①: GET /tasks must never expose the task ConfigJSON (which
+// holds plaintext passwords at rest) — the json:"-" tag is the only guard, so
+// anchor it with an assertion a regression cannot silently pass.
+func TestTasks_ListRedactsPasswords(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "src-x", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "task-pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "tgt-x", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "tpw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+
+	w, req = doReq("POST", "/api/v1/tasks", fmt.Sprintf(`{"name": "t", "source_ref": %q, "target_ref": %q, "opts": {}}`, srcID, tgtID))
+	s.handleCreateTask(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create task: %d %s", w.Code, w.Body.String())
+	}
+
+	w, req = doReq("GET", "/api/v1/tasks", "")
+	s.handleListTasks(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list tasks: %d %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "task-pw") || strings.Contains(w.Body.String(), "tpw") {
+		t.Fatalf("password leaked in task list: %s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "config_json") || strings.Contains(w.Body.String(), "ConfigJSON") {
+		t.Fatalf("config_json exposed in task list: %s", w.Body.String())
+	}
+}
+
+// Missing test ⑤: CDC import-from-datasource — happy path writes config.yaml
+// from refs and echoes a redacted summary; wrong types and dangling refs 400.
+func TestDatasources_CDCImportFromDataSource(t *testing.T) {
+	s, _ := newTestServer(t)
+	// Wire a config.yaml target (missing file → zero config server-side).
+	s.cdcCfgFilePath = filepath.Join(t.TempDir(), "config.yaml")
+
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "cdc-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "cdc-pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "cdc-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "ctpw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+
+	// Wrong types are rejected.
+	w, req = doReq("POST", "/api/v1/cdc/import-from-datasource", fmt.Sprintf(`{"source_ref": %q, "target_ref": %q}`, tgtID, tgtID))
+	s.handleImportCDCFromDataSource(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "PostgreSQL") {
+		t.Fatalf("cdc import wrong source type: %d %s", w.Code, w.Body.String())
+	}
+	w, req = doReq("POST", "/api/v1/cdc/import-from-datasource", fmt.Sprintf(`{"source_ref": %q, "target_ref": %q}`, srcID, srcID))
+	s.handleImportCDCFromDataSource(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "tidb") {
+		t.Fatalf("cdc import wrong target type: %d %s", w.Code, w.Body.String())
+	}
+	// Dangling ref.
+	w, req = doReq("POST", "/api/v1/cdc/import-from-datasource", `{"source_ref": "nope", "target_ref": "nope"}`)
+	s.handleImportCDCFromDataSource(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "source_ref") {
+		t.Fatalf("cdc import dangling ref: %d %s", w.Code, w.Body.String())
+	}
+
+	// Happy path: 200, redacted summary, and the password landed in config.yaml.
+	w, req = doReq("POST", "/api/v1/cdc/import-from-datasource", fmt.Sprintf(`{"source_ref": %q, "target_ref": %q}`, srcID, tgtID))
+	s.handleImportCDCFromDataSource(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("cdc import: %d %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "cdc-pw") || strings.Contains(w.Body.String(), "ctpw") {
+		t.Fatalf("password leaked in cdc import response: %s", w.Body.String())
+	}
+	raw, err := os.ReadFile(s.cdcCfgFilePath)
+	if err != nil {
+		t.Fatalf("config.yaml not written: %v", err)
+	}
+	if !strings.Contains(string(raw), "cdc-pw") || !strings.Contains(string(raw), "ctpw") {
+		t.Fatalf("config.yaml missing imported credentials: %s", string(raw))
+	}
+}

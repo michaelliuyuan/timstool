@@ -218,7 +218,7 @@ func (s *Server) handleCreateDataSource(w http.ResponseWriter, r *http.Request) 
 	}
 	now := time.Now()
 	entry := dataSourceEntry{
-		ID: uuid.New().String()[:8], Name: strings.TrimSpace(req.Name), Type: req.Type,
+		Name: strings.TrimSpace(req.Name), Type: req.Type,
 		Fields: normalizeDSFields(req.Fields, nil), CreatedAt: now, UpdatedAt: now,
 	}
 
@@ -229,6 +229,21 @@ func (s *Server) handleCreateDataSource(w http.ResponseWriter, r *http.Request) 
 			dsMu.Unlock()
 			s.writeError(w, http.StatusConflict, fmt.Sprintf("数据源名称 %q 已存在", entry.Name))
 			return
+		}
+	}
+	// P3-8: uuid[:8] is only 32 bits — regenerate on an id collision instead
+	// of writing a duplicate id (update/delete/resolve would hit the first).
+	for {
+		entry.ID = uuid.New().String()[:8]
+		dup := false
+		for _, e := range list {
+			if e.ID == entry.ID {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			break
 		}
 	}
 	list = append(list, entry)
