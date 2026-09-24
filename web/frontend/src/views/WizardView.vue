@@ -108,86 +108,15 @@ function onLightningSwitchChanged(val: boolean) {
   if (!val) form.opts.lightning_path = ''
 }
 
-const savedConnections = ref<Array<{ name: string; sourceType?: string; source: any; target: any }>>([])
-const saveConnName = ref('')
-const saveConnDialogVisible = ref(false)
-const loadConnDialogVisible = ref(false)
-
-const STORAGE_KEY = 'timstool_saved_connections'
-const LAST_CONN_KEY = 'timstool_last_connection'
-const LEGACY_LAST_CONN_KEY = 'pg2tidb_last_connection'
-
-// Passwords live server-side only (F-02): never persist them to localStorage.
-function stripPassword(conn: any) {
-  if (!conn || typeof conn !== 'object') return conn
-  const { password, ...rest } = conn
-  return rest
-}
-
-function loadSavedConnections() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed)) {
-        savedConnections.value = parsed.map((c: any) => ({
-          name: c.name,
-          sourceType: c.sourceType,
-          source: stripPassword(c.source),
-          target: stripPassword(c.target),
-        }))
-        // Migrate away any legacy entries that stored plaintext passwords.
-        saveConnectionsToStorage()
-      }
-    }
-  } catch {}
-}
-
-function saveConnectionsToStorage() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(savedConnections.value))
-}
-
-function saveCurrentConnection() {
-  if (!saveConnName.value.trim()) {
-    ElMessage.warning('请输入连接配置名称')
-    return
-  }
-  const idx = savedConnections.value.findIndex(c => c.name === saveConnName.value.trim())
-  const entry = {
-    name: saveConnName.value.trim(),
-    sourceType: sourceType.value,
-    source: stripPassword(form.source),
-    target: stripPassword(form.target),
-  }
-  if (idx >= 0) {
-    savedConnections.value[idx] = entry
-  } else {
-    savedConnections.value.push(entry)
-  }
-  saveConnectionsToStorage()
-  saveConnDialogVisible.value = false
-  saveConnName.value = ''
-  ElMessage.success('连接配置已保存')
-}
-
-function loadConnection(conn: { sourceType?: string; source: any; target: any }) {
-  // Restore the source type first (switch selector + reconcile the dynamic form
-  // fields), then overlay the saved values — same mechanism as the manual
-  // selector switch (onSourceTypeChange).
-  if (conn.sourceType && conn.sourceType !== sourceType.value) {
-    onSourceTypeChange(conn.sourceType)
-  }
-  Object.assign(form.source, conn.source)
-  Object.assign(form.target, conn.target)
-  sourceTestResult.value = null
-  loadConnDialogVisible.value = false
-  ElMessage.success('连接配置已加载')
-}
-
-function deleteConnection(idx: number) {
-  savedConnections.value.splice(idx, 1)
-  saveConnectionsToStorage()
-}
+// F-02b: the localStorage connection memory (saved connections + "remember
+// last") is retired — the server-side datasource registry + DataSourcePicker
+// replaced it. The three keys are removed once on mount to wash any stored
+// leftovers from older builds.
+const RETIRED_STORAGE_KEYS = [
+  'timstool_saved_connections',
+  'timstool_last_connection',
+  'pg2tidb_last_connection',
+]
 
 onMounted(async () => {
   // Multi-source: load source metas, then seed the dynamic source form from the
@@ -197,22 +126,7 @@ onMounted(async () => {
   const meta = getSource(sourceType.value)
   if (meta) Object.assign(form.source, reconcileModel({}, meta, meta))
 
-  loadSavedConnections()
-  const last = localStorage.getItem(LEGACY_LAST_CONN_KEY)
-  if (last) {
-    try {
-      const c = JSON.parse(last)
-      if (c.sourceType && c.sourceType !== sourceType.value) {
-        onSourceTypeChange(c.sourceType)
-      }
-      if (c.source) Object.assign(form.source, stripPassword(c.source))
-      if (c.target) Object.assign(form.target, stripPassword(c.target))
-    } catch {}
-    // One-shot migration: drop the legacy key so its plaintext password
-    // (if any) can never be read back.
-    localStorage.removeItem(LEGACY_LAST_CONN_KEY)
-    localStorage.removeItem(LAST_CONN_KEY)
-  }
+  RETIRED_STORAGE_KEYS.forEach(k => localStorage.removeItem(k))
 })
 
 
@@ -381,12 +295,6 @@ function toggleSelectAll() {
 async function submit() {
   loading.value = true
   try {
-    localStorage.setItem(LAST_CONN_KEY, JSON.stringify({
-      sourceType: sourceType.value,
-      source: stripPassword(form.source),
-      target: stripPassword(form.target),
-    }))
-
     const { data } = await apiClient.createTask({
       name: form.name || `Migration ${new Date().toLocaleString()}`,
       source_ref: sourceRef.value || undefined,
@@ -518,14 +426,6 @@ function prevStep() {
             <el-icon size="24" style="margin-right: 8px;"><Connection /></el-icon>
             <span style="font-size: 15px; font-weight: 600;">连接与迁移配置</span>
           </div>
-          <el-space>
-            <el-button size="small" @click="loadConnDialogVisible = true">
-              <el-icon><FolderOpened /></el-icon> 加载连接
-            </el-button>
-            <el-button size="small" @click="saveConnDialogVisible = true">
-              <el-icon><FolderAdd /></el-icon> 保存连接
-            </el-button>
-          </el-space>
         </div>
       </template>
 
@@ -813,37 +713,6 @@ function prevStep() {
         </el-form-item>
       </el-form>
     </el-card>
-
-    <!-- Save Connection Dialog -->
-    <el-dialog v-model="saveConnDialogVisible" title="保存连接配置" width="400px">
-      <el-input v-model="saveConnName" placeholder="输入配置名称（如：生产环境）" />
-      <template #footer>
-        <el-button @click="saveConnDialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="saveCurrentConnection">保存</el-button>
-      </template>
-    </el-dialog>
-
-    <!-- Load Connection Dialog -->
-    <el-dialog v-model="loadConnDialogVisible" title="加载连接配置" width="500px">
-      <div v-if="savedConnections.length === 0" style="color: #999; text-align: center; padding: 20px;">
-        暂无保存的连接配置
-      </div>
-      <div v-for="(conn, idx) in savedConnections" :key="idx" style="border: 1px solid #ebeef5; border-radius: 8px; padding: 12px; margin-bottom: 10px;">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-          <div>
-            <strong>{{ conn.name }}</strong>
-            <div style="color: #909399; font-size: 12px; margin-top: 4px;">
-              {{ getSource(conn.sourceType || 'postgres')?.displayName || 'Source' }}: {{ conn.source.host }}:{{ conn.source.port }}/{{ conn.source.database }}
-              → TiDB: {{ conn.target.host }}:{{ conn.target.port }}/{{ conn.target.database }}
-            </div>
-          </div>
-          <el-space>
-            <el-button size="small" type="primary" @click="loadConnection(conn)">加载</el-button>
-            <el-button size="small" type="danger" plain @click="deleteConnection(idx)">删除</el-button>
-          </el-space>
-        </div>
-      </div>
-    </el-dialog>
   </div>
 </template>
 
