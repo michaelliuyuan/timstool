@@ -676,6 +676,7 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 	}
 
 	// Empty initial watermark ⇒ full backfill from MIN(watermark).
+	minDerived := false
 	if wm == "" {
 		var minWM sql.NullString
 		if err := pgDB.QueryRowContext(ctx,
@@ -695,14 +696,22 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 			return res
 		}
 		wm = minWM.String
+		minDerived = true
 		res.FromWM = "(MIN) " + wm
 	}
 
-	selSQL := incBuildSelectSQL(sc.Schema, t.Table, cols, t.WatermarkColumn, job.StrictMode)
+	// Strict-mode >= exceptions: (a) a cursor derived from MIN(col) MUST scan
+	// with >= first — a strict > would permanently skip every row sitting
+	// exactly at MIN (adversarial ①, v2); (b) after a drain jump the
+	// jumped-to value's rows are entirely unconsumed — a strict > would skip
+	// them all, so the post-jump scan is also >=. Later scans restore the
+	// job's strict semantics (the usual boundary-value tradeoff applies).
+	geScan := minDerived
 	total := int64(0)
 	lastWM := wm
 	for {
 		entryWM := wm
+		selSQL := incBuildSelectSQL(sc.Schema, t.Table, cols, t.WatermarkColumn, job.StrictMode && !geScan)
 		srows, err := pgDB.QueryContext(ctx, selSQL, wm, job.BatchSize)
 		if err != nil {
 			res.Error = "查询源端失败: " + err.Error()
@@ -764,8 +773,10 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 				break
 			}
 			wm = jump
+			geScan = true
 			continue
 		}
+		geScan = false
 		wm = next
 		if done {
 			break

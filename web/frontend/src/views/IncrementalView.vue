@@ -252,11 +252,16 @@ const strategyLabels: Record<string, string> = { replace: 'REPLACE INTO', ignore
         </el-form-item>
         <el-divider content-position="left">同步配置</el-divider>
         <el-form-item label="冲突策略">
-          <el-radio-group v-model="form.conflict_strategy">
-            <el-radio value="replace">REPLACE INTO（默认，幂等）</el-radio>
-            <el-radio value="ignore">INSERT IGNORE（跳过冲突）</el-radio>
-            <el-radio value="error">报错停止</el-radio>
-          </el-radio-group>
+          <div>
+            <el-radio-group v-model="form.conflict_strategy">
+              <el-radio value="replace">REPLACE INTO（默认，幂等）</el-radio>
+              <el-radio value="ignore">INSERT IGNORE（跳过冲突）</el-radio>
+              <el-radio value="error">报错停止</el-radio>
+            </el-radio-group>
+            <div v-if="form.conflict_strategy === 'error'" style="margin-top: 4px; font-size: 13px; color: var(--el-color-warning); line-height: 1.6;">
+              ⚠️ 批次之间无事务：同步失败或中途崩溃后重跑，该策略会撞到已写入行的重复键错误且无自愈——重跑前建议改用 REPLACE/IGNORE。
+            </div>
+          </div>
         </el-form-item>
         <el-form-item label="批大小">
           <el-input-number v-model="form.batch_size" :min="1" :max="100000" :step="500" controls-position="right" />

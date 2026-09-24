@@ -321,13 +321,27 @@ func (f *fakeWMTable) minAbove(wm string) sql.NullString {
 func runLoopModel(t *testing.T, tbl *fakeWMTable, startWM string, batchSize int, strict bool) (written int, finalWM string) {
 	t.Helper()
 	const maxIters = 10000
+	// Mirrors the engine: an empty starting watermark derives the cursor from
+	// MIN(col) — strict jobs then get a >= first scan (adversarial ①, v2);
+	// a >= scan also follows every drain jump (the jumped-to value's rows are
+	// unconsumed — a strict > would skip them all).
+	minDerived := startWM == ""
+	geScan := minDerived
 	wm, lastWM, written := startWM, startWM, 0
 	for i := 0; ; i++ {
 		if i > maxIters {
 			t.Fatal("loop model livelocked (did not terminate)")
 		}
 		entryWM := wm
-		batch := tbl.fetch(entryWM, batchSize, strict)
+		if entryWM == "" {
+			// MIN(col) probe on the fake table.
+			if len(tbl.rows) == 0 {
+				break
+			}
+			entryWM = tbl.rows[0]
+			wm = entryWM
+		}
+		batch := tbl.fetch(entryWM, batchSize, strict && !geScan)
 		if len(batch) == 0 {
 			break
 		}
@@ -345,8 +359,10 @@ func runLoopModel(t *testing.T, tbl *fakeWMTable, startWM string, batchSize int,
 				return written, lastWM
 			}
 			wm = jump
+			geScan = true
 			continue
 		}
+		geScan = false
 		wm = next
 		if done {
 			break
@@ -382,8 +398,24 @@ func TestIncLoopWholeTableSameValue(t *testing.T) {
 		rows = append(rows, "w9")
 	}
 	written, wm := runLoopModel(t, &fakeWMTable{rows: rows}, "", 10, false)
-	if wm != "w9" || written != 10+10+35 {
-		t.Fatalf("whole-table same value: wm=%q written=%d (want w9, 55)", wm, written)
+	if wm != "w9" || written != 10+35 {
+		t.Fatalf("whole-table same value: wm=%q written=%d (want w9, 45)", wm, written)
+	}
+}
+
+func TestIncLoopStrictMINBackfill(t *testing.T) {
+	// Strict mode + empty initial watermark: the MIN-derived first scan must
+	// be >= (all MIN rows arrive via the saturation drain), and the
+	// post-jump scan must also be >= (the w2 row is unconsumed — a strict >
+	// there would drop it entirely).
+	rows := []string{}
+	for i := 0; i < 25; i++ {
+		rows = append(rows, "w1")
+	}
+	rows = append(rows, "w2")
+	written, wm := runLoopModel(t, &fakeWMTable{rows: rows}, "", 10, true)
+	if wm != "w2" || written != 10+25+1 {
+		t.Fatalf("strict MIN backfill: wm=%q written=%d (want w2, 36 — zero rows lost)", wm, written)
 	}
 }
 
