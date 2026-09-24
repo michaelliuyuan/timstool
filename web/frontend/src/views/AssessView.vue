@@ -1,7 +1,13 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import PageHeader from '../components/PageHeader.vue'
+import DataSourcePicker from '../components/DataSourcePicker.vue'
+import { useDataSources } from '../composables/useDataSources'
+
+// F-02: the connection is either a saved datasource (postgres, server-side
+// credentials) or the legacy inline form. The localStorage memory is retired
+// (passwords must not live in the browser).
 
 interface Finding {
   dimension: string
@@ -38,10 +44,11 @@ const ddlDialogVisible = ref(false)
 const ddlDialogTitle = ref('')
 const ddlDialogContent = ref('')
 
-const STORAGE_KEY = 'pg2tidb-assess-source'
+const sourceRef = ref('')
+const { load: loadDataSources } = useDataSources()
+onMounted(() => { loadDataSources() })
 
-const savedSource = localStorage.getItem(STORAGE_KEY)
-const sourceForm = ref(savedSource ? JSON.parse(savedSource) : {
+const sourceForm = ref({
   host: '',
   port: 5432,
   user: 'postgres',
@@ -49,17 +56,6 @@ const sourceForm = ref(savedSource ? JSON.parse(savedSource) : {
   database: '',
   schema: 'public'
 })
-
-function saveSourceConfig() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(sourceForm.value))
-  ElMessage.success('数据源配置已保存')
-}
-
-function clearSourceConfig() {
-  localStorage.removeItem(STORAGE_KEY)
-  sourceForm.value = { host: '', port: 5432, user: 'postgres', password: '', database: '', schema: 'public' }
-  ElMessage.info('已清除保存的配置')
-}
 
 const levelEmoji: Record<string, string> = {
   compatible: '●',
@@ -118,8 +114,8 @@ function badgeClass(level: string): string {
 }
 
 async function runAssess() {
-  if (!sourceForm.value.host || !sourceForm.value.database) {
-    ElMessage.warning('请填写主机和数据库名')
+  if (!sourceRef.value && (!sourceForm.value.host || !sourceForm.value.database)) {
+    ElMessage.warning('请选择数据源或填写主机和数据库名')
     return
   }
   loading.value = true
@@ -127,10 +123,13 @@ async function runAssess() {
   htmlReportUrl.value = ''
 
   try {
+    const body = sourceRef.value
+      ? { source_ref: sourceRef.value }
+      : { ...sourceForm.value }
     const resp = await fetch('/api/v1/assess', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(sourceForm.value)
+      body: JSON.stringify(body)
     })
     if (!resp.ok) {
       const err = await resp.json()
@@ -146,13 +145,17 @@ async function runAssess() {
 }
 
 async function downloadHTML() {
-  if (!sourceForm.value.host) return
+  if (!sourceRef.value && !sourceForm.value.host) return
   loading.value = true
+
   try {
+    const body = sourceRef.value
+      ? { source_ref: sourceRef.value, format: 'html' }
+      : { ...sourceForm.value, format: 'html' }
     const resp = await fetch('/api/v1/assess', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...sourceForm.value, format: 'html' })
+      body: JSON.stringify(body)
     })
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
     const html = await resp.text()
@@ -201,6 +204,7 @@ function copyDDL() {
         <span style="font-weight: 600;">数据源配置</span>
       </template>
       <el-form :model="sourceForm" label-width="80px" size="default" inline>
+        <template v-if="!sourceRef">
         <el-form-item label="主机">
           <el-input v-model="sourceForm.host" placeholder="PG 主机地址" style="width: 160px;" />
         </el-form-item>
@@ -219,12 +223,17 @@ function copyDDL() {
         <el-form-item label="Schema">
           <el-input v-model="sourceForm.schema" style="width: 100px;" />
         </el-form-item>
+        </template>
+        <el-form-item v-else label="数据源" style="min-width: 360px;">
+          <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
+        </el-form-item>
+        <el-form-item v-if="!sourceRef">
+          <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
+        </el-form-item>
         <el-form-item>
           <el-button type="primary" @click="runAssess" :loading="loading">
             {{ loading ? '评估中...' : '开始评估' }}
           </el-button>
-          <el-button @click="saveSourceConfig">保存配置</el-button>
-          <el-button @click="clearSourceConfig" text type="info">清除</el-button>
         </el-form-item>
       </el-form>
     </el-card>

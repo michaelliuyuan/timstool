@@ -4,16 +4,25 @@ import { ElMessage } from 'element-plus'
 import apiClient from '../api'
 import type { CompareTask, CompareReport, CompareOptions } from '../api'
 import ConnectionForm from '../components/ConnectionForm.vue'
+import DataSourcePicker from '../components/DataSourcePicker.vue'
 import PageHeader from '../components/PageHeader.vue'
 import { useSourceSchema } from '../composables/useSourceSchema'
+import { useDataSources } from '../composables/useDataSources'
 import { reconcileModel } from '../composables/reconcileModel'
 
 // Standalone data comparison (独立数据比对): configure source + target, pick
 // tables and a compare mode, run the validator directly — no migration.
 
 const { sources, load: loadSources, getSource } = useSourceSchema()
+const { load: loadDataSources, get: getDataSource } = useDataSources()
 const sourceType = ref('postgres')
 const currentMeta = computed(() => getSource(sourceType.value))
+
+// F-02 datasource refs ('' = manual entry).
+const sourceRef = ref('')
+const targetRef = ref('')
+const effectiveSourceType = computed(() =>
+  sourceRef.value ? (getDataSource(sourceRef.value)?.type || 'postgres') : sourceType.value)
 
 const form = reactive({
   name: '',
@@ -49,18 +58,23 @@ async function loadTables() {
   availableTables.value = []
   selectedTables.value = []
   try {
-    const { data } = sourceType.value === 'postgres'
-      ? await apiClient.listTables({
-          type: 'source',
-          host: form.source.host,
-          port: form.source.port,
-          user: form.source.user,
-          password: form.source.password,
-          database: form.source.database,
-          schema: form.source.schema,
-          sslmode: form.source.sslmode,
-        })
-      : await apiClient.getSourceTables(sourceType.value, { ...form.source })
+    let data: { tables: { name: string; row_estimate: number }[] }
+    if (sourceRef.value) {
+      ;({ data } = await apiClient.getRefTables(sourceRef.value))
+    } else if (sourceType.value === 'postgres') {
+      ;({ data } = await apiClient.listTables({
+        type: 'source',
+        host: form.source.host,
+        port: form.source.port,
+        user: form.source.user,
+        password: form.source.password,
+        database: form.source.database,
+        schema: form.source.schema,
+        sslmode: form.source.sslmode,
+      }))
+    } else {
+      ;({ data } = await apiClient.getSourceTables(sourceType.value, { ...form.source }))
+    }
     availableTables.value = data.tables || []
   } catch (e: any) {
     ElMessage.error(`加载表列表失败: ${e.response?.data?.error || e.message}`)
@@ -86,6 +100,21 @@ const testingTarget = ref(false)
 const targetTestResult = ref<any>(null)
 
 async function testSource() {
+  if (sourceRef.value) {
+    testingSource.value = true
+    sourceTestResult.value = null
+    try {
+      const { data } = await apiClient.testDataSource(sourceRef.value)
+      sourceTestResult.value = { success: data.success, message: data.message }
+      if (data.success) ElMessage.success('数据源连接成功')
+      else ElMessage.error(`连接失败: ${data.message}`)
+    } catch (e: any) {
+      ElMessage.error(`连接测试失败: ${e.response?.data?.error || e.message}`)
+    } finally {
+      testingSource.value = false
+    }
+    return
+  }
   if (!currentMeta.value?.implemented) return
   testingSource.value = true
   sourceTestResult.value = null
@@ -105,6 +134,13 @@ async function testTarget() {
   testingTarget.value = true
   targetTestResult.value = null
   try {
+    if (targetRef.value) {
+      const { data } = await apiClient.testDataSource(targetRef.value)
+      targetTestResult.value = { ok: data.success, error: data.message }
+      if (data.success) ElMessage.success('TiDB 数据源连接成功')
+      else ElMessage.error(`连接失败: ${data.message}`)
+      return
+    }
     const { data } = await apiClient.testConnection({
       type: 'target',
       host: form.target.host,
@@ -273,15 +309,21 @@ async function loadReport(id: string) {
 }
 
 async function startCompare() {
-  if (!form.source.host || !form.target.host) {
-    ElMessage.warning('请先填写源库与目标库连接信息')
+  if (!sourceRef.value && !form.source.host) {
+    ElMessage.warning('请先选择源库数据源或填写连接信息')
+    return
+  }
+  if (!targetRef.value && !form.target.host) {
+    ElMessage.warning('请先选择目标库数据源或填写连接信息')
     return
   }
   starting.value = true
   try {
     const { data } = await apiClient.createCompare({
       name: form.name || `Compare ${new Date().toLocaleString()}`,
-      source: { ...form.source, type: sourceType.value },
+      source_ref: sourceRef.value || undefined,
+      target_ref: targetRef.value || undefined,
+      source: { ...form.source, type: effectiveSourceType.value },
       target: { ...form.target },
       mode: form.mode,
       sample_ratio: form.sample_ratio,
@@ -356,6 +398,7 @@ function diffHeat(n: number | undefined): string {
 
 onMounted(async () => {
   await loadSources()
+  loadDataSources()
   const meta = getSource(sourceType.value)
   if (meta) Object.assign(form.source, reconcileModel({}, meta, meta))
   // Auto-fill the last saved connection (password stays empty); the form is
@@ -393,16 +436,21 @@ onUnmounted(() => {
         </el-form-item>
         <el-row :gutter="24">
           <el-col :span="12">
-            <el-divider content-position="left">源数据库（PostgreSQL）</el-divider>
+            <el-divider content-position="left">源数据库（PostgreSQL / MySQL）</el-divider>
+            <el-form-item label="数据源">
+              <DataSourcePicker v-model="sourceRef" :types="['postgres', 'mysql']" />
+            </el-form-item>
+            <template v-if="!sourceRef">
             <el-form-item label="数据源类型" v-if="sources.length > 0">
               <el-select :model-value="sourceType" style="width: 100%" @change="onSourceTypeChange">
                 <el-option v-for="s in sources" :key="s.name" :label="s.displayName" :value="s.name" :disabled="!s.implemented" />
               </el-select>
             </el-form-item>
             <ConnectionForm v-if="currentMeta" :meta="currentMeta" :model="form.source" />
+            </template>
             <el-form-item>
-              <el-button :loading="testingSource" :disabled="!currentMeta?.implemented" @click="testSource">
-                测试 {{ currentMeta?.displayName || 'PostgreSQL' }} 连接
+              <el-button :loading="testingSource" :disabled="!sourceRef && !currentMeta?.implemented" @click="testSource">
+                {{ sourceRef ? '测试数据源连接' : `测试 ${currentMeta?.displayName || 'PostgreSQL'} 连接` }}
               </el-button>
               <el-tag v-if="sourceTestResult" :type="sourceTestResult.success ? 'success' : 'danger'" style="margin-left: 12px;">
                 {{ sourceTestResult.success ? '连接成功' : sourceTestResult.message }}
@@ -412,13 +460,18 @@ onUnmounted(() => {
 
           <el-col :span="12">
             <el-divider content-position="left">目标数据库（TiDB）</el-divider>
+            <el-form-item label="数据源">
+              <DataSourcePicker v-model="targetRef" :types="['tidb']" />
+            </el-form-item>
+            <template v-if="!targetRef">
             <el-form-item label="主机地址"><el-input v-model="form.target.host" /></el-form-item>
             <el-form-item label="端口"><el-input-number v-model="form.target.port" :min="1" :max="65535" /></el-form-item>
             <el-form-item label="用户名"><el-input v-model="form.target.user" /></el-form-item>
             <el-form-item label="密码"><el-input v-model="form.target.password" type="password" show-password /></el-form-item>
             <el-form-item label="数据库名"><el-input v-model="form.target.database" /></el-form-item>
+            </template>
             <el-form-item>
-              <el-button :loading="testingTarget" @click="testTarget">测试 TiDB 连接</el-button>
+              <el-button :loading="testingTarget" @click="testTarget">{{ targetRef ? '测试数据源连接' : '测试 TiDB 连接' }}</el-button>
               <el-tag v-if="targetTestResult" :type="targetTestResult.ok ? 'success' : 'danger'" style="margin-left: 12px;">
                 {{ targetTestResult.ok ? '连接成功' : targetTestResult.error }}
               </el-tag>

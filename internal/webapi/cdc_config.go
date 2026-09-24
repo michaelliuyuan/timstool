@@ -345,6 +345,64 @@ func (s *Server) handlePutCDCConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleImportCDCFromDataSource (F-02 D4): write a postgres datasource (source)
+// + a tidb datasource (target) into config.yaml in one click. The supervisor /
+// CDC child run chain is untouched — this only edits the same fields the
+// connection card edits, then the operator starts/restarts CDC as usual.
+func (s *Server) handleImportCDCFromDataSource(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SourceRef string `json:"source_ref"`
+		TargetRef string `json:"target_ref"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.SourceRef == "" || req.TargetRef == "" {
+		s.writeError(w, http.StatusBadRequest, "source_ref and target_ref are required")
+		return
+	}
+
+	srcEntry, err := s.resolveDataSourceRef(req.SourceRef)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+		return
+	}
+	if srcEntry.Type != "postgres" {
+		s.writeError(w, http.StatusBadRequest, "source_ref: CDC 仅支持 PostgreSQL 源端数据源")
+		return
+	}
+	tgtEntry, err := s.resolveDataSourceRef(req.TargetRef)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "target_ref: "+err.Error())
+		return
+	}
+	if tgtEntry.Type != "tidb" {
+		s.writeError(w, http.StatusBadRequest, "target_ref: 目标端数据源类型必须是 tidb")
+		return
+	}
+
+	cdcCfgMu.Lock()
+	defer cdcCfgMu.Unlock()
+	cfg, err := s.loadCDCConfig()
+	if err != nil {
+		s.writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	cfg.Source = dataSourceToSourceConfig(srcEntry)
+	cfg.Target = dataSourceToTargetConfig(tgtEntry)
+	if err := s.writeCDCConfig(cfg); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "写入 config.yaml 失败："+err.Error())
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":      true,
+		"message": fmt.Sprintf("已从数据源导入连接到 config.yaml（%s → %s）", srcEntry.Name, tgtEntry.Name),
+		"source":  summarizeSource(cfg.Source),
+		"target":  summarizeTarget(cfg.Target),
+	})
+}
+
 // handleImportCDCConfig copies the source/target of the latest completed
 // migration task into config.yaml (the cdc section and everything else are
 // left untouched). This closes the wizard↔CDC connection split (A1).

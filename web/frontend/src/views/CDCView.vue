@@ -39,6 +39,22 @@
         <button class="btn-refresh" @click="startEditConn" v-if="!editingConn">编辑连接</button>
         <button class="btn-refresh" @click="importConn" :disabled="busy || isActive || editingConn">从最近迁移任务导入</button>
       </div>
+      <!-- F-02 D4: one-click import from saved datasources -->
+      <div class="control-actions ds-import" v-if="!editingConn">
+        <span class="ds-import-label">从数据源导入：</span>
+        <select v-model="dsSourceRef" class="ds-import-select">
+          <option value="">源端（PG 数据源）</option>
+          <option v-for="d in dsByType(['postgres'])" :key="d.id" :value="d.id">{{ d.name }}</option>
+        </select>
+        <span class="ds-import-arrow">→</span>
+        <select v-model="dsTargetRef" class="ds-import-select">
+          <option value="">目标端（TiDB 数据源）</option>
+          <option v-for="d in dsByType(['tidb'])" :key="d.id" :value="d.id">{{ d.name }}</option>
+        </select>
+        <button class="btn-refresh" @click="importFromDS" :disabled="busy || isActive || !dsSourceRef || !dsTargetRef || importingDS">
+          {{ importingDS ? '导入中…' : '导入' }}
+        </button>
+      </div>
       <!-- Inline edit form (A1 manual edit) -->
       <div v-if="editingConn" class="conn-edit">
         <div class="conn-edit-section">源端（PostgreSQL）</div>
@@ -231,6 +247,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import DataPipelineStrip from '../components/DataPipelineStrip.vue'
 import SparkLine from '../components/SparkLine.vue'
 import PageHeader from '../components/PageHeader.vue'
+import { useDataSources } from '../composables/useDataSources'
 
 const API_BASE = '/api/v1/cdc'
 
@@ -384,6 +401,40 @@ async function importConn() {
   } catch (e: any) {
     connError.value = true
     connMsg.value = '请求失败: ' + e
+  }
+}
+
+// F-02 D4: write datasource credentials into config.yaml (supervisor chain
+// untouched; takes effect on next CDC start/restart).
+const { load: loadDataSources, byType: dsByType } = useDataSources()
+const dsSourceRef = ref('')
+const dsTargetRef = ref('')
+const importingDS = ref(false)
+
+async function importFromDS() {
+  if (!dsSourceRef.value || !dsTargetRef.value) return
+  if (!confirm('确认把所选数据源的连接写入 config.yaml？当前 CDC 使用的连接将被覆盖（cdc 配置段不变）。')) return
+  importingDS.value = true
+  connMsg.value = ''
+  connError.value = false
+  try {
+    const r = await fetch(API_BASE + '/config/import-from-datasource', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source_ref: dsSourceRef.value, target_ref: dsTargetRef.value }),
+    })
+    const j = await r.json().catch(() => ({}))
+    if (!r.ok) { connError.value = true; connMsg.value = j.error || '导入失败' }
+    else {
+      connMsg.value = j.message || '已导入'
+      await loadConnConfig()
+      await runPrecheck()
+    }
+  } catch (e: any) {
+    connError.value = true
+    connMsg.value = '请求失败: ' + e
+  } finally {
+    importingDS.value = false
   }
 }
 
@@ -654,6 +705,7 @@ onMounted(() => {
   refresh()
   loadConnConfig()
   runPrecheck()
+  loadDataSources()
   timer = setInterval(refresh, refreshInterval.value * 1000)
 })
 
@@ -663,6 +715,23 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+/* F-02 datasource import row */
+.ds-import {
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ds-import-label { font-size: 12.5px; color: var(--tims-text-2, #909399); }
+.ds-import-arrow { color: var(--tims-text-2, #909399); }
+.ds-import-select {
+  padding: 4px 8px;
+  border: 1px solid var(--tims-border, #dcdfe6);
+  border-radius: 6px;
+  background: #fff;
+  font-size: 12.5px;
+  min-width: 160px;
+}
+
 .cdc-container {
   /* width & centering come from the shared .tims-page class */
 }
@@ -759,8 +828,7 @@ code { background: #f0f0f0; padding: 2px 8px; border-radius: 4px; font-size: 13p
 .disabled-card p { font-size: 14px; margin: 6px 0; }
 .disabled-card .hint { color: #999; font-size: 13px; }
 .disabled-card code { background: #f0f0f0; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
-.btn-refresh {
-  padding: 8px 20px; border: none; border-radius: 8px;
+.btn-refresh {  padding: 8px 20px; border: none; border-radius: 8px;
   background: #1a1a2e; color: #fff; font-size: 14px; cursor: pointer;
 }
 .btn-refresh:hover { opacity: 0.85; }

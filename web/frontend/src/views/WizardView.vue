@@ -4,8 +4,10 @@ import { useRouter } from 'vue-router'
 import { ElMessage, type FormRules } from 'element-plus'
 import apiClient from '../api'
 import ConnectionForm from '../components/ConnectionForm.vue'
+import DataSourcePicker from '../components/DataSourcePicker.vue'
 import PageHeader from '../components/PageHeader.vue'
 import { useSourceSchema } from '../composables/useSourceSchema'
+import { useDataSources } from '../composables/useDataSources'
 import { reconcileModel } from '../composables/reconcileModel'
 
 
@@ -15,8 +17,18 @@ const activeStep = ref(0)
 
 // Multi-source config: schema-driven selector + dynamic connection form (#t77).
 const { sources, load: loadSources, getSource } = useSourceSchema()
+const { load: loadDataSources, get: getDataSource } = useDataSources()
 const sourceType = ref('postgres')
 const currentMeta = computed(() => getSource(sourceType.value))
+
+// F-02 datasource refs: non-empty = use the saved profile (server-side
+// credentials); '' = manual entry (the classic dynamic form).
+const sourceRef = ref('')
+const targetRef = ref('')
+const effectiveSourceType = computed(() =>
+  sourceRef.value ? (getDataSource(sourceRef.value)?.type || 'postgres') : sourceType.value)
+const sourceDS = computed(() => (sourceRef.value ? getDataSource(sourceRef.value) : undefined))
+const targetDS = computed(() => (targetRef.value ? getDataSource(targetRef.value) : undefined))
 
 const availableTables = ref<{name: string; row_estimate: number}[]>([])
 const loadingTables = ref(false)
@@ -162,6 +174,7 @@ onMounted(async () => {
   // Multi-source: load source metas, then seed the dynamic source form from the
   // default source (postgres) defaults.
   await loadSources()
+  loadDataSources()
   const meta = getSource(sourceType.value)
   if (meta) Object.assign(form.source, reconcileModel({}, meta, meta))
 
@@ -208,6 +221,22 @@ function onSourceTypeChange(name: string) {
 
 async function testConnection(type: 'source' | 'target') {
   if (type === 'source') {
+    // F-02: a selected datasource is tested server-side by ref.
+    if (sourceRef.value) {
+      testingSource.value = true
+      sourceTestResult.value = null
+      try {
+        const { data } = await apiClient.testDataSource(sourceRef.value)
+        sourceTestResult.value = { success: data.success, message: data.message }
+        if (data.success) ElMessage.success('数据源连接成功')
+        else ElMessage.error(`连接失败: ${data.message}`)
+      } catch (e: any) {
+        ElMessage.error(`连接测试失败: ${e.response?.data?.error || e.message}`)
+      } finally {
+        testingSource.value = false
+      }
+      return
+    }
     if (!currentMeta.value?.implemented) return
     testingSource.value = true
     sourceTestResult.value = null
@@ -224,10 +253,21 @@ async function testConnection(type: 'source' | 'target') {
     }
     return
   }
-  // target (TiDB): legacy /config/test-connection
+  // target (TiDB): legacy /config/test-connection, or datasource test by ref
   testingTarget.value = true
   targetTestResult.value = null
   try {
+    if (targetRef.value) {
+      const { data } = await apiClient.testDataSource(targetRef.value)
+      targetTestResult.value = {
+        ok: data.success,
+        mysql_ok: data.success,
+        error: data.message,
+        version: data.version,
+      }
+      if (data.success) ElMessage.success('TiDB 数据源连接成功')
+      else ElMessage.error(`连接失败: ${data.message}`)
+    } else {
     const { data } = await apiClient.testConnection({
       type,
       host: form.target.host,
@@ -246,6 +286,7 @@ async function testConnection(type: 'source' | 'target') {
       saveMigrationOptions()
     }
     else ElMessage.error(`连接失败: ${data.error}`)
+    }
   } catch (e: any) {
     ElMessage.error(`连接测试失败: ${e.message}`)
   } finally {
@@ -258,20 +299,26 @@ async function loadTables() {
   availableTables.value = []
   selectedTables.value = []
   try {
-    // PG keeps its dedicated endpoint (reltuples row estimates, zero-regression);
-    // non-PG lists tables via the adapter's SchemaReader (#t79 Phase 1).
-    const { data } = sourceType.value === 'postgres'
-      ? await apiClient.listTables({
-          type: 'source',
-          host: form.source.host,
-          port: form.source.port,
-          user: form.source.user,
-          password: form.source.password,
-          database: form.source.database,
-          schema: form.source.schema,
-          sslmode: form.source.sslmode,
-        })
-      : await apiClient.getSourceTables(sourceType.value, { ...form.source })
+    // F-02: a datasource ref lists tables server-side (no credentials here).
+    let data: { tables: { name: string; row_estimate: number }[] }
+    if (sourceRef.value) {
+      ;({ data } = await apiClient.getRefTables(sourceRef.value))
+    } else if (effectiveSourceType.value === 'postgres') {
+      // PG keeps its dedicated endpoint (reltuples row estimates, zero-regression);
+      // non-PG lists tables via the adapter's SchemaReader (#t79 Phase 1).
+      ;({ data } = await apiClient.listTables({
+        type: 'source',
+        host: form.source.host,
+        port: form.source.port,
+        user: form.source.user,
+        password: form.source.password,
+        database: form.source.database,
+        schema: form.source.schema,
+        sslmode: form.source.sslmode,
+      }))
+    } else {
+      ;({ data } = await apiClient.getSourceTables(effectiveSourceType.value, { ...form.source }))
+    }
     availableTables.value = data.tables || []
   } catch (e: any) {
     ElMessage.error(`加载表列表失败: ${e.response?.data?.error || e.message}`)
@@ -308,7 +355,9 @@ async function submit() {
 
     const { data } = await apiClient.createTask({
       name: form.name || `Migration ${new Date().toLocaleString()}`,
-      source: { ...form.source, type: sourceType.value },
+      source_ref: sourceRef.value || undefined,
+      target_ref: targetRef.value || undefined,
+      source: { ...form.source, type: effectiveSourceType.value },
       target: { ...form.target },
       opts: {
         parallel: form.opts.parallel,
@@ -322,7 +371,7 @@ async function submit() {
         skip_schema: form.opts.skip_schema,
         skip_data: form.opts.skip_data,
         skip_validate: form.opts.skip_validate,
-        cdc_chain: form.opts.cdc_chain && sourceType.value === 'postgres',
+        cdc_chain: form.opts.cdc_chain && effectiveSourceType.value === 'postgres',
         target_policy: form.opts.target_policy,
         compare_mode: form.opts.compare_mode,
         sample_ratio: form.opts.sample_ratio,
@@ -460,6 +509,10 @@ function prevStep() {
           <el-form-item label="任务名称">
             <el-input v-model="form.name" placeholder="可选，自动生成" />
           </el-form-item>
+          <el-form-item label="数据源">
+            <DataSourcePicker v-model="sourceRef" :types="['postgres', 'mysql']" />
+          </el-form-item>
+          <template v-if="!sourceRef">
           <el-form-item label="数据源类型" v-if="sources.length > 0">
             <el-select :model-value="sourceType" placeholder="选择数据源" style="width: 100%" @change="onSourceTypeChange">
               <el-option v-for="s in sources" :key="s.name" :label="s.displayName" :value="s.name" :disabled="!s.implemented">
@@ -469,9 +522,10 @@ function prevStep() {
             </el-select>
           </el-form-item>
           <ConnectionForm v-if="currentMeta" :meta="currentMeta" :model="form.source" />
+          </template>
           <el-form-item>
-            <el-button type="primary" :loading="testingSource" :disabled="!currentMeta?.implemented" @click="testConnection('source')">
-              测试 {{ currentMeta?.displayName || 'PostgreSQL' }} 连接
+            <el-button type="primary" :loading="testingSource" :disabled="!sourceRef && !currentMeta?.implemented" @click="testConnection('source')">
+              {{ sourceRef ? '测试数据源连接' : `测试 ${currentMeta?.displayName || 'PostgreSQL'} 连接` }}
             </el-button>
             <el-tag v-if="sourceTestResult" :type="sourceTestResult.success ? 'success' : 'danger'" style="margin-left: 12px;">
               {{ sourceTestResult.success ? '连接成功' : sourceTestResult.message }}
@@ -481,6 +535,10 @@ function prevStep() {
 
         <!-- Step 1: Target -->
         <div v-show="activeStep === 1">
+          <el-form-item label="数据源">
+            <DataSourcePicker v-model="targetRef" :types="['tidb']" />
+          </el-form-item>
+          <template v-if="!targetRef">
           <el-form-item label="主机地址" prop="target.host">
             <el-input v-model="form.target.host" />
           </el-form-item>
@@ -503,9 +561,10 @@ function prevStep() {
             <el-form-item label="TiDB 状态端口">
             <el-input-number v-model="form.target.status_port" :min="0" :max="65535" placeholder="10080" />
           </el-form-item>
+          </template>
           <el-form-item>
             <el-button type="primary" :loading="testingTarget" @click="testConnection('target')">
-              测试 TiDB 连接
+              {{ targetRef ? '测试数据源连接' : '测试 TiDB 连接' }}
             </el-button>
             <template v-if="targetTestResult">
               <el-tag :type="targetTestResult.mysql_ok === false || (!targetTestResult.mysql_ok && !targetTestResult.ok) ? 'danger' : 'success'" style="margin-left: 12px;">
@@ -600,7 +659,7 @@ function prevStep() {
               <span style="color: var(--tims-brand); font-weight: 600;">全量+增量衔接</span>
             </template>
             <div class="chain-emphasis" style="width: 100%;">
-              <el-switch v-model="form.opts.cdc_chain" :disabled="sourceType !== 'postgres'" />
+              <el-switch v-model="form.opts.cdc_chain" :disabled="effectiveSourceType !== 'postgres'" />
               <div style="color: var(--tims-text-2); font-size: 12px; margin-top: 4px;">
                 仅 PostgreSQL 源端可用。开启后任务启动前会自动预建 CDC 的 publication + replication
                 slot，全量期间源端 WAL 被保留；全量成功后自动启动 CDC 增量同步，从预建点位重放，实现零丢失衔接
@@ -671,8 +730,14 @@ function prevStep() {
           <el-descriptions title="迁移配置确认" :column="2" border>
             <el-descriptions-item label="任务名称">{{ form.name || '自动生成' }}</el-descriptions-item>
             <el-descriptions-item label="并发数">{{ form.opts.parallel }}</el-descriptions-item>
-            <el-descriptions-item label="源数据库">{{ form.source.host }}:{{ form.source.port }}/{{ form.source.database }}</el-descriptions-item>
-            <el-descriptions-item label="目标数据库">{{ form.target.host }}:{{ form.target.port }}/{{ form.target.database }}</el-descriptions-item>
+            <el-descriptions-item label="源数据库">
+              <template v-if="sourceDS">数据源「{{ sourceDS.name }}」{{ sourceDS.fields?.host }}:{{ sourceDS.fields?.port }}/{{ sourceDS.fields?.database }}</template>
+              <template v-else>{{ form.source.host }}:{{ form.source.port }}/{{ form.source.database }}</template>
+            </el-descriptions-item>
+            <el-descriptions-item label="目标数据库">
+              <template v-if="targetDS">数据源「{{ targetDS.name }}」{{ targetDS.fields?.host }}:{{ targetDS.fields?.port }}/{{ targetDS.fields?.database }}</template>
+              <template v-else>{{ form.target.host }}:{{ form.target.port }}/{{ form.target.database }}</template>
+            </el-descriptions-item>
             <el-descriptions-item label="迁移表数">{{ selectedTables.length > 0 ? selectedTables.length : '全部 (' + availableTables.length + ')' }}</el-descriptions-item>
             <el-descriptions-item label="对比模式">{{ compareModes.find(m => m.value === form.opts.compare_mode)?.label }}</el-descriptions-item>
             <el-descriptions-item label="使用 Lightning">{{ form.opts.use_lightning ? '是' : '否' }}</el-descriptions-item>
@@ -681,7 +746,7 @@ function prevStep() {
             </el-descriptions-item>
             <el-descriptions-item label="数据临时目录">{{ form.opts.temp_dir }}</el-descriptions-item>
             <el-descriptions-item label="全量+增量衔接">
-              <el-tag v-if="form.opts.cdc_chain && sourceType === 'postgres'" type="success">已开启（预建 slot，零丢失）</el-tag>
+              <el-tag v-if="form.opts.cdc_chain && effectiveSourceType === 'postgres'" type="success">已开启（预建 slot，零丢失）</el-tag>
               <template v-else>否</template>
             </el-descriptions-item>
             <el-descriptions-item label="数据冲突策略">

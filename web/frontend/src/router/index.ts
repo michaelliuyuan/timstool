@@ -28,6 +28,11 @@ const router = createRouter({
       component: () => import('../views/HistoryView.vue'),
     },
     {
+      path: '/datasources',
+      name: 'DataSources',
+      component: () => import('../views/DataSourcesView.vue'),
+    },
+    {
       path: '/compare',
       name: 'Compare',
       component: () => import('../views/CompareView.vue'),

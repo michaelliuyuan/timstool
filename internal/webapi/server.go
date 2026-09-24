@@ -165,6 +165,16 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		r.Post("/test-connection", s.handleTestConnectionMulti)
 		r.Post("/config/test-connection", s.handleTestConnection)
 		r.Post("/config/list-tables", s.handleListTables)
+		// Unified datasource registry (F-02): server-side named connection
+		// profiles; passwords are write-only (never echoed) and resolved
+		// server-side when tasks/compare/DDL/assess reference them by id.
+		r.Get("/datasources", s.handleListDataSources)
+		r.Post("/datasources", s.handleCreateDataSource)
+		r.Route("/datasources/{id}", func(r chi.Router) {
+			r.Put("/", s.handleUpdateDataSource)
+			r.Delete("/", s.handleDeleteDataSource)
+			r.Post("/test", s.handleTestDataSource)
+		})
 		r.Post("/validate-lightning", s.handleValidateLightning)
 		// Migration options persistence (迁移选项记忆): server-side single
 		// source of truth so the wizard can prefill last-used Lightning path /
@@ -212,6 +222,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		r.Get("/cdc/config", s.handleGetCDCConfig)
 		r.Put("/cdc/config", s.handlePutCDCConfig)
 		r.Post("/cdc/config/import", s.handleImportCDCConfig)
+		r.Post("/cdc/config/import-from-datasource", s.handleImportCDCFromDataSource)
 		r.Get("/cdc/precheck", s.handleCDCPrecheck)
 		r.Get("/cdc/slot", s.handleCDCSlot)
 		r.Post("/cdc/checkpoint/reset", s.handleCDCResetCheckpoint)
@@ -316,6 +327,7 @@ type TestConnectionRequest struct {
 	SSLMode    string `json:"sslmode,omitempty"`
 	PDAddr     string `json:"pd_addr,omitempty"`
 	StatusPort int    `json:"status_port,omitempty"`
+	SourceRef  string `json:"source_ref,omitempty"` // F-02: list-tables by datasource id
 }
 
 func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
@@ -569,6 +581,24 @@ func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// F-02: a source_ref resolves the request's inline fields server-side so
+	// the table-selection step works without credentials in the browser.
+	if req.SourceRef != "" {
+		e, err := s.resolveDataSourceRef(req.SourceRef)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+			return
+		}
+		if e.Type != "postgres" {
+			s.writeError(w, http.StatusBadRequest, "source_ref: 该端点仅支持 PostgreSQL 数据源")
+			return
+		}
+		sc := dataSourceToSourceConfig(e)
+		req.Host, req.Port = sc.Host, sc.Port
+		req.User, req.Password, req.Database, req.Schema, req.SSLMode =
+			sc.User, sc.Password, sc.Database, sc.Schema, sc.SSLMode
+	}
+
 	cfg := config.SourceConfig{
 		Host:     req.Host,
 		Port:     req.Port,
@@ -626,10 +656,40 @@ func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 }
 
 type CreateTaskRequest struct {
-	Name   string              `json:"name"`
-	Source config.SourceConfig `json:"source"`
-	Target config.TargetConfig `json:"target"`
-	Opts   MigrationOptsBody   `json:"opts"`
+	Name      string              `json:"name"`
+	Source    config.SourceConfig `json:"source"`
+	Target    config.TargetConfig `json:"target"`
+	Opts      MigrationOptsBody   `json:"opts"`
+	SourceRef string              `json:"source_ref"` // datasource id (F-02): server resolves + snapshots
+	TargetRef string              `json:"target_ref"` // datasource id (must be type=tidb)
+}
+
+// resolveTaskRefs resolves sourceRef/targetRef into the request's connection
+// configs (snapshot at creation: later datasource edits/deletes never affect
+// the created task). A set ref takes precedence over inline fields — the
+// frontend sends refs instead of credentials, never both.
+func (s *Server) resolveTaskRefs(req *CreateTaskRequest) error {
+	if req.SourceRef != "" {
+		e, err := s.resolveDataSourceRef(req.SourceRef)
+		if err != nil {
+			return fmt.Errorf("source_ref: %w", err)
+		}
+		if e.Type == "tidb" {
+			return fmt.Errorf("source_ref: tidb 数据源不能用作迁移源端")
+		}
+		req.Source = dataSourceToSourceConfig(e)
+	}
+	if req.TargetRef != "" {
+		e, err := s.resolveDataSourceRef(req.TargetRef)
+		if err != nil {
+			return fmt.Errorf("target_ref: %w", err)
+		}
+		if e.Type != "tidb" {
+			return fmt.Errorf("target_ref: 目标端数据源类型必须是 tidb")
+		}
+		req.Target = dataSourceToTargetConfig(e)
+	}
+	return nil
 }
 
 type MigrationOptsBody struct {
@@ -907,6 +967,11 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	var req CreateTaskRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := s.resolveTaskRefs(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1759,17 +1824,33 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 // handleAssess runs a compatibility assessment and returns JSON for the frontend.
 func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Host     string `json:"host"`
-		Port     int    `json:"port"`
-		User     string `json:"user"`
-		Password string `json:"password"`
-		Database string `json:"database"`
-		Schema   string `json:"schema"`
-		Format   string `json:"format"` // "json" (default) or "html"
+		Host      string `json:"host"`
+		Port      int    `json:"port"`
+		User      string `json:"user"`
+		Password  string `json:"password"`
+		Database  string `json:"database"`
+		Schema    string `json:"schema"`
+		Format    string `json:"format"`      // "json" (default) or "html"
+		SourceRef string `json:"source_ref"` // datasource id (F-02): postgres only
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+
+	if req.SourceRef != "" {
+		e, err := s.resolveDataSourceRef(req.SourceRef)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+			return
+		}
+		if e.Type != "postgres" {
+			s.writeError(w, http.StatusBadRequest, "source_ref: 兼容评估仅支持 PostgreSQL 数据源")
+			return
+		}
+		sc := dataSourceToSourceConfig(e)
+		req.Host, req.Port = sc.Host, sc.Port
+		req.User, req.Password, req.Database, req.Schema = sc.User, sc.Password, sc.Database, sc.Schema
 	}
 
 	if req.Host == "" || req.Database == "" {

@@ -34,8 +34,9 @@ func (s *Server) handleSourceConfigSchema(w http.ResponseWriter, r *http.Request
 // testSourceRequest is the {source, fields} body for the multi-source connection
 // test (doc §6.2). source defaults to "postgres" when empty (backward compat).
 type testSourceRequest struct {
-	Source string         `json:"source"`
-	Fields map[string]any `json:"fields"`
+	Source    string         `json:"source"`
+	Fields    map[string]any `json:"fields"`
+	SourceRef string         `json:"source_ref"` // F-02: resolve fields server-side
 }
 
 // versioner is an optional Source capability: the server version string echoed
@@ -148,6 +149,21 @@ func (s *Server) handleSourceTables(w http.ResponseWriter, r *http.Request) {
 	srcType := req.Source
 	if srcType == "" {
 		srcType = "postgres"
+	}
+	// F-02: a source_ref overrides {source, fields} with the stored profile
+	// (server-side password resolution).
+	if req.SourceRef != "" {
+		e, err := s.resolveDataSourceRef(req.SourceRef)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+			return
+		}
+		if e.Type == "tidb" {
+			s.writeError(w, http.StatusBadRequest, "source_ref: tidb 数据源不能用作源端")
+			return
+		}
+		srcType = e.Type
+		req.Fields = e.Fields
 	}
 	meta, err := source.Describe(srcType)
 	if err != nil {

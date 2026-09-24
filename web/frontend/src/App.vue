@@ -41,6 +41,7 @@ onUnmounted(() => window.clearInterval(heartbeatTimer))
 
 const navItems = computed(() => {
   const items = [
+    { path: '/datasources', label: '数据源', icon: 'Coin' },
     { path: '/wizard', label: '新建迁移', icon: 'Connection' },
     { path: '/tasks', label: '任务监控', icon: 'Monitor' },
     { path: '/history', label: '迁移历史', icon: 'Clock' },

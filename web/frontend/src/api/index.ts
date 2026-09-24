@@ -109,6 +109,10 @@ export interface CreateTaskRequest {
     pd_addr: string
     status_port: number
   }
+  /** F-02 datasource refs: the server resolves credentials server-side and
+   * snapshots them into the task; inline fields are omitted when set. */
+  source_ref?: string
+  target_ref?: string
   opts: {
     parallel: number
     batch_size: number
@@ -185,12 +189,37 @@ export interface CreateCompareRequest {
   name: string
   source: Record<string, any>
   target: Record<string, any>
+  /** F-02 datasource refs (same semantics as createTask). */
+  source_ref?: string
+  target_ref?: string
   mode: string
   sample_ratio: number
   checksum_chunk_size: number
   checksum_parallel: number
   parallel: number
   tables: string[]
+}
+
+// F-02 unified datasource registry. Passwords are write-only: they are sent
+// on create/update, never returned (has_password reports presence instead).
+export interface DataSource {
+  id: string
+  name: string
+  type: 'postgres' | 'mysql' | 'tidb'
+  fields: Record<string, any>
+  has_password: boolean
+  created_at: string
+  updated_at: string
+  last_tested?: string
+  last_test_ok: boolean
+}
+
+export interface DataSourceTestResult {
+  source: string
+  success: boolean
+  message: string
+  version?: string
+  datasource?: DataSource
 }
 
 // Saved compare-page connection profile. Passwords round-trip as empty:
@@ -311,6 +340,39 @@ export const apiClient = {
 
   saveCompareOptions: (opts: CompareOptions) =>
     api.put<{ success: boolean }>('/compare/options', opts),
+
+  // Unified datasource registry (F-02): server-side named connection
+  // profiles. Passwords never round-trip (write-only; empty on update keeps
+  // the stored one).
+  listDataSources: () =>
+    api.get<{ datasources: DataSource[] }>('/datasources'),
+
+  createDataSource: (body: { name: string; type: string; fields: Record<string, any> }) =>
+    api.post<DataSource>('/datasources', body),
+
+  updateDataSource: (id: string, body: { name?: string; fields?: Record<string, any> }) =>
+    api.put<DataSource>(`/datasources/${id}`, body),
+
+  deleteDataSource: (id: string) =>
+    api.delete<{ success: boolean }>(`/datasources/${id}`),
+
+  testDataSource: (id: string) =>
+    api.post<DataSourceTestResult>(`/datasources/${id}/test`),
+
+  // Table listing by datasource ref (passwords stay server-side).
+  getRefTables: (ref: string) =>
+    api.post<{ tables: { name: string; row_estimate: number }[]; count: number }>(
+      '/config/list-tables',
+      { type: 'source', source_ref: ref },
+    ),
+
+  // CDC: write a postgres datasource (source) + tidb datasource (target)
+  // into config.yaml in one click (D4; supervisor run chain untouched).
+  importCDCFromDataSource: (sourceRef: string, targetRef: string) =>
+    api.post<{ ok: boolean; message: string }>('/cdc/config/import-from-datasource', {
+      source_ref: sourceRef,
+      target_ref: targetRef,
+    }),
 
   // No-PK table assist (P1): execute ALTER TABLE ... REPLICA IDENTITY FULL on
   // the source for the given "schema.table" refs. Per-table results include

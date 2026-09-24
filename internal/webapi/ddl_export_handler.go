@@ -16,15 +16,16 @@ import (
 // ddlExportRequest is the payload for both /ddl-export/schemas and
 // /ddl-export (the schema/type selections only matter for the latter).
 type ddlExportRequest struct {
-	Host     string          `json:"host"`
-	Port     int             `json:"port"`
-	User     string          `json:"user"`
-	Password string          `json:"password"`
-	Database string          `json:"database"`
-	SSLMode  string          `json:"sslmode"`
-	Schemas  []string        `json:"schemas"`
-	Types    *ddlExportTypes `json:"types"`
-	TiDB     bool            `json:"tidb"`
+	Host      string          `json:"host"`
+	Port      int             `json:"port"`
+	User      string          `json:"user"`
+	Password  string          `json:"password"`
+	Database  string          `json:"database"`
+	SSLMode   string          `json:"sslmode"`
+	Schemas   []string        `json:"schemas"`
+	Types     *ddlExportTypes `json:"types"`
+	TiDB      bool            `json:"tidb"`
+	SourceRef string          `json:"source_ref"` // datasource id (F-02): postgres only
 }
 
 type ddlExportTypes struct {
@@ -68,11 +69,35 @@ func (s *Server) openDDLSource(w http.ResponseWriter, req *ddlExportRequest) (*s
 	return db, true
 }
 
+// applySourceRef resolves a datasource ref into the request's inline fields
+// (shared by both endpoints). Returns false after writing an error response.
+func (s *Server) applySourceRef(w http.ResponseWriter, req *ddlExportRequest) bool {
+	if req.SourceRef == "" {
+		return true
+	}
+	e, err := s.resolveDataSourceRef(req.SourceRef)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+		return false
+	}
+	if e.Type != "postgres" {
+		s.writeError(w, http.StatusBadRequest, "source_ref: DDL 导出仅支持 PostgreSQL 数据源")
+		return false
+	}
+	sc := dataSourceToSourceConfig(e)
+	req.Host, req.Port = sc.Host, sc.Port
+	req.User, req.Password, req.Database, req.SSLMode = sc.User, sc.Password, sc.Database, sc.SSLMode
+	return true
+}
+
 // handleDDLSchemas lists non-system schemas for the schema checkbox step (D3).
 func (s *Server) handleDDLSchemas(w http.ResponseWriter, r *http.Request) {
 	var req ddlExportRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !s.applySourceRef(w, &req) {
 		return
 	}
 	db, ok := s.openDDLSource(w, &req)
@@ -97,6 +122,9 @@ func (s *Server) handleDDLExport(w http.ResponseWriter, r *http.Request) {
 	var req ddlExportRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !s.applySourceRef(w, &req) {
 		return
 	}
 	db, ok := s.openDDLSource(w, &req)

@@ -1,21 +1,19 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import PageHeader from '../components/PageHeader.vue'
+import DataSourcePicker from '../components/DataSourcePicker.vue'
+import { useDataSources } from '../composables/useDataSources'
 
-const STORAGE_KEY = 'pg2tidb-ddlexport-source'
+// F-02: connection comes from a saved postgres datasource (server-side
+// credentials) or the legacy inline form. The localStorage memory is retired —
+// passwords must not persist in the browser.
 
-const savedSource = localStorage.getItem(STORAGE_KEY)
-let parsedSource: Record<string, unknown> | null = null
-if (savedSource) {
-  try {
-    parsedSource = JSON.parse(savedSource)
-  } catch {
-    parsedSource = null
-    localStorage.removeItem(STORAGE_KEY)
-  }
-}
-const sourceForm = ref(parsedSource ?? {
+const sourceRef = ref('')
+const { load: loadDataSources } = useDataSources()
+onMounted(() => { loadDataSources() })
+
+const sourceForm = ref({
   host: '',
   port: 5432,
   user: 'postgres',
@@ -41,22 +39,18 @@ const typeOptions = [
 const selectedTypes = ref<string[]>(typeOptions.map(t => t.key))
 const includeTiDB = ref(false)
 
-function saveSourceConfig() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(sourceForm.value))
-  ElMessage.success('数据源配置已保存')
-}
-
 async function loadSchemas() {
-  if (!sourceForm.value.host || !sourceForm.value.database) {
-    ElMessage.warning('请填写主机和数据库名')
+  if (!sourceRef.value && (!sourceForm.value.host || !sourceForm.value.database)) {
+    ElMessage.warning('请选择数据源或填写主机和数据库名')
     return
   }
   schemasLoading.value = true
   try {
+    const body = sourceRef.value ? { source_ref: sourceRef.value } : { ...sourceForm.value }
     const resp = await fetch('/api/v1/ddl-export/schemas', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(sourceForm.value)
+      body: JSON.stringify(body)
     })
     if (!resp.ok) {
       const err = await resp.json()
@@ -75,8 +69,8 @@ async function loadSchemas() {
 }
 
 async function exportDDL() {
-  if (!sourceForm.value.host || !sourceForm.value.database) {
-    ElMessage.warning('请填写主机和数据库名')
+  if (!sourceRef.value && (!sourceForm.value.host || !sourceForm.value.database)) {
+    ElMessage.warning('请选择数据源或填写主机和数据库名')
     return
   }
   if (selectedSchemas.value.length === 0) {
@@ -95,7 +89,7 @@ async function exportDDL() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        ...sourceForm.value,
+        ...(sourceRef.value ? { source_ref: sourceRef.value } : { ...sourceForm.value }),
         schemas: selectedSchemas.value,
         types,
         tidb: includeTiDB.value
@@ -127,12 +121,10 @@ async function exportDDL() {
 
     <el-card shadow="never" style="margin-bottom: 20px;">
       <template #header>
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-          <span style="font-weight: 600;">数据源</span>
-          <el-button size="small" @click="saveSourceConfig">保存配置</el-button>
-        </div>
+        <span style="font-weight: 600;">数据源</span>
       </template>
       <el-form :model="sourceForm" label-width="80px" size="default" inline>
+        <template v-if="!sourceRef">
         <el-form-item label="主机">
           <el-input v-model="sourceForm.host" placeholder="PG 主机地址" style="width: 160px;" />
         </el-form-item>
@@ -147,6 +139,13 @@ async function exportDDL() {
         </el-form-item>
         <el-form-item label="数据库">
           <el-input v-model="sourceForm.database" placeholder="数据库名" style="width: 140px;" />
+        </el-form-item>
+        </template>
+        <el-form-item label="数据源" v-else>
+          <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
+        </el-form-item>
+        <el-form-item v-if="!sourceRef" label=" ">
+          <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
         </el-form-item>
         <el-form-item>
           <el-button type="primary" @click="loadSchemas" :loading="schemasLoading">

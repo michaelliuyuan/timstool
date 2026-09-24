@@ -39,6 +39,8 @@ type CompareTaskRequest struct {
 	Name              string              `json:"name"`
 	Source            config.SourceConfig `json:"source"`
 	Target            config.TargetConfig `json:"target"`
+	SourceRef         string              `json:"source_ref"` // datasource id (F-02)
+	TargetRef         string              `json:"target_ref"` // datasource id (tidb)
 	Mode              string              `json:"mode"` // quick | sample | checksum
 	SampleRatio       float64             `json:"sample_ratio"`
 	ChecksumChunkSize int64               `json:"checksum_chunk_size"`
@@ -317,6 +319,32 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	// F-02 datasource refs: resolve into a connection snapshot before any
+	// validation/persistence (same semantics as migration tasks).
+	if req.SourceRef != "" {
+		e, err := s.resolveDataSourceRef(req.SourceRef)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+			return
+		}
+		if e.Type == "tidb" {
+			s.writeError(w, http.StatusBadRequest, "source_ref: tidb 数据源不能用作比对源端")
+			return
+		}
+		req.Source = dataSourceToSourceConfig(e)
+	}
+	if req.TargetRef != "" {
+		e, err := s.resolveDataSourceRef(req.TargetRef)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "target_ref: "+err.Error())
+			return
+		}
+		if e.Type != "tidb" {
+			s.writeError(w, http.StatusBadRequest, "target_ref: 目标端数据源类型必须是 tidb")
+			return
+		}
+		req.Target = dataSourceToTargetConfig(e)
 	}
 	if req.Source.Host == "" || req.Target.Host == "" {
 		s.writeError(w, http.StatusBadRequest, "source and target host are required")
