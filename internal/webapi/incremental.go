@@ -116,6 +116,52 @@ func incBuildSelectSQL(schema, table string, cols []string, wmCol string, strict
 		strings.Join(quoted, ", "), incQuotePG(schema), incQuotePG(table), incQuotePG(wmCol), op, incQuotePG(wmCol))
 }
 
+// incBuildDrainSQL renders the same-value drain scan used when a full batch
+// sits entirely on one watermark value: no LIMIT (streamed), equality only.
+// The watermark value stays the $1 parameter.
+func incBuildDrainSQL(schema, table string, cols []string, wmCol string) string {
+	quoted := make([]string, len(cols))
+	for i, c := range cols {
+		quoted[i] = incQuotePG(c)
+	}
+	return fmt.Sprintf("SELECT %s FROM %s.%s WHERE %s = $1",
+		strings.Join(quoted, ", "), incQuotePG(schema), incQuotePG(table), incQuotePG(wmCol))
+}
+
+// incBuildNextWatermarkSQL renders the post-drain jump probe: the smallest
+// watermark strictly above the drained value ("" / NULL ⇒ table complete).
+func incBuildNextWatermarkSQL(schema, table, wmCol string) string {
+	return fmt.Sprintf("SELECT MIN(%s) FROM %s.%s WHERE %s > $1",
+		incQuotePG(wmCol), incQuotePG(schema), incQuotePG(table), incQuotePG(wmCol))
+}
+
+// incCursorStep decides the keyset cursor after one fetched batch.
+// saturated=true means the batch was full AND its max watermark equals the
+// watermark we entered the batch with: a plain keyset retry would refetch the
+// exact same batch forever (same-value livelock, e.g. same-second bulk
+// INSERTs), so the caller must drain that value and jump past it.
+func incCursorStep(entryWM, lastWM string, batchLen, batchSize int) (nextWM string, saturated, done bool) {
+	if batchLen == 0 {
+		return entryWM, false, true
+	}
+	if batchLen == batchSize && lastWM == entryWM {
+		return lastWM, true, false
+	}
+	if batchLen < batchSize {
+		return lastWM, false, true
+	}
+	return lastWM, false, false
+}
+
+// incJumpAfterDrain maps the MIN(watermark) > wm probe result to the next
+// cursor: done=true when no value remains above the drained watermark.
+func incJumpAfterDrain(nextMin sql.NullString) (string, bool) {
+	if !nextMin.Valid || nextMin.String == "" {
+		return "", true
+	}
+	return nextMin.String, false
+}
+
 // incBuildInsertSQL renders the batched target write with the conflict
 // strategy prefix. nRows rows, len(colNames) placeholders each.
 func incBuildInsertSQL(db, table string, colNames []string, nRows int, strategy string) string {
@@ -334,6 +380,26 @@ func (s *Server) handleUpdateIncrementalJob(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// D4 double-gate on update too (F-02 dual-path gate parity): a PUT must
+	// not be able to swap refs past the create-side type checks.
+	src, err := s.resolveDataSourceRef(job.SourceRef)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+		return
+	}
+	if src.Type != "postgres" {
+		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
+		return
+	}
+	tgt, err := s.resolveDataSourceRef(job.TargetRef)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "target_ref: "+err.Error())
+		return
+	}
+	if tgt.Type != "tidb" {
+		s.writeError(w, http.StatusBadRequest, "目标数据源必须是 TiDB")
+		return
+	}
 
 	incMu.Lock()
 	defer incMu.Unlock()
@@ -504,6 +570,8 @@ func incValueToString(v any) string {
 // runIncrementalJob executes one manual sync pass over the (sub)set of tables
 // and returns the run record. Failures are per-table: one bad table never
 // blocks the others.
+// v1 assumption: runs are NOT serialized — two concurrent manual runs of the
+// same job interleave and the later state persist wins (last writer wins).
 func (s *Server) runIncrementalJob(r *http.Request, job *incJob, subset map[string]bool) incRunRecord {
 	rec := incRunRecord{RunID: uuid.New().String()[:8], StartedAt: time.Now()}
 	src, err := s.resolveDataSourceRef(job.SourceRef)
@@ -618,7 +686,8 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 			return res
 		}
 		if !minWM.Valid || minWM.String == "" {
-			// Empty table: nothing to do, and nothing to advance to.
+			// Empty table: nothing to do, and nothing to advance to
+			// (re-probing MIN on every run is harmless — no state to keep).
 			now := time.Now()
 			st.LastSyncAt = &now
 			st.Failed = ""
@@ -633,6 +702,7 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 	total := int64(0)
 	lastWM := wm
 	for {
+		entryWM := wm
 		srows, err := pgDB.QueryContext(ctx, selSQL, wm, job.BatchSize)
 		if err != nil {
 			res.Error = "查询源端失败: " + err.Error()
@@ -678,8 +748,26 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 		total += int64(len(batch))
 		// ORDER BY watermark ⇒ the last row carries the batch MAX.
 		lastWM = incValueToString(batch[len(batch)-1][wmIndex(cols, t.WatermarkColumn)])
-		wm = lastWM
-		if len(batch) < job.BatchSize {
+		next, saturated, done := incCursorStep(entryWM, lastWM, len(batch), job.BatchSize)
+		if saturated {
+			// Same-value saturation: the keyset cannot advance inside this
+			// value's window. Drain every remaining row at this watermark
+			// (streamed, chunked writes), then jump to the next value.
+			n, jump, tableDone, derr := s.incDrainWatermark(ctx, pgDB, myDB, sc, tc, job, t, cols, lastWM)
+			if derr != nil {
+				res.Error = "泄流同值批次失败: " + derr.Error()
+				st.Failed = res.Error
+				return res
+			}
+			total += n
+			if tableDone {
+				break
+			}
+			wm = jump
+			continue
+		}
+		wm = next
+		if done {
 			break
 		}
 	}
@@ -701,6 +789,71 @@ func wmIndex(cols []string, wmCol string) int {
 		}
 	}
 	return -1
+}
+
+// incDrainWatermark consumes ALL rows whose watermark equals wm — the
+// same-value saturation fix. The equality scan is unbounded and streamed;
+// rows are written in BatchSize chunks with the job's conflict strategy
+// (semantics identical to the main path). Afterwards the cursor jumps to
+// MIN(watermark) > wm: no such value ⇒ the whole table is synced (done).
+// Memory stays bounded regardless of how many rows share the value.
+func (s *Server) incDrainWatermark(ctx context.Context, pgDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, cols []string, wm string) (rows int64, nextWM string, done bool, err error) {
+	srows, qErr := pgDB.QueryContext(ctx, incBuildDrainSQL(sc.Schema, t.Table, cols, t.WatermarkColumn), wm)
+	if qErr != nil {
+		return 0, "", false, qErr
+	}
+	batch := [][]any{}
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		args := make([]any, 0, len(batch)*len(cols))
+		for _, row := range batch {
+			args = append(args, row...)
+		}
+		insSQL := incBuildInsertSQL(tc.Database, t.Table, cols, len(batch), job.ConflictStrategy)
+		if _, eErr := myDB.ExecContext(ctx, insSQL, args...); eErr != nil {
+			return eErr
+		}
+		rows += int64(len(batch))
+		batch = batch[:0]
+		return nil
+	}
+	for srows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if sErr := srows.Scan(ptrs...); sErr != nil {
+			srows.Close()
+			return rows, "", false, sErr
+		}
+		batch = append(batch, vals)
+		if len(batch) >= job.BatchSize {
+			if fErr := flush(); fErr != nil {
+				srows.Close()
+				return rows, "", false, fErr
+			}
+		}
+	}
+	if sErr := srows.Err(); sErr != nil {
+		srows.Close()
+		return rows, "", false, sErr
+	}
+	srows.Close()
+	if fErr := flush(); fErr != nil {
+		return rows, "", false, fErr
+	}
+
+	var next sql.NullString
+	if qErr = pgDB.QueryRowContext(ctx,
+		incBuildNextWatermarkSQL(sc.Schema, t.Table, t.WatermarkColumn), wm,
+	).Scan(&next); qErr != nil {
+		return rows, "", false, qErr
+	}
+	jump, tableDone := incJumpAfterDrain(next)
+	return rows, jump, tableDone, nil
 }
 
 func (s *Server) handleRunIncrementalJob(w http.ResponseWriter, r *http.Request) {
