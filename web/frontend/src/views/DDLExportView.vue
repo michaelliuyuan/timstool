@@ -242,6 +242,9 @@ async function exportDDL() {
           <span style="margin-left: 12px; font-size: 13px; color: var(--tims-text-2);">
             同时导出 TiDB 转换版 tidb-tables.sql（参考脚本）
           </span>
+          <el-text v-if="includeTiDB && !selectedTypes.includes('tables')" type="warning" size="small" style="display: block; margin-top: 4px;">
+            未勾选「表」类型，TiDB 转换版不会导出
+          </el-text>
         </el-form-item>
         <el-form-item>
           <el-button type="primary" @click="exportDDL" :loading="exporting">
