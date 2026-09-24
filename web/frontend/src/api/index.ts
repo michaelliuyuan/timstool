@@ -359,11 +359,20 @@ export const apiClient = {
   testDataSource: (id: string) =>
     api.post<DataSourceTestResult>(`/datasources/${id}/test`),
 
-  // Table listing by datasource ref (passwords stay server-side).
+  // Table listing by datasource ref (passwords stay server-side). PG-only
+  // endpoint (reltuples estimates); non-PG refs must use getRefTablesMulti.
   getRefTables: (ref: string) =>
     api.post<{ tables: { name: string; row_estimate: number }[]; count: number }>(
       '/config/list-tables',
       { type: 'source', source_ref: ref },
+    ),
+
+  // Table listing by datasource ref via the multi-source adapter path
+  // (/sources/tables resolves source_ref server-side, supports mysql).
+  getRefTablesMulti: (ref: string) =>
+    api.post<{ tables: { name: string; row_estimate: number }[]; count: number }>(
+      '/sources/tables',
+      { source_ref: ref },
     ),
 
   // CDC: write a postgres datasource (source) + tidb datasource (target)

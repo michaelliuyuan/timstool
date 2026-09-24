@@ -438,7 +438,7 @@ onUnmounted(() => {
           <el-col :span="12">
             <el-divider content-position="left">源数据库（PostgreSQL / MySQL）</el-divider>
             <el-form-item label="数据源">
-              <DataSourcePicker v-model="sourceRef" :types="['postgres', 'mysql']" />
+              <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
             </el-form-item>
             <template v-if="!sourceRef">
             <el-form-item label="数据源类型" v-if="sources.length > 0">

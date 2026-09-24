@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -30,28 +31,28 @@ var dsMu sync.Mutex
 
 // dataSourceEntry is the persisted shape (fields INCLUDE the password).
 type dataSourceEntry struct {
-	ID          string         `json:"id"`
-	Name        string         `json:"name"`
-	Type        string         `json:"type"` // postgres | mysql | tidb
-	Fields      map[string]any `json:"fields"`
-	CreatedAt   time.Time      `json:"created_at"`
-	UpdatedAt   time.Time      `json:"updated_at"`
-	LastTested  *time.Time     `json:"last_tested,omitempty"`
-	LastTestOK  bool           `json:"last_test_ok"`
+	ID         string         `json:"id"`
+	Name       string         `json:"name"`
+	Type       string         `json:"type"` // postgres | mysql | tidb
+	Fields     map[string]any `json:"fields"`
+	CreatedAt  time.Time      `json:"created_at"`
+	UpdatedAt  time.Time      `json:"updated_at"`
+	LastTested *time.Time     `json:"last_tested,omitempty"`
+	LastTestOK bool           `json:"last_test_ok"`
 }
 
 // dataSourceView is the API shape: identical to the entry but the password
 // field is stripped and reported as has_password instead.
 type dataSourceView struct {
-	ID           string         `json:"id"`
-	Name         string         `json:"name"`
-	Type         string         `json:"type"`
-	Fields       map[string]any `json:"fields"`
-	HasPassword  bool           `json:"has_password"`
-	CreatedAt    time.Time      `json:"created_at"`
-	UpdatedAt    time.Time      `json:"updated_at"`
-	LastTested   *time.Time     `json:"last_tested,omitempty"`
-	LastTestOK   bool           `json:"last_test_ok"`
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Type        string         `json:"type"`
+	Fields      map[string]any `json:"fields"`
+	HasPassword bool           `json:"has_password"`
+	CreatedAt   time.Time      `json:"created_at"`
+	UpdatedAt   time.Time      `json:"updated_at"`
+	LastTested  *time.Time     `json:"last_tested,omitempty"`
+	LastTestOK  bool           `json:"last_test_ok"`
 }
 
 func viewDataSource(e *dataSourceEntry) dataSourceView {
@@ -80,6 +81,23 @@ var dataSourceTypes = map[string]int{
 }
 
 func (s *Server) datasourcesFile() string { return s.dataDir + "/datasources.json" }
+
+// cleanupDataSourceTempFiles removes crash-orphaned "datasources-*.tmp" files
+// at startup: they contain the full plaintext registry and would otherwise
+// linger forever (P2-6).
+func (s *Server) cleanupDataSourceTempFiles() {
+	matches, err := filepath.Glob(s.dataDir + "/datasources-*.tmp")
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		if err := os.Remove(m); err != nil {
+			zap.L().Warn("failed to remove orphaned datasource temp file", zap.String("file", m), zap.Error(err))
+		} else {
+			zap.L().Info("removed orphaned datasource temp file", zap.String("file", m))
+		}
+	}
+}
 
 // loadDataSources reads the registry; missing/corrupt file → empty list (the
 // next successful save rewrites it — same self-heal as migration-options).
@@ -280,12 +298,20 @@ func (s *Server) handleUpdateDataSource(w http.ResponseWriter, r *http.Request) 
 }
 
 // normalizeDSFields stringifies the loose JSON field map (numbers arrive as
-// float64) and applies the write-only password rule: an empty/absent password
-// keeps the previously stored one (old may be nil for create).
+// float64) and applies the write-only password rule: an empty, absent or
+// non-string password keeps the previously stored one (old may be nil for
+// create) — a non-string password value is never stringified into garbage.
 func normalizeDSFields(fields, old map[string]any) map[string]any {
 	out := make(map[string]any, len(fields))
 	for k, v := range fields {
 		if v == nil {
+			continue
+		}
+		if k == "password" {
+			if s, ok := v.(string); ok {
+				out[k] = s
+			}
+			// non-string password: drop, falls through to the keep-old rule below
 			continue
 		}
 		if s, ok := v.(string); ok {

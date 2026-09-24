@@ -132,6 +132,21 @@ func (s *Server) handleTestConnectionMulti(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	// P2-5: honor the documented source_ref — resolve fields server-side
+	// (same semantics as /sources/tables).
+	if req.SourceRef != "" {
+		e, err := s.resolveDataSourceRef(req.SourceRef)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+			return
+		}
+		if e.Type == "tidb" {
+			s.writeError(w, http.StatusBadRequest, "source_ref: tidb 数据源不能用作源端")
+			return
+		}
+		req.Source = e.Type
+		req.Fields = e.Fields
+	}
 	s.writeJSON(w, http.StatusOK, s.testSource(r.Context(), req.Source, req.Fields))
 }
 

@@ -65,6 +65,16 @@ func NewStore(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+
+	// F-02 (P2-7): task configs contain plaintext passwords at rest — tighten
+	// the db file (and its WAL/SHM siblings) to owner-only. SQLite may not
+	// have created the WAL files yet, so chmod best-effort on what exists.
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !os.IsNotExist(err) {
+			db.Close()
+			return nil, fmt.Errorf("chmod %s: %w", p, err)
+		}
+	}
 	return s, nil
 }
 

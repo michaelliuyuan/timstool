@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-chi/chi/v5"
 	"context"
+	"github.com/go-chi/chi/v5"
 )
 
 // Unified datasource registry (F-02): CRUD round-trip, write-only password
@@ -257,5 +257,139 @@ func TestDatasources_DDLAndAssessRefTypeGate(t *testing.T) {
 	s.handleAssess(w, req)
 	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "PostgreSQL") {
 		t.Fatalf("assess mysql ref: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// P2-2: a non-string password value must NOT be stringified into garbage and
+// overwrite the stored password — it is dropped and the keep-old rule applies.
+func TestDatasources_NonStringPasswordKeepsStored(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "np", "type": "postgres",
+		"fields": {"host": "h1", "user": "u", "password": "good-pw", "database": "d"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	id := dsBody(t, w)["id"].(string)
+
+	// Object password → dropped, stored password preserved.
+	w, req = doReq("PUT", "/api/v1/datasources", `{"fields": {"host": "h2", "password": {"deep": 1}}}`)
+	req = withChiParam(req, "id", id)
+	s.handleUpdateDataSource(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update object password: %d %s", w.Code, w.Body.String())
+	}
+	e, err := s.resolveDataSourceRef(id)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if stringField(e.Fields, "password") != "good-pw" {
+		t.Fatalf("non-string password clobbered stored one: %v", e.Fields["password"])
+	}
+
+	// A genuine new string password DOES replace the stored one (write-only).
+	w, req = doReq("PUT", "/api/v1/datasources", `{"fields": {"host": "h2", "password": "new-pw"}}`)
+	req = withChiParam(req, "id", id)
+	s.handleUpdateDataSource(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update new password: %d %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "new-pw") {
+		t.Fatalf("password leaked in update response: %s", w.Body.String())
+	}
+	if v, ok := dsBody(t, w)["has_password"]; !ok || v != true {
+		t.Fatalf("has_password must stay true: %s", w.Body.String())
+	}
+	e, err = s.resolveDataSourceRef(id)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if stringField(e.Fields, "password") != "new-pw" {
+		t.Fatalf("new password not stored: %v", e.Fields["password"])
+	}
+}
+
+// P2-3: compare rejects non-postgres source refs (the validator speaks the PG
+// wire protocol only) and rejects non-PG inline source types.
+func TestDatasources_CompareSourceTypeGate(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "my2", "type": "mysql",
+		"fields": {"host": "10.0.0.4", "port": 3306, "user": "root", "password": "pw", "database": "d"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	myID := dsBody(t, w)["id"].(string)
+
+	w, req = doReq("POST", "/api/v1/compare", fmt.Sprintf(`{"source_ref": %q, "target": {"host": "t", "port": 4000}}`, myID))
+	s.handleCreateCompare(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "postgres") {
+		t.Fatalf("compare mysql ref: %d %s", w.Code, w.Body.String())
+	}
+
+	// Inline mysql source type is equally rejected.
+	w, req = doReq("POST", "/api/v1/compare", `{"source": {"host": "s", "type": "mysql"}, "target": {"host": "t", "port": 4000}}`)
+	s.handleCreateCompare(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "postgres") {
+		t.Fatalf("compare inline mysql: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// P2-5: the documented source_ref on the connection-test endpoints must be
+// consumed server-side; a dangling ref 400s instead of silently testing empty
+// fields.
+func TestDatasources_TestConnectionSourceRef(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	// Dangling ref on /test-connection (multi-source).
+	w, req := doReq("POST", "/api/v1/test-connection", `{"source_ref": "nope"}`)
+	s.handleTestConnectionMulti(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "source_ref") {
+		t.Fatalf("dangling multi test ref: %d %s", w.Code, w.Body.String())
+	}
+
+	// Dangling ref on /config/test-connection.
+	w, req = doReq("POST", "/api/v1/config/test-connection", `{"type": "source", "source_ref": "nope"}`)
+	s.handleTestConnection(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "source_ref") {
+		t.Fatalf("dangling config test ref: %d %s", w.Code, w.Body.String())
+	}
+
+	// A mysql ref on the PG-only /config/test-connection is rejected with a
+	// pointer to the multi-source endpoint.
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "my3", "type": "mysql",
+		"fields": {"host": "10.0.0.5", "port": 3306, "user": "root", "password": "pw", "database": "d"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	myID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/config/test-connection", fmt.Sprintf(`{"type": "source", "source_ref": %q}`, myID))
+	s.handleTestConnection(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "postgres") {
+		t.Fatalf("mysql ref on PG test endpoint: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// P2-6: crash-orphaned datasources-*.tmp files are removed at server start.
+func TestDatasources_TempFileCleanup(t *testing.T) {
+	s, _ := newTestServer(t)
+	// A registry must exist so we can prove cleanup only touches tmp files.
+	if err := os.WriteFile(s.datasourcesFile(), []byte(`[]`), 0o600); err != nil {
+		t.Fatalf("write registry: %v", err)
+	}
+	orphan := filepath.Join(s.dataDir, "datasources-123456.tmp")
+	if err := os.WriteFile(orphan, []byte(`[{"fields":{"password":"x"}}]`), 0o600); err != nil {
+		t.Fatalf("write orphan: %v", err)
+	}
+	s.cleanupDataSourceTempFiles()
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphaned tmp file not removed (err=%v)", err)
+	}
+	// The registry itself is untouched.
+	if _, err := os.Stat(s.datasourcesFile()); err != nil {
+		t.Fatalf("datasources.json must survive cleanup: %v", err)
 	}
 }

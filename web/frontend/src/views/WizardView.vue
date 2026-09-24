@@ -323,9 +323,16 @@ async function loadTables() {
   selectedTables.value = []
   try {
     // F-02: a datasource ref lists tables server-side (no credentials here).
+    // P2-4: mysql refs route through the multi-source adapter endpoint —
+    // /config/list-tables is PG-wire only and would 400.
     let data: { tables: { name: string; row_estimate: number }[] }
     if (sourceRef.value) {
-      ;({ data } = await apiClient.getRefTables(sourceRef.value))
+      const ds = getDataSource(sourceRef.value)
+      if (ds?.type === 'mysql') {
+        ;({ data } = await apiClient.getRefTablesMulti(sourceRef.value))
+      } else {
+        ;({ data } = await apiClient.getRefTables(sourceRef.value))
+      }
     } else if (effectiveSourceType.value === 'postgres') {
       // PG keeps its dedicated endpoint (reltuples row estimates, zero-regression);
       // non-PG lists tables via the adapter's SchemaReader (#t79 Phase 1).

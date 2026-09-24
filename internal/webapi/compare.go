@@ -41,7 +41,7 @@ type CompareTaskRequest struct {
 	Target            config.TargetConfig `json:"target"`
 	SourceRef         string              `json:"source_ref"` // datasource id (F-02)
 	TargetRef         string              `json:"target_ref"` // datasource id (tidb)
-	Mode              string              `json:"mode"` // quick | sample | checksum
+	Mode              string              `json:"mode"`       // quick | sample | checksum
 	SampleRatio       float64             `json:"sample_ratio"`
 	ChecksumChunkSize int64               `json:"checksum_chunk_size"`
 	ChecksumParallel  int                 `json:"checksum_parallel"`
@@ -328,8 +328,11 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 			return
 		}
-		if e.Type == "tidb" {
-			s.writeError(w, http.StatusBadRequest, "source_ref: tidb 数据源不能用作比对源端")
+		if e.Type != "postgres" {
+			// The compare validator speaks the PG wire protocol only
+			// (SourceConfig.DSN is always postgresql://), so non-PG sources
+			// are rejected at the gate instead of failing at runtime (P2-3).
+			s.writeError(w, http.StatusBadRequest, "source_ref: 比对源端数据源类型必须是 postgres")
 			return
 		}
 		req.Source = dataSourceToSourceConfig(e)
@@ -348,6 +351,12 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Source.Host == "" || req.Target.Host == "" {
 		s.writeError(w, http.StatusBadRequest, "source and target host are required")
+		return
+	}
+	// P2-3 (inline path): non-PG source types are equally unsupported by the
+	// PG-wire-only validator — reject at the gate.
+	if req.Source.Type != "" && req.Source.Type != "postgres" {
+		s.writeError(w, http.StatusBadRequest, "source.type: 比对源端类型必须是 postgres")
 		return
 	}
 	switch req.Mode {

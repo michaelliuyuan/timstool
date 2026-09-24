@@ -142,6 +142,10 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 	// died mid-run; fail them so the UI is not stuck (M3).
 	s.recoverStaleCompares()
 
+	// F-02 (P2-6): remove crash-orphaned datasource temp files — they hold the
+	// full plaintext registry.
+	s.cleanupDataSourceTempFiles()
+
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -335,6 +339,28 @@ func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+
+	// P2-5: honor the documented source_ref — resolve the stored profile
+	// server-side so the password never travels to the browser.
+	if req.SourceRef != "" {
+		e, err := s.resolveDataSourceRef(req.SourceRef)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+			return
+		}
+		sc := dataSourceToSourceConfig(e)
+		req.Host = sc.Host
+		req.Port = sc.Port
+		req.User = sc.User
+		req.Password = sc.Password
+		req.Database = sc.Database
+		req.Schema = sc.Schema
+		req.SSLMode = sc.SSLMode
+		if e.Type != "postgres" {
+			s.writeError(w, http.StatusBadRequest, "source_ref: 此端点仅支持 postgres 数据源（mysql 请用 /test-connection）")
+			return
+		}
 	}
 
 	var result map[string]interface{}
@@ -1830,7 +1856,7 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 		Password  string `json:"password"`
 		Database  string `json:"database"`
 		Schema    string `json:"schema"`
-		Format    string `json:"format"`      // "json" (default) or "html"
+		Format    string `json:"format"`     // "json" (default) or "html"
 		SourceRef string `json:"source_ref"` // datasource id (F-02): postgres only
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

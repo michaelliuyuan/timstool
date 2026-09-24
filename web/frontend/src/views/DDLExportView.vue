@@ -11,7 +11,13 @@ import { useDataSources } from '../composables/useDataSources'
 
 const sourceRef = ref('')
 const { load: loadDataSources } = useDataSources()
-onMounted(() => { loadDataSources() })
+// P1-1: one-shot migration — the retired localStorage key historically stored
+// the inline sourceForm including a plaintext password; drop it so the value
+// can never be read back.
+onMounted(() => {
+  localStorage.removeItem('pg2tidb-ddlexport-source')
+  loadDataSources()
+})
 
 const sourceForm = ref({
   host: '',
