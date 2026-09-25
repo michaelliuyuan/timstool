@@ -60,6 +60,9 @@ func TestBuildViewDDLStripsPGCasts(t *testing.T) {
 		{"SELECT id::character varying(10) FROM t", "SELECT id FROM t"},
 		{"SELECT ts::timestamp without time zone FROM t", "SELECT ts FROM t"},
 		{"SELECT d::double precision, n::numeric(10,2) FROM t", "SELECT d, n FROM t"},
+		{"SELECT ts::timestamp(3) with time zone FROM t", "SELECT ts FROM t"},
+		{"SELECT ts::time(3) with time zone, u::timestamp without time zone FROM t", "SELECT ts, u FROM t"},
+		{"SELECT x::timestamp(3) FROM t", "SELECT x FROM t"},
 		{"SELECT 'x::y' AS lit FROM t", "SELECT 'x::y' AS lit FROM t"},
 		{"SELECT id FROM t", "SELECT id FROM t"},
 	}

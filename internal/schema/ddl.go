@@ -255,6 +255,18 @@ func skipPGCastType(def string, i int) int {
 			j = j2
 		}
 	case "timestamp", "time":
+		// optional precision modifier before the with/without clause:
+		// ::timestamp(3) with time zone (timestamptz(3) — real
+		// pg_get_viewdef output, F-07 amendment)
+		if j < n && def[j] == '(' {
+			k := j + 1
+			for k < n && (def[k] >= '0' && def[k] <= '9' || def[k] == ',' || def[k] == ' ') {
+				k++
+			}
+			if k < n && def[k] == ')' {
+				j = k + 1
+			}
+		}
 		k := j
 		for k < n && (def[k] == ' ' || def[k] == '\t' || def[k] == '\n' || def[k] == '\r') {
 			k++
