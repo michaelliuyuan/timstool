@@ -245,7 +245,7 @@ func (s *Store) ListTasks(limit, offset int) ([]*Task, error) {
 	rows, err := s.db.Query(`
 		SELECT id, name, status, config_json, phase, progress, tables_total, tables_done,
 			rows_total, rows_done, error, result_json, created_at, started_at, finished_at, updated_at
-		FROM tasks ORDER BY created_at DESC LIMIT ? OFFSET ?`, limit, offset)
+		FROM tasks ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
