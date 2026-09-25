@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 )
 
@@ -602,26 +602,30 @@ func isSchemaError(err error) bool {
 // table missing because its CREATE was skipped → 1146; already-applied DDL
 // replayed at-least-once → 1050/1061/1091).
 //
+// Matching is by the driver's NUMERIC error code (*mysql.MySQLError.Number),
+// never by substring: a table or database literally named e.g.
+// 'myError_1064_x' inside an access-denied (1142) message must not trick us
+// into skipping a fail-hard error.
+//
 // The list is deliberately EXPLICIT and must stay narrow:
 //   - transient errors (lock wait 1205, deadlock 1213, connection, timeout)
 //     belong to the retry paths, NEVER to skip — skipping them would drop
 //     live data;
-//   - access/privilege and driver-level errors stay fail-hard.
+//   - access/privilege and driver-level errors stay fail-hard;
+//   - 1054 (unknown column) is NOT here: column-level drift is a true schema
+//     divergence — skipping it silently drops column data.
 func isDegradableError(err error) bool {
-	if err == nil {
+	var myErr *mysql.MySQLError
+	if !errors.As(err, &myErr) {
 		return false
 	}
-	msg := err.Error()
-	for _, p := range []string{
-		"Error 1064", // syntax (untranslatable DDL)
-		"Error 1146", // table doesn't exist
-		"Error 1050", // table already exists (idempotent replay)
-		"Error 1061", // duplicate index (idempotent replay)
-		"Error 1091", // index doesn't exist (idempotent replay)
-	} {
-		if strings.Contains(msg, p) {
-			return true
-		}
+	switch myErr.Number {
+	case 1064, // syntax (untranslatable DDL)
+		1146, // table doesn't exist
+		1050, // table already exists (idempotent replay)
+		1061, // duplicate index (idempotent replay)
+		1091: // index doesn't exist (idempotent replay)
+		return true
 	}
 	return false
 }
