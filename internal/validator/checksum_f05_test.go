@@ -35,7 +35,7 @@ type fakeConn struct {
 }
 
 func (c *fakeConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("unsupported") }
-func (c *fakeConn) Close() error                       { return nil }
+func (c *fakeConn) Close() error                        { return nil }
 func (c *fakeConn) Begin() (driver.Tx, error)           { return nil, errors.New("unsupported") }
 
 func (c *fakeConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
