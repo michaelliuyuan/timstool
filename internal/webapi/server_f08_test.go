@@ -36,7 +36,9 @@ func TestTaskMapsConcurrentAccess(t *testing.T) {
 				s.beginRun(id, cancel)
 				s.setLogCore(id, NewTaskLogCore(nil, id, nil))
 				if i%3 == 0 {
-					s.cancelRunning(id)
+					if c := s.runningCancel(id); c != nil {
+						c()
+					}
 				}
 				s.deleteLogCore(id)
 				cancel()
@@ -78,8 +80,14 @@ func TestResumeCancelsPreviousRun(t *testing.T) {
 		}(ctx)
 	}
 
-	// Cancel-and-replace exactly like handleResumeTask does.
-	s.cancelRunning(taskID)
+	// Cancel-and-replace exactly like handleResumeTask does (F-08 v2):
+	// swapRunning hands ownership to a new generation, oldCancel fires
+	// outside the lock.
+	noop := func() {}
+	oldCancel, _ := s.swapRunning(taskID, noop)
+	if oldCancel != nil {
+		oldCancel()
+	}
 	select {
 	case <-cancelled:
 	case <-time.After(2 * time.Second):
@@ -395,6 +403,63 @@ func TestSupersededRunSuccessDoesNotWriteTerminalState(t *testing.T) {
 		if strings.Contains(e.Message, "CDC chain:") {
 			t.Error("superseded stale run started a CDC chain")
 		}
+	}
+
+	close(freshRelease)
+}
+
+// F-08 v2 fix-A anchor (start path): handleStartTask must swapRunning —
+// starting a paused task whose stale run goroutine is still alive cancels
+// the stale run instead of leaving two concurrent pipelines.
+func TestStartOnPausedCancelsStaleRun(t *testing.T) {
+	s, st := newTestServer(t)
+
+	taskID := "t-startswap"
+	if err := st.CreateTask(&store.Task{ID: taskID, Name: "ss", Status: store.TaskStatusPaused, ConfigJSON: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+
+	staleCancelled := make(chan struct{})
+	freshRelease := make(chan struct{})
+	var call int32
+	oldPipeline := runPipeline
+	defer func() { runPipeline = oldPipeline }()
+	runPipeline = func(ctx context.Context, _ config.Config, _ orchestrator.PipelineConfig) ([]orchestrator.PipelineResult, error) {
+		if atomic.AddInt32(&call, 1) == 1 {
+			<-ctx.Done()
+			close(staleCancelled)
+			return nil, ctx.Err()
+		}
+		<-freshRelease
+		return nil, nil
+	}
+
+	// Stale run alive (paused without cancel), exactly the double-run setup.
+	staleCtx, staleCancel := context.WithCancel(context.Background())
+	defer staleCancel()
+	staleRun := s.beginRun(taskID, staleCancel)
+	go s.runMigration(staleCtx, taskID, config.Config{}, staleRun)
+	time.Sleep(150 * time.Millisecond)
+
+	// Drive the real start handler.
+	w, req := doReq("POST", "/api/v1/tasks/"+taskID+"/start", "")
+	s.handleStartTask(w, withChiParam(req, "taskID", taskID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("start: %d %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case <-staleCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("start-on-paused did not cancel the stale run")
+	}
+
+	task, _ := st.GetTask(taskID)
+	if task.Status != store.TaskStatusRunning {
+		t.Fatalf("fresh run must be Running, got %s", task.Status)
+	}
+	if s.ownsRun(taskID, staleRun) {
+		t.Error("stale generation must no longer own the task after start")
 	}
 
 	close(freshRelease)

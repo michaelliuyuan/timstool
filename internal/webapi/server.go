@@ -1229,7 +1229,13 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 	os.RemoveAll(fmt.Sprintf(".checkpoint/%s", taskID))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	runID := s.beginRun(taskID, cancel)
+	// swapRunning (not beginRun): a start on a paused task may still have a
+	// stale run goroutine alive (paused without cancel) — hand ownership to
+	// this run and cancel the stale one, same as resume (F-08 v2, fix A).
+	oldCancel, runID := s.swapRunning(taskID, cancel)
+	if oldCancel != nil {
+		oldCancel()
+	}
 
 	go s.runMigration(ctx, taskID, cfg, runID)
 
@@ -1593,23 +1599,6 @@ func (s *Server) beginRun(taskID string, cancel context.CancelFunc) uint64 {
 	s.runningTasks[taskID] = cancel
 	s.taskRuns[taskID] = s.runSeq
 	return s.runSeq
-}
-
-// cancelRunning cancels and removes the task's cancel func if present.
-// The cancel call happens outside the lock: context cancel runs child
-// callbacks synchronously and any of them taking taskMu would deadlock.
-func (s *Server) cancelRunning(taskID string) bool {
-	s.taskMu.Lock()
-	cancel, ok := s.runningTasks[taskID]
-	if ok {
-		delete(s.runningTasks, taskID)
-		delete(s.taskRuns, taskID)
-	}
-	s.taskMu.Unlock()
-	if ok {
-		cancel()
-	}
-	return ok
 }
 
 // swapRunning atomically replaces the task's run entry with a fresh
