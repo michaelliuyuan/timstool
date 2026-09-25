@@ -74,10 +74,26 @@ function openEdit(j: IncrementalJob) {
 }
 
 function addRow() {
+  // S1-UI-08: guard against adding a duplicate table entry.
+  if (form.tables.some(t => !t.table.trim())) {
+    ElMessage.warning('请先填写上一行的表名再添加新表')
+    return
+  }
   form.tables.push({ table: '', watermark_column: '', initial_watermark: '', columns: [] })
 }
 function removeRow(i: number) {
   form.tables.splice(i, 1)
+}
+
+function onTableChanged(i: number) {
+  const row = form.tables[i]
+  row.columns = []
+  row.watermark_column = ''
+  const name = row.table.trim().toLowerCase()
+  if (name && form.tables.some((t, idx) => idx !== i && t.table.trim().toLowerCase() === name)) {
+    ElMessage.warning(`表「${row.table.trim()}」已添加，请勿重复`)
+    row.table = ''
+  }
 }
 
 // Fetch the column list for a table row (marks comparable types + unindexed).
@@ -115,11 +131,18 @@ async function save() {
     ElMessage.warning('请至少添加一张表')
     return
   }
+  const seen = new Set<string>()
   for (const t of form.tables) {
     if (!t.table || !t.watermark_column) {
       ElMessage.warning('每张表都需要表名和水位列')
       return
     }
+    const key = t.table.trim().toLowerCase()
+    if (seen.has(key)) {
+      ElMessage.warning(`表「${t.table.trim()}」重复添加`)
+      return
+    }
+    seen.add(key)
   }
   saving.value = true
   try {
@@ -279,7 +302,7 @@ const strategyLabels: Record<string, string> = { replace: 'REPLACE INTO', ignore
         <el-form-item label="表与水位列">
           <div style="width: 100%;">
             <div v-for="(t, i) in form.tables" :key="i" class="inc-table-row">
-              <el-input v-model="t.table" placeholder="表名" style="width: 180px;" @change="t.columns = []; t.watermark_column = ''" />
+              <el-input v-model="t.table" placeholder="表名" style="width: 180px;" @change="onTableChanged(i)" />
               <el-button size="small" style="margin: 0 4px 0 8px;" @click="loadColumns(i)">获取列</el-button>
               <el-select v-if="t.columns.length" v-model="t.watermark_column" placeholder="水位列" style="width: 260px;" @change="onColumnPicked(i)">
                 <el-option v-for="c in t.columns" :key="c.name" :value="c.name" :label="`${c.name}（${c.data_type}${c.indexed ? '' : ' · 无索引'}）`" :disabled="!c.comparable" />

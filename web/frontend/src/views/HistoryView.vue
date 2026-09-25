@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import apiClient from '../api'
 import type { Task } from '../api'
 import PageHeader from '../components/PageHeader.vue'
@@ -30,6 +30,9 @@ async function fetchHistory() {
 }
 
 async function deleteTask(id: string) {
+  try {
+    await ElMessageBox.confirm('确认删除该任务？删除后不可恢复。', '确认', { type: 'warning' })
+  } catch { return }
   try {
     await apiClient.deleteTask(id)
     ElMessage.success('已删除')

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import apiClient from '../api'
 import type { Task, TaskLogEntry, PhaseInfo } from '../api'
 
@@ -196,6 +196,9 @@ async function action(actionName: string) {
 
 async function cancelTask() {
   try {
+    await ElMessageBox.confirm('确认取消该迁移任务？进行中的同步将中断。', '确认', { type: 'warning' })
+  } catch { return }
+  try {
     await apiClient.cancelTask(taskId)
     ElMessage.success('任务已取消')
     await fetchTask()
@@ -206,6 +209,9 @@ async function cancelTask() {
 
 async function deleteTask() {
   try {
+    await ElMessageBox.confirm('确认删除该任务？删除后不可恢复。', '确认', { type: 'warning' })
+  } catch { return }
+  try {
     await apiClient.deleteTask(taskId)
     ElMessage.success('任务已删除')
     router.push('/tasks')
@@ -215,14 +221,18 @@ async function deleteTask() {
 }
 
 async function downloadReport() {
-  const { data } = await apiClient.getTaskReport(taskId, 'html')
-  const blob = new Blob([data], { type: 'text/html' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `report-${taskId}.html`
-  a.click()
-  URL.revokeObjectURL(url)
+  try {
+    const { data } = await apiClient.getTaskReport(taskId, 'html')
+    const blob = new Blob([data], { type: 'text/html' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `report-${taskId}.html`
+    a.click()
+    URL.revokeObjectURL(url)
+  } catch (e: any) {
+    ElMessage.error(`报告下载失败: ${e.response?.data?.error || e.message}`)
+  }
 }
 
 async function loadLogs() {
@@ -461,9 +471,9 @@ function logLevelClass(level: string): string {
         <template #header>任务信息</template>
         <el-descriptions :column="2" border>
           <el-descriptions-item label="任务 ID">{{ task.id }}</el-descriptions-item>
-          <el-descriptions-item label="创建时间">{{ task.created_at }}</el-descriptions-item>
-          <el-descriptions-item label="开始时间">{{ task.started_at || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="结束时间">{{ task.finished_at || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="创建时间">{{ new Date(task.created_at).toLocaleString() }}</el-descriptions-item>
+          <el-descriptions-item label="开始时间">{{ task.started_at ? new Date(task.started_at).toLocaleString() : '-' }}</el-descriptions-item>
+          <el-descriptions-item label="结束时间">{{ task.finished_at ? new Date(task.finished_at).toLocaleString() : '-' }}</el-descriptions-item>
         </el-descriptions>
       </el-card>
     </template>

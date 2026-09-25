@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import apiClient from '../api'
 import type { CompareTask, CompareReport, CompareOptions } from '../api'
 import ConnectionForm from '../components/ConnectionForm.vue'
@@ -316,6 +316,9 @@ async function startCompare() {
 async function cancelActive() {
   if (!activeTask.value) return
   try {
+    await ElMessageBox.confirm('确认取消当前比对任务？进行中的比对将中断。', '确认', { type: 'warning' })
+  } catch { return }
+  try {
     await apiClient.cancelCompare(activeTask.value.id)
     ElMessage.success('已请求取消')
   } catch (e: any) {
@@ -330,6 +333,9 @@ async function viewTask(t: CompareTask) {
 }
 
 async function removeTask(t: CompareTask) {
+  try {
+    await ElMessageBox.confirm(`确认删除比对任务「${t.name}」？删除后不可恢复。`, '确认', { type: 'warning' })
+  } catch { return }
   try {
     await apiClient.deleteCompare(t.id)
     if (activeTask.value?.id === t.id) {
@@ -591,7 +597,9 @@ onUnmounted(() => {
         <el-table-column label="表进度" width="120">
           <template #default="{ row }">{{ row.tables_done }} / {{ row.tables_total || '?' }}</template>
         </el-table-column>
-        <el-table-column prop="created_at" label="创建时间" width="170" />
+        <el-table-column label="创建时间" width="170">
+          <template #default="{ row }">{{ new Date(row.created_at).toLocaleString() }}</template>
+        </el-table-column>
         <el-table-column label="操作" width="140">
           <template #default="{ row }">
             <el-button size="small" link type="primary" @click="viewTask(row)">查看</el-button>

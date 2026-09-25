@@ -57,6 +57,10 @@ const router = createRouter({
       name: 'CDC',
       component: () => import('../views/CDCView.vue'),
     },
+    {
+      path: '/:pathMatch(.*)*',
+      redirect: '/',
+    },
   ],
 })
 

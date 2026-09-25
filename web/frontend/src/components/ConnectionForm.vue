@@ -36,6 +36,7 @@ const groups = ['common', 'source']
       v-for="f in fieldsOf(g)"
       :key="f.key"
       :label="f.label"
+      :prop="`source.${f.key}`"
       :required="f.required"
     >
       <el-input

@@ -19,12 +19,19 @@ const statusMap: Record<string, { type: string; label: string }> = {
   cancelled: { type: 'info', label: '已取消' },
 }
 
+// Poll toast throttle (S1-UI-08): routine 5s polls must not re-toast the
+// same failure — only the first failure (or a state change back to OK) flips
+// the flag so the next failure toasts once again.
+let lastFetchFailed = false
+
 async function fetchTasks() {
   try {
     const { data } = await apiClient.listTasks()
     tasks.value = data || []
+    lastFetchFailed = false
   } catch {
-    ElMessage.error('获取任务列表失败')
+    if (!lastFetchFailed) ElMessage.error('获取任务列表失败')
+    lastFetchFailed = true
   } finally {
     loading.value = false
   }
@@ -55,7 +62,7 @@ onUnmounted(() => {
     </PageHeader>
 
     <el-card v-loading="loading">
-      <el-table :data="tasks" style="width: 100%;" @row-click="(row: Task) => goToTask(row.id)" cursor: pointer>
+      <el-table :data="tasks" style="width: 100%;" @row-click="(row: Task) => goToTask(row.id)">
         <el-table-column prop="name" label="任务名称" min-width="180" />
         <el-table-column label="状态" width="120">
           <template #default="{ row }">

@@ -6,6 +6,11 @@ const api = axios.create({
   timeout: 30000,
 })
 
+// Long-running endpoints (assess / ddl-export / cdc precheck / replica
+// identity ALTERs) scan whole databases server-side; they override the
+// global 30s timeout per request so axios never cuts them off mid-run.
+const LONG_TIMEOUT = 300000
+
 export interface Task {
   id: string
   name: string
@@ -311,6 +316,13 @@ export const apiClient = {
       { source, fields },
     ),
 
+  // Same endpoint, datasource-ref flavour (server-side credentials).
+  testSourceConnectionRef: (sourceRef: string) =>
+    api.post<{ source: string; success: boolean; message: string; version?: string }>(
+      '/test-connection',
+      { source_ref: sourceRef },
+    ),
+
   testConnection: (req: ConnectionTestRequest) =>
     api.post<ConnectionTestResult>('/config/test-connection', req),
 
@@ -446,7 +458,7 @@ export const apiClient = {
       ok: boolean
       results: { table: string; sql: string; ok: boolean; error?: string; can_alter: boolean }[]
       hint: string
-    }>('/cdc/replica-identity', { confirm: 'ALTER', tables }),
+    }>('/cdc/replica-identity', { confirm: 'ALTER', tables }, { timeout: LONG_TIMEOUT }),
 
   // Timestamp-watermark incremental sync (F-04): manual-trigger jobs, PG
   // sources only; passwords stay server-side behind datasource refs.
@@ -472,6 +484,41 @@ export const apiClient = {
       `/sources/tables/${encodeURIComponent(table)}/columns`,
       { params: { source_ref: ref } },
     ),
+
+  // Compatibility assessment (S1-UI-08): body is { source_ref } or the inline
+  // PG form; format 'html' returns the report as text instead of JSON.
+  assess: (body: Record<string, any>, format?: string) =>
+    api.post<any>(
+      '/assess',
+      format ? { ...body, format } : body,
+      {
+        timeout: LONG_TIMEOUT,
+        responseType: format === 'html' ? 'text' : 'json',
+        transformResponse: format === 'html' ? [(d: any) => d] : undefined,
+      },
+    ),
+
+  // DDL export (S1-UI-08): schema listing + the ZIP export itself. The export
+  // may walk every object in every selected schema — long timeout, blob body.
+  ddlExportSchemas: (body: Record<string, any>) =>
+    api.post<{ schemas: string[] }>('/ddl-export/schemas', body, { timeout: LONG_TIMEOUT }),
+
+  ddlExport: (body: Record<string, any>) =>
+    api.post<Blob>('/ddl-export', body, { timeout: LONG_TIMEOUT, responseType: 'blob' }),
+
+  // CDC monitoring/control (S1-UI-08: migrated off raw fetch). precheck
+  // probes PG slot/publication server-side — extended timeout.
+  cdcStatus: () => api.get('/cdc/status'),
+  cdcStats: () => api.get('/cdc/stats'),
+  cdcCheckpoint: () => api.get('/cdc/checkpoint'),
+  cdcSlot: () => api.get('/cdc/slot'),
+  cdcPrecheck: () => api.get('/cdc/precheck', { timeout: LONG_TIMEOUT }),
+  cdcControl: (action: 'start' | 'stop') => api.post(`/cdc/${action}`),
+  resetCDCCheckpoint: () => api.post('/cdc/checkpoint/reset', { confirm: 'DELETE' }),
+  getCDCConfig: () => api.get('/cdc/config'),
+  saveCDCConfig: (source: Record<string, any>, target: Record<string, any>) =>
+    api.put('/cdc/config', { source, target }),
+  importCDCConfig: () => api.post('/cdc/config/import'),
 }
 
 export default apiClient

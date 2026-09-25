@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
+import apiClient from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import DataSourcePicker from '../components/DataSourcePicker.vue'
 import { useDataSources } from '../composables/useDataSources'
@@ -72,22 +73,18 @@ async function testSourceConn() {
   testingSource.value = true
   sourceTestResult.value = null
   try {
-    const body = sourceRef.value
-      ? { source_ref: sourceRef.value }
-      : { source: 'postgres', fields: { ...sourceForm.value } }
-    const resp = await fetch('/api/v1/test-connection', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    })
-    const data = await resp.json()
-    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+    // S1-UI-08: unified apiClient — axios rejects non-2xx so the ok check is
+    // implicit and the payload can never be mis-parsed as JSON.
+    const { data } = sourceRef.value
+      ? await apiClient.testSourceConnectionRef(sourceRef.value)
+      : await apiClient.testSourceConnection('postgres', { ...sourceForm.value })
     sourceTestResult.value = data
     if (data.success) ElMessage.success('连接成功')
     else ElMessage.error(`连接失败: ${data.message}`)
   } catch (e: any) {
-    sourceTestResult.value = { success: false, message: e.message }
-    ElMessage.error(`连接测试失败: ${e.message}`)
+    const msg = e.response?.data?.error || e.message
+    sourceTestResult.value = { success: false, message: msg }
+    ElMessage.error(`连接测试失败: ${msg}`)
   } finally {
     testingSource.value = false
   }
@@ -162,19 +159,13 @@ async function runAssess() {
     const body = sourceRef.value
       ? { source_ref: sourceRef.value }
       : { ...sourceForm.value }
-    const resp = await fetch('/api/v1/assess', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    })
-    if (!resp.ok) {
-      const err = await resp.json()
-      throw new Error(err.error || `HTTP ${resp.status}`)
-    }
-    report.value = await resp.json()
+    // S1-UI-08: apiClient with extended timeout — assess scans the whole
+    // database server-side and must not hit the global 30s cutoff.
+    const { data } = await apiClient.assess(body)
+    report.value = data
     ElMessage.success('评估完成')
   } catch (e: any) {
-    ElMessage.error(e.message || '评估失败')
+    ElMessage.error(e.response?.data?.error || e.message || '评估失败')
   } finally {
     loading.value = false
   }
@@ -188,13 +179,8 @@ async function downloadHTML() {
     const body = sourceRef.value
       ? { source_ref: sourceRef.value, format: 'html' }
       : { ...sourceForm.value, format: 'html' }
-    const resp = await fetch('/api/v1/assess', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    })
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-    const html = await resp.text()
+    const { data } = await apiClient.assess(body, 'html')
+    const html = String(data)
     const blob = new Blob([html], { type: 'text/html' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -203,7 +189,7 @@ async function downloadHTML() {
     a.click()
     URL.revokeObjectURL(url)
   } catch (e: any) {
-    ElMessage.error(e.message || '下载失败')
+    ElMessage.error(e.response?.data?.error || e.message || '下载失败')
   } finally {
     loading.value = false
   }

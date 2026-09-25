@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
+import apiClient from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import DataSourcePicker from '../components/DataSourcePicker.vue'
 import { useDataSources } from '../composables/useDataSources'
@@ -36,22 +37,17 @@ async function testSourceConn() {
   testingSource.value = true
   sourceTestResult.value = null
   try {
-    const body = sourceRef.value
-      ? { source_ref: sourceRef.value }
-      : { source: 'postgres', fields: { ...sourceForm.value } }
-    const resp = await fetch('/api/v1/test-connection', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    })
-    const data = await resp.json()
-    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+    // S1-UI-08: unified apiClient — axios rejects non-2xx implicitly.
+    const { data } = sourceRef.value
+      ? await apiClient.testSourceConnectionRef(sourceRef.value)
+      : await apiClient.testSourceConnection('postgres', { ...sourceForm.value })
     sourceTestResult.value = data
     if (data.success) ElMessage.success('连接成功')
     else ElMessage.error(`连接失败: ${data.message}`)
   } catch (e: any) {
-    sourceTestResult.value = { success: false, message: e.message }
-    ElMessage.error(`连接测试失败: ${e.message}`)
+    const msg = e.response?.data?.error || e.message
+    sourceTestResult.value = { success: false, message: msg }
+    ElMessage.error(`连接测试失败: ${msg}`)
   } finally {
     testingSource.value = false
   }
@@ -83,22 +79,13 @@ async function loadSchemas() {
   schemasLoading.value = true
   try {
     const body = sourceRef.value ? { source_ref: sourceRef.value } : { ...sourceForm.value }
-    const resp = await fetch('/api/v1/ddl-export/schemas', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    })
-    if (!resp.ok) {
-      const err = await resp.json()
-      throw new Error(err.error || `HTTP ${resp.status}`)
-    }
-    const data = await resp.json()
+    const { data } = await apiClient.ddlExportSchemas(body)
     schemas.value = data.schemas || []
     // D3: default-select public when present
     selectedSchemas.value = schemas.value.includes('public') ? ['public'] : schemas.value.slice(0, 1)
     ElMessage.success(`发现 ${schemas.value.length} 个 schema`)
   } catch (e: any) {
-    ElMessage.error(e.message || '获取 schema 失败')
+    ElMessage.error(e.response?.data?.error || e.message || '获取 schema 失败')
   } finally {
     schemasLoading.value = false
   }
@@ -121,22 +108,16 @@ async function exportDDL() {
   try {
     const types: Record<string, boolean> = {}
     for (const opt of typeOptions) types[opt.key] = selectedTypes.value.includes(opt.key)
-    const resp = await fetch('/api/v1/ddl-export', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ...(sourceRef.value ? { source_ref: sourceRef.value } : { ...sourceForm.value }),
-        schemas: selectedSchemas.value,
-        types,
-        tidb: includeTiDB.value
-      })
+    // S1-UI-08: apiClient (blob + long timeout) — the export walks every
+    // selected object server-side and must not hit the global 30s cutoff.
+    const { data, headers } = await apiClient.ddlExport({
+      ...(sourceRef.value ? { source_ref: sourceRef.value } : { ...sourceForm.value }),
+      schemas: selectedSchemas.value,
+      types,
+      tidb: includeTiDB.value,
     })
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }))
-      throw new Error(err.error || `HTTP ${resp.status}`)
-    }
-    const skipped = parseInt(resp.headers.get('X-Tims-Skipped') || '0', 10)
-    const blob = await resp.blob()
+    const skipped = parseInt(headers['x-tims-skipped'] || '0', 10)
+    const blob = data as Blob
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
@@ -149,7 +130,7 @@ async function exportDDL() {
       ElMessage.success('DDL 导出完成')
     }
   } catch (e: any) {
-    ElMessage.error(e.message || '导出失败')
+    ElMessage.error(e.response?.data?.error || e.message || '导出失败')
   } finally {
     exporting.value = false
   }

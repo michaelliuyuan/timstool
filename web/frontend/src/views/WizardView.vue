@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage, type FormRules } from 'element-plus'
+import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import apiClient from '../api'
 import ConnectionForm from '../components/ConnectionForm.vue'
 import DataSourcePicker from '../components/DataSourcePicker.vue'
@@ -73,6 +73,18 @@ const sourceTestResult = ref<any>(null)
 const targetTestResult = ref<any>(null)
 const testingSource = ref(false)
 const testingTarget = ref(false)
+
+// S1-UI-08: editing any connection input (or swapping a datasource ref)
+// invalidates a previous green-light — the user must re-test before the
+// wizard may advance (防止带着已失效的配置进入下一步).
+watch(sourceRef, () => { sourceTestResult.value = null })
+watch(targetRef, () => { targetTestResult.value = null })
+watch(() => form.source, () => { sourceTestResult.value = null }, { deep: true })
+watch(() => form.target, () => { targetTestResult.value = null }, { deep: true })
+
+// S1-UI-08: form ref was declared nowhere in the script, so :rules never
+// had a live FormInstance to validate against.
+const formRef = ref<FormInstance>()
 
 // Lightning path gate (迁移选项页门禁): must validate successfully (explicit
 // path OR auto-discovery probe) before the wizard may advance past step 3.
@@ -322,7 +334,13 @@ async function submit() {
       },
     })
     ElMessage.success('迁移任务创建成功')
-    await apiClient.startTask(data.id)
+    // S1-UI-08: a failed start must not be misreported as a failed create —
+    // the task exists (已创建未启动) and is usable from its detail page.
+    try {
+      await apiClient.startTask(data.id)
+    } catch (e: any) {
+      ElMessage.warning(`任务已创建但启动失败：${e.response?.data?.error || e.message}，可在任务详情页重试启动`)
+    }
     router.push(`/tasks/${data.id}`)
   } catch (e: any) {
     ElMessage.error(`创建失败: ${e.response?.data?.error || e.message}`)
@@ -373,6 +391,15 @@ async function saveMigrationOptions() {
 }
 
 async function nextStep() {
+  // S1-UI-08: run the :rules validation on the connection steps — required
+  // fields must pass before the step gates (green light etc.) are consulted.
+  if (activeStep.value <= 1) {
+    const valid = await formRef.value?.validate().then(() => true).catch(() => false)
+    if (!valid) {
+      ElMessage.warning('请完整填写连接信息（必填项不能为空）')
+      return
+    }
+  }
   if (activeStep.value === 0 && !sourceTestResult.value?.success) {
     ElMessage.warning('请先测试源数据库连接')
     return
