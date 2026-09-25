@@ -1255,7 +1255,10 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 	s.logCollector.RemoveBuffer(taskID)
 	os.RemoveAll(fmt.Sprintf(".checkpoint/%s", taskID))
 
-	if err := s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning); err != nil {
+	// F-08-2 item 7 ("Plan A"): stamp the ownership generation into the row
+	// TOGETHER with Running — every migration-run store write below is now
+	// conditional on run_id, closing the µs window at the database itself.
+	if err := s.store.SetTaskRun(taskID, runID); err != nil {
 		// We already swapped ownership — roll the (never-started) entry back
 		// so the map stays clean; the ctx is dropped by defer-less cancel.
 		cancel()
@@ -1301,7 +1304,7 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 
 	progressCtx, progressCancel := context.WithCancel(ctx)
 	defer progressCancel()
-	go s.pollProgress(progressCtx, taskID, cfg.Migration.CheckpointDir)
+	go s.pollProgress(progressCtx, taskID, cfg.Migration.CheckpointDir, runID)
 
 	pipeCfg := orchestrator.PipelineConfig{
 		SkipPrecheck: cfg.Migration.SkipPrecheck,
@@ -1316,7 +1319,13 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 	if ctx.Err() == context.Canceled {
 		if owns() {
 			s.logCollector.Append(taskID, "WARN", "Migration task cancelled", "")
-			s.store.UpdateTaskStatus(taskID, store.TaskStatusCancelled)
+			// Conditioned write (F-08-2 item 7): the DB row itself rejects
+			// the write if ownership was swapped in the µs since owns().
+			if ok, werr := s.store.UpdateTaskStatusIfRun(taskID, store.TaskStatusCancelled, runID); werr != nil {
+				s.logCollector.Append(taskID, "ERROR", "write cancelled status: "+werr.Error(), "")
+			} else if !ok {
+				s.logCollector.Append(taskID, "INFO", "stale run lost DB ownership while cancelling; fresh run's state kept", "")
+			}
 		} else {
 			// Superseded by a newer run (resume cancelled this stale one):
 			// the fresh run already flipped the status to Running — leave it.
@@ -1341,12 +1350,9 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 	// below instead of failing fast at SetTaskError.
 	if err != nil && !onlyValidateFailed(results, cfg.Migration.CDCChain) {
 		s.logCollector.Append(taskID, "ERROR", "Migration failed: "+err.Error(), "")
-		// Re-check: ownership may have been swapped away (resume/start)
-		// between the pipeline return and here — a superseded run must not
-		// clobber the fresh run's Running status with an error terminal.
-		if owns() {
-			s.store.SetTaskError(taskID, err.Error())
-		} else {
+		// Conditioned write: even if ownership was swapped after the last
+		// owns() check, the run_id guard keeps the fresh Running intact.
+		if ok, werr := s.store.SetTaskErrorIfRun(taskID, err.Error(), runID); werr == nil && !ok {
 			s.logCollector.Append(taskID, "INFO", "stale run finished (superseded by resume); skipping terminal state write", "")
 		}
 		return
@@ -1376,15 +1382,18 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 			zap.Int64("rows_total", rTotal),
 			zap.Int64("rows_done", rDone))
 		prog := computeTaskProgress(cpPhase, tDone, tTotal, rDone, rTotal, cpMgr.GetImportedTables(), cpMgr.GetImportMode())
-		_ = s.store.UpdateTaskProgress(taskID, cpPhase, prog, tDone, tTotal, rDone, rTotal)
-		s.BroadcastProgress(taskID, map[string]interface{}{
-			"phase":        cpPhase,
-			"progress":     prog,
-			"tables_done":  tDone,
-			"tables_total": tTotal,
-			"rows_done":    rDone,
-			"rows_total":   rTotal,
-		})
+		// Conditioned write: a superseded run's final progress sync must not
+		// clobber the fresh run's counters; only a live owner broadcasts.
+		if ok, _ := s.store.UpdateTaskProgressIfRun(taskID, cpPhase, prog, tDone, tTotal, rDone, rTotal, runID); ok {
+			s.BroadcastProgress(taskID, map[string]interface{}{
+				"phase":        cpPhase,
+				"progress":     prog,
+				"tables_done":  tDone,
+				"tables_total": tTotal,
+				"rows_done":    rDone,
+				"rows_total":   rTotal,
+			})
+		}
 	}
 
 	// Second ownership gate: the progress sync above is a long tail — the
@@ -1396,7 +1405,7 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 	}
 
 	resultData, _ := json.Marshal(results)
-	s.store.SetTaskResult(taskID, string(resultData))
+	s.store.SetTaskResultIfRun(taskID, string(resultData), runID)
 
 	allSuccess := true
 	for _, r := range results {
@@ -1423,19 +1432,22 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 			})
 		}
 		s.logCollector.Append(taskID, "INFO", "Migration completed successfully", "")
-		s.store.UpdateTaskStatus(taskID, store.TaskStatusCompleted)
-		// 全量+增量衔接 (P1): auto-start CDC from the pre-created slot. The
-		// message (success or loud failure) lands in the task log + broadcast.
-		if cfg.Migration.CDCChain {
-			s.startCDCChainAfterSuccess(taskID, &cfg)
+		// Conditioned write: Completed only lands if this generation still
+		// owns the row; the CDC chain follows the same ownership verdict.
+		if ok, werr := s.store.UpdateTaskStatusIfRun(taskID, store.TaskStatusCompleted, runID); werr == nil && ok {
+			// 全量+增量衔接 (P1): auto-start CDC from the pre-created slot. The
+			// message (success or loud failure) lands in the task log + broadcast.
+			if cfg.Migration.CDCChain {
+				s.startCDCChainAfterSuccess(taskID, &cfg)
+			}
 		}
 	} else {
 		s.logCollector.Append(taskID, "WARN", "Migration completed with errors", "")
-		s.store.UpdateTaskStatus(taskID, store.TaskStatusFailed)
+		s.store.UpdateTaskStatusIfRun(taskID, store.TaskStatusFailed, runID)
 	}
 }
 
-func (s *Server) pollProgress(ctx context.Context, taskID string, checkpointDir string) {
+func (s *Server) pollProgress(ctx context.Context, taskID string, checkpointDir string, runID uint64) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -1471,7 +1483,12 @@ func (s *Server) pollProgress(ctx context.Context, taskID string, checkpointDir 
 			importMode := cpMgr.GetImportMode()
 			progress := computeTaskProgress(rawPhase, tablesDone, tablesTotal, rowsDone, rowsTotal, importedTables, importMode)
 
-			_ = s.store.UpdateTaskProgress(taskID, phase, progress, tablesDone, tablesTotal, rowsDone, rowsTotal)
+			// Conditioned: a superseded run's poller stops writing/broadcasting
+			// the moment a fresh generation takes the row (F-08-2 item 7).
+			ok, _ := s.store.UpdateTaskProgressIfRun(taskID, phase, progress, tablesDone, tablesTotal, rowsDone, rowsTotal, runID)
+			if !ok {
+				continue
+			}
 
 			msg := map[string]interface{}{
 				"phase":        phase,
@@ -1612,7 +1629,8 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 	if oldCancel != nil {
 		oldCancel()
 	}
-	s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning)
+	// F-08-2 item 7: stamp generation + Running in one conditioned write.
+	_ = s.store.SetTaskRun(taskID, runID)
 	go s.runMigration(ctx, taskID, cfg, runID)
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})

@@ -256,7 +256,11 @@ func TestCDCChain_ValidateErrDemotionInRunMigration(t *testing.T) {
 		}
 		return rs, fmt.Errorf("data validation failed: 1/2 tables failed")
 	}
-	s.runMigration(context.Background(), taskID, mkCfg(), s.beginRun(taskID, func() {}))
+	// F-08-2 item 7: stamp the ownership generation into the row so the
+	// run-conditioned writes inside runMigration land.
+	runID := s.beginRun(taskID, func() {})
+	_ = s.store.SetTaskRun(taskID, runID)
+	s.runMigration(context.Background(), taskID, mkCfg(), runID)
 	task := GetTaskForTest(t, s, taskID)
 	if task.Status != "completed" {
 		t.Fatalf("validate-only failure must demote to completed, got %q (err=%q)", task.Status, task.Error)
@@ -289,7 +293,9 @@ func TestCDCChain_ValidateErrDemotionInRunMigration(t *testing.T) {
 		}
 		return rs, fmt.Errorf("data migration failed: boom")
 	}
-	s.runMigration(context.Background(), taskID2, mkCfg(), s.beginRun(taskID2, func() {}))
+	runID2 := s.beginRun(taskID2, func() {})
+	_ = s.store.SetTaskRun(taskID2, runID2)
+	s.runMigration(context.Background(), taskID2, mkCfg(), runID2)
 	task2 := GetTaskForTest(t, s, taskID2)
 	if task2.Status != "failed" {
 		t.Fatalf("data failure must stay failed, got %q", task2.Status)
@@ -317,7 +323,9 @@ func TestCDCChain_ValidateErrDemotionInRunMigration(t *testing.T) {
 		}
 		cfg3 := mkCfg()
 		cfg3.Migration.CDCChain = false
-		s.runMigration(context.Background(), taskID3, cfg3, s.beginRun(taskID3, func() {}))
+		runID3 := s.beginRun(taskID3, func() {})
+		_ = s.store.SetTaskRun(taskID3, runID3)
+		s.runMigration(context.Background(), taskID3, cfg3, runID3)
 		task3 := GetTaskForTest(t, s, taskID3)
 		if task3.Status != "failed" {
 			t.Fatalf("non-chained validate failure must stay failed, got %q", task3.Status)

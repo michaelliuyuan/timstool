@@ -310,6 +310,9 @@ func TestPureCancelOwningRunWritesCancelled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	runID := s.beginRun(taskID, cancel)
+	// F-08-2 item 7: the owning run must hold the DB-side generation too —
+	// its cancel-branch write is run-conditioned now.
+	_ = st.SetTaskRun(taskID, runID)
 	go func() {
 		s.runMigration(ctx, taskID, config.Config{}, runID)
 		close(runDone)
