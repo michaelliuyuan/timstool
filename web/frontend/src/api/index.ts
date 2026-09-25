@@ -9,7 +9,10 @@ const api = axios.create({
 // Long-running endpoints (assess / ddl-export / cdc precheck / replica
 // identity ALTERs) scan whole databases server-side; they override the
 // global 30s timeout per request so axios never cuts them off mid-run.
-const LONG_TIMEOUT = 300000
+// Three-layer alignment (F-10): server chi group Timeout = http.Server
+// WriteTimeout = this client timeout, all 120s — a larger value here would
+// just wait on a connection the server has already cut.
+const LONG_TIMEOUT = 120000
 
 export interface Task {
   id: string

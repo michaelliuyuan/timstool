@@ -224,7 +224,9 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(60 * time.Second))
+	// F-10: the global 60s Timeout moved into /api/v1 groups below — a
+	// root-level middleware.Timeout would cap the long-running group at 60s
+	// regardless of its own 120s deadline (chi applies the min).
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
@@ -234,88 +236,101 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 	}))
 
 	r.Route("/api/v1", func(r chi.Router) {
-		r.Get("/health", s.handleHealth)
-		r.Get("/features", s.handleFeatures)
-		// Multi-source config endpoints (#t67 WSC)
-		r.Get("/sources", s.handleSources)
-		r.Get("/sources/{type}/config-schema", s.handleSourceConfigSchema)
-		r.Post("/sources/{type}/test", s.handleSourceTest)
-		r.Post("/sources/tables", s.handleSourceTables)
-		r.Post("/test-connection", s.handleTestConnectionMulti)
-		r.Post("/config/test-connection", s.handleTestConnection)
-		r.Post("/config/list-tables", s.handleListTables)
-		// Unified datasource registry (F-02): server-side named connection
-		// profiles; passwords are write-only (never echoed) and resolved
-		// server-side when tasks/compare/DDL/assess reference them by id.
-		r.Get("/datasources", s.handleListDataSources)
-		r.Post("/datasources", s.handleCreateDataSource)
-		r.Route("/datasources/{id}", func(r chi.Router) {
-			r.Put("/", s.handleUpdateDataSource)
-			r.Delete("/", s.handleDeleteDataSource)
-			r.Post("/test", s.handleTestDataSource)
+		// Default protection plane: 60s for every standard endpoint
+		// (preserves the pre-F-10 global timeout semantics).
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Timeout(60 * time.Second))
+			r.Get("/health", s.handleHealth)
+			r.Get("/features", s.handleFeatures)
+			// Multi-source config endpoints (#t67 WSC)
+			r.Get("/sources", s.handleSources)
+			r.Get("/sources/{type}/config-schema", s.handleSourceConfigSchema)
+			r.Post("/sources/{type}/test", s.handleSourceTest)
+			r.Post("/sources/tables", s.handleSourceTables)
+			r.Post("/test-connection", s.handleTestConnectionMulti)
+			r.Post("/config/test-connection", s.handleTestConnection)
+			r.Post("/config/list-tables", s.handleListTables)
+			// Unified datasource registry (F-02): server-side named connection
+			// profiles; passwords are write-only (never echoed) and resolved
+			// server-side when tasks/compare/DDL/assess reference them by id.
+			r.Get("/datasources", s.handleListDataSources)
+			r.Post("/datasources", s.handleCreateDataSource)
+			r.Route("/datasources/{id}", func(r chi.Router) {
+				r.Put("/", s.handleUpdateDataSource)
+				r.Delete("/", s.handleDeleteDataSource)
+				r.Post("/test", s.handleTestDataSource)
+			})
+			r.Post("/validate-lightning", s.handleValidateLightning)
+			// Migration options persistence (迁移选项记忆): server-side single
+			// source of truth so the wizard can prefill last-used Lightning path /
+			// temp dir across sessions, browsers, and service restarts.
+			r.Get("/migration-options", s.handleGetMigrationOptions)
+			r.Put("/migration-options", s.handlePutMigrationOptions)
+			r.Post("/tasks", s.handleCreateTask)
+			r.Get("/tasks", s.handleListTasks)
+			r.Route("/tasks/{taskID}", func(r chi.Router) {
+				r.Get("/", s.handleGetTask)
+				r.Post("/start", s.handleStartTask)
+				r.Post("/pause", s.handlePauseTask)
+				r.Post("/resume", s.handleResumeTask)
+				r.Post("/cancel", s.handleCancelTask)
+				r.Delete("/", s.handleDeleteTask)
+				r.Get("/progress", s.handleTaskProgress)
+				r.Get("/report", s.handleTaskReport)
+				r.Get("/logs", s.handleTaskLogs)
+				r.Get("/phases", s.handleTaskPhases)
+			})
+			r.Get("/ws", s.handleWebSocket)
+			// Source DDL export (F-01): schema listing + zip download
+			// Standalone comparison (独立数据比对): run the validator against
+			// explicit connections without migrating; own task namespace.
+			r.Post("/compare/tasks", s.handleCreateCompare)
+			r.Get("/compare/options", s.handleGetCompareOptions)
+			r.Put("/compare/options", s.handlePutCompareOptions)
+			r.Get("/compare/tasks", s.handleListCompares)
+			r.Route("/compare/tasks/{compareID}", func(r chi.Router) {
+				r.Get("/", s.handleGetCompare)
+				r.Get("/report", s.handleCompareReport)
+				r.Post("/cancel", s.handleCancelCompare)
+				r.Delete("/", s.handleDeleteCompare)
+			})
+			// CDC endpoints (#t48 B: read CDC process status file)
+			r.Get("/cdc/status", s.handleCDCStatus)
+			r.Get("/cdc/stats", s.handleCDCStats)
+			r.Get("/cdc/checkpoint", s.handleCDCCheckpoint)
+			r.Post("/cdc/start", s.handleCDCStart)
+			r.Post("/cdc/stop", s.handleCDCStop)
+			// CDC connection config + precheck + resume inspection (A1/A2/A3)
+			r.Get("/cdc/config", s.handleGetCDCConfig)
+			r.Put("/cdc/config", s.handlePutCDCConfig)
+			r.Post("/cdc/config/import", s.handleImportCDCConfig)
+			r.Post("/cdc/config/import-from-datasource", s.handleImportCDCFromDataSource)
+			r.Get("/cdc/slot", s.handleCDCSlot)
+			r.Post("/cdc/checkpoint/reset", s.handleCDCResetCheckpoint)
+			// Timestamp-watermark incremental sync (F-04): pull-based table
+			// granularity jobs, manual trigger only, PostgreSQL sources only.
+			r.Get("/incremental/jobs", s.handleListIncrementalJobs)
+			r.Post("/incremental/jobs", s.handleCreateIncrementalJob)
+			r.Route("/incremental/jobs/{id}", func(r chi.Router) {
+				r.Put("/", s.handleUpdateIncrementalJob)
+				r.Delete("/", s.handleDeleteIncrementalJob)
+				r.Post("/run", s.handleRunIncrementalJob)
+			})
+			r.Get("/sources/tables/{table}/columns", s.handleIncrementalColumns)
 		})
-		r.Post("/validate-lightning", s.handleValidateLightning)
-		// Migration options persistence (迁移选项记忆): server-side single
-		// source of truth so the wizard can prefill last-used Lightning path /
-		// temp dir across sessions, browsers, and service restarts.
-		r.Get("/migration-options", s.handleGetMigrationOptions)
-		r.Put("/migration-options", s.handlePutMigrationOptions)
-		r.Post("/tasks", s.handleCreateTask)
-		r.Get("/tasks", s.handleListTasks)
-		r.Route("/tasks/{taskID}", func(r chi.Router) {
-			r.Get("/", s.handleGetTask)
-			r.Post("/start", s.handleStartTask)
-			r.Post("/pause", s.handlePauseTask)
-			r.Post("/resume", s.handleResumeTask)
-			r.Post("/cancel", s.handleCancelTask)
-			r.Delete("/", s.handleDeleteTask)
-			r.Get("/progress", s.handleTaskProgress)
-			r.Get("/report", s.handleTaskReport)
-			r.Get("/logs", s.handleTaskLogs)
-			r.Get("/phases", s.handleTaskPhases)
+
+		// F-10 long-running endpoints: 120s deadline, three-layer aligned —
+		// handler ctx deadline = http.Server WriteTimeout (120s) = frontend
+		// LONG_TIMEOUT (120s). Anything genuinely slower needs the job/poll
+		// pattern (backlog).
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Timeout(120 * time.Second))
+			r.Post("/assess", s.handleAssess)
+			r.Post("/ddl-export/schemas", s.handleDDLSchemas)
+			r.Post("/ddl-export", s.handleDDLExport)
+			r.Get("/cdc/precheck", s.handleCDCPrecheck)
+			r.Post("/cdc/replica-identity", s.handleCDCReplicaIdentity)
 		})
-		r.Get("/ws", s.handleWebSocket)
-		r.Post("/assess", s.handleAssess)
-		// Source DDL export (F-01): schema listing + zip download
-		r.Post("/ddl-export/schemas", s.handleDDLSchemas)
-		r.Post("/ddl-export", s.handleDDLExport)
-		// Standalone comparison (独立数据比对): run the validator against
-		// explicit connections without migrating; own task namespace.
-		r.Post("/compare/tasks", s.handleCreateCompare)
-		r.Get("/compare/options", s.handleGetCompareOptions)
-		r.Put("/compare/options", s.handlePutCompareOptions)
-		r.Get("/compare/tasks", s.handleListCompares)
-		r.Route("/compare/tasks/{compareID}", func(r chi.Router) {
-			r.Get("/", s.handleGetCompare)
-			r.Get("/report", s.handleCompareReport)
-			r.Post("/cancel", s.handleCancelCompare)
-			r.Delete("/", s.handleDeleteCompare)
-		})
-		// CDC endpoints (#t48 B: read CDC process status file)
-		r.Get("/cdc/status", s.handleCDCStatus)
-		r.Get("/cdc/stats", s.handleCDCStats)
-		r.Get("/cdc/checkpoint", s.handleCDCCheckpoint)
-		r.Post("/cdc/start", s.handleCDCStart)
-		r.Post("/cdc/stop", s.handleCDCStop)
-		// CDC connection config + precheck + resume inspection (A1/A2/A3)
-		r.Get("/cdc/config", s.handleGetCDCConfig)
-		r.Put("/cdc/config", s.handlePutCDCConfig)
-		r.Post("/cdc/config/import", s.handleImportCDCConfig)
-		r.Post("/cdc/config/import-from-datasource", s.handleImportCDCFromDataSource)
-		r.Get("/cdc/precheck", s.handleCDCPrecheck)
-		r.Get("/cdc/slot", s.handleCDCSlot)
-		r.Post("/cdc/checkpoint/reset", s.handleCDCResetCheckpoint)
-		r.Post("/cdc/replica-identity", s.handleCDCReplicaIdentity)
-		// Timestamp-watermark incremental sync (F-04): pull-based table
-		// granularity jobs, manual trigger only, PostgreSQL sources only.
-		r.Get("/incremental/jobs", s.handleListIncrementalJobs)
-		r.Post("/incremental/jobs", s.handleCreateIncrementalJob)
-		r.Route("/incremental/jobs/{id}", func(r chi.Router) {
-			r.Put("/", s.handleUpdateIncrementalJob)
-			r.Delete("/", s.handleDeleteIncrementalJob)
-			r.Post("/run", s.handleRunIncrementalJob)
-		})
-		r.Get("/sources/tables/{table}/columns", s.handleIncrementalColumns)
 	})
 
 	if staticFS != (embed.FS{}) {
