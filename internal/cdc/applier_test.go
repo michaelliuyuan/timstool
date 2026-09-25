@@ -2,6 +2,7 @@ package cdc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -126,8 +127,11 @@ func TestApplyEvent_SkipsInternalTable(t *testing.T) {
 		Table:   "pg2tidb_ddl_log",
 		Columns: []ColumnValue{{Name: "id", Value: "1", Type: "oid_23"}},
 	})
-	if err != nil {
-		t.Fatalf("internal-table DML must be skipped (nil err), got: %v", err)
+	// The skip must surface as skippedError so the worker counts it ONLY as
+	// skipped (never applied — received = applied+skipped+failed, F-09).
+	var sk *skippedError
+	if !errors.As(err, &sk) {
+		t.Fatalf("internal-table DML must return skippedError, got: %v", err)
 	}
 	if got := a.stats.EventsSkipped; got != 1 {
 		t.Errorf("EventsSkipped = %d, want 1 (internal table skipped)", got)

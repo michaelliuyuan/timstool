@@ -341,6 +341,14 @@ func (a *Applier) worker(ctx context.Context, workCh <-chan *CDCEvent, id int) {
 				}
 				return
 			}
+			var sk *skippedError
+			if errors.As(err, &sk) {
+				// Intentionally not applied (internal table / skip list /
+				// degradable schema mismatch) — already counted as skipped
+				// inside applyEvent. Counting it here again as applied would
+				// break received = applied + skipped + failed.
+				continue
+			}
 			a.log.Error("apply event failed",
 				zap.Int("worker", id),
 				zap.String("table", tableKey(event.Schema, event.Table)),
@@ -361,6 +369,13 @@ func (a *Applier) worker(ctx context.Context, workCh <-chan *CDCEvent, id int) {
 	}
 }
 
+// skippedError marks an event intentionally not applied. The worker must
+// count it ONLY as skipped — never applied, never failed — so the status
+// counters stay self-consistent (received = applied + skipped + failed).
+type skippedError struct{ reason string }
+
+func (e *skippedError) Error() string { return "event skipped: " + e.reason }
+
 // applyEvent applies a single event to TiDB.
 func (a *Applier) applyEvent(ctx context.Context, event *CDCEvent) error {
 	// Never replicate CDC's own internal tables (e.g. the DDLTracker's
@@ -371,7 +386,7 @@ func (a *Applier) applyEvent(ctx context.Context, event *CDCEvent) error {
 		a.stats.mu.Lock()
 		a.stats.EventsSkipped++
 		a.stats.mu.Unlock()
-		return nil
+		return &skippedError{reason: "cdc internal table " + event.Table}
 	}
 	// Check skip table
 	for _, skip := range a.cfg.SkipTables {
@@ -379,7 +394,7 @@ func (a *Applier) applyEvent(ctx context.Context, event *CDCEvent) error {
 			a.stats.mu.Lock()
 			a.stats.EventsSkipped++
 			a.stats.mu.Unlock()
-			return nil
+			return &skippedError{reason: "skip-listed table " + skip}
 		}
 	}
 
@@ -428,7 +443,7 @@ func (a *Applier) applyEvent(ctx context.Context, event *CDCEvent) error {
 				a.stats.LastError = err.Error()
 				a.stats.LastSkipReason = fmt.Sprintf("[dml/1146] %s: %v", tableKey(event.Schema, event.Table), err)
 				a.stats.mu.Unlock()
-				return nil
+				return &skippedError{reason: fmt.Sprintf("[dml/1146] %s: %v", tableKey(event.Schema, event.Table), err)}
 			}
 			if err := sleepCtx(ctx, schemaBackoff); err != nil {
 				return err
