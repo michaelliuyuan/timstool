@@ -1216,7 +1216,22 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 				chainSlotName(&cfg), map[bool]string{true: "复用已有", false: "新建"}[reused], lsn), "")
 	}
 
+	// F-08 (adversarial 🟡, order fix): swapRunning BEFORE writing Running —
+	// a stale run (start-on-paused) returning in the write→swap gap would
+	// still own the task and clobber the fresh Running with a terminal
+	// state. After the swap any interleaving is ownership-gate-guarded; the
+	// stale cancel fires right here, outside the lock.
+	ctx, cancel := context.WithCancel(context.Background())
+	oldCancel, runID := s.swapRunning(taskID, cancel)
+	if oldCancel != nil {
+		oldCancel()
+	}
+
 	if err := s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning); err != nil {
+		// We already swapped ownership — roll the (never-started) entry back
+		// so the map stays clean; the ctx is dropped by defer-less cancel.
+		cancel()
+		s.endRun(taskID, runID)
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1227,15 +1242,6 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 	// Clear old logs and checkpoint data
 	s.logCollector.RemoveBuffer(taskID)
 	os.RemoveAll(fmt.Sprintf(".checkpoint/%s", taskID))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	// swapRunning (not beginRun): a start on a paused task may still have a
-	// stale run goroutine alive (paused without cancel) — hand ownership to
-	// this run and cancel the stale one, same as resume (F-08 v2, fix A).
-	oldCancel, runID := s.swapRunning(taskID, cancel)
-	if oldCancel != nil {
-		oldCancel()
-	}
 
 	go s.runMigration(ctx, taskID, cfg, runID)
 
@@ -1561,16 +1567,16 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 	var cfg config.Config
 	json.Unmarshal([]byte(task.ConfigJSON), &cfg)
 
-	s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning)
-	// F-08 v2 ruling: swap-then-cancel. swapRunning atomically hands
-	// ownership to the new generation; the stale run (paused, never
-	// cancelled) is cancelled OUTSIDE the lock and its terminal-state
-	// writes/cleanup are all ownership-guarded off.
+	// F-08 v2 ruling: swap-then-cancel, and SWAP BEFORE writing Running —
+	// if the status write happened first, a stale run returning in that
+	// gap still owns the task and could clobber the fresh Running with a
+	// terminal state. After the swap any interleaving is gate-guarded.
 	ctx, cancel := context.WithCancel(context.Background())
 	oldCancel, runID := s.swapRunning(taskID, cancel)
 	if oldCancel != nil {
 		oldCancel()
 	}
+	s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning)
 	go s.runMigration(ctx, taskID, cfg, runID)
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
