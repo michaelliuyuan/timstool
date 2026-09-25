@@ -118,12 +118,18 @@ func (s *Server) writeCDCConfig(cfg *config.Config) error {
 	}
 	raw, err := os.ReadFile(f)
 	if err != nil {
-		// Missing file: fall back to a plain marshal of the full config.
+		// Missing file: fall back to a plain marshal of the full config —
+		// still atomic (tmp+rename): a crash mid-write must never leave a
+		// half file that would break the next server start.
 		out, merr := yaml.Marshal(cfg)
 		if merr != nil {
 			return merr
 		}
-		return os.WriteFile(f, out, 0o600)
+		tmp := f + ".tmp"
+		if werr := os.WriteFile(tmp, out, 0o600); werr != nil {
+			return werr
+		}
+		return os.Rename(tmp, f)
 	}
 	var doc yaml.Node
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
