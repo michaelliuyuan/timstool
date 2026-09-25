@@ -22,6 +22,11 @@ type CDCStatusResponse struct {
 	UptimeSeconds float64 `json:"uptime_seconds,omitempty"`
 	FatalError    string  `json:"fatal_error,omitempty"`
 
+	// Stats is the apply-side counter face (F-09 visibility on the HTTP
+	// API): applied/failed/skipped/ddl_skipped/last_skip_reason etc., read
+	// from the same status file the dashboard uses. Nil when no status file.
+	Stats *cdc.CDCStatusStats `json:"stats,omitempty"`
+
 	// Control is the supervisor's lifecycle view (CONTROL channel, #t55):
 	// state/pid/restarts/uptime/adopted. Omitted when CDC control isn't wired.
 	Control *CDCControlStatus `json:"control,omitempty"`
@@ -140,6 +145,7 @@ func (s *Server) handleCDCStatus(w http.ResponseWriter, r *http.Request) {
 		PID:           v.PID,
 		UptimeSeconds: v.UptimeSeconds,
 		FatalError:    v.FatalError,
+		Stats:         v.Stats,
 	}
 	if s.cdcSupervisor != nil {
 		cs := s.cdcSupervisor.Status()
