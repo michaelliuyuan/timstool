@@ -1247,17 +1247,16 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 	logCore := NewTaskLogCore(s.logCollector, taskID, nil)
 	s.setLogCore(taskID, logCore)
 
-	// Ownership guard (F-08 adversarial rework): when resume cancels a
-	// stale run, that stale run must NOT write Cancelled over the fresh
-	// Running status, delete the fresh run's log core, or unregister the
-	// fresh run's extra logger core. A run owns the task only while its
-	// generation token is still the current one.
+	// Ownership guard (F-08 v2 ruling): a superseded (resume-swapped)
+	// run must not write terminal state, delete the fresh run's log
+	// core, or unregister the fresh run's extra logger core. endRun is
+	// the single cleanup point and only acts while this run's
+	// generation token is still current.
 	owns := func() bool { return s.ownsRun(taskID, runID) }
 
 	defer func() {
 		logCore.Disable()
-		if owns() {
-			s.deleteLogCore(taskID)
+		if s.endRun(taskID, runID) {
 			logger.UnregisterExtraCore()
 		}
 	}()
@@ -1548,13 +1547,15 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 	json.Unmarshal([]byte(task.ConfigJSON), &cfg)
 
 	s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning)
-	// A pause never cancels the task's context, so the previous run's
-	// goroutine (and its cancel entry) may still be alive — cancel it
-	// before starting a fresh one, otherwise two runMigration goroutines
-	// race on the same task's checkpoints (F-08).
-	s.cancelRunning(taskID)
+	// F-08 v2 ruling: swap-then-cancel. swapRunning atomically hands
+	// ownership to the new generation; the stale run (paused, never
+	// cancelled) is cancelled OUTSIDE the lock and its terminal-state
+	// writes/cleanup are all ownership-guarded off.
 	ctx, cancel := context.WithCancel(context.Background())
-	runID := s.beginRun(taskID, cancel)
+	oldCancel, runID := s.swapRunning(taskID, cancel)
+	if oldCancel != nil {
+		oldCancel()
+	}
 	go s.runMigration(ctx, taskID, cfg, runID)
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
@@ -1562,8 +1563,15 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
-	s.cancelRunning(taskID)
-	s.store.UpdateTaskStatus(taskID, store.TaskStatusCancelled)
+	// F-08 v2 ruling: pure cancel keeps the entry — the OWNING run's
+	// cancel branch writes Cancelled and its defer cleans up. Only when
+	// there is no live run (paused/finished/never started) does the
+	// handler write the terminal status itself.
+	if cancel := s.runningCancel(taskID); cancel != nil {
+		cancel()
+	} else {
+		s.store.UpdateTaskStatus(taskID, store.TaskStatusCancelled)
+	}
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 }
 
@@ -1593,6 +1601,48 @@ func (s *Server) cancelRunning(taskID string) bool {
 		cancel()
 	}
 	return ok
+}
+
+// swapRunning atomically replaces the task's run entry with a fresh
+// generation (resume path, F-08 v2 ruling): the stale run loses ownership
+// the instant the new entry is written, closing the cancel→set gap. The
+// old cancel func (or nil) is returned for the caller to invoke OUTSIDE
+// the lock.
+func (s *Server) swapRunning(taskID string, cancel context.CancelFunc) (oldCancel context.CancelFunc, newRunID uint64) {
+	s.taskMu.Lock()
+	oldCancel = s.runningTasks[taskID]
+	s.runSeq++
+	s.runningTasks[taskID] = cancel
+	s.taskRuns[taskID] = s.runSeq
+	newRunID = s.runSeq
+	s.taskMu.Unlock()
+	return oldCancel, newRunID
+}
+
+// runningCancel returns the currently registered cancel func (or nil),
+// WITHOUT removing the entry: the pure-cancel handler cancels but leaves
+// the owning run to write its own terminal state and clean up (F-08 v2
+// ruling).
+func (s *Server) runningCancel(taskID string) context.CancelFunc {
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	return s.runningTasks[taskID]
+}
+
+// endRun is the owning run's single cleanup point: if runID is still the
+// current generation it removes the run entry and the log core and
+// reports ownership. logger core unregistration is the caller's job
+// (outside the lock).
+func (s *Server) endRun(taskID string, runID uint64) bool {
+	s.taskMu.Lock()
+	owned := s.taskRuns[taskID] == runID
+	if owned {
+		delete(s.taskRuns, taskID)
+		delete(s.runningTasks, taskID)
+		delete(s.logCores, taskID)
+	}
+	s.taskMu.Unlock()
+	return owned
 }
 
 // ownsRun reports whether runID is still the current generation for

@@ -199,13 +199,17 @@ func TestSupersededRunKeepsFreshStatusAndLogCore(t *testing.T) {
 	go s.runMigration(staleCtx, taskID, config.Config{}, staleRun)
 	time.Sleep(150 * time.Millisecond) // let it register its log core
 
-	// Resume mirrors handleResumeTask: flip status, cancel stale, begin
-	// a fresh run with a new generation token.
+	// Resume mirrors handleResumeTask (F-08 v2): swap-then-cancel —
+	// swapRunning atomically hands ownership to the fresh generation,
+	// the stale cancel fires outside the lock.
 	_ = st.UpdateTaskStatus(taskID, store.TaskStatusRunning)
-	s.cancelRunning(taskID)
 	freshCtx, freshCancel := context.WithCancel(context.Background())
 	defer freshCancel()
-	freshRun := s.beginRun(taskID, freshCancel)
+	oldCancel, freshRun := s.swapRunning(taskID, freshCancel)
+	if oldCancel == nil {
+		t.Fatal("swapRunning must return the stale cancel func")
+	}
+	oldCancel()
 	go s.runMigration(freshCtx, taskID, config.Config{}, freshRun)
 	time.Sleep(150 * time.Millisecond)
 
@@ -241,6 +245,80 @@ func TestSupersededRunKeepsFreshStatusAndLogCore(t *testing.T) {
 	}
 
 	close(freshRelease)
+}
+
+// F-08 v2 ruling anchor (pure-cancel path): cancelling a live run keeps
+// the entry; the OWNING run's cancel branch writes Cancelled and its
+// defer cleans up — the handler does not write terminal state.
+func TestPureCancelOwningRunWritesCancelled(t *testing.T) {
+	s, st := newTestServer(t)
+	taskID := "t-purecancel"
+	if err := st.CreateTask(&store.Task{ID: taskID, Name: "pc", Status: store.TaskStatusRunning, ConfigJSON: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+
+	runDone := make(chan struct{})
+	oldPipeline := runPipeline
+	defer func() { runPipeline = oldPipeline }()
+	runPipeline = func(ctx context.Context, _ config.Config, _ orchestrator.PipelineConfig) ([]orchestrator.PipelineResult, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runID := s.beginRun(taskID, cancel)
+	go func() {
+		s.runMigration(ctx, taskID, config.Config{}, runID)
+		close(runDone)
+	}()
+	time.Sleep(150 * time.Millisecond)
+
+	// Pure cancel: take the cancel func WITHOUT removing the entry.
+	if c := s.runningCancel(taskID); c == nil {
+		t.Fatal("live run expected a registered cancel func")
+	} else {
+		c()
+	}
+
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("owning run never finished")
+	}
+
+	task, _ := st.GetTask(taskID)
+	if task.Status != store.TaskStatusCancelled {
+		t.Fatalf("owning run must write Cancelled, got %s", task.Status)
+	}
+	// Cleanup: entry and log core removed by the owning run's defer.
+	s.taskMu.Lock()
+	_, hasRun := s.taskRuns[taskID]
+	_, hasCore := s.logCores[taskID]
+	s.taskMu.Unlock()
+	if hasRun || hasCore {
+		t.Error("owning run must clean up its run entry and log core")
+	}
+}
+
+// F-08 v2 ruling anchor (no-live-run cancel): with no registered run
+// (paused/finished), the handler writes Cancelled itself.
+func TestCancelNoLiveRunHandlerWritesCancelled(t *testing.T) {
+	s, st := newTestServer(t)
+	taskID := "t-norun"
+	if err := st.CreateTask(&store.Task{ID: taskID, Name: "nr", Status: store.TaskStatusPaused, ConfigJSON: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+
+	if c := s.runningCancel(taskID); c != nil {
+		t.Fatal("no live run expected")
+	} else {
+		// mirror handleCancelTask's else-branch
+		_ = st.UpdateTaskStatus(taskID, store.TaskStatusCancelled)
+	}
+	task, _ := st.GetTask(taskID)
+	if task.Status != store.TaskStatusCancelled {
+		t.Fatalf("handler must write Cancelled for a task without a live run, got %s", task.Status)
+	}
 }
 
 // F-08 anchor: unregister closes the send channel so a writePump blocked
