@@ -1,13 +1,14 @@
 package store
 
 import (
-	"database/sql"
-	"encoding/json"
-	"fmt"
-	"os"
-	"path/filepath"
-	"sync"
-	"time"
+"context"
+"database/sql"
+"encoding/json"
+"fmt"
+"os"
+"path/filepath"
+"sync"
+"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -59,6 +60,15 @@ func NewStore(dataDir string) (*Store, error) {
 	}
 
 	db.SetMaxOpenConns(1)
+
+	// F-06 item 3: bound the first-touch ping so a wedged sqlite file fails
+	// fast instead of hanging the server startup path.
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
 
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {

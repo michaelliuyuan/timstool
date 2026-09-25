@@ -73,7 +73,9 @@ func pgDB(cfg *config.Config) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Ping(); err != nil {
+	ctx, cancel := pingTimeout()
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -207,7 +209,9 @@ func (realCDCProber) PingTarget(cfg *config.Config) error {
 		return err
 	}
 	defer db.Close()
-	return db.Ping()
+	ctx, cancel := pingTimeout()
+	defer cancel()
+	return db.PingContext(ctx)
 }
 
 // loadCheckpointInfo reads the CDC checkpoint file (A3). The path follows the

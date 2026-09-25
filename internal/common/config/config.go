@@ -80,13 +80,18 @@ func (s SourceConfig) SourceType() string {
 	return s.Type
 }
 
+// ConnectTimeoutSec is the DSN-injected connect timeout (F-06 item 3):
+// PG uses connect_timeout=<sec>, the MySQL/TiDB driver uses timeout=<dur>
+// for the dial. 10s keeps a dead host from stalling handlers for minutes.
+const ConnectTimeoutSec = 10
+
 func (s SourceConfig) DSN() string {
 	sslmode := s.SSLMode
 	if sslmode == "" {
 		sslmode = "disable"
 	}
-	return fmt.Sprintf("postgresql://%s:%s@%s:%d/%s?sslmode=%s",
-		url.QueryEscape(s.User), url.QueryEscape(s.Password), s.Host, s.Port, s.Database, sslmode)
+	return fmt.Sprintf("postgresql://%s:%s@%s:%d/%s?sslmode=%s&connect_timeout=%d",
+		url.QueryEscape(s.User), url.QueryEscape(s.Password), s.Host, s.Port, s.Database, sslmode, ConnectTimeoutSec)
 }
 
 type TargetConfig struct {
@@ -100,8 +105,8 @@ type TargetConfig struct {
 }
 
 func (t TargetConfig) DSN() string {
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=true&timeout=30s&readTimeout=300s&writeTimeout=300s",
-		t.User, t.Password, t.Host, t.Port, t.Database)
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=true&timeout=%ds&readTimeout=300s&writeTimeout=300s",
+		t.User, t.Password, t.Host, t.Port, t.Database, ConnectTimeoutSec)
 }
 
 type MigrationConfig struct {

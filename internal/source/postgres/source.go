@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/common/version"
 	"github.com/michaelliuyuan/timstool/internal/schema"
 	"github.com/michaelliuyuan/timstool/internal/source"
@@ -128,8 +129,8 @@ func dsn(c source.SourceConfig) string {
 	if sslmode == "" {
 		sslmode = "disable"
 	}
-	return fmt.Sprintf("postgresql://%s:%s@%s:%d/%s?sslmode=%s",
-		url.QueryEscape(c.User), url.QueryEscape(c.Password), c.Host, c.Port, c.Database, sslmode)
+	return fmt.Sprintf("postgresql://%s:%s@%s:%d/%s?sslmode=%s&connect_timeout=%d",
+		url.QueryEscape(c.User), url.QueryEscape(c.Password), c.Host, c.Port, c.Database, sslmode, config.ConnectTimeoutSec)
 }
 
 // --- Dialect ---
