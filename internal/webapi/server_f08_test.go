@@ -6,12 +6,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/orchestrator"
+	"github.com/michaelliuyuan/timstool/internal/store"
 )
 
 // F-08 anchor: runningTasks/logCores maps are touched from concurrent
@@ -20,6 +22,7 @@ import (
 func TestTaskMapsConcurrentAccess(t *testing.T) {
 	s := &Server{
 		runningTasks: make(map[string]context.CancelFunc),
+		taskRuns:     make(map[string]uint64),
 		logCores:     make(map[string]*TaskLogCore),
 	}
 	var wg sync.WaitGroup
@@ -29,9 +32,8 @@ func TestTaskMapsConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
 				id := string(rune('a' + (w+i)%6))
-				ctx, cancel := context.WithCancel(context.Background())
-				_ = ctx
-				s.setRunningCancel(id, cancel)
+				_, cancel := context.WithCancel(context.Background())
+				s.beginRun(id, cancel)
 				s.setLogCore(id, NewTaskLogCore(nil, id, nil))
 				if i%3 == 0 {
 					s.cancelRunning(id)
@@ -51,6 +53,7 @@ func TestTaskMapsConcurrentAccess(t *testing.T) {
 func TestResumeCancelsPreviousRun(t *testing.T) {
 	s := &Server{
 		runningTasks: make(map[string]context.CancelFunc),
+		taskRuns:     make(map[string]uint64),
 		logCores:     make(map[string]*TaskLogCore),
 	}
 
@@ -66,7 +69,7 @@ func TestResumeCancelsPreviousRun(t *testing.T) {
 	taskID := "t-resume"
 	for i := 0; i < 2; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
-		s.setRunningCancel(taskID, cancel)
+		s.beginRun(taskID, cancel)
 		go func(c context.Context) {
 			lc := NewTaskLogCore(nil, taskID, nil)
 			s.setLogCore(taskID, lc)
@@ -157,6 +160,87 @@ func TestSameOriginCheck(t *testing.T) {
 			t.Errorf("sameOriginCheck(origin=%q host=%q) = %v, want %v", c.origin, c.host, got, c.want)
 		}
 	}
+}
+
+// F-08 adversarial-rework anchor: when resume cancels a stale run, the
+// stale run's cancel branch must NOT overwrite the fresh Running status
+// with Cancelled, and must not delete the fresh run's log core.
+func TestSupersededRunKeepsFreshStatusAndLogCore(t *testing.T) {
+	s, st := newTestServer(t)
+
+	taskID := "t-supersede"
+	if err := st.CreateTask(&store.Task{ID: taskID, Name: "sup", Status: store.TaskStatusPaused, ConfigJSON: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	freshRelease := make(chan struct{})
+	var call int32
+	staleDone := make(chan struct{})
+	oldPipeline := runPipeline
+	defer func() { runPipeline = oldPipeline }()
+	runPipeline = func(ctx context.Context, _ config.Config, _ orchestrator.PipelineConfig) ([]orchestrator.PipelineResult, error) {
+		if atomic.AddInt32(&call, 1) == 1 {
+			// stale run: hold open until superseded, then observe cancel
+			<-release
+			<-ctx.Done()
+			close(staleDone)
+			return nil, ctx.Err()
+		}
+		// fresh run: just hold open
+		<-freshRelease
+		return nil, nil
+	}
+
+	// Stale run (as if started earlier, then paused without cancel).
+	staleCtx, staleCancel := context.WithCancel(context.Background())
+	defer staleCancel()
+	staleRun := s.beginRun(taskID, staleCancel)
+	go s.runMigration(staleCtx, taskID, config.Config{}, staleRun)
+	time.Sleep(150 * time.Millisecond) // let it register its log core
+
+	// Resume mirrors handleResumeTask: flip status, cancel stale, begin
+	// a fresh run with a new generation token.
+	_ = st.UpdateTaskStatus(taskID, store.TaskStatusRunning)
+	s.cancelRunning(taskID)
+	freshCtx, freshCancel := context.WithCancel(context.Background())
+	defer freshCancel()
+	freshRun := s.beginRun(taskID, freshCancel)
+	go s.runMigration(freshCtx, taskID, config.Config{}, freshRun)
+	time.Sleep(150 * time.Millisecond)
+
+	// Release the stale run so its cancel branch executes AFTER the fresh
+	// run registered — the exact interleaving that used to clobber state.
+	close(release)
+	select {
+	case <-staleDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale run never finished")
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	task, _ := st.GetTask(taskID)
+	if task.Status == store.TaskStatusCancelled {
+		t.Fatal("superseded stale run overwrote the fresh Running status with Cancelled")
+	}
+
+	// The fresh run's log core must have survived the stale run's defer.
+	s.taskMu.Lock()
+	_, hasCore := s.logCores[taskID]
+	s.taskMu.Unlock()
+	if !hasCore {
+		t.Fatal("stale run's cleanup deleted the fresh run's log core")
+	}
+
+	// Ownership token semantics.
+	if s.ownsRun(taskID, staleRun) {
+		t.Error("stale generation must no longer own the task")
+	}
+	if !s.ownsRun(taskID, freshRun) {
+		t.Error("fresh generation must own the task")
+	}
+
+	close(freshRelease)
 }
 
 // F-08 anchor: unregister closes the send channel so a writePump blocked

@@ -74,9 +74,15 @@ type Server struct {
 	// running tasks
 	runningTasks map[string]context.CancelFunc
 
-	// taskMu guards runningTasks and logCores: handler goroutines
+	// taskRuns holds the generation token of the CURRENT run per task —
+	// the ownership check that keeps a superseded (resume-cancelled) run
+	// from clobbering the fresh run's status/log core (F-08).
+	taskRuns map[string]uint64
+	runSeq   uint64
+
+	// taskMu guards runningTasks, taskRuns and logCores: handler goroutines
 	// (start/resume/cancel) and per-task runMigration goroutines touch
-	// both maps concurrently — an unguarded map write is a fatal
+	// these maps concurrently — an unguarded map write is a fatal
 	// concurrent-map-write crash for the whole web process (F-08).
 	taskMu sync.Mutex
 
@@ -183,6 +189,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		addr:          fmt.Sprintf("%s:%d", host, port),
 		hub:           newHub(),
 		runningTasks:  make(map[string]context.CancelFunc),
+		taskRuns:      make(map[string]uint64),
 		dataDir:       dataDir,
 		logCollector:  NewLogCollector(),
 		logCores:      make(map[string]*TaskLogCore),
@@ -1222,9 +1229,9 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 	os.RemoveAll(fmt.Sprintf(".checkpoint/%s", taskID))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	s.setRunningCancel(taskID, cancel)
+	runID := s.beginRun(taskID, cancel)
 
-	go s.runMigration(ctx, taskID, cfg)
+	go s.runMigration(ctx, taskID, cfg, runID)
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "started", "task_id": taskID})
 }
@@ -1236,14 +1243,23 @@ var runPipeline = func(ctx context.Context, cfg config.Config, pipeCfg orchestra
 	return o.Run(ctx, pipeCfg)
 }
 
-func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Config) {
+func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Config, runID uint64) {
 	logCore := NewTaskLogCore(s.logCollector, taskID, nil)
 	s.setLogCore(taskID, logCore)
 
+	// Ownership guard (F-08 adversarial rework): when resume cancels a
+	// stale run, that stale run must NOT write Cancelled over the fresh
+	// Running status, delete the fresh run's log core, or unregister the
+	// fresh run's extra logger core. A run owns the task only while its
+	// generation token is still the current one.
+	owns := func() bool { return s.ownsRun(taskID, runID) }
+
 	defer func() {
 		logCore.Disable()
-		s.deleteLogCore(taskID)
-		logger.UnregisterExtraCore()
+		if owns() {
+			s.deleteLogCore(taskID)
+			logger.UnregisterExtraCore()
+		}
 	}()
 
 	s.logCollector.GetBuffer(taskID)
@@ -1266,8 +1282,14 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 	progressCancel()
 
 	if ctx.Err() == context.Canceled {
-		s.logCollector.Append(taskID, "WARN", "Migration task cancelled", "")
-		s.store.UpdateTaskStatus(taskID, store.TaskStatusCancelled)
+		if owns() {
+			s.logCollector.Append(taskID, "WARN", "Migration task cancelled", "")
+			s.store.UpdateTaskStatus(taskID, store.TaskStatusCancelled)
+		} else {
+			// Superseded by a newer run (resume cancelled this stale one):
+			// the fresh run already flipped the status to Running — leave it.
+			s.logCollector.Append(taskID, "INFO", "stale run cancelled (superseded by resume)", "")
+		}
 		return
 	}
 
@@ -1532,8 +1554,8 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 	// race on the same task's checkpoints (F-08).
 	s.cancelRunning(taskID)
 	ctx, cancel := context.WithCancel(context.Background())
-	s.setRunningCancel(taskID, cancel)
-	go s.runMigration(ctx, taskID, cfg)
+	runID := s.beginRun(taskID, cancel)
+	go s.runMigration(ctx, taskID, cfg, runID)
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
 }
@@ -1545,11 +1567,15 @@ func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 }
 
-// setRunningCancel records the cancel func for a running task (locked).
-func (s *Server) setRunningCancel(taskID string, cancel context.CancelFunc) {
+// beginRun registers the cancel func and a fresh generation token for a
+// new run of taskID, returning the token (the run's ownership id).
+func (s *Server) beginRun(taskID string, cancel context.CancelFunc) uint64 {
 	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	s.runSeq++
 	s.runningTasks[taskID] = cancel
-	s.taskMu.Unlock()
+	s.taskRuns[taskID] = s.runSeq
+	return s.runSeq
 }
 
 // cancelRunning cancels and removes the task's cancel func if present.
@@ -1560,6 +1586,7 @@ func (s *Server) cancelRunning(taskID string) bool {
 	cancel, ok := s.runningTasks[taskID]
 	if ok {
 		delete(s.runningTasks, taskID)
+		delete(s.taskRuns, taskID)
 	}
 	s.taskMu.Unlock()
 	if ok {
@@ -1568,10 +1595,27 @@ func (s *Server) cancelRunning(taskID string) bool {
 	return ok
 }
 
+// ownsRun reports whether runID is still the current generation for
+// taskID — the run's ownership token (F-08).
+func (s *Server) ownsRun(taskID string, runID uint64) bool {
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	return s.taskRuns[taskID] == runID
+}
+
 func (s *Server) setLogCore(taskID string, core *TaskLogCore) {
 	s.taskMu.Lock()
 	s.logCores[taskID] = core
 	s.taskMu.Unlock()
+}
+
+// ownsRunningCancel reports whether the given cancel func is still the
+// registered one for taskID — the run's ownership token (F-08).
+func (s *Server) ownsRunningCancel(taskID string, cancel context.CancelFunc) bool {
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	current := s.runningTasks[taskID]
+	return current != nil && reflect.ValueOf(current).Pointer() == reflect.ValueOf(cancel).Pointer()
 }
 
 func (s *Server) deleteLogCore(taskID string) {
