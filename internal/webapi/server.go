@@ -1352,7 +1352,9 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 		s.logCollector.Append(taskID, "ERROR", "Migration failed: "+err.Error(), "")
 		// Conditioned write: even if ownership was swapped after the last
 		// owns() check, the run_id guard keeps the fresh Running intact.
-		if ok, werr := s.store.SetTaskErrorIfRun(taskID, err.Error(), runID); werr == nil && !ok {
+		if ok, werr := s.store.SetTaskErrorIfRun(taskID, err.Error(), runID); werr != nil {
+			s.logCollector.Append(taskID, "ERROR", "write failed status: "+werr.Error(), "")
+		} else if !ok {
 			s.logCollector.Append(taskID, "INFO", "stale run finished (superseded by resume); skipping terminal state write", "")
 		}
 		return
