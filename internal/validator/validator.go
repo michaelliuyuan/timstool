@@ -297,7 +297,9 @@ func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn
 
 func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, tidbDB *sql.DB, table string, ratio float64) reporter.TableReport {
 	tr := v.validateRowCount(ctx, pgDB, tidbConn, table)
-	if tr.Status == reporter.StatusFail && tr.DiffRows != 0 {
+	// Same fallthrough guard as checksum.go: a COUNT error (DiffRows==0,
+	// Status=Fail) must not reach the SourceRows==0 PASS branch (F-05).
+	if tr.Status == reporter.StatusFail {
 		return tr
 	}
 
@@ -971,6 +973,9 @@ func (v *Validator) getTables(ctx context.Context, pgDB *sql.DB, include []strin
 			return nil, err
 		}
 		tables = append(tables, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list tables: %w", err)
 	}
 	return tables, nil
 }

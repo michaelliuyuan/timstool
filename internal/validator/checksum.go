@@ -29,7 +29,10 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 
 	// First do exact row count
 	tr = v.validateRowCount(ctx, pgDB, tidbConn, table)
-	if tr.Status == reporter.StatusFail && tr.DiffRows != 0 {
+	// Any row-count failure (COUNT error or mismatch) aborts the table:
+	// falling through would hit the SourceRows==0 branch below and report a
+	// count ERROR as PASS (F-05).
+	if tr.Status == reporter.StatusFail {
 		return tr
 	}
 
@@ -157,10 +160,25 @@ type chunkRange struct {
 	limit  int64
 }
 
+// quoteOrderByCols quotes a comma-separated key column list per column.
+// Wrapping the whole "col1, col2" string in one pair of quotes produces a
+// single bogus identifier and breaks SQL for every composite-key table (F-05).
+func quoteOrderByCols(orderBy string, quote func(string) string) string {
+	parts := strings.Split(orderBy, ",")
+	quoted := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			quoted = append(quoted, quote(p))
+		}
+	}
+	return strings.Join(quoted, ", ")
+}
+
 // computeChunkHashPG computes an aggregate hash for a chunk of PG rows.
 func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema, table, orderBy string, ch chunkRange) (string, error) {
 	query := fmt.Sprintf("SELECT * FROM %s.%s ORDER BY %s LIMIT %d OFFSET %d",
-		quotePG(schema), quotePG(table), orderBy, ch.limit, ch.offset)
+		quotePG(schema), quotePG(table), quoteOrderByCols(orderBy, quotePG), ch.limit, ch.offset)
 
 	rows, err := pgDB.QueryContext(ctx, query)
 	if err != nil {
@@ -208,7 +226,7 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 	var rowHashes []string
 	for rows.Next() {
 		if err := rows.Scan(ptrs...); err != nil {
-			continue
+			return "", fmt.Errorf("scan row in chunk: %w", err)
 		}
 		var buf strings.Builder
 		for i, idx := range hashIdxs {
@@ -220,6 +238,9 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 		}
 		rowHashes = append(rowHashes, fmt.Sprintf("%x", md5.Sum([]byte(buf.String()))))
 	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("iterate chunk rows: %w", err)
+	}
 
 	sort.Strings(rowHashes)
 	return fmt.Sprintf("%x", md5.Sum([]byte(strings.Join(rowHashes, ",")))), nil
@@ -229,7 +250,7 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 // It gets its own dedicated connection with UTC timezone for parallel goroutines.
 func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, table, orderBy string, ch chunkRange) (string, error) {
 	query := fmt.Sprintf("SELECT * FROM %s ORDER BY %s LIMIT %d OFFSET %d",
-		quoteMySQL(table), quoteMySQL(orderBy), ch.limit, ch.offset)
+		quoteMySQL(table), quoteOrderByCols(orderBy, quoteMySQL), ch.limit, ch.offset)
 
 	// Get dedicated connection with UTC timezone for this goroutine.
 	conn, err := getTiDBConn(ctx, tidbDB)
@@ -282,7 +303,7 @@ func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, ta
 	var rowHashes []string
 	for rows.Next() {
 		if err := rows.Scan(ptrs...); err != nil {
-			continue
+			return "", fmt.Errorf("scan row in chunk: %w", err)
 		}
 		var buf strings.Builder
 		for i, idx := range hashIdxs {
@@ -293,6 +314,9 @@ func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, ta
 			buf.WriteString(val)
 		}
 		rowHashes = append(rowHashes, fmt.Sprintf("%x", md5.Sum([]byte(buf.String()))))
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("iterate chunk rows: %w", err)
 	}
 
 	sort.Strings(rowHashes)

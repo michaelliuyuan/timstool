@@ -157,8 +157,8 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 		}
 
 		rpt.AddTableReport(reporter.TableReport{
-			TableName: table.Name,
-			Status:    reporter.StatusPass,
+			TableName:  table.Name,
+			Status:     reporter.StatusPass,
 			SourceRows: int64(len(table.Columns)),
 		})
 	}
@@ -201,7 +201,7 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 
 	if !opts.DryRun && opts.OutputFile == "" {
 		zap.L().Info("executing DDL on TiDB", zap.Int("statements", len(builder.Statements())))
-		if err := m.executeDDL(ctx, sql); err != nil {
+		if err := m.executeDDL(ctx, builder.Statements()); err != nil {
 			zap.L().Error("DDL execution failed, full SQL", zap.String("ddl", truncate(sql, 5000)))
 			return cerrors.Wrap(cerrors.ErrSchemaApply, "execute DDL", err)
 		}
@@ -223,14 +223,16 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 	return nil
 }
 
-func (m *Migrator) executeDDL(ctx context.Context, ddl string) error {
+// executeDDL runs each pre-built statement individually. Statements arrive
+// as a slice (not a joined blob) so semicolons inside view bodies, DEFAULT
+// literals or comments can never split a statement in half (F-05).
+func (m *Migrator) executeDDL(ctx context.Context, statements []string) error {
 	tidbDB, err := sql.Open("mysql", m.cfg.Target.DSN())
 	if err != nil {
 		return fmt.Errorf("connect to TiDB: %w", err)
 	}
 	defer tidbDB.Close()
 
-	statements := strings.Split(ddl, ";")
 	executed := 0
 	failed := 0
 	for _, stmt := range statements {

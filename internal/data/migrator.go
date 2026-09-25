@@ -267,6 +267,9 @@ func (m *Migrator) getTables(ctx context.Context, include, exclude []string) ([]
 			tables = append(tables, name)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list tables: %w", err)
+	}
 	return tables, nil
 }
 
@@ -534,6 +537,9 @@ func (m *Migrator) exportTableFallback(ctx context.Context, schema, table string
 			*totalRows = rowCount
 			m.cpMgr.UpdateTableProgress(table, rowCount, 0)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read rows from %s: %w", table, err)
 	}
 
 	if err := bw.Flush(); err != nil {
@@ -1079,6 +1085,10 @@ func (m *Migrator) ensureTablesExist(ctx context.Context, tidbDB *sql.DB, pgSche
 			}
 			columns = append(columns, c)
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("read columns for %s: %w", table, err)
+		}
 		rows.Close()
 
 		if len(columns) == 0 {
@@ -1354,8 +1364,9 @@ func (m *Migrator) streamTable(ctx context.Context, tidbDB *sql.DB, schema, tabl
 			valuePtrs[i] = &values[i]
 		}
 		if err := rows.Scan(valuePtrs...); err != nil {
-			logger.Warn("scan error", zap.String("table", table), zap.Error(err))
-			continue
+			// Silently skipping broken rows under-reports the table and
+			// still marks it completed — data loss posing as success (F-05).
+			return fmt.Errorf("scan row in %s: %w", table, err)
 		}
 
 		converted := make([]interface{}, len(cols))
@@ -1378,6 +1389,11 @@ func (m *Migrator) streamTable(ctx context.Context, tidbDB *sql.DB, schema, tabl
 			logger.Info("batch inserted", zap.String("table", table), zap.Int("rows_in_batch", totalRows), zap.Int64("total", rowCount))
 			batch = batch[:0]
 		}
+	}
+	// A mid-stream failure leaves rows.Next()==false without any scan error;
+	// without this check a partial table would be marked completed (F-05).
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("stream rows for %s: %w", table, err)
 	}
 
 	if len(batch) > 0 {
@@ -1466,7 +1482,7 @@ func convertSQLValue(val interface{}) interface{} {
 }
 
 func tryConvertArray(s string) interface{} {
-	if isPGArray(s) {
+	if isPGArrayLiteral(s) {
 		return pgArrayToJSON(s)
 	}
 	return s
@@ -1477,6 +1493,14 @@ func isPGArray(s string) bool {
 		return false
 	}
 	return true
+}
+
+// isPGArrayLiteral reports whether s is a PostgreSQL array literal
+// ({1,2,3}) and NOT a JSON object ({"a":1}). JSON objects always contain a
+// "key": pattern; converting them as PG arrays rewrites JSON columns into
+// garbage. Shared by both the CSV and streaming paths (F-05).
+func isPGArrayLiteral(s string) bool {
+	return isPGArray(s) && !strings.Contains(s, `":`)
 }
 
 func pgArrayToJSON(s string) string {
@@ -1579,11 +1603,7 @@ func convertStringValue(s string) string {
 	// PG arrays use {elem1,elem2,...} syntax, JSON objects use {"key":"val"}.
 	// JSON already starts with {" (object) or [" (array).
 	// Only convert if it's a PG array, not JSON.
-	if len(s) > 1 && s[0] == '{' && s[len(s)-1] == '}' {
-		// JSON objects contain "key": pattern — don't touch them
-		if strings.Contains(s, `":`) {
-			return s
-		}
+	if isPGArrayLiteral(s) {
 		return pgArrayToJSON(s)
 	}
 	return s
@@ -1651,6 +1671,9 @@ func (m *Migrator) buildSelectCols(ctx context.Context, schema, table string) (s
 			return "*", nil
 		}
 		cols = append(cols, c)
+	}
+	if err := rows.Err(); err != nil {
+		return "*", nil
 	}
 	if len(cols) == 0 {
 		return "*", nil
@@ -1763,6 +1786,18 @@ func (m *Migrator) calculateChunkBoundariesByOffset(numChunks, chunkSize int64) 
 	return boundaries
 }
 
+// offsetChunkQuery builds the ctid-ordered page query for offset-mode
+// chunks. The LIMIT must equal the cursor stride (chunkSize) or rows are
+// silently lost between chunks; the last chunk reads to the end (F-05).
+func offsetChunkQuery(selectCols, schema, table string, chunkSize, offset int64, isLast bool) string {
+	if isLast {
+		return fmt.Sprintf("SELECT %s FROM %s.%s ORDER BY ctid LIMIT ALL OFFSET %d",
+			selectCols, quotePG(schema), quotePG(table), offset)
+	}
+	return fmt.Sprintf("SELECT %s FROM %s.%s ORDER BY ctid LIMIT %d OFFSET %d",
+		selectCols, quotePG(schema), quotePG(table), chunkSize, offset)
+}
+
 func (m *Migrator) exportChunk(
 	ctx context.Context,
 	schema, table, pkColumn, selectCols string,
@@ -1770,6 +1805,7 @@ func (m *Migrator) exportChunk(
 	chunkFile string,
 	opts common.DataOpts,
 	isOffsetMode bool,
+	chunkSize int64,
 ) (int64, int64, error) {
 	f, err := os.Create(chunkFile)
 	if err != nil {
@@ -1781,14 +1817,12 @@ func (m *Migrator) exportChunk(
 	var rows *sql.Rows
 
 	if isOffsetMode {
+		// Offset mode walks the table in chunkSize strides, so each chunk
+		// must read exactly chunkSize rows (final chunk: to the end).
+		// The old LIMIT BatchSize*2 lost chunkSize-2*BatchSize rows per
+		// chunk on non-integer-PK tables (F-05).
 		offset := boundary.MinValue.(int64)
-		if boundary.IsLast {
-			query = fmt.Sprintf("SELECT %s FROM %s.%s ORDER BY ctid LIMIT %d OFFSET %d",
-				selectCols, quotePG(schema), quotePG(table), opts.BatchSize*2, offset)
-		} else {
-			query = fmt.Sprintf("SELECT %s FROM %s.%s ORDER BY ctid LIMIT %d OFFSET %d",
-				selectCols, quotePG(schema), quotePG(table), opts.BatchSize*2, offset)
-		}
+		query = offsetChunkQuery(selectCols, schema, table, chunkSize, offset, boundary.IsLast)
 		rows, err = m.pgDB.QueryContext(ctx, query)
 	} else {
 		if boundary.IsLast {
@@ -1835,6 +1869,9 @@ func (m *Migrator) exportChunk(
 		}
 		byteCount += int64(n)
 		rowCount++
+	}
+	if err := rows.Err(); err != nil {
+		return rowCount, byteCount, fmt.Errorf("iterate chunk %d rows: %w", boundary.Index, err)
 	}
 
 	if err := bw.Flush(); err != nil {
@@ -1933,7 +1970,7 @@ func (m *Migrator) exportTableChunked(
 			defer func() { <-sem }()
 
 			chunkFile := filepath.Join(opts.TempDir, fmt.Sprintf("%s.%d.csv", table, b.Index))
-			rows, bytes, exportErr := m.exportChunk(ctx, schema, table, pkColumn, selectCols, b, chunkFile, opts, isOffsetMode)
+			rows, bytes, exportErr := m.exportChunk(ctx, schema, table, pkColumn, selectCols, b, chunkFile, opts, isOffsetMode, chunkSize)
 			if exportErr != nil {
 				m.cpMgr.MarkChunkFailed(table, b.Index, exportErr.Error())
 				mu.Lock()
