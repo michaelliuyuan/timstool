@@ -1293,7 +1293,7 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 	defer func() {
 		logCore.Disable()
 		if s.endRun(taskID, runID) {
-			logger.UnregisterExtraCore()
+			logger.UnregisterExtraCore(logCore)
 		}
 	}()
 
@@ -1407,7 +1407,11 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 	}
 
 	resultData, _ := json.Marshal(results)
-	s.store.SetTaskResultIfRun(taskID, string(resultData), runID)
+	if ok, werr := s.store.SetTaskResultIfRun(taskID, string(resultData), runID); werr != nil {
+		s.logCollector.Append(taskID, "ERROR", "write task result: "+werr.Error(), "")
+	} else if !ok {
+		s.logCollector.Append(taskID, "INFO", "stale run finished (superseded by resume); skipping terminal state write", "")
+	}
 
 	allSuccess := true
 	for _, r := range results {
@@ -1445,7 +1449,11 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 		}
 	} else {
 		s.logCollector.Append(taskID, "WARN", "Migration completed with errors", "")
-		s.store.UpdateTaskStatusIfRun(taskID, store.TaskStatusFailed, runID)
+		if ok, werr := s.store.UpdateTaskStatusIfRun(taskID, store.TaskStatusFailed, runID); werr != nil {
+			s.logCollector.Append(taskID, "ERROR", "write failed status: "+werr.Error(), "")
+		} else if !ok {
+			s.logCollector.Append(taskID, "INFO", "stale run finished (superseded by resume); skipping terminal state write", "")
+		}
 	}
 }
 
