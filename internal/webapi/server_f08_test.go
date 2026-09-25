@@ -159,6 +159,51 @@ func TestSameOriginCheck(t *testing.T) {
 	}
 }
 
+// F-08 anchor: unregister closes the send channel so a writePump blocked
+// in range exits (no goroutine leak on idle disconnect); pending frames
+// are drained first.
+func TestUnregisterClosesSendAndStopsWritePump(t *testing.T) {
+	h := newHub()
+	go h.Run()
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer up.Close()
+	client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(up.URL, "http"), nil)
+	if err != nil {
+		t.Skip("websocket dial failed:", err)
+	}
+	defer client.Close()
+
+	c := &wsClient{conn: client, send: make(chan []byte, wsSendBuffer)}
+	h.register <- c
+	h.broadcast <- []byte("frame") // writePump busy writing
+	h.unregister <- c              // idle disconnect path
+
+	// send must be closed; receiving from a closed channel is immediate.
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case _, ok := <-c.send:
+			if !ok {
+				return // closed = writePump will exit
+			}
+		case <-deadline:
+			t.Fatal("send channel was never closed after unregister")
+		}
+	}
+}
+
 // F-08 anchor: writePump writes one frame per send with a deadline; a
 // write error must terminate the pump without blocking the hub.
 func TestWritePumpStopsOnDeadConn(t *testing.T) {

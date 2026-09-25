@@ -126,6 +126,12 @@ func (h *Hub) Run() {
 			go h.writePump(c)
 		case c := <-h.unregister:
 			delete(h.clients, c)
+			// Safe: the only sender to c.send is this same goroutine (the
+			// broadcast branch), and delete above already removed the
+			// client from future broadcasts — no send-on-closed race.
+			// Closing lets writePump drain and exit instead of leaking on
+			// idle disconnects (F-08).
+			close(c.send)
 			c.conn.Close()
 		case msg := <-h.broadcast:
 			for c := range h.clients {
