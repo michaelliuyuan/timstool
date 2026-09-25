@@ -57,15 +57,15 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Web.Enable != false {
 		t.Error("web should be disabled by default")
 	}
-	if cfg.CDC.Enable != false {
-		t.Error("cdc should be disabled by default")
+	if cfg.CDC.Enable != true {
+		t.Error("cdc should be enabled by default (49e073b: enable CDC incremental sync by default)")
 	}
 }
 
 func TestCDCConfigDefault(t *testing.T) {
 	cdc := DefaultConfig().CDC
-	if cdc.Enable {
-		t.Error("cdc.enable should default to false")
+	if !cdc.Enable {
+		t.Error("cdc.enable should default to true (49e073b)")
 	}
 	if cdc.Mode != "full_incr" {
 		t.Errorf("cdc.mode default = %q, want full_incr", cdc.Mode)
@@ -217,8 +217,8 @@ cdc:
 	}
 }
 
-// Backward compatibility: a config file with NO cdc section must load with the
-// CDC module disabled (defaults), and must validate.
+// Backward compatibility: a config file with NO cdc section loads with the
+// DEFAULT CDC settings (enable=true since 49e073b) and must validate.
 func TestCDCConfigLoadNoSectionBackwardCompat(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
@@ -238,8 +238,8 @@ target:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.CDC.Enable {
-		t.Error("missing cdc section should load as disabled")
+	if !cfg.CDC.Enable {
+		t.Error("missing cdc section should load with the default (enabled, 49e073b)")
 	}
 	if cfg.CDC.Mode != "full_incr" {
 		t.Errorf("missing cdc section should default mode to full_incr, got %q", cfg.CDC.Mode)
