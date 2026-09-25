@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1259,45 +1260,66 @@ func (m *Migrator) importViaSQL(ctx context.Context, opts common.DataOpts) error
 	var firstErr error
 	var errMu sync.Mutex
 
-	for _, table := range tables {
-		rowCount, err := m.getRowCount(ctx, table)
-		if err != nil {
-			logger.Warn("failed to get row count, keeping estimate", zap.String("table", table), zap.Error(err))
-			if estimates != nil {
-				rowCount = estimates[table]
-			} else {
-				rowCount = 0
-			}
-		} else {
-			m.setExactRowsTotal(table, rowCount)
-		}
-		m.cpMgr.GetOrCreateTable(table, rowCount)
-		m.cpMgr.MarkTableRunning(table)
-
-		sem <- struct{}{}
-		wg.Add(1)
-
-		go func(tableName string, estimatedRows int64) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			if err := m.streamTable(ctx, tidbDB, schema, tableName, batchSize, estimatedRows); err != nil {
-				m.cpMgr.MarkTableFailed(tableName, err.Error())
-				if m.cfg.Migration.OnError != "skip" {
-					errMu.Lock()
-					if firstErr == nil {
-						firstErr = fmt.Errorf("stream table %s: %w", tableName, err)
-					}
-					errMu.Unlock()
-					return
-				}
-				logger.Warn("table stream error", zap.String("table", tableName), zap.Error(err))
-				return
-			}
-		}(table, rowCount)
+	// FK-aware import order: TiDB enforces foreign keys, so a child table
+	// streamed before its parent hits 1452. Import in topological levels —
+	// parents first — keeping tables within a level parallel and
+	// alphabetical (F-08). Errors here only degrade to the plain
+	// alphabetical order, never fail the import.
+	levels := [][]string{tables}
+	if fkEdges, err := m.loadFKDependencies(ctx, schema, tables); err != nil {
+		logger.Warn("failed to load FK dependencies, importing in alphabetical order",
+			zap.Error(err))
+	} else if len(fkEdges) > 0 {
+		levels = topoLevels(tables, fkEdges)
+		logger.Info("import order planned by FK topology",
+			zap.Int("levels", len(levels)))
 	}
 
-	wg.Wait()
+	for _, level := range levels {
+		for _, table := range level {
+			rowCount, err := m.getRowCount(ctx, table)
+			if err != nil {
+				logger.Warn("failed to get row count, keeping estimate", zap.String("table", table), zap.Error(err))
+				if estimates != nil {
+					rowCount = estimates[table]
+				} else {
+					rowCount = 0
+				}
+			} else {
+				m.setExactRowsTotal(table, rowCount)
+			}
+			m.cpMgr.GetOrCreateTable(table, rowCount)
+			m.cpMgr.MarkTableRunning(table)
+
+			sem <- struct{}{}
+			wg.Add(1)
+
+			go func(tableName string, estimatedRows int64) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				if err := m.streamTable(ctx, tidbDB, schema, tableName, batchSize, estimatedRows); err != nil {
+					m.cpMgr.MarkTableFailed(tableName, err.Error())
+					if m.cfg.Migration.OnError != "skip" {
+						errMu.Lock()
+						if firstErr == nil {
+							firstErr = fmt.Errorf("stream table %s: %w", tableName, err)
+						}
+						errMu.Unlock()
+						return
+					}
+					logger.Warn("table stream error", zap.String("table", tableName), zap.Error(err))
+					return
+				}
+			}(table, rowCount)
+		}
+		// Level barrier: every parent in this level must finish before any
+		// child table starts (within a level there are no FK edges).
+		wg.Wait()
+		if firstErr != nil {
+			return firstErr
+		}
+	}
 
 	if firstErr != nil {
 		return firstErr
@@ -2017,4 +2039,116 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm%.3fs", minutes, seconds)
 	}
 	return fmt.Sprintf("%.3fs", seconds)
+}
+
+// loadFKDependencies returns child->parents foreign-key edges restricted to
+// the given table set (a single pg_catalog query; self-references dropped).
+func (m *Migrator) loadFKDependencies(ctx context.Context, schema string, tables []string) (map[string][]string, error) {
+	if m.pgDB == nil {
+		return nil, nil
+	}
+	inSet := make(map[string]bool, len(tables))
+	for _, t := range tables {
+		inSet[t] = true
+	}
+	query := `
+		SELECT src.relname, ref.relname
+		FROM pg_constraint con
+		JOIN pg_class src ON src.oid = con.conrelid
+		JOIN pg_namespace ns ON ns.oid = src.relnamespace
+		JOIN pg_class ref ON ref.oid = con.confrelid
+		WHERE con.contype = 'f' AND ns.nspname = $1`
+	rows, err := m.pgDB.QueryContext(ctx, query, schema)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	edges := make(map[string][]string)
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var child, parent string
+		if err := rows.Scan(&child, &parent); err != nil {
+			return nil, err
+		}
+		if child == parent || !inSet[child] || !inSet[parent] {
+			continue
+		}
+		key := child + "\x00" + parent
+		if !seen[key] {
+			seen[key] = true
+			edges[child] = append(edges[child], parent)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return edges, nil
+}
+
+// topoLevels groups tables into topological levels: level 0 holds tables
+// with no parents in the set, each later level holds tables whose parents
+// are all in earlier levels. Tables inside a level are alphabetically
+// sorted and have no FK relationship among themselves, so they can stream
+// in parallel. Cycles (mutually-referencing tables) cannot be ordered —
+// the remainder is appended as one final alphabetical level. Deterministic
+// for identical input (F-08).
+func topoLevels(tables []string, fkEdges map[string][]string) [][]string {
+	sorted := append([]string(nil), tables...)
+	sort.Strings(sorted)
+
+	remaining := make(map[string]bool, len(sorted))
+	indegree := make(map[string]int, len(sorted)) // unplaced parents count
+	for _, t := range sorted {
+		remaining[t] = true
+		indegree[t] = 0
+	}
+	for child, parents := range fkEdges {
+		if !remaining[child] {
+			continue
+		}
+		for _, p := range parents {
+			if p != child && remaining[p] {
+				indegree[child]++
+			}
+		}
+	}
+
+	var levels [][]string
+	for len(remaining) > 0 {
+		var level []string
+		for _, t := range sorted {
+			if remaining[t] && indegree[t] == 0 {
+				level = append(level, t)
+			}
+		}
+		if len(level) == 0 {
+			// Cycle: order the rest alphabetically in one final level.
+			for _, t := range sorted {
+				if remaining[t] {
+					level = append(level, t)
+				}
+			}
+			levels = append(levels, level)
+			return levels
+		}
+		for _, t := range level {
+			delete(remaining, t)
+		}
+		for child, parents := range fkEdges {
+			if !remaining[child] {
+				continue
+			}
+			for _, p := range parents {
+				for _, t := range level {
+					if p == t {
+						indegree[child]--
+						break
+					}
+				}
+			}
+		}
+		levels = append(levels, level)
+	}
+	return levels
 }
