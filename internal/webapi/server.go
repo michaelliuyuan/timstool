@@ -1636,6 +1636,22 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 	var cfg config.Config
 	json.Unmarshal([]byte(task.ConfigJSON), &cfg)
 
+	// F-10 group 1 — resume Plan B ("clear target and re-import"): a resumed
+	// task re-runs the FULL migration, and re-inserting into tables that
+	// still hold the first attempt's rows is what produced the 1062 debt.
+	// Force the truncate target policy for this run (drop, if the user
+	// configured the stronger policy, is kept) and drop the task's
+	// checkpoint so the data phase starts fresh. The table scope is the
+	// task's own configured table set (getTables + Tables/ExcludeTables) —
+	// never other tasks' tables. Chained (CDC) tasks converge the re-import
+	// window via the pre-created slot replay, unchanged.
+	if cfg.Migration.TargetPolicy != "drop" {
+		cfg.Migration.TargetPolicy = "truncate"
+	}
+	os.RemoveAll(fmt.Sprintf(".checkpoint/%s", taskID))
+	s.logCollector.Append(taskID, "INFO",
+		"任务恢复：已按「清空目标表数据并全量重导」执行（truncate 策略，范围仅限本任务表集）；增量衔接任务由 CDC 从预建点位重放收敛", "")
+
 	// F-08 v2 ruling: swap-then-cancel, and SWAP BEFORE writing Running —
 	// if the status write happened first, a stale run returning in that
 	// gap still owns the task and could clobber the fresh Running with a
