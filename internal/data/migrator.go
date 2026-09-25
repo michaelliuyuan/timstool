@@ -1009,7 +1009,13 @@ func isBadConnection(err error) bool {
 		strings.Contains(msg, "EOF")
 }
 
-func (m *Migrator) applyTargetPolicy(ctx context.Context, tidbDB *sql.DB, tables []string) error {
+// execContext is the subset of *sql.DB that policy application needs; it
+// exists so tests can fake the target connection (F-10 anchor).
+type execContext interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func (m *Migrator) applyTargetPolicy(ctx context.Context, tidbDB execContext, tables []string) error {
 	policy := m.cfg.Migration.TargetPolicy
 	if policy == "" || policy == "insert" {
 		return nil
@@ -1245,6 +1251,21 @@ func (m *Migrator) importViaSQL(ctx context.Context, opts common.DataOpts) error
 
 	if err := tidbDB.PingContext(ctx); err != nil {
 		return fmt.Errorf("ping TiDB: %w", err)
+	}
+
+	// F-10 (leader ruling seq 189): apply target policy on the streaming
+	// path too — previously only the Lightning branch truncated, so a
+	// resume with use_lightning=false re-streamed into tables still holding
+	// the previous run's rows (1062 duplicate-key debt). Same semantics as
+	// the Lightning branch: truncate only, drop is handled by schema
+	// migration.
+	if m.cfg.Migration.TargetPolicy == "truncate" {
+		logger.Info("applying target policy before streaming import",
+			zap.String("policy", m.cfg.Migration.TargetPolicy),
+			zap.Int("tables", len(tables)))
+		if applyErr := m.applyTargetPolicy(ctx, tidbDB, tables); applyErr != nil {
+			return fmt.Errorf("apply target policy: %w", applyErr)
+		}
 	}
 
 	batchSize := opts.BatchSize
