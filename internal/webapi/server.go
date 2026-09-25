@@ -1295,9 +1295,12 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 
 	defer func() {
 		logCore.Disable()
-		if s.endRun(taskID, runID) {
-			logger.UnregisterExtraCore(logCore)
-		}
+		// F-09 adversarial L2: unregister THIS core unconditionally —
+		// identity-based removal is exact and idempotent. Gating it on
+		// endRun leaked the core of every superseded run (endRun false)
+		// into the global registry for the process lifetime.
+		logger.UnregisterExtraCore(logCore)
+		_ = s.endRun(taskID, runID)
 	}()
 
 	s.logCollector.GetBuffer(taskID)
