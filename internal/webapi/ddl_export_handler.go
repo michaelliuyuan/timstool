@@ -2,7 +2,6 @@ package webapi
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -108,8 +107,9 @@ func (s *Server) handleDDLSchemas(w http.ResponseWriter, r *http.Request) {
 	}
 	defer db.Close()
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
+	// F-10: no handler-level timeout — deadline belongs to the chi 120s
+	// long-running group; an inner cap would only ever shorten it.
+	ctx := r.Context()
 
 	schemas, err := ddlexport.ListSchemas(ctx, db)
 	if err != nil {
@@ -146,8 +146,9 @@ func (s *Server) handleDDLExport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
-	defer cancel()
+	// F-10: no handler-level timeout — deadline belongs to the chi 120s
+	// long-running group; an inner cap would only ever shorten it.
+	ctx := r.Context()
 
 	exporter := ddlexport.NewExporter(db, ddlexport.Options{
 		Schemas:     req.Schemas,

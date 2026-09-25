@@ -2212,8 +2212,10 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 	}
 	defer pgDB.Close()
 
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
+	// F-10: no handler-level timeout here — the deadline belongs to the
+	// chi 120s long-running group; an inner WithTimeout(r.Context(), …)
+	// would only ever shorten it.
+	ctx := r.Context()
 
 	// Scan and assess
 	scanner := assess.NewScanner(pgDB, req.Schema)
