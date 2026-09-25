@@ -69,15 +69,21 @@ func TestResumeCancelsPreviousRun(t *testing.T) {
 	}
 
 	taskID := "t-resume"
+	var cancels []context.CancelFunc
+	dones := make([]chan struct{}, 0, 2)
 	for i := 0; i < 2; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
+		cancels = append(cancels, cancel)
 		s.beginRun(taskID, cancel)
-		go func(c context.Context) {
+		done := make(chan struct{})
+		dones = append(dones, done)
+		go func(c context.Context, d chan struct{}) {
+			defer close(d)
 			lc := NewTaskLogCore(nil, taskID, nil)
 			s.setLogCore(taskID, lc)
 			defer s.deleteLogCore(taskID)
 			_, _ = runPipeline(c, config.Config{}, orchestrator.PipelineConfig{})
-		}(ctx)
+		}(ctx, done)
 	}
 
 	// Cancel-and-replace exactly like handleResumeTask does (F-08 v2):
@@ -92,6 +98,30 @@ func TestResumeCancelsPreviousRun(t *testing.T) {
 	case <-cancelled:
 	case <-time.After(2 * time.Second):
 		t.Fatal("previous run was not cancelled")
+	}
+
+	// Join every pipeline goroutine BEFORE the deferred runPipeline restore
+	// fires — otherwise the restore races their read of the global (-race).
+	for _, c := range cancels {
+		c()
+	}
+	for _, d := range dones {
+		select {
+		case <-d:
+		case <-time.After(2 * time.Second):
+			t.Fatal("pipeline goroutine never finished")
+		}
+	}
+}
+
+// waitRun joins a runMigration goroutine so the deferred restore of the
+// global runPipeline stub never races its read (-race hygiene).
+func waitRun(t *testing.T, done <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("%s never finished", what)
 	}
 }
 
@@ -218,7 +248,11 @@ func TestSupersededRunKeepsFreshStatusAndLogCore(t *testing.T) {
 		t.Fatal("swapRunning must return the stale cancel func")
 	}
 	oldCancel()
-	go s.runMigration(freshCtx, taskID, config.Config{}, freshRun)
+	freshDone := make(chan struct{})
+	go func() {
+		defer close(freshDone)
+		s.runMigration(freshCtx, taskID, config.Config{}, freshRun)
+	}()
 	time.Sleep(150 * time.Millisecond)
 
 	// Release the stale run so its cancel branch executes AFTER the fresh
@@ -253,6 +287,7 @@ func TestSupersededRunKeepsFreshStatusAndLogCore(t *testing.T) {
 	}
 
 	close(freshRelease)
+	waitRun(t, freshDone, "fresh run")
 }
 
 // F-08 v2 ruling anchor (pure-cancel path): cancelling a live run keeps
@@ -376,7 +411,11 @@ func TestSupersededRunSuccessDoesNotWriteTerminalState(t *testing.T) {
 		t.Fatal("swapRunning must return the stale cancel func")
 	}
 	oldCancel()
-	go s.runMigration(freshCtx, taskID, config.Config{}, freshRun)
+	freshDone := make(chan struct{})
+	go func() {
+		defer close(freshDone)
+		s.runMigration(freshCtx, taskID, config.Config{}, freshRun)
+	}()
 	time.Sleep(150 * time.Millisecond)
 
 	// Stale pipeline returns success AFTER losing ownership.
@@ -406,6 +445,7 @@ func TestSupersededRunSuccessDoesNotWriteTerminalState(t *testing.T) {
 	}
 
 	close(freshRelease)
+	waitRun(t, freshDone, "fresh run")
 }
 
 // F-08 v2 fix-A anchor (start path): handleStartTask must swapRunning —
@@ -460,6 +500,17 @@ func TestStartOnPausedCancelsStaleRun(t *testing.T) {
 	}
 	if s.ownsRun(taskID, staleRun) {
 		t.Error("stale generation must no longer own the task after start")
+	}
+
+	// The handler spawns the fresh run internally — wait until its pipeline
+	// stub has been ENTERED (atomic counter) so the deferred runPipeline
+	// restore is ordered after the global read (-race hygiene).
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&call) < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&call) < 2 {
+		t.Fatal("fresh run never entered its pipeline stub")
 	}
 
 	close(freshRelease)
@@ -520,6 +571,16 @@ func TestStaleFinishDuringResumeKeepsRunning(t *testing.T) {
 	task, _ := st.GetTask(taskID)
 	if task.Status != store.TaskStatusRunning {
 		t.Fatalf("final status must be Running regardless of interleaving, got %s", task.Status)
+	}
+
+	// Wait until the handler-spawned fresh run has entered its stub (HB edge
+	// for the deferred runPipeline restore, -race hygiene).
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&call) < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&call) < 2 {
+		t.Fatal("fresh run never entered its pipeline stub")
 	}
 
 	close(freshRelease)
