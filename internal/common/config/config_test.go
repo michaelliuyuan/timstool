@@ -1,10 +1,47 @@
 package config
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
+
+// F-06 item 4 anchor: passwords/users full of DSN-breaking specials must
+// round-trip through both DSN builders without derailing the parsers.
+func TestDSNEscapingSpecialChars(t *testing.T) {
+	const user = "u@ser" // NOTE: ':' in a MySQL username is unrepresentable (driver parses user:pass at the first ':')
+	const pass = "p@ss:w/rd?+% #&=()"
+
+	// PG: parse the URL back and extract userinfo.
+	pg := SourceConfig{Host: "db", Port: 5432, User: user, Password: pass, Database: "d", SSLMode: "disable"}.DSN()
+	u, err := url.Parse(pg)
+	if err != nil {
+		t.Fatalf("PG DSN no longer parses: %v (%q)", err, pg)
+	}
+	if u.User.Username() != user {
+		t.Errorf("PG user round-trip: got %q want %q (dsn=%s)", u.User.Username(), user, pg)
+	}
+	if got, ok := u.User.Password(); !ok || got != pass {
+		t.Errorf("PG password round-trip: got %q want %q (dsn=%s)", got, pass, pg)
+	}
+
+	// MySQL/TiDB: parse with the driver itself.
+	my := TargetConfig{Host: "db", Port: 4000, User: user, Password: pass, Database: "d"}.DSN()
+	mc, err := mysql.ParseDSN(my)
+	if err != nil {
+		t.Fatalf("MySQL DSN no longer parses: %v (%q)", err, my)
+	}
+	if mc.User != user || mc.Passwd != pass {
+		t.Errorf("MySQL round-trip: got %q/%q want %q/%q (dsn=%s)", mc.User, mc.Passwd, user, pass, my)
+	}
+	if mc.Timeout != ConnectTimeoutSec*time.Second {
+		t.Errorf("MySQL connect timeout: got %v want %vs", mc.Timeout, ConnectTimeoutSec)
+	}
+}
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
@@ -319,7 +356,7 @@ func TestSourceDSN(t *testing.T) {
 		Database: "testdb",
 		SSLMode:  "disable",
 	}
-	expected := "postgresql://postgres:pass@localhost:5432/testdb?sslmode=disable&connect_timeout=10"
+	expected := "postgresql://postgres:pass@localhost:5432/testdb?connect_timeout=10&sslmode=disable"
 	if dsn := cfg.DSN(); dsn != expected {
 		t.Errorf("expected %s, got %s", expected, dsn)
 	}
@@ -333,7 +370,7 @@ func TestTargetDSN(t *testing.T) {
 		Password: "",
 		Database: "testdb",
 	}
-	expected := "root:@tcp(127.0.0.1:4000)/testdb?charset=utf8mb4&parseTime=true&timeout=10s&readTimeout=300s&writeTimeout=300s"
+	expected := "root@tcp(127.0.0.1:4000)/testdb?parseTime=true&readTimeout=5m0s&timeout=10s&writeTimeout=5m0s&charset=utf8mb4"
 	if dsn := cfg.DSN(); dsn != expected {
 		t.Errorf("expected %s, got %s", expected, dsn)
 	}

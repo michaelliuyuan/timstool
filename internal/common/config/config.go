@@ -2,11 +2,13 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
@@ -85,13 +87,54 @@ func (s SourceConfig) SourceType() string {
 // for the dial. 10s keeps a dead host from stalling handlers for minutes.
 const ConnectTimeoutSec = 10
 
-func (s SourceConfig) DSN() string {
-	sslmode := s.SSLMode
+// BuildPGDSN assembles a libpq URL with CORRECTLY escaped userinfo (F-06
+// item 4): url.UserPassword percent-encodes specials (@ : / ? # % space & =
+// + etc.) in user/password, unlike fmt.Sprintf concatenation which a single
+// '@' or '/' in the password would silently break. extra adds further query
+// parameters (e.g. replication=database for the CDC stream connection).
+func BuildPGDSN(host string, port int, user, password, database, sslmode string, extra map[string]string) string {
 	if sslmode == "" {
 		sslmode = "disable"
 	}
-	return fmt.Sprintf("postgresql://%s:%s@%s:%d/%s?sslmode=%s&connect_timeout=%d",
-		url.QueryEscape(s.User), url.QueryEscape(s.Password), s.Host, s.Port, s.Database, sslmode, ConnectTimeoutSec)
+	q := url.Values{}
+	q.Set("sslmode", sslmode)
+	q.Set("connect_timeout", strconv.Itoa(ConnectTimeoutSec))
+	for k, v := range extra {
+		q.Set(k, v)
+	}
+	u := url.URL{
+		Scheme:   "postgresql",
+		User:     url.UserPassword(user, password),
+		Host:     net.JoinHostPort(host, strconv.Itoa(port)),
+		Path:     "/" + database,
+		RawQuery: q.Encode(),
+	}
+	return u.String()
+}
+
+// BuildMySQLDSN assembles a go-sql-driver DSN via mysql.Config.FormatDSN,
+// which escapes user/passwd/dbname specials — a password containing
+// '@ : / ? ( )' stays intact instead of derailing the DSN parser (F-06
+// item 4). extra becomes additional params (e.g. charset); loc selects the
+// time zone param (nil = driver default UTC, time.Local = loc=Local).
+func BuildMySQLDSN(host string, port int, user, password, database string, extra map[string]string, loc *time.Location) string {
+	cfg := mysql.NewConfig()
+	cfg.Net = "tcp"
+	cfg.Addr = net.JoinHostPort(host, strconv.Itoa(port))
+	cfg.User = user
+	cfg.Passwd = password
+	cfg.DBName = database
+	cfg.ParseTime = true
+	cfg.Timeout = ConnectTimeoutSec * time.Second
+	cfg.ReadTimeout = 300 * time.Second
+	cfg.WriteTimeout = 300 * time.Second
+	cfg.Params = extra
+	cfg.Loc = loc
+	return cfg.FormatDSN()
+}
+
+func (s SourceConfig) DSN() string {
+	return BuildPGDSN(s.Host, s.Port, s.User, s.Password, s.Database, s.SSLMode, nil)
 }
 
 type TargetConfig struct {
@@ -105,8 +148,7 @@ type TargetConfig struct {
 }
 
 func (t TargetConfig) DSN() string {
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=true&timeout=%ds&readTimeout=300s&writeTimeout=300s",
-		t.User, t.Password, t.Host, t.Port, t.Database, ConnectTimeoutSec)
+	return BuildMySQLDSN(t.Host, t.Port, t.User, t.Password, t.Database, map[string]string{"charset": "utf8mb4"}, nil)
 }
 
 type MigrationConfig struct {

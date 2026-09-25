@@ -2110,8 +2110,7 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 		req.Port = 5432
 	}
 
-	dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
-		req.User, req.Password, req.Host, req.Port, req.Database)
+	dsn := config.BuildPGDSN(req.Host, req.Port, req.User, req.Password, req.Database, "disable", nil)
 
 	pgDB, err := sql.Open("pgx", dsn)
 	if err != nil {

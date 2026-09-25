@@ -12,6 +12,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"go.uber.org/zap"
 )
 
@@ -329,12 +330,8 @@ func (r *Runner) Stats() map[string]interface{} {
 // trigger, and starts the DDL poll goroutine. Returns the DDL error channel
 // (receives a fatal DDL apply error that should halt the pipeline). #t59.
 func (r *Runner) setupDDLReplication(ctx context.Context, targetDB *sql.DB) (chan error, error) {
-	sslmode := r.srcCfg.SSLMode
-	if sslmode == "" {
-		sslmode = "disable"
-	}
-	dsn := fmt.Sprintf("postgresql://%s:%s@%s:%d/%s?sslmode=%s",
-		r.srcCfg.User, r.srcCfg.Password, r.srcCfg.Host, r.srcCfg.Port, r.srcCfg.Database, sslmode)
+	dsn := config.BuildPGDSN(r.srcCfg.Host, r.srcCfg.Port, r.srcCfg.User, r.srcCfg.Password,
+		r.srcCfg.Database, r.srcCfg.SSLMode, nil)
 	srcDB, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open source for ddl tracker: %w", err)

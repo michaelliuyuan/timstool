@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/source"
@@ -127,9 +128,8 @@ func dsn(c source.SourceConfig) string {
 	if charset == "" {
 		charset = "utf8mb4"
 	}
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=true&loc=Local&timeout=%ds",
-		c.User, c.Password,
-		c.Host, c.Port, c.Database, charset, config.ConnectTimeoutSec)
+	return config.BuildMySQLDSN(c.Host, c.Port, c.User, c.Password, c.Database,
+		map[string]string{"charset": charset}, time.Local)
 }
 
 // --- Dialect ---
