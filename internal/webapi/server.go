@@ -1134,6 +1134,16 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	if cfg.Migration.BatchSize <= 0 {
 		cfg.Migration.BatchSize = 100000
 	}
+	// F-08-2 ride d: reject out-of-range tuning knobs at task creation with
+	// an actionable message (unit confusion / typo would degrade the source).
+	if cfg.Migration.Parallel > config.MaxParallel {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("parallel 必须在 1-%d 之间（当前 %d）", config.MaxParallel, cfg.Migration.Parallel))
+		return
+	}
+	if cfg.Migration.BatchSize > config.MaxBatchSize {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("batch_size 必须在 1-%d 之间（当前 %d）", config.MaxBatchSize, cfg.Migration.BatchSize))
+		return
+	}
 	if cfg.Migration.TempDir == "" {
 		cfg.Migration.TempDir = "/tmp/timstool"
 	}

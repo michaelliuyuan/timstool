@@ -88,6 +88,14 @@ func (s SourceConfig) SourceType() string {
 // for the dial. 10s keeps a dead host from stalling handlers for minutes.
 const ConnectTimeoutSec = 10
 
+// Upper bounds for tuning knobs (F-08-2 ride d): values beyond these are
+// almost certainly operator error (unit confusion, typo) and would degrade
+// the source database or blow up a single transaction.
+const (
+	MaxParallel  = 64
+	MaxBatchSize = 1000000
+)
+
 // BuildPGDSN assembles a libpq URL with CORRECTLY escaped userinfo (F-06
 // item 4): url.UserPassword percent-encodes specials (@ : / ? # % space & =
 // + etc.) in user/password, unlike fmt.Sprintf concatenation which a single
@@ -487,10 +495,16 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("target.port must be positive")
 	}
 	if c.Migration.Parallel <= 0 {
-		return fmt.Errorf("migration.parallel must be positive")
+		return fmt.Errorf("migration.parallel must be between 1 and %d", MaxParallel)
+	}
+	if c.Migration.Parallel > MaxParallel {
+		return fmt.Errorf("migration.parallel must be between 1 and %d (got %d) — 并行过高会压垮源库连接数", MaxParallel, c.Migration.Parallel)
 	}
 	if c.Migration.BatchSize <= 0 {
-		return fmt.Errorf("migration.batch_size must be positive")
+		return fmt.Errorf("migration.batch_size must be between 1 and %d", MaxBatchSize)
+	}
+	if c.Migration.BatchSize > MaxBatchSize {
+		return fmt.Errorf("migration.batch_size must be between 1 and %d (got %d) — 批次过大会撑爆内存/单事务", MaxBatchSize, c.Migration.BatchSize)
 	}
 	if c.Migration.OnError != "abort" && c.Migration.OnError != "skip" {
 		return fmt.Errorf("migration.on_error must be 'abort' or 'skip'")
@@ -505,11 +519,11 @@ func (c *Config) Validate() error {
 		if !ValidCDCModes[c.CDC.Mode] {
 			return fmt.Errorf("cdc.mode must be 'full_incr' or 'incr_only'")
 		}
-		if c.CDC.BatchSize <= 0 {
-			return fmt.Errorf("cdc.batch_size must be positive")
+		if c.CDC.BatchSize <= 0 || c.CDC.BatchSize > MaxBatchSize {
+			return fmt.Errorf("cdc.batch_size must be between 1 and %d (got %d)", MaxBatchSize, c.CDC.BatchSize)
 		}
-		if c.CDC.Parallel <= 0 {
-			return fmt.Errorf("cdc.parallel must be positive")
+		if c.CDC.Parallel <= 0 || c.CDC.Parallel > MaxParallel {
+			return fmt.Errorf("cdc.parallel must be between 1 and %d (got %d)", MaxParallel, c.CDC.Parallel)
 		}
 		if !ValidCDCConflictStrategies[c.CDC.ConflictStrategy] {
 			return fmt.Errorf("cdc.conflict_strategy must be one of replace, insert_ignore, upsert, skip")
