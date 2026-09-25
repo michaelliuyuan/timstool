@@ -46,6 +46,11 @@ type CDCStatusStats struct {
 	LagSeconds    float64 `json:"lag_seconds"`
 	UptimeSeconds float64 `json:"uptime_seconds"`
 	LastError     string  `json:"last_error,omitempty"`
+	// Degradable-skip visibility (F-09 group 1): DDL skips counted by the
+	// runner's poller; LastSkipReason carries the object-type-classified
+	// reason (DDL or DML face). Skipped above already counts DML skips.
+	DDLSkipped     int64  `json:"ddl_skipped,omitempty"`
+	LastSkipReason string `json:"last_skip_reason,omitempty"`
 }
 
 // CDCStatusCheckpoint is the last-saved checkpoint snapshot.

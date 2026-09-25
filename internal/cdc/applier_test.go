@@ -70,7 +70,7 @@ func TestIsFatalError(t *testing.T) {
 		fatal  bool
 	}{
 		{"Error 1064: You have an error in your SQL syntax", true},
-		{"Error 1146: Table 'test.users' doesn't exist", false}, // schema error now (#t59): retried then halted via StructuralError, not fatal-no-retry
+		{"Error 1146: Table 'test.users' doesn't exist", false}, // schema error (#t59): long retry, then F-09 degradable skip (visible, chain continues)
 		{"Error 1054: Unknown column 'foo' in 'field list'", true},
 		{"syntax error near 'SELECT'", true},
 		{"access denied for user 'root'", true},

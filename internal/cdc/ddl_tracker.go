@@ -95,11 +95,26 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 			object_type TEXT,
 			ddl_command TEXT,
 			txid BIGINT,
-			lsn_txid BIGINT
+			lsn_txid BIGINT,
+			status TEXT NOT NULL DEFAULT 'applied',
+			skip_reason TEXT,
+			skipped_at TIMESTAMPTZ
 		);
 	`)
 	if err != nil {
 		return fmt.Errorf("create ddl log table: %w", err)
+	}
+
+	// F-09 group 1: skip bookkeeping columns for pre-existing tables
+	// (ADD COLUMN IF NOT EXISTS keeps old libraries compatible).
+	_, err = t.db.ExecContext(ctx, `
+		ALTER TABLE pg2tidb_ddl_log
+			ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'applied',
+			ADD COLUMN IF NOT EXISTS skip_reason TEXT,
+			ADD COLUMN IF NOT EXISTS skipped_at TIMESTAMPTZ;
+	`)
+	if err != nil {
+		return fmt.Errorf("migrate ddl log table: %w", err)
 	}
 
 	// Create the event trigger (ddl_command_end captures CREATE/ALTER).
@@ -217,6 +232,21 @@ func (t *DDLTracker) FetchNewDDL(ctx context.Context, sinceID int64) ([]DDLEntry
 	t.mu.Unlock()
 
 	return entries, nil
+}
+
+// MarkSkipped records a degradable DDL skip (F-09 group 1) on the log row so
+// the divergence is queryable and manually compensable: fix the target by
+// hand, replay the DDL, then set the row back to 'applied'. reason carries
+// the object-type classification (e.g. "[ddl/table]") for compensation
+// prioritization. Best-effort: a failure is logged, never fatal.
+func (t *DDLTracker) MarkSkipped(ctx context.Context, id int64, reason string) {
+	_, err := t.db.ExecContext(ctx, `
+		UPDATE pg2tidb_ddl_log SET status='skipped', skip_reason=$1, skipped_at=now()
+		WHERE id=$2
+	`, reason, id)
+	if err != nil {
+		t.log.Warn("ddl tracker: mark skipped failed", zap.Int64("id", id), zap.Error(err))
+	}
 }
 
 // RecentDDL returns the last N DDL entries.

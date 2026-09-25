@@ -85,6 +85,7 @@ type ApplierStats struct {
 	LastLSN        string
 	LastFlushTime  time.Time
 	LastError      string
+	LastSkipReason string
 }
 
 // ApplierStatsSnapshot is a lock-free, copy-safe DTO of ApplierStats for
@@ -98,6 +99,7 @@ type ApplierStatsSnapshot struct {
 	LastLSN        string    `json:"last_lsn"`
 	LastFlushTime  time.Time `json:"last_flush_time"`
 	LastError      string    `json:"last_error"`
+	LastSkipReason string    `json:"last_skip_reason,omitempty"`
 }
 
 // Snapshot returns a lock-free copy of the current stats. Copying ApplierStats
@@ -114,6 +116,7 @@ func (s *ApplierStats) Snapshot() ApplierStatsSnapshot {
 		LastLSN:        s.LastLSN,
 		LastFlushTime:  s.LastFlushTime,
 		LastError:      s.LastError,
+		LastSkipReason: s.LastSkipReason,
 	}
 }
 
@@ -411,10 +414,21 @@ func (a *Applier) applyEvent(ctx context.Context, event *CDCEvent) error {
 			// Non-schema fatal (syntax / unknown column / access): don't retry.
 			return fmt.Errorf("apply fatal: %w", err)
 		case isSchemaError(err):
-			// Target table not created yet — wait for DDL replication, then halt
-			// loudly if it never catches up (don't silently drop the DML).
+			// Target table not created yet — wait for DDL replication.
+			// F-09 group 1 (degradable replay): if the DDL never catches up
+			// (e.g. its CREATE was skipped as a 1064), the event is dropped
+			// LOUDLY instead of halting the chain: EventsSkipped counter +
+			// LastError/LastSkipReason surface in the status JSON. Never
+			// silent divergence.
 			if attempt >= schemaRetries {
-				return &StructuralError{Msg: fmt.Sprintf("schema mismatch after %d retries (target table likely not created by DDL yet): %v", schemaRetries, err)}
+				a.log.Error("cdc applier: schema mismatch after retries, skipping event (degradable; target table missing)",
+					zap.String("sql", sql), zap.Error(err))
+				a.stats.mu.Lock()
+				a.stats.EventsSkipped++
+				a.stats.LastError = err.Error()
+				a.stats.LastSkipReason = fmt.Sprintf("[dml/1146] %s: %v", tableKey(event.Schema, event.Table), err)
+				a.stats.mu.Unlock()
+				return nil
 			}
 			if err := sleepCtx(ctx, schemaBackoff); err != nil {
 				return err
@@ -559,6 +573,37 @@ func isSchemaError(err error) bool {
 	}
 	msg := err.Error()
 	for _, p := range []string{"table doesn't exist", "no such table", "Error 1146"} {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isDegradableError reports an "object-state mismatch" error on the TiDB
+// target that a replay may legitimately skip WITH VISIBLE RECORD (F-09 group
+// 1): the object's actual state diverges from what the DDL/DML expected
+// (quoted mixed-case DDL the transformer could not fully translate → 1064;
+// table missing because its CREATE was skipped → 1146; already-applied DDL
+// replayed at-least-once → 1050/1061/1091).
+//
+// The list is deliberately EXPLICIT and must stay narrow:
+//   - transient errors (lock wait 1205, deadlock 1213, connection, timeout)
+//     belong to the retry paths, NEVER to skip — skipping them would drop
+//     live data;
+//   - access/privilege and driver-level errors stay fail-hard.
+func isDegradableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, p := range []string{
+		"Error 1064", // syntax (untranslatable DDL)
+		"Error 1146", // table doesn't exist
+		"Error 1050", // table already exists (idempotent replay)
+		"Error 1061", // duplicate index (idempotent replay)
+		"Error 1091", // index doesn't exist (idempotent replay)
+	} {
 		if strings.Contains(msg, p) {
 			return true
 		}
