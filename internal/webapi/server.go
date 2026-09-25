@@ -1322,7 +1322,14 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 	// below instead of failing fast at SetTaskError.
 	if err != nil && !onlyValidateFailed(results, cfg.Migration.CDCChain) {
 		s.logCollector.Append(taskID, "ERROR", "Migration failed: "+err.Error(), "")
-		s.store.SetTaskError(taskID, err.Error())
+		// Re-check: ownership may have been swapped away (resume/start)
+		// between the pipeline return and here — a superseded run must not
+		// clobber the fresh run's Running status with an error terminal.
+		if owns() {
+			s.store.SetTaskError(taskID, err.Error())
+		} else {
+			s.logCollector.Append(taskID, "INFO", "stale run finished (superseded by resume); skipping terminal state write", "")
+		}
 		return
 	}
 
@@ -1359,6 +1366,14 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 			"rows_done":    rDone,
 			"rows_total":   rTotal,
 		})
+	}
+
+	// Second ownership gate: the progress sync above is a long tail — the
+	// run may have been superseded (resume/start swap) after the first gate
+	// passed. Result + terminal writes must not clobber the fresh run.
+	if !owns() {
+		s.logCollector.Append(taskID, "INFO", "stale run finished (superseded by resume); skipping terminal state write", "")
+		return
 	}
 
 	resultData, _ := json.Marshal(results)

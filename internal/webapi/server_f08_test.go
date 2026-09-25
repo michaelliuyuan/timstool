@@ -465,6 +465,66 @@ func TestStartOnPausedCancelsStaleRun(t *testing.T) {
 	close(freshRelease)
 }
 
+// F-08 ordering anchor (seq 84/85): the stale run is released at handler
+// ENTRY — it may finish with ctx.Err()==nil before/after the swap and
+// before/after the Running write. Because ownership is swapped BEFORE the
+// Running status write, every interleaving must leave the task Running
+// (with the old order the window intermittently flipped it to
+// Completed). Non-deterministic interleaving, deterministic outcome.
+func TestStaleFinishDuringResumeKeepsRunning(t *testing.T) {
+	s, st := newTestServer(t)
+
+	taskID := "t-order"
+	if err := st.CreateTask(&store.Task{ID: taskID, Name: "ord", Status: store.TaskStatusPaused, ConfigJSON: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	freshRelease := make(chan struct{})
+	var call int32
+	staleDone := make(chan struct{})
+	oldPipeline := runPipeline
+	defer func() { runPipeline = oldPipeline }()
+	runPipeline = func(ctx context.Context, _ config.Config, _ orchestrator.PipelineConfig) ([]orchestrator.PipelineResult, error) {
+		if atomic.AddInt32(&call, 1) == 1 {
+			<-release // stale: released at handler entry, may finish any time
+			close(staleDone)
+			return []orchestrator.PipelineResult{{Success: true}}, nil
+		}
+		<-freshRelease // fresh: hold open
+		return nil, nil
+	}
+
+	staleCtx, staleCancel := context.WithCancel(context.Background())
+	defer staleCancel()
+	staleRun := s.beginRun(taskID, staleCancel)
+	go s.runMigration(staleCtx, taskID, config.Config{}, staleRun)
+	time.Sleep(150 * time.Millisecond)
+
+	// Release the stale run at handler ENTRY (before the handler swaps or
+	// writes Running), then drive the real resume handler concurrently.
+	close(release)
+	w, req := doReq("POST", "/api/v1/tasks/"+taskID+"/resume", "")
+	s.handleResumeTask(w, withChiParam(req, "taskID", taskID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("resume: %d %s", w.Code, w.Body.String())
+	}
+
+	select {
+	case <-staleDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale run never finished")
+	}
+	time.Sleep(200 * time.Millisecond) // let any late stale terminal write land
+
+	task, _ := st.GetTask(taskID)
+	if task.Status != store.TaskStatusRunning {
+		t.Fatalf("final status must be Running regardless of interleaving, got %s", task.Status)
+	}
+
+	close(freshRelease)
+}
+
 // F-08 anchor: unregister closes the send channel so a writePump blocked
 // in range exits (no goroutine leak on idle disconnect); pending frames
 // are drained first.
