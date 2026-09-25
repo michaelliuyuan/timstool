@@ -1632,7 +1632,16 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 		oldCancel()
 	}
 	// F-08-2 item 7: stamp generation + Running in one conditioned write.
-	_ = s.store.SetTaskRun(taskID, runID)
+	if err := s.store.SetTaskRun(taskID, runID); err != nil {
+		// Symmetric with start: roll back the swapped (never-started)
+		// entry and fail the request — a resume without a stamped
+		// generation would silently skip every conditioned write and
+		// leave the task stuck in paused.
+		cancel()
+		s.endRun(taskID, runID)
+		s.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	go s.runMigration(ctx, taskID, cfg, runID)
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
