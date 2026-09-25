@@ -2,7 +2,7 @@
 
 **TiDB 多源异构数据同步工具**（TiDB Multi-source Integrated Tool）—— 多源异构数据库 → TiDB 迁移/同步工具。当前以 PostgreSQL → TiDB 全量迁移（含可选 CDC 增量同步 + DDL 复制）为首个已实现源，架构上扩展为多源（MySQL/Oracle/SqlServer/DB2 … → TiDB）。
 
-覆盖兼容性评估、Schema 迁移、全量数据迁移、数据校验四大能力，并含**可选的 CDC 增量同步**（实时增量 + DDL 复制，默认关闭）。支持 CLI 和 Web 管理界面两种使用方式。
+覆盖兼容性评估、源端 DDL 导出、Schema 迁移、全量数据迁移、数据校验、独立数据比对六大能力，并含**可选的 CDC 增量同步**（实时增量 + DDL 复制，默认关闭）与**时间戳水位补齐**（基于更新时间列的拉式增量）。支持 CLI 和 Web 管理界面两种使用方式，Web 端提供**统一数据源管理**（服务端保存连接，密码只写不读）。
 
 ## 数据源支持状态
 
@@ -16,6 +16,10 @@
 
 ## 近期更新
 
+- **时间戳水位补齐**（`e1cf148`）— Web「数据同步」组新增「时间戳水位补齐」页面：基于更新时间列的拉式批同步（PG→TiDB），每表配置水位列（自动探测可比较类型列 timestamp/date/int/bigint，含索引提示）、初始水位（留空 = MIN(col) 全量补齐）、批次大小、冲突策略（replace/ignore/error）；默认 `≥` 模式每轮重读边界时刻的行保证同秒迟到行不丢，严格模式用 `>` 跳过边界重读（同秒迟到行可能丢失，UI 有提示）；表级水位状态、累计行数、运行历史（run 级表级结果与耗时）全量记录，手动触发、可重跑。边界说明：源端 DELETE 不会被捕获（可用「数据比对」兜底核对）；不更新水位列的 UPDATE 会漏同步。适合无 CDC 权限或定时补齐场景。
+- **源端 DDL 一键导出**（`10ba895`）— Web 新增「DDL 导出」页面 + `export-ddl` CLI：按 schema 导出 PostgreSQL 原生 DDL，每个 schema 一个自包含目录（tables.sql / indexes.sql / views.sql / sequences.sql / functions.sql / procedures.sql / triggers.sql / types.sql + README.txt + manifest.json 对象计数与跳过清单），Web 端一键 zip 下载；勾选「TiDB 变体」额外生成 `tidb-tables.sql`（类型映射后的 CREATE TABLE 参考，含 `DDL 导出 tidb 版本`）。不支持的语句逐条跳过：服务端记 Warn 日志 + 响应头 `X-Tims-Skipped` 计数 + UI 跳过提示；选择 TiDB 变体但未勾选 tables 类型时 UI 预警。
+- **统一数据源管理**（`c0a2467`）— 服务端统一数据源注册表：Web「数据源」页面集中管理 postgres / mysql / tidb 连接档案（创建/编辑/删除/测试连接），向导、数据比对、CDC、DDL 导出、兼容评估、水位补齐等页面改为**按引用选择数据源**，不再手填重复连接；密码**只写不读**（服务端保存，列表仅显示 `has_password`，彻底移出浏览器 localStorage），任务详情返回前脱敏；TiDB 数据源支持可选 `pd_addr` / `status_port`（严格校验格式与端口 + 自动归一化存储）；数据源页内嵌 Lightning 环境校验（`POST /api/v1/validate-lightning`）与迁移选项记忆（服务端持久化，跨浏览器/重启生效）。
+- **界面统一与体验优化**（S1-UI 系列）— 全站表单标准两列布局 + 数据源选择器优先 + 兼容评估/DDL 导出页接入「测试连接」（S1-UI-04）；任务详情总览改表级文字进度、导入进度按 checkpoint 已导入表数计算（S1-UI-05）；导航新增「数据同步」分组区分「CDC 实时同步」与「时间戳水位补齐」，两页共享「选哪个」对比卡片（S1-UI-06）；测试连接版本号精简（TiDB 只显示 release line，PG 不带 build 后缀）（S1-UI-07）；HTML 报告对齐 V2.2 设计规范。
 - **全量+增量衔接（cdc_chain）** — 向导新增「全量+增量衔接」选项（仅 PG 源）：任务启动前自动预建 publication + replication slot，全量期间源端 WAL 被 slot 保留；全量成功后自动拉起 CDC，并把记录的 slot 点位预置进 checkpoint，从该点位重放整个迁移窗口的变更，实现零丢失衔接（重放与全量重叠数据按 conflict_strategy=replace 幂等去重）。**校验降级**：链式任务若仅「数据校验」阶段未通过（全量期间源端持续写入导致的预期行数差异），任务仍按成功完成并正常衔接，差异由 CDC 重放收敛，稳定后可用「数据比对」核验；其他阶段失败仍按失败处理不衔接。注意全量期间源端 WAL 持续累积，`max_slot_wal_keep_size` 不要设置过小。
 - **无主键表一键修复** — CDC 预检的「无主键表预警」支持一键生成/执行 `ALTER TABLE x REPLICA IDENTITY FULL`（需表 owner/superuser，无权限则复制 SQL 手动执行），修复后该表 UPDATE/DELETE 可正常同步并自动移出预警清单。
 - **独立数据比对（数据对比）**（`0067a13`）— Web 新增「数据比对」页面：独立配置源端/目标端连接（不依赖迁移任务），支持 quick / sample / checksum 三种比对模式、表级选择（含预估行数与搜索）、实时进度与 WebSocket 推送、比对历史与表级差异报告（源/目标行数、差异行数、耗时）；连接信息可「保存连接 / 加载连接」复用（密码永不落盘，需重新输入）。
@@ -29,11 +33,15 @@
 
 - **多源异构架构** — 统一 Source 抽象层，支持 PostgreSQL（生产可用）、MySQL（开发中）、Oracle/SqlServer/DB2（Stub 规划中）→ TiDB
 - **兼容性评估** — 迁移前扫描不兼容对象（Trigger、Stored Function、特殊索引等），输出风险报告（`assess` 命令，支持 terminal/json 输出）
+- **源端 DDL 导出** — 按 schema 自包含目录导出 PG 原生 DDL（表/索引/视图/序列/函数/存储过程/触发器/类型 + manifest），可选 TiDB 类型映射变体；Web 一键 zip 下载或 `export-ddl` CLI
 - **Schema Migration** — 自动采集 PG schema，类型映射 + DDL AST 转换，生成 TiDB 兼容 DDL，支持 `--dry-run` 预览
 - **Data Migration** — 基于 PG COPY 协议导出 + TiDB Lightning CLI 导入，实现高性能并行数据迁移；MySQL 源使用 Dumpling 导出；支持大表分片拆分
 - **Data Validation** — 四种校验模式（quick 行数对比 / sample 抽样验证 / checksum 分块哈希 / full 全量校验）确保数据一致性
 - **独立数据比对** — Web「数据比对」页面，脱离迁移流水线手工比对任意源/目标：三种模式（quick / sample / checksum）、表级选择、连接配置保存/加载（密码不落盘）、比对历史与差异报告
-- **Web 管理界面** — 可视化配置向导（含数据源选择器）、独立数据比对、交互式表选择、实时进度监控、日志流查看、CDC 仪表盘、迁移历史、HTML 报告下载
+- **统一数据源管理** — 服务端数据源注册表（postgres/mysql/tidb），向导/比对/CDC/DDL 导出/水位补齐按引用复用连接；密码只写不读，任务与列表全程脱敏
+- **CDC 实时同步** — PostgreSQL 逻辑复制 → TiDB 实时增量（可选模块，默认关闭），含 DDL 复制与全量+增量零丢失衔接
+- **时间戳水位补齐** — 基于更新时间列的拉式增量（PG→TiDB）：表级水位、手动触发、可重跑，适合无 CDC 权限或定时补齐场景
+- **Web 管理界面** — 可视化配置向导（数据源选择器）、独立数据比对、交互式表选择、实时进度监控、日志流查看、CDC 仪表盘、迁移历史、HTML 报告下载
 - **断点续传** — Checkpoint 机制支持中断后从断点恢复
 - **单二进制部署** — 前端通过 `go:embed` 嵌入，零外部依赖，Docker 一键启动
 
@@ -106,9 +114,6 @@ ls build/timstool
 ```bash
 # Linux amd64
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o timstool .
-
-# Linux arm64
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o timstool .
 
 # Linux arm64
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o timstool .
@@ -218,12 +223,19 @@ timstool [command]
 Commands:
   all                一键执行完整迁移流程（precheck → schema → data → validate）
   assess             兼容性评估（迁移前扫描不兼容对象，输出风险报告）
+  export-ddl         源端 DDL 导出（按 schema 导出 PG 原生 DDL，可选 TiDB 变体）
   precheck           预检与兼容性评估
   schema             Schema 迁移（--dry-run 仅预览 DDL）
   data               全量数据迁移
   validate           数据校验（L1/L2/L3）
   web                启动 Web 管理界面
   cdc                CDC 增量同步（可选模块，默认关闭；见下文「CDC 增量同步」节）
+
+export-ddl Command Flags:
+  -o, --out string      输出目录（必填）
+      --schemas string  逗号分隔 schema 清单（默认 public）
+      --types string    逗号分隔对象类型（tables,indexes,views,sequences,functions,procedures,triggers,types）
+      --tidb            额外生成 TiDB 类型映射变体 tidb-tables.sql
 
 Global Flags:
   -c, --config string     配置文件路径 (默认 "configs/config.yaml")
@@ -475,11 +487,14 @@ docker run -p 8080:8080 -v /data/timstool:/data timstool
 
 | 页面 | 功能说明 |
 |------|----------|
-| **配置向导** | 5 步向导：数据源选择（PG/MySQL/...）→ 源端配置 → 目标端配置 → 选择表（支持搜索/全选） → 迁移选项 → 确认执行 |
-| **数据比对** | 独立数据比对（不执行迁移）：配置源/目标连接并测试，三种模式（快速行数 / 采样 / 分块校验）+ 表级选择；「保存连接 / 加载连接」复用连接配置（密码永不保存）；实时进度（WebSocket + 轮询）、取消、比对历史与表级差异报告（源/目标行数、差异行数、耗时、错误建议） |
-| **兼容性评估** | 迁移前风险评估，展示不兼容对象清单和迁移建议 |
-| **任务监控** | 实时进度、表级详情（导出/导入行数、百分比）、吞吐量指标 |
-| **CDC 仪表盘** | CDC 增量同步监控（LSN、吞吐、延迟），一键启停 |
+| **数据源** | 统一数据源管理：创建/编辑/删除 postgres / mysql / tidb 连接档案，一键测试连接（含版本号回显）；TiDB 数据源可配置可选 PD 地址与状态端口（严格校验+归一化）；密码只写不读；内嵌 Lightning 环境校验 |
+| **配置向导** | 5 步向导：数据源选择（从「数据源」档案引用或新建）→ 源端配置 → 目标端配置 → 选择表（支持搜索/全选） → 迁移选项（临时目录/Lightning 路径等服务端记忆预填） → 确认执行 |
+| **数据比对** | 独立数据比对（不执行迁移）：引用数据源或手填连接并测试，三种模式（快速行数 / 采样 / 分块校验）+ 表级选择；实时进度（WebSocket + 轮询）、取消、比对历史与表级差异报告（源/目标行数、差异行数、耗时、错误建议） |
+| **兼容评估** | 迁移前风险评估，展示不兼容对象清单和迁移建议（引用数据源 + 测试连接） |
+| **DDL 导出** | 源端 PostgreSQL DDL 一键导出：选择 schema 与对象类型，按 schema 自包含目录打包 zip 下载；可选 TiDB 类型映射变体（tidb-tables.sql）；跳过对象服务端 Warn + UI 提示 |
+| **任务监控** | 实时进度、表级详情（导出/导入行数、百分比）、吞吐量指标；导入进度按 checkpoint 已导入表数展示 |
+| **CDC 实时同步** | CDC 增量同步监控（LSN、吞吐、延迟），一键启停；连接卡片、启动预检与续传点位检查、无主键表 REPLICA IDENTITY 一键修复 |
+| **时间戳水位补齐** | 基于更新时间列的拉式批同步（PG→TiDB）：表级水位列（自动探测+索引提示）、初始水位（留空=全量补齐）、严格模式与冲突策略、表级状态/累计行数/运行历史，手动触发可重跑 |
 | **日志查看** | 实时日志流，按级别过滤（info/warn/error） |
 | **迁移历史** | 历史任务列表、详情查看、重新执行 |
 | **报告下载** | 生成 HTML 格式完整迁移报告，包含各阶段执行结果 |
@@ -509,6 +524,40 @@ GET  /api/v1/tasks/{id}/phases           # 获取各阶段状态
 GET  /api/v1/tasks/{id}/logs             # 获取任务日志
 GET  /api/v1/tasks/{id}/report           # 获取迁移报告
 GET  /api/v1/ws                          # WebSocket 实时推送（进度+日志）
+```
+
+#### 数据源管理
+
+```
+GET    /api/v1/datasources               # 数据源列表（密码脱敏，仅 has_password）
+POST   /api/v1/datasources               # 创建数据源（postgres | mysql | tidb）
+PUT    /api/v1/datasources/{id}          # 更新数据源（密码留空 = 沿用已存值）
+DELETE /api/v1/datasources/{id}          # 删除数据源
+POST   /api/v1/datasources/{id}/test     # 测试连接（回显精简版本号）
+POST   /api/v1/validate-lightning        # Lightning 环境校验
+GET    /api/v1/migration-options         # 读取迁移选项记忆（Lightning 路径/临时目录等）
+PUT    /api/v1/migration-options         # 保存迁移选项记忆（服务端持久化）
+```
+
+> 数据源被任务/比对/CDC/DDL 导出/水位补齐按 `id` 引用，连接信息在服务端解析；密码只写不读，任何读取接口不回传。
+
+#### 兼容评估与 DDL 导出
+
+```
+POST /api/v1/assess                  # 兼容性评估（数据源引用，JSON 结果）
+POST /api/v1/ddl-export/schemas      # 列出源端 schema 与对象计数
+POST /api/v1/ddl-export              # 导出 DDL zip（X-Tims-Skipped 头返回跳过语句数）
+```
+
+#### 时间戳水位补齐
+
+```
+GET    /api/v1/incremental/jobs            # 拉式增量任务列表（表级水位状态+运行历史）
+POST   /api/v1/incremental/jobs            # 创建任务（表/水位列/初始水位/严格模式/冲突策略）
+PUT    /api/v1/incremental/jobs/{id}       # 更新任务
+DELETE /api/v1/incremental/jobs/{id}       # 删除任务
+POST   /api/v1/incremental/jobs/{id}/run   # 手动触发一轮同步
+GET    /api/v1/sources/tables/{table}/columns  # 列出表列（类型可比较性/索引，供水位列选择）
 ```
 
 #### 独立数据比对
@@ -711,6 +760,7 @@ timstool/
 │   ├── validate.go             # validate — 数据校验
 │   ├── web.go                  # web — Web 管理界面
 │   ├── cdc.go                  # cdc — CDC 增量同步
+│   ├── ddl_export.go           # export-ddl — 源端 DDL 导出
 │   └── static/                 # 嵌入式前端资源（go:embed）
 ├── web/
 │   └── frontend/               # Vue 3 前端源码
@@ -744,6 +794,7 @@ timstool/
 │   │   └── scheduler.go        # 并发调度器（含大表分片）
 │   ├── lightning/              # TiDB Lightning 集成（独立模块）
 │   ├── dumpling/               # MySQL Dumpling 导出（MySQL→TiDB）
+│   ├── ddlexport/              # 源端 DDL 导出（按 schema 自包含目录 + TiDB 变体）
 │   ├── cdc/                    # CDC 增量同步模块
 │   ├── validator/              # 数据校验模块
 │   │   ├── validator.go        # L1/L2/L3/full 校验引擎
@@ -754,7 +805,10 @@ timstool/
 │   │   └── orchestrator.go     # 4 阶段管道编排
 │   ├── webapi/                 # Web API 服务
 │   │   ├── server.go           # HTTP + WebSocket 服务（chi 路由）
+│   │   ├── datasource.go       # 统一数据源注册表（/api/v1/datasources/*，密码只写不读）
 │   │   ├── compare.go          # 独立数据比对任务（/api/v1/compare/*）
+│   │   ├── ddl_export_handler.go # DDL 导出（/api/v1/ddl-export/*，zip 响应）
+│   │   ├── incremental.go      # 时间戳水位补齐（/api/v1/incremental/*）
 │   │   ├── dbconn.go           # 数据库连接测试
 │   │   ├── logbuffer.go        # 日志缓冲（支持实时订阅）
 │   │   └── logcore.go          # Zap 日志采集 Core
@@ -905,6 +959,9 @@ A: `timstool assess` 命令在迁移前扫描源端数据库，检查不兼容�
 
 **Q: 「数据比对」页面和迁移流水线里的数据校验有什么区别？**
 A: 数据校验（validate）是迁移流水线的第 4 阶段，依赖迁移任务上下文；「数据比对」页面是**独立比对**能力——手工填写源端/目标端连接即可对任意两端数据比对，无需创建迁移任务。支持 quick / sample / checksum 三种模式、表级选择、比对历史与差异报告；连接配置可保存/加载复用（密码永不落盘）。同一时刻仅允许一个比对任务运行。API 见「独立数据比对」端点一节。
+
+**Q: CDC 实时同步和时间戳水位补齐怎么选？**
+A: CDC 基于逻辑复制，实时性高、能捕获 DELETE，但需要 PG 逻辑复制权限（publication/replication slot）并管理源端 WAL 保留；时间戳水位补齐是拉式批同步，只需普通查询权限 + 可比较的更新时间列，但捕获不到 DELETE、会漏掉不更新水位列的 UPDATE，且需手动触发。需要零停机实时增量 → CDC；无 CDC 权限或只需定时补齐 → 水位补齐；两者可并用（CDC 为主、水位补齐兜底），最终用「数据比对」核验一致性。
 
 **Q: 大表迁移如何优化？**
 A: timstool 支持大表分片拆分（见 `docs/large-table-chunking-design.md`），将大表按主键范围拆分为多个分片并行导出，提升迁移效率。
