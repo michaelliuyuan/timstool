@@ -1609,15 +1609,6 @@ func (s *Server) setLogCore(taskID string, core *TaskLogCore) {
 	s.taskMu.Unlock()
 }
 
-// ownsRunningCancel reports whether the given cancel func is still the
-// registered one for taskID — the run's ownership token (F-08).
-func (s *Server) ownsRunningCancel(taskID string, cancel context.CancelFunc) bool {
-	s.taskMu.Lock()
-	defer s.taskMu.Unlock()
-	current := s.runningTasks[taskID]
-	return current != nil && reflect.ValueOf(current).Pointer() == reflect.ValueOf(cancel).Pointer()
-}
-
 func (s *Server) deleteLogCore(taskID string) {
 	s.taskMu.Lock()
 	delete(s.logCores, taskID)
