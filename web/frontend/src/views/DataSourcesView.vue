@@ -226,7 +226,7 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
     </el-card>
 
     <!-- Create / edit dialog -->
-    <el-dialog v-model="dialogVisible" :title="editing ? '编辑数据源' : '新建数据源'" width="560px" :close-on-click-modal="false">
+    <el-dialog v-model="dialogVisible" :title="editing ? '编辑数据源' : '新建数据源'" width="560px" :close-on-click-modal="false" :close-on-press-escape="false">
       <el-form label-width="100px">
         <el-form-item label="名称" required>
           <el-input v-model="form.name" placeholder="如：生产 PG / 测试 TiDB" />
