@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -82,7 +83,15 @@ func (s *Server) testSource(ctx context.Context, srcType string, fields map[stri
 		Options:  stringifyMap(fields),
 	}
 	if port := stringField(fields, "port"); port != "" {
-		fmt.Sscanf(port, "%d", &cfg.Port)
+		// Strict: strconv.Atoi rejects trailing garbage ("80x"), unlike
+		// fmt.Sscanf("%d") which silently stopped at the first non-digit.
+		n, err := strconv.Atoi(strings.TrimSpace(port))
+		if err != nil {
+			result["success"] = false
+			result["message"] = fmt.Sprintf("invalid port %q: must be an integer", port)
+			return result
+		}
+		cfg.Port = n
 	}
 
 	src, err := source.Open(srcType, cfg)
@@ -200,7 +209,13 @@ func (s *Server) handleSourceTables(w http.ResponseWriter, r *http.Request) {
 		Options:  stringifyMap(req.Fields),
 	}
 	if port := stringField(req.Fields, "port"); port != "" {
-		fmt.Sscanf(port, "%d", &cfg.Port)
+		// Strict parse (rejects trailing garbage, unlike Sscanf).
+		n, err := strconv.Atoi(strings.TrimSpace(port))
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid port %q: must be an integer", port))
+			return
+		}
+		cfg.Port = n
 	}
 
 	src, err := source.Open(srcType, cfg)

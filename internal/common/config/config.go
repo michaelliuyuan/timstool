@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -353,10 +354,31 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// parseOverrideInt strictly parses a whole string as an integer override:
+// unlike fmt.Sscanf("%d") it rejects trailing garbage ("80x" fails instead
+// of silently meaning 80).
+func parseOverrideInt(v string) (int, error) {
+	return strconv.Atoi(strings.TrimSpace(v))
+}
+
 func LoadWithOverrides(path string, overrides map[string]string) (*Config, error) {
 	cfg, err := Load(path)
 	if err != nil {
 		return nil, err
+	}
+
+	parseInt := func(key, v string, dst *int) error {
+		n, err := parseOverrideInt(v)
+		if err != nil {
+			return fmt.Errorf("override %s=%q: must be an integer", key, v)
+		}
+		*dst = n
+		return nil
+	}
+	if v, ok := overrides["source.port"]; ok {
+		if err := parseInt("source.port", v, &cfg.Source.Port); err != nil {
+			return nil, err
+		}
 	}
 
 	if v, ok := overrides["source.host"]; ok {
@@ -378,7 +400,9 @@ func LoadWithOverrides(path string, overrides map[string]string) (*Config, error
 		cfg.Target.Host = v
 	}
 	if v, ok := overrides["target.port"]; ok {
-		fmt.Sscanf(v, "%d", &cfg.Target.Port)
+		if err := parseInt("target.port", v, &cfg.Target.Port); err != nil {
+			return nil, err
+		}
 	}
 	if v, ok := overrides["target.user"]; ok {
 		cfg.Target.User = v
@@ -393,10 +417,14 @@ func LoadWithOverrides(path string, overrides map[string]string) (*Config, error
 		cfg.Target.PDAddr = v
 	}
 	if v, ok := overrides["migration.parallel"]; ok {
-		fmt.Sscanf(v, "%d", &cfg.Migration.Parallel)
+		if err := parseInt("migration.parallel", v, &cfg.Migration.Parallel); err != nil {
+			return nil, err
+		}
 	}
 	if v, ok := overrides["migration.batch_size"]; ok {
-		fmt.Sscanf(v, "%d", &cfg.Migration.BatchSize)
+		if err := parseInt("migration.batch_size", v, &cfg.Migration.BatchSize); err != nil {
+			return nil, err
+		}
 	}
 	if v, ok := overrides["logging.level"]; ok {
 		cfg.Logging.Level = v
@@ -423,10 +451,14 @@ func LoadWithOverrides(path string, overrides map[string]string) (*Config, error
 		cfg.CDC.Publication = v
 	}
 	if v, ok := overrides["cdc.batch_size"]; ok {
-		fmt.Sscanf(v, "%d", &cfg.CDC.BatchSize)
+		if err := parseInt("cdc.batch_size", v, &cfg.CDC.BatchSize); err != nil {
+			return nil, err
+		}
 	}
 	if v, ok := overrides["cdc.parallel"]; ok {
-		fmt.Sscanf(v, "%d", &cfg.CDC.Parallel)
+		if err := parseInt("cdc.parallel", v, &cfg.CDC.Parallel); err != nil {
+			return nil, err
+		}
 	}
 	if v, ok := overrides["cdc.conflict_strategy"]; ok {
 		cfg.CDC.ConflictStrategy = v
