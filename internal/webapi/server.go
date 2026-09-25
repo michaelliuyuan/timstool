@@ -207,6 +207,15 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 	// died mid-run; fail them so the UI is not stuck (M3).
 	s.recoverStaleCompares()
 
+	// F-08-2 ride b: migration tasks left in "running" by a dead previous
+	// process are zombies — no goroutine owns them. Mark them failed with an
+	// interrupted message so the UI unsticks and resume stays available.
+	if n, err := s.store.FailAllRunning("服务重启导致任务中断（上个进程在运行中退出）；可从断点续传或重新开始"); err != nil {
+		zap.L().Warn("stale-running recovery failed", zap.Error(err))
+	} else if n > 0 {
+		zap.L().Info("recovered stale running tasks", zap.Int("count", n))
+	}
+
 	// F-02 (P2-6): remove crash-orphaned datasource temp files — they hold the
 	// full plaintext registry.
 	s.cleanupDataSourceTempFiles()

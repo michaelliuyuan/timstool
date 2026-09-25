@@ -209,6 +209,25 @@ func (s *Store) SetTaskError(id string, taskErr string) error {
 	return err
 }
 
+// FailAllRunning marks every task still in "running" state as failed with
+// the given message. Called once at server startup (F-08-2 ride b): a task
+// left running can only mean the previous process died mid-run — no
+// goroutine will ever finish or cancel it, so the UI would be stuck on a
+// zombie running state forever. Returns the number of recovered tasks.
+func (s *Store) FailAllRunning(message string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	res, err := s.db.Exec(`UPDATE tasks SET status='failed', error=?, finished_at=?, updated_at=? WHERE status='running'`,
+		message, now, now)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 func (s *Store) ResetTaskForRerun(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
