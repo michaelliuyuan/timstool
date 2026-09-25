@@ -139,7 +139,20 @@ type Applier struct {
 
 	fatalMu  sync.Mutex
 	fatalErr error // set when the applier halts on a structural failure; see Fatal()
+
+	// missingTables is the 1146 short-circuit set (F-10 group 2 item 3):
+	// tableKey → time the exhaustion was recorded. A table whose event has
+	// exhausted the schema retries is KNOWN missing; further events for it
+	// skip immediately instead of burning 10×500ms each. Entries expire
+	// (missingTTL) so manual table compensation is re-probed even without
+	// a DDL poller callback.
+	missingMu     sync.Mutex
+	missingTables map[string]time.Time
 }
+
+// missingTTL bounds how long a confirmed-missing table stays short-circuited
+// without external confirmation (DDL applied / manual compensation).
+const missingTTL = 60 * time.Second
 
 // tableBuffer accumulates events for a single table, maintaining insert order.
 type tableBuffer struct {
@@ -174,12 +187,13 @@ func NewApplier(db *sql.DB, cfg BatchConfig, transformer *Transformer) *Applier 
 		cfg.FlushInterval = 5 * time.Second
 	}
 	return &Applier{
-		cfg:         cfg,
-		db:          db,
-		log:         zap.NewNop(),
-		stats:       &ApplierStats{},
-		buffers:     make(map[string]*tableBuffer),
-		transformer: transformer,
+		cfg:           cfg,
+		db:            db,
+		log:           zap.NewNop(),
+		stats:         &ApplierStats{},
+		buffers:       make(map[string]*tableBuffer),
+		missingTables: make(map[string]time.Time),
+		transformer:   transformer,
 	}
 }
 
@@ -376,6 +390,37 @@ type skippedError struct{ reason string }
 
 func (e *skippedError) Error() string { return "event skipped: " + e.reason }
 
+// markMissing records a table as confirmed-missing (1146 retries exhausted).
+func (a *Applier) markMissing(tk string) {
+	a.missingMu.Lock()
+	a.missingTables[tk] = time.Now()
+	a.missingMu.Unlock()
+}
+
+// isMissing reports whether tk is short-circuited as missing (TTL-fresh).
+func (a *Applier) isMissing(tk string) bool {
+	a.missingMu.Lock()
+	defer a.missingMu.Unlock()
+	at, ok := a.missingTables[tk]
+	if !ok {
+		return false
+	}
+	if time.Since(at) > missingTTL {
+		delete(a.missingTables, tk) // expired: re-probe (manual compensation)
+		return false
+	}
+	return true
+}
+
+// ResetMissingTables clears the 1146 short-circuit set. The DDL poller calls
+// this after every successful DDL apply — a CREATE TABLE most likely just
+// made one or more short-circuited tables exist again.
+func (a *Applier) ResetMissingTables() {
+	a.missingMu.Lock()
+	a.missingTables = make(map[string]time.Time)
+	a.missingMu.Unlock()
+}
+
 // applyEvent applies a single event to TiDB.
 func (a *Applier) applyEvent(ctx context.Context, event *CDCEvent) error {
 	// Never replicate CDC's own internal tables (e.g. the DDLTracker's
@@ -396,6 +441,17 @@ func (a *Applier) applyEvent(ctx context.Context, event *CDCEvent) error {
 			a.stats.mu.Unlock()
 			return &skippedError{reason: "skip-listed table " + skip}
 		}
+	}
+
+	// 1146 short-circuit (F-10 group 2 item 3): this table was already
+	// CONFIRMED missing (retries exhausted earlier) — skip immediately
+	// instead of burning the 10×500ms schema window per event.
+	tk := tableKey(event.Schema, event.Table)
+	if a.isMissing(tk) {
+		a.stats.mu.Lock()
+		a.stats.EventsSkipped++
+		a.stats.mu.Unlock()
+		return &skippedError{reason: "short-circuit: table confirmed missing earlier this window: " + tk}
 	}
 
 	sql, err := a.transformer.TransformEvent(event)
@@ -436,14 +492,15 @@ func (a *Applier) applyEvent(ctx context.Context, event *CDCEvent) error {
 			// LastError/LastSkipReason surface in the status JSON. Never
 			// silent divergence.
 			if attempt >= schemaRetries {
-				a.log.Error("cdc applier: schema mismatch after retries, skipping event (degradable; target table missing)",
+				a.log.Error("cdc applier: schema mismatch after retries, skipping event (degradable; target table missing; same-table events now short-circuited)",
 					zap.String("sql", sql), zap.Error(err))
 				a.stats.mu.Lock()
 				a.stats.EventsSkipped++
 				a.stats.LastError = err.Error()
-				a.stats.LastSkipReason = fmt.Sprintf("[dml/1146] %s: %v", tableKey(event.Schema, event.Table), err)
+				a.stats.LastSkipReason = fmt.Sprintf("[dml/1146] %s: %v", tk, err)
 				a.stats.mu.Unlock()
-				return &skippedError{reason: fmt.Sprintf("[dml/1146] %s: %v", tableKey(event.Schema, event.Table), err)}
+				a.markMissing(tk)
+				return &skippedError{reason: fmt.Sprintf("[dml/1146] %s: %v", tk, err)}
 			}
 			if err := sleepCtx(ctx, schemaBackoff); err != nil {
 				return err

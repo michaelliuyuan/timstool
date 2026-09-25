@@ -457,6 +457,12 @@ func (r *Runner) runDDLPoller(ctx context.Context, targetDB *sql.DB, errCh chan<
 			lastID = e.ID
 			r.checkpoint.SetLastDDLID(e.ID)
 			r.log.Info("cdc runner: ddl applied", zap.Int64("id", e.ID), zap.String("ddl", ddl))
+			// A successful DDL may have just created previously-missing
+			// tables — clear the applier's 1146 short-circuit set so their
+			// DML resumes immediately (F-10 group 2 item 3).
+			if r.applier != nil {
+				r.applier.ResetMissingTables()
+			}
 		}
 	}
 }
