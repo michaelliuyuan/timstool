@@ -36,6 +36,12 @@ type CDCStatusFile struct {
 }
 
 // CDCStatusStats holds the apply-side counters the dashboard renders.
+//
+// Scope note (identity pin, F-09): SourceEvents counts on the SOURCE side
+// and includes DDL log rows, which never flow through the applier. The
+// counter identity received = applied + failed + skipped holds ONLY over
+// the four applier counters (SourceEvents vs EventsReceived included);
+// assertions must anchor those, not SourceEvents.
 type CDCStatusStats struct {
 	SourceEvents  int64   `json:"source_events"`
 	Applied       int64   `json:"applied"`

@@ -245,7 +245,12 @@ func (t *DDLTracker) MarkSkipped(ctx context.Context, id int64, reason string) {
 		WHERE id=$2
 	`, reason, id)
 	if err != nil {
-		t.log.Warn("ddl tracker: mark skipped failed", zap.Int64("id", id), zap.Error(err))
+		// ERROR, not Warn: on failure the row stays at its default
+		// 'applied' — a FALSE applied record. The in-memory counter and
+		// log line keep this skip visible, but the queryable compensation
+		// row is MISSING and an operator must reconcile by DDL id/time.
+		t.log.Error("ddl tracker: mark skipped FAILED - compensation row is MISSING (row falsely reads applied); reconcile manually",
+			zap.Int64("id", id), zap.Error(err))
 	}
 }
 
