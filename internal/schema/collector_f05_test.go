@@ -48,3 +48,26 @@ func TestCollectForeignKeysQueryPairsByOrdinal(t *testing.T) {
 		t.Error("FK query must not use the cross-product-prone ccu join")
 	}
 }
+
+// F-07 anchor: pg_get_viewdef always emits PG casts (::text, ::character
+// varying(N), ::timestamp without time zone) which TiDB rejects with 1064 —
+// BuildViewDDL must strip them, while leaving casts inside string literals
+// and non-cast colons untouched.
+func TestBuildViewDDLStripsPGCasts(t *testing.T) {
+	b := NewDDLBuilder()
+	cases := []struct{ in, want string }{
+		{"SELECT id, v::text FROM vsrc", "SELECT id, v FROM vsrc"},
+		{"SELECT id::character varying(10) FROM t", "SELECT id FROM t"},
+		{"SELECT ts::timestamp without time zone FROM t", "SELECT ts FROM t"},
+		{"SELECT d::double precision, n::numeric(10,2) FROM t", "SELECT d, n FROM t"},
+		{"SELECT 'x::y' AS lit FROM t", "SELECT 'x::y' AS lit FROM t"},
+		{"SELECT id FROM t", "SELECT id FROM t"},
+	}
+	for _, c := range cases {
+		got := b.BuildViewDDL(View{Name: "v", Definition: c.in})
+		want := "CREATE OR REPLACE VIEW `v` AS " + c.want
+		if got != want {
+			t.Errorf("BuildViewDDL(%q)\n got %s\nwant %s", c.in, got, want)
+		}
+	}
+}

@@ -171,7 +171,127 @@ func (b *DDLBuilder) BuildViewDDL(view View) string {
 	if !strings.HasPrefix(strings.ToUpper(def), "SELECT") {
 		return fmt.Sprintf("-- WARNING: view %s has complex definition, manual review needed\n-- %s", view.Name, def)
 	}
+	// pg_get_viewdef always emits PG casts (::text, ::character varying(10),
+	// ::timestamp without time zone, ...). TiDB rejects them with ER 1064,
+	// so strip casts outside string literals before applying (F-07).
+	def = stripPGCasts(def)
 	return fmt.Sprintf("CREATE OR REPLACE VIEW %s AS %s", QuoteIdentifier(view.Name), def)
+}
+
+// stripPGCasts removes `::<type>` casts from a view definition. Text inside
+// single-quoted literals (with ” escapes) is left untouched; multi-word PG
+// types (character varying, double precision, timestamp without time zone)
+// and sized types (numeric(10,2)) are consumed as a whole.
+func stripPGCasts(def string) string {
+	var b strings.Builder
+	i := 0
+	n := len(def)
+	for i < n {
+		c := def[i]
+		if c == '\'' {
+			// copy the entire literal verbatim, honoring '' escapes
+			j := i + 1
+			for j < n {
+				if def[j] == '\'' {
+					if j+1 < n && def[j+1] == '\'' {
+						j += 2
+						continue
+					}
+					j++
+					break
+				}
+				j++
+			}
+			b.WriteString(def[i:j])
+			i = j
+			continue
+		}
+		if c == ':' && i+1 < n && def[i+1] == ':' {
+			end := skipPGCastType(def, i+2)
+			if end > i+2 {
+				i = end
+				continue
+			}
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
+}
+
+// skipPGCastType returns the index just past a PG type name starting at def[i],
+// or i if no type name is present.
+func skipPGCastType(def string, i int) int {
+	n := len(def)
+	start := i
+	readWord := func(k int) (string, int) {
+		j := k
+		for j < n && (isIdentChar(def[j])) {
+			j++
+		}
+		return def[k:j], j
+	}
+	word, j := readWord(i)
+	if word == "" {
+		return start
+	}
+	lower := strings.ToLower(word)
+	switch lower {
+	case "character", "bit":
+		// character varying / bit varying
+		k := j
+		for k < n && (def[k] == ' ' || def[k] == '\t' || def[k] == '\n' || def[k] == '\r') {
+			k++
+		}
+		if w2, j2 := readWord(k); strings.ToLower(w2) == "varying" {
+			j = j2
+		}
+	case "double":
+		k := j
+		for k < n && (def[k] == ' ' || def[k] == '\t' || def[k] == '\n' || def[k] == '\r') {
+			k++
+		}
+		if w2, j2 := readWord(k); strings.ToLower(w2) == "precision" {
+			j = j2
+		}
+	case "timestamp", "time":
+		k := j
+		for k < n && (def[k] == ' ' || def[k] == '\t' || def[k] == '\n' || def[k] == '\r') {
+			k++
+		}
+		if w2, j2 := readWord(k); strings.ToLower(w2) == "with" || strings.ToLower(w2) == "without" {
+			k = j2
+			for k < n && (def[k] == ' ' || def[k] == '\t' || def[k] == '\n' || def[k] == '\r') {
+				k++
+			}
+			if w3, j3 := readWord(k); strings.ToLower(w3) == "time" {
+				k = j3
+				for k < n && (def[k] == ' ' || def[k] == '\t' || def[k] == '\n' || def[k] == '\r') {
+					k++
+				}
+				if w4, j4 := readWord(k); strings.ToLower(w4) == "zone" {
+					j = j4
+				} else {
+					j = k
+				}
+			}
+		}
+	}
+	// optional type modifier: (N) or (N,M)
+	if j < n && def[j] == '(' {
+		k := j + 1
+		for k < n && (def[k] >= '0' && def[k] <= '9' || def[k] == ',' || def[k] == ' ') {
+			k++
+		}
+		if k < n && def[k] == ')' {
+			j = k + 1
+		}
+	}
+	return j
+}
+
+func isIdentChar(c byte) bool {
+	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 }
 
 func (b *DDLBuilder) BuildEnumDDL(enum EnumType) string {

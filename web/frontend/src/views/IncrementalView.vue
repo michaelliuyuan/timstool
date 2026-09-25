@@ -243,7 +243,7 @@ const strategyLabels: Record<string, string> = { replace: 'REPLACE INTO', ignore
       </el-table>
     </el-card>
 
-    <el-dialog v-model="dialogVisible" :title="editing ? '编辑补齐任务' : '新建补齐任务'" width="860px">
+    <el-dialog v-model="dialogVisible" :title="editing ? '编辑补齐任务' : '新建补齐任务'" width="860px" :close-on-click-modal="false">
       <el-form label-width="120px">
         <el-form-item label="任务名称">
           <el-input v-model="form.name" placeholder="例如：订单表水位补齐" style="width: 360px;" />

@@ -64,3 +64,27 @@ func TestIsPGArrayLiteral(t *testing.T) {
 		t.Error("empty string is not a PG array")
 	}
 }
+
+// F-07 anchor: PG json columns preserve source text verbatim, so legal JSON
+// with a space before the colon (`{"a" : 1}`) must not be rewritten as a PG
+// array; the reverse misjudgment ({":x","y"} — array element starting with a
+// colon) keeps its pass-through behavior.
+func TestIsPGArrayLiteralJSONSpaceVariant(t *testing.T) {
+	for _, c := range []string{`{"a" : 1}`, `{"k" : "v;w"}`, `{"a"  :  1}`} {
+		if isPGArrayLiteral(c) {
+			t.Errorf("JSON with spaced colon must not be treated as PG array: %s", c)
+		}
+		if got := convertSQLValue(c); got != c {
+			t.Errorf("convertSQLValue(%s) rewrote spaced JSON to %v", c, got)
+		}
+		if got := convertStringValue(c); got != c {
+			t.Errorf("convertStringValue(%s) rewrote spaced JSON to %s", c, got)
+		}
+	}
+	// Reverse direction: unchanged behavior — array element starting with a
+	// colon still matches the JSON pattern and is conservatively passed
+	// through as a string (no corruption, merely not converted).
+	if isPGArrayLiteral(`{":x", "y"}`) {
+		t.Error("array element starting with colon stays pass-through (guard false)")
+	}
+}

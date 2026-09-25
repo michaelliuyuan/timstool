@@ -1497,11 +1497,16 @@ func isPGArray(s string) bool {
 
 // isPGArrayLiteral reports whether s is a PostgreSQL array literal
 // ({1,2,3}) and NOT a JSON object ({"a":1}). JSON objects always contain a
-// "key": pattern; converting them as PG arrays rewrites JSON columns into
-// garbage. Shared by both the CSV and streaming paths (F-05).
+// quoted key followed by a colon; the colon may carry spaces before it
+// (`{"a" : 1}` — preserved verbatim by PG json columns), so the check must
+// allow whitespace between the quote and the colon. Converting JSON objects
+// as PG arrays rewrites them into garbage. Shared by both the CSV and
+// streaming paths (F-05, F-07).
 func isPGArrayLiteral(s string) bool {
-	return isPGArray(s) && !strings.Contains(s, `":`)
+	return isPGArray(s) && !jsonKeyColonRe.MatchString(s)
 }
+
+var jsonKeyColonRe = regexp.MustCompile(`"\s*:`)
 
 func pgArrayToJSON(s string) string {
 	inner := s[1 : len(s)-1]
