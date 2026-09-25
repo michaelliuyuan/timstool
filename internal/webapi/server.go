@@ -1227,6 +1227,15 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 		oldCancel()
 	}
 
+	// Stale cancel BEFORE cleanup (seq 84 ruling): the old flow stops first,
+	// so its last checkpoint write is far less likely to race RemoveAll.
+	// Reset all progress fields for a fresh run
+	_ = s.store.ResetTaskForRerun(taskID)
+
+	// Clear old logs and checkpoint data
+	s.logCollector.RemoveBuffer(taskID)
+	os.RemoveAll(fmt.Sprintf(".checkpoint/%s", taskID))
+
 	if err := s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning); err != nil {
 		// We already swapped ownership — roll the (never-started) entry back
 		// so the map stays clean; the ctx is dropped by defer-less cancel.
@@ -1235,13 +1244,6 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	// Reset all progress fields for a fresh run
-	_ = s.store.ResetTaskForRerun(taskID)
-
-	// Clear old logs and checkpoint data
-	s.logCollector.RemoveBuffer(taskID)
-	os.RemoveAll(fmt.Sprintf(".checkpoint/%s", taskID))
 
 	go s.runMigration(ctx, taskID, cfg, runID)
 
