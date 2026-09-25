@@ -321,6 +321,85 @@ func TestCancelNoLiveRunHandlerWritesCancelled(t *testing.T) {
 	}
 }
 
+// F-08 v2 ruling anchor (superseded success path): a stale run whose
+// pipeline returns SUCCESS before the resume's cancel is observed
+// (ctx.Err()==nil) must not write Completed/Failed, not store a result,
+// and not start a CDC chain — the fresh run owns the task.
+func TestSupersededRunSuccessDoesNotWriteTerminalState(t *testing.T) {
+	s, st := newTestServer(t)
+
+	taskID := "t-supersede-ok"
+	if err := st.CreateTask(&store.Task{ID: taskID, Name: "sok", Status: store.TaskStatusPaused, ConfigJSON: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	freshRelease := make(chan struct{})
+	var call int32
+	staleDone := make(chan struct{})
+	oldPipeline := runPipeline
+	defer func() { runPipeline = oldPipeline }()
+	runPipeline = func(ctx context.Context, _ config.Config, _ orchestrator.PipelineConfig) ([]orchestrator.PipelineResult, error) {
+		if atomic.AddInt32(&call, 1) == 1 {
+			// stale run: hold open until superseded, then return SUCCESS
+			// before observing the cancel (the exact race the gate closes).
+			<-release
+			close(staleDone)
+			return []orchestrator.PipelineResult{{Success: true}}, nil
+		}
+		// fresh run: hold open
+		<-freshRelease
+		return nil, nil
+	}
+
+	staleCtx, staleCancel := context.WithCancel(context.Background())
+	defer staleCancel()
+	staleRun := s.beginRun(taskID, staleCancel)
+	// CDCChain on so the un-guarded path would call startCDCChainAfterSuccess
+	// (cdcSupervisor is nil in the test server → it would log a CDC chain line).
+	go s.runMigration(staleCtx, taskID, config.Config{}, staleRun)
+	time.Sleep(150 * time.Millisecond)
+
+	_ = st.UpdateTaskStatus(taskID, store.TaskStatusRunning)
+	freshCtx, freshCancel := context.WithCancel(context.Background())
+	defer freshCancel()
+	oldCancel, freshRun := s.swapRunning(taskID, freshCancel)
+	if oldCancel == nil {
+		t.Fatal("swapRunning must return the stale cancel func")
+	}
+	oldCancel()
+	go s.runMigration(freshCtx, taskID, config.Config{}, freshRun)
+	time.Sleep(150 * time.Millisecond)
+
+	// Stale pipeline returns success AFTER losing ownership.
+	close(release)
+	select {
+	case <-staleDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale run never finished")
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	task, _ := st.GetTask(taskID)
+	if task.Status != store.TaskStatusRunning {
+		t.Fatalf("superseded stale run must not write terminal state, got %s", task.Status)
+	}
+	if task.ResultJSON != "" {
+		t.Error("superseded stale run must not store a task result")
+	}
+
+	// CDC chain must not have been started for the stale run (the test
+	// server has no cdcSupervisor, so an un-guarded call would leave a
+	// "CDC chain:" line in the task log buffer).
+	for _, e := range s.logCollector.GetBuffer(taskID).GetAll() {
+		if strings.Contains(e.Message, "CDC chain:") {
+			t.Error("superseded stale run started a CDC chain")
+		}
+	}
+
+	close(freshRelease)
+}
+
 // F-08 anchor: unregister closes the send channel so a writePump blocked
 // in range exits (no goroutine leak on idle disconnect); pending frames
 // are drained first.

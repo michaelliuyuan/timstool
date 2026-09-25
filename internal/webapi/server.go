@@ -1292,6 +1292,15 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 		return
 	}
 
+	// Ownership gate (F-08 v2 ruling): a superseded run whose pipeline
+	// returned BEFORE the resume's cancel was observed (ctx.Err()==nil)
+	// must not write any terminal state, result, progress, or start a
+	// CDC chain — the fresh run owns the task now.
+	if !owns() {
+		s.logCollector.Append(taskID, "INFO", "stale run finished (superseded by resume); skipping terminal state write", "")
+		return
+	}
+
 	// Chained-mode validation demotion (P1 deviation B): when the orchestrator
 	// aborts on a validate-phase failure it returns that failure as err AND
 	// records it in results. Re-check onlyValidateFailed here so a chained
