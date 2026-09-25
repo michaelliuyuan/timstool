@@ -12,15 +12,15 @@ import (
 // truth for "which fields a source needs" — adding an adapter auto-enables its
 // form with zero frontend changes (doc multi-source-web-form-design §4).
 type FieldSpec struct {
-	Key         string   `json:"key"`                    // "host"|"port"|"user"|"password"|"database"|"schema"|"sslmode"|...
-	Label       string   `json:"label"`                  // display label
-	Type        string   `json:"type"`                   // text|number|password|select|switch
+	Key         string   `json:"key"`   // "host"|"port"|"user"|"password"|"database"|"schema"|"sslmode"|...
+	Label       string   `json:"label"` // display label
+	Type        string   `json:"type"`  // text|number|password|select|switch
 	Required    bool     `json:"required"`
-	Default     any      `json:"default,omitempty"`      // default value (port/charset/...)
+	Default     any      `json:"default,omitempty"` // default value (port/charset/...)
 	Placeholder string   `json:"placeholder,omitempty"`
-	Options     []Option `json:"options,omitempty"`      // candidates for type=select
+	Options     []Option `json:"options,omitempty"` // candidates for type=select
 	Help        string   `json:"help,omitempty"`
-	Group       string   `json:"group"`                  // "common"|"source" (advanced reserved, added in a later batch)
+	Group       string   `json:"group"` // "common"|"source" (advanced reserved, added in a later batch)
 }
 
 // Option is one candidate for a select-type FieldSpec.
@@ -33,7 +33,7 @@ type Option struct {
 type Capabilities struct {
 	Schema bool `json:"schema"` // can read schema
 	Data   bool `json:"data"`   // can full-export data
-	CDC    bool `json:"cdc"`     // can incremental (PG=true; MySQL CDC deferred)
+	CDC    bool `json:"cdc"`    // can incremental (PG=true; MySQL CDC deferred)
 }
 
 // SourceMeta is a source's complete connection description. It drives both the
@@ -41,13 +41,13 @@ type Capabilities struct {
 // require opening a connection, so stub sources can still describe themselves
 // (Implemented=false) for the UI (doc §4).
 type SourceMeta struct {
-	Name         string       `json:"name"`                   // "postgres"
-	DisplayName  string       `json:"displayName"`            // "PostgreSQL"
-	Implemented  bool         `json:"implemented"`            // stub=false
-	DefaultPort  int          `json:"defaultPort"`            // 5432
+	Name         string       `json:"name"`        // "postgres"
+	DisplayName  string       `json:"displayName"` // "PostgreSQL"
+	Implemented  bool         `json:"implemented"` // stub=false
+	DefaultPort  int          `json:"defaultPort"` // 5432
 	Fields       []FieldSpec  `json:"fields"`
 	Capabilities Capabilities `json:"capabilities"`
-	NotImplMsg   string       `json:"notImplMsg,omitempty"`   // stub hint shown in the disabled form
+	NotImplMsg   string       `json:"notImplMsg,omitempty"` // stub hint shown in the disabled form
 }
 
 var (

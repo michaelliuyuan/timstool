@@ -15,8 +15,8 @@ import (
 )
 
 var (
-	assessFormat  string
-	assessOutput  string
+	assessFormat string
+	assessOutput string
 )
 
 var assessCmd = &cobra.Command{

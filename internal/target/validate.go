@@ -22,12 +22,12 @@ type ValidationReport struct {
 
 // TableValidation is the row-count + value-level (sample) comparison for one table.
 type TableValidation struct {
-	Name            string `json:"name"`
-	SourceRows      int64  `json:"source_rows"`
-	TargetRows      int64  `json:"target_rows"`
-	Passed          bool   `json:"passed"`
-	SampleChecked   int    `json:"sample_checked"`
-	SampleMismatches int   `json:"sample_mismatches"`
+	Name             string `json:"name"`
+	SourceRows       int64  `json:"source_rows"`
+	TargetRows       int64  `json:"target_rows"`
+	Passed           bool   `json:"passed"`
+	SampleChecked    int    `json:"sample_checked"`
+	SampleMismatches int    `json:"sample_mismatches"`
 }
 
 // ValidateMigration checks row-count parity AND value-level consistency (sampled

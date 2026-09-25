@@ -63,9 +63,9 @@ type TypeMapping struct {
 type SupportLevel string
 
 const (
-	Supported    SupportLevel = "supported"
-	Convert      SupportLevel = "convert"
-	Unsupported  SupportLevel = "unsupported"
+	Supported   SupportLevel = "supported"
+	Convert     SupportLevel = "convert"
+	Unsupported SupportLevel = "unsupported"
 )
 
 var typeMap = map[PGType]TypeMapping{

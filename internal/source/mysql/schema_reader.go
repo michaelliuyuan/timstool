@@ -112,9 +112,9 @@ func (r *schemaReader) readColumns(ctx context.Context, db *sql.DB, database, ta
 	for rows.Next() {
 		var (
 			colName, dataType, colType, isNullable string
-			colDefault, extra, comment            sql.NullString
-			colKey                                sql.NullString
-			numPrec, numScale                     sql.NullInt64
+			colDefault, extra, comment             sql.NullString
+			colKey                                 sql.NullString
+			numPrec, numScale                      sql.NullInt64
 		)
 		if err := rows.Scan(&colName, &dataType, &colType, &isNullable,
 			&colDefault, &extra, &comment, &numPrec, &numScale, &colKey); err != nil {

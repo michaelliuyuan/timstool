@@ -12,22 +12,22 @@ import (
 // Metrics holds CDC pipeline metrics for monitoring and Prometheus export.
 type Metrics struct {
 	// Source metrics
-	SourceEventsTotal    int64 `json:"source_events_total"`
-	SourceLSN            string `json:"source_lsn"`
-	SourceRunning        bool  `json:"source_running"`
+	SourceEventsTotal int64  `json:"source_events_total"`
+	SourceLSN         string `json:"source_lsn"`
+	SourceRunning     bool   `json:"source_running"`
 
 	// Applier metrics
-	ApplierEventsReceived  int64 `json:"applier_events_received"`
-	ApplierEventsApplied   int64 `json:"applier_events_applied"`
-	ApplierEventsFailed    int64 `json:"applier_events_failed"`
-	ApplierEventsSkipped   int64 `json:"applier_events_skipped"`
-	ApplierBatchesFlushed  int64 `json:"applier_batches_flushed"`
-	ApplierLastLSN         string `json:"applier_last_lsn"`
-	ApplierLastError       string `json:"applier_last_error,omitempty"`
+	ApplierEventsReceived int64  `json:"applier_events_received"`
+	ApplierEventsApplied  int64  `json:"applier_events_applied"`
+	ApplierEventsFailed   int64  `json:"applier_events_failed"`
+	ApplierEventsSkipped  int64  `json:"applier_events_skipped"`
+	ApplierBatchesFlushed int64  `json:"applier_batches_flushed"`
+	ApplierLastLSN        string `json:"applier_last_lsn"`
+	ApplierLastError      string `json:"applier_last_error,omitempty"`
 
 	// Lag metrics
-	LagSeconds     float64 `json:"lag_seconds"`
-	LagEvents      int64   `json:"lag_events"`
+	LagSeconds float64 `json:"lag_seconds"`
+	LagEvents  int64   `json:"lag_events"`
 
 	// Throughput
 	EventsPerSecond float64 `json:"events_per_second"`
@@ -37,8 +37,8 @@ type Metrics struct {
 	UptimeSeconds float64 `json:"uptime_seconds"`
 
 	// Internal
-	startTime     time.Time
-	lastCalcTime  time.Time
+	startTime      time.Time
+	lastCalcTime   time.Time
 	lastCalcEvents int64
 }
 
@@ -50,8 +50,8 @@ type MetricsCollector struct {
 	runner *Runner // for pulling live stats
 
 	// Event counters (atomic for concurrent access)
-	eventsProcessed atomic.Int64
-	eventsFailed    atomic.Int64
+	eventsProcessed  atomic.Int64
+	eventsFailed     atomic.Int64
 	bytesTransferred atomic.Int64
 }
 

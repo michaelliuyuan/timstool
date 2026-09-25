@@ -12,7 +12,7 @@ type mockReader struct {
 	tables map[string]TableState
 }
 
-func (m *mockReader) GetPhase() string { return m.phase }
+func (m *mockReader) GetPhase() string                    { return m.phase }
 func (m *mockReader) GetAllTables() map[string]TableState { return m.tables }
 func (m *mockReader) Summary() (int, int, int, int) {
 	c, f, p, r := 0, 0, 0, 0

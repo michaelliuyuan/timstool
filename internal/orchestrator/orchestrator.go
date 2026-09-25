@@ -37,10 +37,10 @@ type Orchestrator struct {
 
 func NewOrchestrator(cfg config.Config) *Orchestrator {
 	return &Orchestrator{
-		cfg:       cfg,
-		schemaMig: schema.NewMigrator(cfg),
-		dataMig:   data.NewMigrator(cfg),
-		validator: validator.NewValidator(cfg),
+		cfg:        cfg,
+		schemaMig:  schema.NewMigrator(cfg),
+		dataMig:    data.NewMigrator(cfg),
+		validator:  validator.NewValidator(cfg),
 		prechecker: precheck.NewChecker(cfg),
 	}
 }
@@ -145,6 +145,7 @@ func (o *Orchestrator) Run(ctx context.Context, pipelineCfg PipelineConfig) ([]P
 //  1. ApplyDDL — open the source adapter, read schema into CIR, CREATE TABLE on TiDB.
 //  2. LoadData — dumpling fast-path (or stream fallback) → Lightning import.
 //  3. Validate — row-count + value-level sample comparison (#t82, wired here).
+//
 // Source-agnostic: the target only sees CIR. PG is unaffected (COPY→Lightning path).
 func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, error) {
 	log := zap.L()

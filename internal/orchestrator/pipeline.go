@@ -7,17 +7,17 @@ import (
 type Phase string
 
 const (
-	PhasePrecheck  Phase = "precheck"
-	PhaseSchema    Phase = "schema"
-	PhaseData      Phase = "data"
-	PhaseValidate  Phase = "validate"
+	PhasePrecheck Phase = "precheck"
+	PhaseSchema   Phase = "schema"
+	PhaseData     Phase = "data"
+	PhaseValidate Phase = "validate"
 )
 
 type PipelineConfig struct {
-	SkipPrecheck  bool
-	SkipSchema    bool
-	SkipData      bool
-	SkipValidate  bool
+	SkipPrecheck    bool
+	SkipSchema      bool
+	SkipData        bool
+	SkipValidate    bool
 	OnErrorContinue bool
 }
 

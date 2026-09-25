@@ -16,43 +16,43 @@ type Object struct {
 type ObjectType string
 
 const (
-	ObjTable       ObjectType = "table"
-	ObjColumn      ObjectType = "column"
-	ObjIndex       ObjectType = "index"
-	ObjConstraint  ObjectType = "constraint"
-	ObjView        ObjectType = "view"
-	ObjSequence    ObjectType = "sequence"
-	ObjEnum        ObjectType = "enum"
-	ObjFunction    ObjectType = "function"
-	ObjTrigger     ObjectType = "trigger"
-	ObjExtension   ObjectType = "extension"
-	ObjCustomType  ObjectType = "custom_type"
+	ObjTable      ObjectType = "table"
+	ObjColumn     ObjectType = "column"
+	ObjIndex      ObjectType = "index"
+	ObjConstraint ObjectType = "constraint"
+	ObjView       ObjectType = "view"
+	ObjSequence   ObjectType = "sequence"
+	ObjEnum       ObjectType = "enum"
+	ObjFunction   ObjectType = "function"
+	ObjTrigger    ObjectType = "trigger"
+	ObjExtension  ObjectType = "extension"
+	ObjCustomType ObjectType = "custom_type"
 )
 
 type Column struct {
-	TableName     string
-	ColumnName    string
-	OrdinalPos    int
-	DataType      string
-	PGType        PGType
-	MaxLength     int
-	NumericPrec   int
-	NumericScale  int
-	IsNullable    bool
-	DefaultValue  string
-	IsPrimaryKey  bool
-	IsAutoIncr    bool
-	Comment       string
+	TableName    string
+	ColumnName   string
+	OrdinalPos   int
+	DataType     string
+	PGType       PGType
+	MaxLength    int
+	NumericPrec  int
+	NumericScale int
+	IsNullable   bool
+	DefaultValue string
+	IsPrimaryKey bool
+	IsAutoIncr   bool
+	Comment      string
 }
 
 type Index struct {
-	TableName  string
-	IndexName  string
-	Columns    []string
-	IsUnique   bool
-	IsPrimary  bool
-	IndexType  string
-	Where      string
+	TableName string
+	IndexName string
+	Columns   []string
+	IsUnique  bool
+	IsPrimary bool
+	IndexType string
+	Where     string
 }
 
 type ForeignKey struct {
@@ -99,12 +99,12 @@ type SchemaInfo struct {
 }
 
 type TableInfo struct {
-	Schema     string
-	Name       string
-	Columns    []Column
-	Indexes    []Index
+	Schema      string
+	Name        string
+	Columns     []Column
+	Indexes     []Index
 	ForeignKeys []ForeignKey
-	Comment    string
+	Comment     string
 }
 
 func (t *TableInfo) PrimaryKey() *Index {

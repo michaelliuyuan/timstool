@@ -40,11 +40,11 @@ type DataOpts struct {
 }
 
 type DataResult struct {
-	TotalRows    int64
-	TotalTables  int
-	TotalBytes   int64
-	Duration     string
-	ExportPath   string
+	TotalRows   int64
+	TotalTables int
+	TotalBytes  int64
+	Duration    string
+	ExportPath  string
 }
 
 type ValidateOpts struct {

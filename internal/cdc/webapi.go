@@ -9,20 +9,20 @@ import (
 
 // CDCState represents the current CDC pipeline state for the Web API.
 type CDCState struct {
-	Running    bool              `json:"running"`
-	SourceLSN  string            `json:"source_lsn"`
-	Checkpoint Checkpoint        `json:"checkpoint"`
+	Running    bool                 `json:"running"`
+	SourceLSN  string               `json:"source_lsn"`
+	Checkpoint Checkpoint           `json:"checkpoint"`
 	Stats      ApplierStatsSnapshot `json:"stats"`
-	Filter     TableFilterConfig `json:"filter"`
-	Config     CDCConfigSummary  `json:"config"`
+	Filter     TableFilterConfig    `json:"filter"`
+	Config     CDCConfigSummary     `json:"config"`
 }
 
 // TableFilterConfig is the serializable filter configuration.
 type TableFilterConfig struct {
-	IncludeTables   []string `json:"include_tables,omitempty"`
-	ExcludeTables   []string `json:"exclude_tables,omitempty"`
-	IncludeSchemas  []string `json:"include_schemas,omitempty"`
-	ExcludeSchemas  []string `json:"exclude_schemas,omitempty"`
+	IncludeTables  []string `json:"include_tables,omitempty"`
+	ExcludeTables  []string `json:"exclude_tables,omitempty"`
+	IncludeSchemas []string `json:"include_schemas,omitempty"`
+	ExcludeSchemas []string `json:"exclude_schemas,omitempty"`
 }
 
 // CDCConfigSummary is a summary of CDC config for the API.

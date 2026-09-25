@@ -23,16 +23,16 @@ const (
 
 // CDCStatusFile is the JSON the CDC process writes and the web UI reads.
 type CDCStatusFile struct {
-	Schema      int                  `json:"schema"`
-	Timestamp   time.Time            `json:"timestamp"`
-	PID         int                  `json:"pid"`
-	Slot        string               `json:"slot"`
-	Publication string               `json:"publication"`
-	LSN         string               `json:"lsn"`
-	State       CDCSelfState         `json:"state"`
-	FatalError  string               `json:"fatal_error,omitempty"`
-	Stats       CDCStatusStats       `json:"stats"`
-	Checkpoint  CDCStatusCheckpoint  `json:"checkpoint"`
+	Schema      int                 `json:"schema"`
+	Timestamp   time.Time           `json:"timestamp"`
+	PID         int                 `json:"pid"`
+	Slot        string              `json:"slot"`
+	Publication string              `json:"publication"`
+	LSN         string              `json:"lsn"`
+	State       CDCSelfState        `json:"state"`
+	FatalError  string              `json:"fatal_error,omitempty"`
+	Stats       CDCStatusStats      `json:"stats"`
+	Checkpoint  CDCStatusCheckpoint `json:"checkpoint"`
 }
 
 // CDCStatusStats holds the apply-side counters the dashboard renders.

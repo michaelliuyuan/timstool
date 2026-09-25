@@ -40,10 +40,10 @@ func TestMapType(t *testing.T) {
 
 func TestMapTypeWithPrecision(t *testing.T) {
 	tests := []struct {
-		pgType    PGType
-		prec      int
-		scale     int
-		expected  string
+		pgType   PGType
+		prec     int
+		scale    int
+		expected string
 	}{
 		{PGNumeric, 10, 2, "DECIMAL(10,2)"},
 		{PGNumeric, 10, 0, "DECIMAL(10)"},

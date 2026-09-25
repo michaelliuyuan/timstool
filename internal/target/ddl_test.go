@@ -60,9 +60,9 @@ func TestRenderCreateTable_DefaultRawPassthrough(t *testing.T) {
 	got := RenderCreateTable(source.Table{
 		Name: "t_orders",
 		Columns: []source.Column{
-			{Name: "currency", TiDBType: "CHAR(3)", Default: "'CNY'"},                  // adapter-quoted
-			{Name: "amount", TiDBType: "DECIMAL(10,2)", Default: "0.00"},               // numeric raw
-			{Name: "created_at", TiDBType: "DATETIME", Default: "CURRENT_TIMESTAMP"},   // expr raw
+			{Name: "currency", TiDBType: "CHAR(3)", Default: "'CNY'"},                // adapter-quoted
+			{Name: "amount", TiDBType: "DECIMAL(10,2)", Default: "0.00"},             // numeric raw
+			{Name: "created_at", TiDBType: "DATETIME", Default: "CURRENT_TIMESTAMP"}, // expr raw
 		},
 	})
 	if !strings.Contains(got, "DEFAULT 'CNY'") {
@@ -78,9 +78,9 @@ func TestRenderCreateTable_DefaultRawPassthrough(t *testing.T) {
 
 func TestQuoteIdent(t *testing.T) {
 	cases := map[string]string{
-		"col":       "`col`",
-		"o`db":      "`o``db`",
-		"a'b":       "`a'b`",
+		"col":        "`col`",
+		"o`db":       "`o``db`",
+		"a'b":        "`a'b`",
 		"with space": "`with space`",
 	}
 	for in, want := range cases {

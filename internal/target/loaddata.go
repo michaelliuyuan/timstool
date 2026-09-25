@@ -10,8 +10,8 @@ import (
 	"strings"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
-	"github.com/michaelliuyuan/timstool/internal/source"
 	lightningpkg "github.com/michaelliuyuan/timstool/internal/lightning"
+	"github.com/michaelliuyuan/timstool/internal/source"
 	"go.uber.org/zap"
 )
 
