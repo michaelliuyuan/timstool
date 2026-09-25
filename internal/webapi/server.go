@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -34,7 +35,7 @@ import (
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: sameOriginCheck,
 }
 
 type Server struct {
@@ -73,6 +74,12 @@ type Server struct {
 	// running tasks
 	runningTasks map[string]context.CancelFunc
 
+	// taskMu guards runningTasks and logCores: handler goroutines
+	// (start/resume/cancel) and per-task runMigration goroutines touch
+	// both maps concurrently — an unguarded map write is a fatal
+	// concurrent-map-write crash for the whole web process (F-08).
+	taskMu sync.Mutex
+
 	// standalone compare tasks (独立数据比对): single-run invariant + state
 	compare compareState
 
@@ -81,39 +88,83 @@ type Server struct {
 	logCores     map[string]*TaskLogCore
 }
 
+// wsClient is one connected browser tab. Each client owns a dedicated
+// writer goroutine (writePump) so a slow or dead consumer can only stall
+// its own send buffer — never the hub's broadcast loop (F-08).
+type wsClient struct {
+	conn *websocket.Conn
+	send chan []byte
+}
+
 type Hub struct {
-	clients    map[*websocket.Conn]bool
+	clients    map[*wsClient]bool
 	broadcast  chan []byte
-	register   chan *websocket.Conn
-	unregister chan *websocket.Conn
+	register   chan *wsClient
+	unregister chan *wsClient
 }
 
 func newHub() *Hub {
 	return &Hub{
-		clients:    make(map[*websocket.Conn]bool),
+		clients:    make(map[*wsClient]bool),
 		broadcast:  make(chan []byte, 256),
-		register:   make(chan *websocket.Conn),
-		unregister: make(chan *websocket.Conn),
+		register:   make(chan *wsClient),
+		unregister: make(chan *wsClient),
 	}
 }
+
+// wsWriteTimeout bounds a single frame write; a consumer slower than this
+// is dropped instead of blocking the broadcast loop.
+const wsWriteTimeout = 10 * time.Second
+
+const wsSendBuffer = 64
 
 func (h *Hub) Run() {
 	for {
 		select {
-		case conn := <-h.register:
-			h.clients[conn] = true
-		case conn := <-h.unregister:
-			delete(h.clients, conn)
-			conn.Close()
+		case c := <-h.register:
+			h.clients[c] = true
+			go h.writePump(c)
+		case c := <-h.unregister:
+			delete(h.clients, c)
+			c.conn.Close()
 		case msg := <-h.broadcast:
-			for conn := range h.clients {
-				if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-					delete(h.clients, conn)
-					conn.Close()
+			for c := range h.clients {
+				// Non-blocking: a client whose buffer is full is skipped
+				// (progress broadcasts are periodic; losing one frame of
+				// a stalled consumer is fine, stalling everyone is not).
+				select {
+				case c.send <- msg:
+				default:
 				}
 			}
 		}
 	}
+}
+
+func (h *Hub) writePump(c *wsClient) {
+	for msg := range c.send {
+		_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			// conn dead or too slow: the read pump in handleWebSocket will
+			// unregister this client; just stop writing.
+			return
+		}
+	}
+}
+
+// sameOriginCheck rejects cross-origin WebSocket handshakes: a browser
+// page from another origin must not be able to subscribe to task logs
+// (F-08). Non-browser clients (no Origin header) are allowed.
+func sameOriginCheck(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return u.Host == r.Host
 }
 
 func NewServer(store *store.Store, host string, port int, dataDir string, staticFS embed.FS, cdcSupervisor *CDCSupervisor, cdcStatusFile string, cdcStale time.Duration) *Server {
@@ -1165,7 +1216,7 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 	os.RemoveAll(fmt.Sprintf(".checkpoint/%s", taskID))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	s.runningTasks[taskID] = cancel
+	s.setRunningCancel(taskID, cancel)
 
 	go s.runMigration(ctx, taskID, cfg)
 
@@ -1181,11 +1232,11 @@ var runPipeline = func(ctx context.Context, cfg config.Config, pipeCfg orchestra
 
 func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Config) {
 	logCore := NewTaskLogCore(s.logCollector, taskID, nil)
-	s.logCores[taskID] = logCore
+	s.setLogCore(taskID, logCore)
 
 	defer func() {
 		logCore.Disable()
-		delete(s.logCores, taskID)
+		s.deleteLogCore(taskID)
 		logger.UnregisterExtraCore()
 	}()
 
@@ -1469,8 +1520,13 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 	json.Unmarshal([]byte(task.ConfigJSON), &cfg)
 
 	s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning)
+	// A pause never cancels the task's context, so the previous run's
+	// goroutine (and its cancel entry) may still be alive — cancel it
+	// before starting a fresh one, otherwise two runMigration goroutines
+	// race on the same task's checkpoints (F-08).
+	s.cancelRunning(taskID)
 	ctx, cancel := context.WithCancel(context.Background())
-	s.runningTasks[taskID] = cancel
+	s.setRunningCancel(taskID, cancel)
 	go s.runMigration(ctx, taskID, cfg)
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
@@ -1478,12 +1534,44 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
-	if cancel, ok := s.runningTasks[taskID]; ok {
-		cancel()
-		delete(s.runningTasks, taskID)
-	}
+	s.cancelRunning(taskID)
 	s.store.UpdateTaskStatus(taskID, store.TaskStatusCancelled)
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
+}
+
+// setRunningCancel records the cancel func for a running task (locked).
+func (s *Server) setRunningCancel(taskID string, cancel context.CancelFunc) {
+	s.taskMu.Lock()
+	s.runningTasks[taskID] = cancel
+	s.taskMu.Unlock()
+}
+
+// cancelRunning cancels and removes the task's cancel func if present.
+// The cancel call happens outside the lock: context cancel runs child
+// callbacks synchronously and any of them taking taskMu would deadlock.
+func (s *Server) cancelRunning(taskID string) bool {
+	s.taskMu.Lock()
+	cancel, ok := s.runningTasks[taskID]
+	if ok {
+		delete(s.runningTasks, taskID)
+	}
+	s.taskMu.Unlock()
+	if ok {
+		cancel()
+	}
+	return ok
+}
+
+func (s *Server) setLogCore(taskID string, core *TaskLogCore) {
+	s.taskMu.Lock()
+	s.logCores[taskID] = core
+	s.taskMu.Unlock()
+}
+
+func (s *Server) deleteLogCore(taskID string) {
+	s.taskMu.Lock()
+	delete(s.logCores, taskID)
+	s.taskMu.Unlock()
 }
 
 func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
@@ -1643,10 +1731,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	s.hub.register <- conn
+	c := &wsClient{conn: conn, send: make(chan []byte, wsSendBuffer)}
+	s.hub.register <- c
 
 	defer func() {
-		s.hub.unregister <- conn
+		s.hub.unregister <- c
 	}()
 
 	for {
