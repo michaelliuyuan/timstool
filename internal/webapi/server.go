@@ -1246,18 +1246,12 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 		oldCancel()
 	}
 
-	// Stale cancel BEFORE cleanup (seq 84 ruling): the old flow stops first,
-	// so its last checkpoint write is far less likely to race RemoveAll.
-	// Reset all progress fields for a fresh run
-	_ = s.store.ResetTaskForRerun(taskID)
-
-	// Clear old logs and checkpoint data
-	s.logCollector.RemoveBuffer(taskID)
-	os.RemoveAll(fmt.Sprintf(".checkpoint/%s", taskID))
-
 	// F-08-2 item 7 ("Plan A"): stamp the ownership generation into the row
-	// TOGETHER with Running — every migration-run store write below is now
-	// conditional on run_id, closing the µs window at the database itself.
+	// TOGETHER with Running, IMMEDIATELY after the swap (F-09 item 5 order
+	// fix): while the row still carries the old generation, an in-flight
+	// stale write conditioned on that old run_id can land. Stamping before
+	// the reset/cleanup tail closes that window — ResetTaskForRerun does
+	// not touch status/run_id, so clearing fields after the stamp is safe.
 	if err := s.store.SetTaskRun(taskID, runID); err != nil {
 		// We already swapped ownership — roll the (never-started) entry back
 		// so the map stays clean; the ctx is dropped by defer-less cancel.
@@ -1266,6 +1260,15 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	// Stale cancel BEFORE cleanup (seq 84 ruling): the old flow stops first,
+	// so its last checkpoint write is far less likely to race RemoveAll.
+	// Reset all progress fields for a fresh run
+	_ = s.store.ResetTaskForRerun(taskID)
+
+	// Clear old logs and checkpoint data
+	s.logCollector.RemoveBuffer(taskID)
+	os.RemoveAll(fmt.Sprintf(".checkpoint/%s", taskID))
 
 	go s.runMigration(ctx, taskID, cfg, runID)
 
