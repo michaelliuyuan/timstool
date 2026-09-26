@@ -305,7 +305,8 @@ function copyDDL() {
       <el-row :gutter="16" style="margin-bottom: 20px;">
         <el-col :span="6" v-for="(key, idx) in ['compatible', 'convertible', 'manual_needed', 'incompatible']" :key="key">
           <el-card shadow="never" :body-style="{ textAlign: 'center', padding: '20px' }">
-            <div :style="{ fontSize: '32px', fontWeight: 700, color: ['#52c41a','#faad14','#fa8c16','#f5222d'][idx] }">
+            <!-- #t2 P1(adversarial ⚠️-1)：原 #52c41a/#faad14/#fa8c16/#f5222d 白底 2.27/1.90/2.38/4.08 连大字 3:1 都不达标，换 AA 档（映射=fixer 提案 seq 23 + positive 数值背书 seq 24） -->
+            <div :style="{ fontSize: '32px', fontWeight: 700, color: ['var(--tims-tag-success-text)', 'var(--tims-tag-warning-text)', 'var(--tims-tag-manual-text)', 'var(--tims-tag-danger-text)'][idx] }">
               {{ report.summary[key] || 0 }}
             </div>
             <div style="font-size: var(--tims-font-sm); color: var(--tims-text-2); margin-top: 4px;">
@@ -327,9 +328,10 @@ function copyDDL() {
           <el-table-column prop="total" label="对象数" width="100" align="center" />
           <el-table-column label="得分" width="220">
             <template #default="{ row }">
+              <!-- #t2 ⚠️-1 填充色族同步 AA -->
               <el-progress
                 :percentage="Math.round(row.score)"
-                :color="row.score >= 90 ? '#52c41a' : row.score >= 70 ? '#faad14' : row.score >= 40 ? '#fa8c16' : '#f5222d'"
+                :color="row.score >= 90 ? '#0b7a7a' : row.score >= 70 ? '#9a5700' : row.score >= 40 ? '#7a4300' : '#c02f2f'"
                 :stroke-width="10"
               />
             </template>

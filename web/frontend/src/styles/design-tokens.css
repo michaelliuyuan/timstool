@@ -77,6 +77,7 @@
   --tims-tag-warning-text: #9a5700; /* on #faf1e3 = 5.02 / on #fff = 5.62 */
   --tims-tag-danger-text: #c02f2f;  /* on #fdf1f1 = 5.16 / on #fff = 5.69 */
   --tims-tag-info-text: #606266;    /* on #f4f4f5 = 5.56 / on #fff = 5.56 */
+  --tims-tag-manual-text: #7a4300;  /* #t2 ⚠️-1 需手动档深琥珀（比 warning 深一档区分，on #fff = 7.98） */
   --tims-ok-text: #2e7d0a;          /* on #f6ffed = 5.04 / on #fff = 5.18 */
 
   /* --- Element Plus re-skin --- */
