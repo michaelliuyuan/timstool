@@ -6,11 +6,12 @@
     <SyncCompareCard current="cdc" />
 
     <!-- Module disabled (cdc.enable=false) -->
-    <div class="disabled-card" v-if="disabled">
+    <!-- P1 巡检修复 #7：div → el-card，白底/边框/圆角由 el-card 皮肤提供 -->
+    <el-card class="disabled-card" v-if="disabled">
       <h3>CDC 模块未启用</h3>
       <p>当前部署未开启 CDC 实时同步（<code>cdc.enable: false</code>）。</p>
       <p class="hint">如需使用：在 config.yaml 设置 <code>cdc.enable: true</code>，或用 <code>pg2tidb cdc --enable-cdc</code> 启动。</p>
-    </div>
+    </el-card>
 
     <template v-else>
     <!-- Signature pipeline strip -->
@@ -20,7 +21,8 @@
     />
 
     <!-- Connection card (A1): the live config.yaml the CDC child uses -->
-    <div class="detail-card" v-if="connCfg">
+    <!-- P1 巡检修复 #7：div → el-card（下同） -->
+    <el-card class="detail-card" v-if="connCfg">
       <h3>连接信息（CDC 实际使用）</h3>
       <div class="detail-row">
         <span class="detail-label">配置文件:</span>
@@ -83,10 +85,10 @@
         </div>
         <div v-if="connMsg" class="control-msg" :class="{ error: connError }">{{ connMsg }}</div>
       </div>
-    </div>
+    </el-card>
 
     <!-- Precheck panel (A2): run before Start; fail items block -->
-    <div class="detail-card" v-if="precheck">
+    <el-card class="detail-card" v-if="precheck">
       <h3>启动预检 <el-button size="small" style="margin-left: 8px;" @click="runPrecheck" :disabled="checking" :loading="checking">{{ checking ? '检查中…' : '重新检查' }}</el-button></h3>
       <div v-for="it in precheck.items" :key="it.item" class="precheck-row" :class="it.level">
         <span class="precheck-dot">{{ it.level === 'ok' ? '✓' : it.level === 'warn' ? '!' : '✗' }}</span>
@@ -103,10 +105,11 @@
       <div class="control-actions" style="margin-top: 8px;" v-if="precheck.checkpoint.exists && !isActive">
         <el-button type="danger" plain size="small" @click="resetCheckpoint">重置断点（危险）</el-button>
       </div>
-    </div>
+    </el-card>
 
     <!-- Control panel: one-click start/stop (#t55) -->
-    <div class="control-card">
+    <!-- P1 巡检修复 #7：div → el-card -->
+    <el-card class="control-card">
       <div class="control-head">
         <span class="control-badge" :class="controlState">{{ controlLabel }}</span>
         <span v-if="control && control.restarts > 0" class="control-restarts">自动重启 {{ control.restarts }} 次</span>
@@ -116,7 +119,7 @@
         <el-button type="danger" :disabled="busy || !canStop" @click="confirmStopCDC">停止 CDC</el-button>
       </div>
       <div v-if="controlMsg" class="control-msg" :class="{ error: controlError }">{{ controlMsg }}</div>
-    </div>
+    </el-card>
 
     <!-- Status Card -->
     <div class="status-card" :class="cardState">
@@ -172,7 +175,7 @@
     </div>
 
     <!-- Checkpoint Card -->
-    <div class="detail-card" v-if="checkpoint && checkpoint.lsn">
+    <el-card class="detail-card" v-if="checkpoint && checkpoint.lsn">
       <h3>检查点</h3>
       <div class="detail-row">
         <span class="detail-label">LSN:</span>
@@ -186,10 +189,10 @@
         <span class="detail-label">更新时间:</span>
         <span>{{ checkpoint.updated_at ? new Date(checkpoint.updated_at).toLocaleString() : '-' }}</span>
       </div>
-    </div>
+    </el-card>
 
     <!-- Config Card (from status: slot/publication/pid) -->
-    <div class="detail-card" v-if="status.slot || status.publication">
+    <el-card class="detail-card" v-if="status.slot || status.publication">
       <h3>配置</h3>
       <div class="detail-row" v-if="status.slot">
         <span class="detail-label">Slot:</span>
@@ -207,10 +210,10 @@
         <span class="detail-label">运行时长:</span>
         <span>{{ formatUptime(status.uptime_seconds) }}</span>
       </div>
-    </div>
+    </el-card>
 
     <!-- Live slot / lag card (A3): restart_lsn + retained WAL + checkpoint age -->
-    <div class="detail-card" v-if="slotView && slotView.slot.exists">
+    <el-card class="detail-card" v-if="slotView && slotView.slot.exists">
       <h3>Slot 与延迟</h3>
       <div class="detail-row">
         <span class="detail-label">restart_lsn:</span>
@@ -228,13 +231,14 @@
         <code>{{ slotView.checkpoint.lsn }}</code>
         <span class="detail-hint">（{{ Math.floor(slotView.checkpoint_age_seconds || 0) }}s 前更新）</span>
       </div>
-    </div>
+    </el-card>
 
     <!-- Error display -->
-    <div class="error-card" v-if="stats && stats.last_error">
+    <!-- P1 巡检修复 #7：div → el-card -->
+    <el-card class="error-card" v-if="stats && stats.last_error">
       <h3>最近错误</h3>
       <pre>{{ stats.last_error }}</pre>
-    </div>
+    </el-card>
 
     <!-- Refresh button -->
     <div class="actions">
@@ -716,28 +720,30 @@ onUnmounted(() => {
   gap: 8px;
   flex-wrap: wrap;
 }
-.ds-import-label { font-size: 12.5px; color: var(--tims-text-2, #909399); }
+.ds-import-label { font-size: var(--tims-font-xs); color: var(--tims-text-2, #909399); } /* P1 巡检修复 #7 字号归一 */
 .ds-import-arrow { color: var(--tims-text-2, #909399); }
 .ds-import-select { width: 180px; }
 
 .cdc-container {
   /* width & centering come from the shared .tims-page class */
 }
+.cdc-container code { word-break: break-all; } /* #t2 375 视口长 LSN/配置串防御性换行 */
 
 .status-card {
   border-radius: var(--tims-radius); padding: 24px; margin-bottom: 24px;
   box-shadow: var(--tims-shadow);
 }
-.status-card.running { background: linear-gradient(135deg, #0fa3a3, #2cb4ad); color: #fff; }
-.status-card.starting { background: linear-gradient(135deg, #2c4a8f, #4b6cb3); color: #fff; }
+/* #t2 对比度二轮：状态横幅渐变两档白字均 ≥4.5 */
+.status-card.running { background: linear-gradient(135deg, #0b7a7a, #0d8484); color: #fff; }
+.status-card.starting { background: linear-gradient(135deg, #2c4a8f, #3d5ea3); color: #fff; }
 .status-card.stopped { background: #eef0f6; color: var(--tims-text-2); }
-.status-card.halted { background: linear-gradient(135deg, #e13c3c, #ee6a6a); color: #fff; }
-.status-card.stale { background: linear-gradient(135deg, #d97e00, #e8a548); color: #fff; }
+.status-card.halted { background: linear-gradient(135deg, #c02f2f, #d03a3a); color: #fff; }
+.status-card.stale { background: linear-gradient(135deg, #9a5700, #a86200); color: #fff; }
 .status-indicator { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .status-dot { width: 12px; height: 12px; border-radius: 50%; background: #d9d9d9; }
 .status-dot.active { background: #fff; animation: pulse 2s infinite; }
 .status-text { font-size: 18px; font-weight: 600; }
-.status-meta { font-size: 13px; opacity: 0.85; }
+.status-meta { font-size: var(--tims-font-sm); opacity: 0.85; }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
@@ -754,81 +760,76 @@ onUnmounted(() => {
   box-shadow: var(--tims-shadow);
 }
 .stat-value {
-  font-family: var(--tims-font-mono); font-weight: 500; font-size: 26px;
+  font-family: var(--tims-font-mono); font-weight: 500; font-size: var(--tims-font-xl); /* #t2 P2 字号归一：26→22 大数值档 */
   letter-spacing: -0.5px; color: var(--tims-text);
 }
 .stat-value.error { color: var(--tims-brand); }
 .stat-label { font-size: 12px; color: var(--tims-text-2); margin-top: 4px; letter-spacing: 0.4px; }
 
-.detail-card {
-  background: var(--tims-card); border-radius: var(--tims-radius); padding: 20px; margin-bottom: 16px;
-  border: 1px solid var(--tims-border);
-  box-shadow: var(--tims-shadow);
-}
-.detail-card h3 { font-size: 16px; margin-bottom: 12px; color: #1a1a2e; }
+/* P1 巡检修复 #7：div → el-card，白底/边框/圆角/阴影由全局 .el-card 皮肤提供，此处仅保留间距 */
+.detail-card { margin-bottom: 16px; }
+.detail-card h3 { font-size: var(--tims-font-md); margin-bottom: 12px; color: var(--tims-text); } /* P1 巡检修复 #7 字号/灰阶 */
 .detail-row { display: flex; align-items: center; padding: 6px 0; font-size: 14px; }
-.detail-label { width: 100px; color: #666; }
-code { background: #f0f0f0; padding: 2px 8px; border-radius: 4px; font-size: 13px; }
+.detail-label { width: 100px; color: var(--tims-text-2); } /* P1 巡检修复 #7 灰阶统一 */
+code { background: #f0f0f0; padding: 2px 8px; border-radius: 4px; font-size: var(--tims-font-sm); } /* P1 巡检修复 #7 字号归一 */
 
-.error-card {
-  background: #fff1f0; border: 1px solid #ffccc7; border-radius: 12px;
-  padding: 16px; margin-bottom: 16px;
-}
-.error-card h3 { font-size: 16px; color: #cf1322; margin-bottom: 8px; }
-.error-card pre { font-size: 13px; color: #cf1322; white-space: pre-wrap; word-break: break-all; }
+/* P1 巡检修复 #7：div → el-card，仅覆盖语义色底/边框色（单层框）；#cf1322 深红达标保留 */
+.error-card { background: #fff1f0; border-color: #ffccc7; margin-bottom: 16px; }
+.error-card :deep(.el-card__body) { padding: 16px; }
+.error-card h3 { font-size: var(--tims-font-md); color: #cf1322; margin-bottom: 8px; }
+.error-card pre { font-size: var(--tims-font-sm); color: #cf1322; white-space: pre-wrap; word-break: break-all; }
 
 .actions {
   display: flex; align-items: center; gap: 16px; margin-top: 16px;
 }
 
-.control-card {
-  background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 24px;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-  display: flex; flex-direction: column; gap: 12px;
-}
+/* P1 巡检修复 #7：div → el-card，外观由 el-card 提供，仅保留间距与纵向布局 */
+.control-card { margin-bottom: 24px; }
+.control-card :deep(.el-card__body) { display: flex; flex-direction: column; gap: 12px; }
 .control-head { display: flex; align-items: center; gap: 12px; }
 .control-badge {
-  font-size: 13px; font-weight: 600; padding: 4px 12px; border-radius: 12px;
-  background: #f0f0f0; color: #666;
+  font-size: var(--tims-font-sm); font-weight: 600; padding: 4px 12px; border-radius: 12px;
+  background: #f0f0f0; color: var(--tims-text-2); /* P1 巡检修复 #7 字号/灰阶；胶囊圆角保留 */
 }
-.control-badge.running, .control-badge.adopted { background: #f6ffed; color: #389e0d; }
+.control-badge.running, .control-badge.adopted { background: #f6ffed; color: var(--tims-ok-text); } /* P1 巡检修复 #9：#389e0d(3.37:1) → AA 绿 */
 .control-badge.starting, .control-badge.stopping { background: #e6f7ff; color: #1890ff; }
 .control-badge.failed { background: #fff1f0; color: #cf1322; }
-.control-restarts { font-size: 12px; color: #faad14; }
+.control-restarts { font-size: 12px; color: var(--tims-tag-warning-text); } /* P1 巡检修复 #9：#faad14(≈2.2:1) → AA */
 .control-actions { display: flex; gap: 12px; align-items: center; }
-.control-msg { font-size: 13px; color: #52c41a; }
+.control-msg { font-size: var(--tims-font-sm); color: var(--tims-ok-text); } /* P1 巡检修复 #9：#52c41a → AA 绿；字号 #7 */
 .control-msg.error { color: #cf1322; }
 
-.disabled-card {
-  background: #fff; border: 1px dashed #d9d9d9; border-radius: 12px;
-  padding: 32px 24px; text-align: center; color: #666;
-}
-.disabled-card h3 { font-size: 18px; color: #1a1a2e; margin-bottom: 12px; }
+/* P1 巡检修复 #7：div → el-card，保留 dashed 边框语义；灰阶/字号统一 */
+.disabled-card { border-style: dashed; text-align: center; color: var(--tims-text-2); }
+.disabled-card :deep(.el-card__body) { padding: 32px 24px; }
+.disabled-card h3 { font-size: var(--tims-font-md); color: var(--tims-text); margin-bottom: 12px; }
 .disabled-card p { font-size: 14px; margin: 6px 0; }
-.disabled-card .hint { color: #999; font-size: 13px; }
+.disabled-card .hint { color: var(--tims-text-2); font-size: var(--tims-font-sm); }
 .disabled-card code { background: #f0f0f0; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
-.auto-refresh { font-size: 12px; color: #999; }
+.auto-refresh { font-size: 12px; color: var(--tims-text-2); } /* P1 巡检修复 #7 灰阶统一 */
 
 /* A1 connection edit form */
 .conn-edit { margin-top: 12px; padding: 12px; background: #fafafa; border-radius: 8px; }
-.conn-edit-section { font-size: 13px; font-weight: 600; color: #1a1a2e; margin: 8px 0; }
+.conn-edit-section { font-size: var(--tims-font-sm); font-weight: 600; color: var(--tims-text); margin: 8px 0; } /* P1 巡检修复 #7 字号/灰阶 */
 .conn-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-.conn-grid label { display: flex; flex-direction: column; font-size: 12px; color: #666; gap: 2px; }
+.conn-grid label { display: flex; flex-direction: column; font-size: 12px; color: var(--tims-text-2); gap: 2px; } /* P1 巡检修复 #7 灰阶统一 */
 .conn-grid-num { width: 100%; }
 
 /* A2 precheck panel */
-.precheck-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 0; font-size: 13px; border-bottom: 1px dashed #f0f0f0; }
+.precheck-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 0; font-size: var(--tims-font-sm); border-bottom: 1px dashed #f0f0f0; } /* P1 巡检修复 #7 字号归一 */
 .precheck-dot { width: 18px; height: 18px; border-radius: 50%; color: #fff; font-size: 12px; display: inline-flex; align-items: center; justify-content: center; flex: none; align-self: center; }
 .precheck-row.ok .precheck-dot { background: #52c41a; }
 .precheck-row.warn .precheck-dot { background: #faad14; }
 .precheck-row.fail .precheck-dot { background: #f5222d; }
-.precheck-label { font-weight: 600; color: #1a1a2e; flex: none; width: 150px; }
-.precheck-detail { color: #666; word-break: break-all; }
-.resume-box { margin-top: 12px; padding: 10px 12px; background: #f6ffed; border: 1px solid #b7eb8f; border-radius: 8px; font-size: 13px; color: #389e0d; }
+.precheck-label { font-weight: 600; color: var(--tims-text); flex: none; width: 150px; } /* P1 巡检修复 #7 灰阶统一 */
+.precheck-detail { color: var(--tims-text-2); word-break: break-all; } /* P1 巡检修复 #7 灰阶统一 */
+/* P1 巡检修复 #7 圆角/字号 + #9：#389e0d(3.37:1) → AA 绿 */
+.resume-box { margin-top: 12px; padding: 10px 12px; background: #f6ffed; border: 1px solid #b7eb8f; border-radius: var(--tims-radius-s); font-size: var(--tims-font-sm); color: var(--tims-ok-text); }
 
 /* A3 slot card */
-.tag-ok { font-size: 12px; padding: 1px 8px; border-radius: 10px; background: #f6ffed; color: #389e0d; margin-left: 8px; }
-.tag-warn { font-size: 12px; padding: 1px 8px; border-radius: 10px; background: #fff7e6; color: #d48806; margin-left: 8px; }
-.detail-hint { font-size: 12px; color: #999; margin-left: 8px; }
+/* P1 巡检修复 #9：tag 文字换 AA 深色（#389e0d/#d48806 不足 4.5:1）；胶囊圆角保留 */
+.tag-ok { font-size: 12px; padding: 1px 8px; border-radius: 10px; background: #f6ffed; color: var(--tims-ok-text); margin-left: 8px; }
+.tag-warn { font-size: 12px; padding: 1px 8px; border-radius: 10px; background: #fff7e6; color: var(--tims-tag-warning-text); margin-left: 8px; }
+.detail-hint { font-size: 12px; color: var(--tims-text-2); margin-left: 8px; } /* P1 巡检修复 #7 灰阶统一 */
 .lag-warn { color: #cf1322; font-weight: 700; }
 </style>

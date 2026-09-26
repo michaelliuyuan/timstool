@@ -60,12 +60,12 @@ withDefaults(
   padding: 8px 14px;
   border-radius: var(--tims-radius-s);
   font-weight: 600;
-  font-size: 13px;
+  font-size: var(--tims-font-sm);
   letter-spacing: 0.3px;
   white-space: nowrap;
 }
 .dps-src { background: var(--tims-ink); color: var(--tims-text-inv); }
-.dps-dst { background: var(--tims-teal-soft); color: var(--tims-teal); border: 1px solid rgba(15, 163, 163, 0.35); }
+.dps-dst { background: var(--tims-teal-soft); color: var(--tims-tag-success-text); border: 1px solid rgba(15, 163, 163, 0.35); } /* #t2 对比度二轮：仅改文字色 */
 
 .dps-flow {
   position: relative;
@@ -102,8 +102,10 @@ withDefaults(
   position: absolute;
   top: -9px;
   right: -2px;
-  font-size: 11px;
+  font-size: var(--tims-font-xs);
   line-height: 1;
+  display: inline-flex;
+  min-width: 1em; /* #t2 P2：▶ 字形占位不足致 375 瞬态溢出 */
 }
 .dps.is-running .dps-arrow { animation: dps-travel 2.4s linear infinite; }
 @keyframes dps-travel {
@@ -127,15 +129,15 @@ withDefaults(
   border-radius: 999px;
   background: var(--tims-work);
   border: 1px solid var(--tims-border);
-  font-size: 11px;
+  font-size: var(--tims-font-xs);
 }
 .dps.is-running .dps-badge { border-color: rgba(15, 163, 163, 0.35); }
 .dps-badge-label { color: var(--tims-text-2); }
-.dps-badge-value { color: var(--tims-text); font-size: 11px; }
+.dps-badge-value { color: var(--tims-text); font-size: var(--tims-font-xs); }
 
 /* Mini variant: topbar / compact cards */
 .dps.is-mini { padding: 6px 8px; box-shadow: none; border: none; background: transparent; }
-.dps.is-mini .dps-node { padding: 3px 8px; font-size: 11px; }
+.dps.is-mini .dps-node { padding: 3px 8px; font-size: var(--tims-font-xs); }
 .dps.is-mini .dps-line { border-top-width: 1.5px; }
 
 @media (prefers-reduced-motion: reduce) {

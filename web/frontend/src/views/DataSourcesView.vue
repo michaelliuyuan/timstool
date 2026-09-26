@@ -176,7 +176,7 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
       <template #header>
         <div style="display: flex; align-items: center; justify-content: space-between;">
           <span style="font-weight: 600;">已保存数据源（{{ sorted.length }}）</span>
-          <el-button type="primary" size="small" @click="openCreate">新建数据源</el-button>
+          <el-button type="primary" @click="openCreate">新建数据源</el-button>
         </div>
       </template>
 
@@ -266,11 +266,11 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
 <style scoped>
 .ds-mono {
   font-family: var(--tims-mono, 'JetBrains Mono', Consolas, monospace);
-  font-size: 12.5px;
+  font-size: var(--tims-font-xs);
 }
-.ds-dim { color: var(--tims-text-2, #909399); font-size: 12px; margin-left: 6px; }
-.ds-hint { color: var(--tims-text-2, #909399); font-size: 12px; line-height: 1.4; margin-top: 2px; }
-.ds-test-result { margin-top: 8px; font-size: 12.5px; }
-.ds-test-result.ok { color: var(--tims-teal, #0fa3a3); }
-.ds-test-result.bad { color: var(--tims-brand, #e13c3c); }
+.ds-dim { color: var(--tims-text-2, #6b7280); font-size: var(--tims-font-xs); margin-left: 6px; }
+.ds-hint { color: var(--tims-text-2, #6b7280); font-size: var(--tims-font-xs); line-height: 1.4; margin-top: 2px; }
+.ds-test-result { margin-top: 8px; font-size: var(--tims-font-xs); }
+.ds-test-result.ok { color: var(--tims-tag-success-text, #0b7a7a); }
+.ds-test-result.bad { color: var(--tims-tag-danger-text, #c02f2f); }
 </style>

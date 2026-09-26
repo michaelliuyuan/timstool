@@ -34,7 +34,7 @@ defineProps<{
 }
 .tims-page-header__subtitle {
   margin: 4px 0 0;
-  font-size: 13px;
+  font-size: var(--tims-font-sm);
   color: var(--tims-text-2, #6b7280);
 }
 .tims-page-header__actions {

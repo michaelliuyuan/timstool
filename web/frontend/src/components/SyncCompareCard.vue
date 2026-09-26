@@ -59,7 +59,7 @@ const active = ref<string[]>([])
 .cmp-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: var(--tims-font-sm);
   margin-bottom: 10px;
 }
 .cmp-table th,
@@ -86,7 +86,7 @@ const active = ref<string[]>([])
   white-space: nowrap;
 }
 .cmp-foot {
-  font-size: 13px;
+  font-size: var(--tims-font-sm);
   color: var(--tims-text-2);
   margin: 0 0 4px;
 }

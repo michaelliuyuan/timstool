@@ -239,7 +239,7 @@ function copyDDL() {
             </el-col>
             <el-col :span="12">
               <el-form-item label="端口">
-                <el-input-number v-model="sourceForm.port" :min="1" :max="65535" controls-position="right" style="width: 100%;" />
+                <el-input-number v-model="sourceForm.port" :min="1" :max="65535" style="width: 100%;" />
               </el-form-item>
             </el-col>
             <el-col :span="12">
@@ -308,7 +308,7 @@ function copyDDL() {
             <div :style="{ fontSize: '32px', fontWeight: 700, color: ['#52c41a','#faad14','#fa8c16','#f5222d'][idx] }">
               {{ report.summary[key] || 0 }}
             </div>
-            <div style="font-size: 13px; color: #666; margin-top: 4px;">
+            <div style="font-size: var(--tims-font-sm); color: var(--tims-text-2); margin-top: 4px;">
               {{ ['兼容', '可转换', '需手动', '不兼容'][idx] }}
             </div>
           </el-card>

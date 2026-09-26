@@ -40,10 +40,10 @@
   --tims-ink-3: #1c2742;      /* 墨蓝 hover */
   --tims-work: #f6f7fb;       /* 工作区底 */
   --tims-card: #ffffff;       /* 卡片底 */
-  --tims-brand: #e13c3c;      /* 品牌红 */
+  --tims-brand: #cc3030;      /* 品牌红 #t2 对比度二轮：白字 5.21 */
   --tims-brand-soft: rgba(225, 60, 60, 0.09);
-  --tims-teal: #0fa3a3;       /* 数据青：运行/成功 */
-  --tims-teal-soft: rgba(15, 163, 163, 0.10);
+  --tims-teal: #0d8484;       /* 数据青 #t2 对比度二轮：白字 4.52 */
+  --tims-teal-soft: rgba(13, 132, 132, 0.10); /* #t2 色相跟随 */
   --tims-amber: #d97e00;      /* 琥珀：warn */
   --tims-amber-soft: rgba(217, 126, 0, 0.10);
   --tims-text: #2a3040;       /* 主文字 */
@@ -54,26 +54,41 @@
   --tims-border-ink: #263154;
 
   /* Shape & depth */
-  --tims-radius: 12px;
-  --tims-radius-s: 8px;
+  --tims-radius: 12px;   /* 大容器档（卡片级） */
+  --tims-radius-s: 8px;  /* 控件档（全站唯一控件圆角） */
   --tims-content-width: 1200px; /* unified main-module container width */
   --tims-shadow: 0 1px 2px rgba(12, 18, 34, 0.04), 0 4px 14px rgba(12, 18, 34, 0.06);
   --tims-shadow-lift: 0 2px 4px rgba(12, 18, 34, 0.06), 0 10px 28px rgba(12, 18, 34, 0.10);
 
-  /* Type */
+  /* Type — 字号四档：12 / 14 / 16 / 22（xl 为大数值展示档） */
+  --tims-font-xs: 12px;
+  --tims-font-sm: 14px;
+  --tims-font-md: 16px;
+  --tims-font-xl: 22px;
   --tims-font-ui: 'TiMS Inter', 'HarmonyOS Sans SC', 'MiSans', 'Segoe UI', system-ui, sans-serif;
   --tims-font-mono: 'TiMS Mono', 'JetBrains Mono', Consolas, ui-monospace, monospace;
 
+  /* Button sizing — 行内操作 24px / 主操作 32px */
+  --tims-btn-inline-h: 24px;
+  --tims-btn-main-h: 32px;
+
+  /* Status text on soft backgrounds — WCAG AA (≥4.5:1) deep variants */
+  --tims-tag-success-text: #0b7a7a; /* on #eef8f8 = 4.76 / on #fff = 5.15 */
+  --tims-tag-warning-text: #9a5700; /* on #faf1e3 = 5.02 / on #fff = 5.62 */
+  --tims-tag-danger-text: #c02f2f;  /* on #fdf1f1 = 5.16 / on #fff = 5.69 */
+  --tims-tag-info-text: #606266;    /* on #f4f4f5 = 5.56 / on #fff = 5.56 */
+  --tims-ok-text: #2e7d0a;          /* on #f6ffed = 5.04 / on #fff = 5.18 */
+
   /* --- Element Plus re-skin --- */
   --el-color-primary: var(--tims-brand);
-  --el-color-primary-light-3: #ea6a6a;
+  --el-color-primary-light-3: #d03333; /* #t2 对比度二轮：悬停白字 5.00 */
   --el-color-primary-light-5: #f19c9c;
   --el-color-primary-light-7: #f8cfcf;
   --el-color-primary-light-8: #fbe2e2;
   --el-color-primary-light-9: #fdf1f1;
   --el-color-primary-dark-2: #b43030;
   --el-color-success: var(--tims-teal);
-  --el-color-success-light-3: #4fb5b5;
+  --el-color-success-light-3: #0c8282; /* #t2 对比度二轮：悬停白字 4.63 */
   --el-color-success-light-5: #86cfcf;
   --el-color-success-light-7: #bde7e7;
   --el-color-success-light-8: #dbf1f1;
@@ -83,7 +98,11 @@
   --el-color-warning-light-9: #faf1e3;
   --el-color-danger: var(--tims-brand);
   --el-color-info: #6b7280;
+  /* Placeholder / 未激活步骤标题等浅灰文字统一加深一档：
+     #a8abb2(2.30:1) → #6b7280(4.83:1，AA) */
+  --el-text-color-placeholder: var(--tims-text-2);
   --el-border-radius-base: 8px;
+  --el-border-radius-small: 8px; /* #t2 P2：EP small 档默认 calc(base-1px)=7px，圆角收敛为唯一 8px 控件档 */
   --el-border-color: var(--tims-border);
   --el-border-color-light: var(--tims-border);
   --el-text-color-primary: var(--tims-text);
@@ -94,6 +113,34 @@
 }
 
 html, body, #app { height: 100%; }
+
+/* --- Element Plus tag family: AA-compliant deep text on light/plain fills ---
+   light 与 plain 两种 effect 共用 --el-tag-text-color，一处覆盖同时生效；
+   dark（反白）不变。原色/底对比：teal 2.86 · amber 3.03 · red 3.87 · info 2.80 */
+.el-tag.el-tag--success:not(.el-tag--dark) { --el-tag-text-color: var(--tims-tag-success-text); }
+.el-tag.el-tag--warning:not(.el-tag--dark) { --el-tag-text-color: var(--tims-tag-warning-text); }
+.el-tag.el-tag--danger:not(.el-tag--dark) { --el-tag-text-color: var(--tims-tag-danger-text); }
+.el-tag.el-tag--error:not(.el-tag--dark) { --el-tag-text-color: var(--tims-tag-danger-text); }
+.el-tag.el-tag--primary:not(.el-tag--dark) { --el-tag-text-color: var(--tims-tag-danger-text); } /* primary = 品牌红 */
+.el-tag.el-tag--info:not(.el-tag--dark) { --el-tag-text-color: var(--tims-tag-info-text); }
+
+/* --- Button sizing: inline ops 24px / primary 32px（link 型默认高度不足 24） --- */
+.el-button--small { height: var(--tims-btn-inline-h); }
+.el-button.is-link { height: var(--tims-btn-inline-h); padding-block: 0; }
+.el-button.is-text { height: var(--tims-btn-inline-h); }
+
+/* --- #t2 P2 档位终末收敛：EP small 档圆角硬编码 calc(base-1px)=7px、进度条文本随
+   strokeWidth 22×0.8=17.6px（JS 内联），统一到 8px 控件档 / 16px 字号档 --- */
+.el-button--small, .el-checkbox--small, .el-segmented--small { border-radius: var(--el-border-radius-small); }
+.el-segmented__item, .el-segmented__item-selected { border-radius: calc(var(--el-border-radius-small) - 2px); }
+.el-progress__text { font-size: var(--tims-font-md) !important; }
+
+/* #t2 对比度二轮：禁用态按钮标准化（EP 皮肤禁用实心 success/danger 钮白字仅 1.77） */
+.el-button.is-disabled {
+  --el-button-text-color: var(--el-text-color-placeholder);
+  --el-button-bg-color: var(--el-fill-color-light);
+  --el-button-border-color: var(--el-border-color-light);
+}
 
 body {
   margin: 0;
@@ -146,11 +193,11 @@ body {
 .tims-gauge .tims-gauge-value {
   font-family: var(--tims-font-mono);
   font-weight: 500;
-  font-size: 26px;
+  font-size: var(--tims-font-xl);
   line-height: 1.15;
   color: var(--tims-text);
 }
-.tims-gauge .tims-gauge-value.is-teal { color: var(--tims-teal); }
+.tims-gauge .tims-gauge-value.is-teal { color: var(--tims-tag-success-text); } /* #t2 对比度二轮 */
 .tims-gauge .tims-gauge-value.is-brand { color: var(--tims-brand); }
 .tims-gauge .tims-gauge-value.is-amber { color: var(--tims-amber); }
 .tims-gauge .tims-gauge-sub {
@@ -166,14 +213,14 @@ body {
   border: 1px solid var(--tims-border-ink);
   padding: 14px 16px;
   font-family: var(--tims-font-mono);
-  font-size: 12.5px;
+  font-size: var(--tims-font-xs);
   line-height: 1.7;
   color: var(--tims-text-inv);
   overflow: auto;
 }
 .tims-terminal .t-log-line { white-space: pre-wrap; word-break: break-all; }
 .tims-terminal .t-ts { color: var(--tims-text-inv-2); }
-.tims-terminal .t-info .t-tag { color: var(--tims-teal); }
+.tims-terminal .t-info .t-tag { color: var(--tims-tag-success-text); } /* #t2 对比度二轮 */
 .tims-terminal .t-warn .t-tag { color: var(--tims-amber); }
 .tims-terminal .t-error .t-tag { color: var(--tims-brand); }
 

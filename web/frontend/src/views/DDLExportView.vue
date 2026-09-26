@@ -159,7 +159,7 @@ async function exportDDL() {
             </el-col>
             <el-col :span="12">
               <el-form-item label="端口">
-                <el-input-number v-model="sourceForm.port" :min="1" :max="65535" controls-position="right" style="width: 100%;" />
+                <el-input-number v-model="sourceForm.port" :min="1" :max="65535" style="width: 100%;" />
               </el-form-item>
             </el-col>
             <el-col :span="12">
@@ -220,7 +220,7 @@ async function exportDDL() {
         </el-row>
         <el-form-item label="TiDB 版">
           <el-switch v-model="includeTiDB" />
-          <span style="margin-left: 12px; font-size: 13px; color: var(--tims-text-2);">
+          <span style="margin-left: 12px; font-size: var(--tims-font-sm); color: var(--tims-text-2);">
             同时导出 TiDB 转换版 tidb-tables.sql（参考脚本）
           </span>
           <el-text v-if="includeTiDB && !selectedTypes.includes('tables')" type="warning" size="small" style="display: block; margin-top: 4px;">
@@ -256,9 +256,9 @@ async function exportDDL() {
   min-height: 100px;
 }
 .pick-panel-title {
-  font-size: 13px;
+  font-size: var(--tims-font-sm);
   font-weight: 600;
-  color: var(--tims-text-1, #303133);
+  color: var(--tims-text, #2a3040);
   margin-bottom: 8px;
 }
 .pick-panel :deep(.el-checkbox) {

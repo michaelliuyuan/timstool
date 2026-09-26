@@ -499,7 +499,16 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
           <el-button type="primary" @click="openCreate">新建任务</el-button>
         </div>
       </template>
-      <el-table :data="jobs" v-loading="loading" empty-text="暂无补齐任务">
+      <el-table :data="jobs" v-loading="loading">
+        <template #empty>
+          <div class="inc-empty">
+            <el-icon :size="42" class="inc-empty-icon"><Calendar /></el-icon>
+            <p class="inc-empty-text">暂无补齐任务</p>
+            <el-button type="primary" @click="openCreate">
+              <el-icon><Plus /></el-icon> 新建任务
+            </el-button>
+          </div>
+        </template>
         <el-table-column prop="name" label="名称" min-width="140" />
         <el-table-column label="表" min-width="200">
           <template #default="{ row }">
@@ -553,7 +562,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
               <el-radio value="ignore">INSERT IGNORE（跳过冲突）</el-radio>
               <el-radio value="error">报错停止</el-radio>
             </el-radio-group>
-            <div v-if="form.conflict_strategy === 'error'" style="margin-top: 4px; font-size: 13px; color: var(--el-color-warning); line-height: 1.6;">
+            <div v-if="form.conflict_strategy === 'error'" style="margin-top: 4px; font-size: var(--tims-font-sm); color: var(--tims-tag-warning-text); line-height: 1.6;">
               ⚠️ 批次之间无事务：同步失败或中途崩溃后重跑，该策略会撞到已写入行的重复键错误且无自愈——重跑前建议改用 REPLACE/IGNORE。
             </div>
           </div>
@@ -563,7 +572,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
         </el-form-item>
         <el-form-item label="严格模式">
           <el-switch v-model="form.strict_mode" />
-          <span style="margin-left: 12px; font-size: 13px; color: var(--tims-text-2);">使用 &gt; 代替 ≥（跳过边界重读，但同秒迟到行可能丢失）</span>
+          <span style="margin-left: 12px; font-size: var(--tims-font-sm); color: var(--tims-text-2);">使用 &gt; 代替 ≥（跳过边界重读，但同秒迟到行可能丢失）</span>
         </el-form-item>
 
         <el-form-item label="表与水位列">
@@ -581,7 +590,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
               </el-form-item>
               <el-form-item>
                 <el-button :loading="batchChecking" :disabled="batchTables.length === 0" @click="checkBatch">校验所选表</el-button>
-                <span style="margin-left: 8px; font-size: 13px; color: var(--tims-text-2);">单连接批量拉取列信息，校验各表是否都含所选水位列</span>
+                <span style="margin-left: 8px; font-size: var(--tims-font-sm); color: var(--tims-text-2);">单连接批量拉取列信息，校验各表是否都含所选水位列</span>
               </el-form-item>
               <template v-if="batchTables.length > 0">
                 <el-form-item label="统一水位列">
@@ -703,11 +712,27 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
 
 .batch-panel {
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 6px;
+  border-radius: var(--tims-radius-s);
   padding: 12px 12px 0 0;
   margin-bottom: 12px;
   width: 100%;
 }
+
+/* Empty state: icon + guidance CTA (reuses the page-level 新建任务 entry) */
+.inc-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 28px 0 24px;
+}
+.inc-empty-icon { color: var(--tims-text-2); }
+.inc-empty-text {
+  margin: 0;
+  font-size: var(--tims-font-sm);
+  color: var(--tims-text-2);
+}
+.inc-empty .el-button { margin-bottom: 4px; }
 
 .wm-input-wrap {
   display: inline-block;

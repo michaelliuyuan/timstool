@@ -400,7 +400,7 @@ onUnmounted(() => {
       <template #header>
         <div style="display: flex; align-items: center; gap: 8px;">
           <el-icon size="24"><Grid /></el-icon>
-          <span style="font-size: 15px; font-weight: 600;">连接配置</span>
+          <span style="font-size: var(--tims-font-md); font-weight: 600;">连接配置</span>
         </div>
       </template>
 
@@ -460,13 +460,13 @@ onUnmounted(() => {
               v-for="m in compareModes" :key="m.value"
               @click="form.mode = m.value"
               :style="{
-                padding: '10px 16px', borderRadius: '6px', cursor: 'pointer', textAlign: 'center',
+                padding: '10px 16px', borderRadius: '8px', cursor: 'pointer', textAlign: 'center',
                 border: form.mode === m.value ? '2px solid ' + m.color : '2px solid #dcdfe6',
                 background: form.mode === m.value ? m.color + '10' : '#fff',
               }"
             >
               <div style="font-weight: bold;">{{ m.label }}</div>
-              <div style="font-size: 12px; color: #909399;">{{ m.desc }}</div>
+              <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2);">{{ m.desc }}</div>
             </div>
           </div>
         </el-form-item>
@@ -481,14 +481,14 @@ onUnmounted(() => {
         </el-form-item>
         <el-form-item label="并发数">
           <el-input-number v-model="form.parallel" :min="1" :max="32" />
-          <span style="color: #909399; font-size: 12px; margin-left: 8px;">同时比对的表个数</span>
+          <span style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-left: 8px;">同时比对的表个数</span>
         </el-form-item>
 
         <el-form-item label="选择表">
           <div style="width: 100%;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
               <el-button size="small" @click="loadTables">加载表列表</el-button>
-              <span style="color: #909399; font-size: 13px;">已选 {{ selectedTables.length }} / {{ availableTables.length }} 张表</span>
+              <span style="color: var(--tims-text-2); font-size: var(--tims-font-sm);">已选 {{ selectedTables.length }} / {{ availableTables.length }} 张表</span>
             </div>
             <el-input v-model="tableSearch" placeholder="搜索表名" style="width: 300px; margin-bottom: 8px;" clearable />
             <el-table
@@ -503,7 +503,7 @@ onUnmounted(() => {
               <el-table-column prop="name" label="表名" />
               <el-table-column label="预估行数" width="160" align="right">
                 <template #default="{ row }">
-                  <span style="color: #909399;">{{ row.row_estimate >= 0 ? row.row_estimate.toLocaleString() : '-' }}</span>
+                  <span style="color: var(--tims-text-2);">{{ row.row_estimate >= 0 ? row.row_estimate.toLocaleString() : '-' }}</span>
                 </template>
               </el-table-column>
             </el-table>
@@ -512,7 +512,7 @@ onUnmounted(() => {
         </el-form-item>
 
         <el-form-item>
-          <el-button type="primary" size="large" :loading="starting" @click="startCompare">
+          <el-button type="primary" :loading="starting" @click="startCompare">
             开始比对
           </el-button>
         </el-form-item>
@@ -535,7 +535,7 @@ onUnmounted(() => {
         :status="activeTask.status === 'failed' ? 'exception' : activeTask.status === 'completed' ? 'success' : undefined"
         style="margin-bottom: 12px;"
       />
-      <div v-if="activeTask.status === 'running'" style="color: #909399; margin-bottom: 12px;">
+      <div v-if="activeTask.status === 'running'" style="color: var(--tims-text-2); margin-bottom: 12px;">
         比对进度：{{ activeTask.tables_done }} / {{ activeTask.tables_total || '?' }} 张表
         <span v-if="activeTask.current_table">（当前：{{ activeTask.current_table }}）</span>
       </div>
@@ -618,7 +618,7 @@ onUnmounted(() => {
   gap: 12px;
   margin-bottom: 12px;
 }
-.diff-zero { color: var(--tims-teal); }
+.diff-zero { color: var(--tims-tag-success-text); } /* #t2 对比度二轮 */
 .diff-low { color: var(--tims-amber); }
 .diff-high { color: var(--tims-brand); font-weight: 500; }
 :deep(.tims-num-col .cell) { font-family: var(--tims-font-mono); }

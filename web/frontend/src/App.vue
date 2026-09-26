@@ -144,7 +144,7 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
   margin-top: 10px;
   padding: 2px 0 4px;
   text-align: center;
-  font-size: 10px;
+  font-size: var(--tims-font-xs);
   letter-spacing: 1px;
   color: var(--tims-text-inv-2);
   opacity: 0.65;
@@ -181,7 +181,7 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
 .tims-sidenav-foot {
   margin-top: auto;
   text-align: center;
-  font-size: 10px;
+  font-size: var(--tims-font-xs);
   color: var(--tims-text-inv-2);
   opacity: 0.6;
 }
@@ -211,7 +211,7 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 11.5px;
+  font-size: var(--tims-font-xs);
   color: var(--tims-text-inv-2);
 }
 .tims-heartbeat-dot {
@@ -231,7 +231,7 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
   50% { box-shadow: 0 0 0 5px rgba(15, 163, 163, 0); }
 }
 
-.tims-version { font-size: 11px; color: var(--tims-text-inv-2); opacity: 0.8; }
+.tims-version { font-size: var(--tims-font-xs); color: var(--tims-text-inv-2); opacity: 0.8; }
 
 .tims-workspace {
   flex: 1;

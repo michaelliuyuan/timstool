@@ -313,7 +313,7 @@ function logLevelClass(level: string): string {
           </el-col>
           <el-col :span="4">
             <el-statistic title="行数" :value="task.rows_done.toLocaleString()" />
-            <div style="font-size: 12px; color: #999;">/ {{ task.rows_total.toLocaleString() }}</div>
+            <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2);">/ {{ task.rows_total.toLocaleString() }}</div>
           </el-col>
           <el-col :span="4">
             <el-statistic title="吞吐量" :value="rowsPerSec.toLocaleString()" suffix="rows/s" />
@@ -327,7 +327,7 @@ function logLevelClass(level: string): string {
         </el-row>
         <el-progress :percentage="progressPercent" :stroke-width="20" style="margin-top: 16px;"
           :status="task.status === 'completed' ? 'success' : task.status === 'failed' ? 'exception' : undefined" />
-        <div v-if="importSubText" style="margin-top: 6px; font-size: 13px; color: #909399;">{{ importSubText }}</div>
+        <div v-if="importSubText" style="margin-top: 6px; font-size: var(--tims-font-sm); color: var(--tims-text-2);">{{ importSubText }}</div>
       </el-card>
 
       <!-- Actions -->
@@ -375,11 +375,11 @@ function logLevelClass(level: string): string {
                     {{ phase.status === 'completed' ? '已完成' : phase.status === 'running' ? '进行中' : phase.status === 'failed' ? '失败' : '等待中' }}
                   </el-tag>
                 </div>
-                <div v-if="phase.table_count > 0 && phase.name === 'data'" style="margin-top: 8px; color: #606266; font-size: 13px;">
+                <div v-if="phase.table_count > 0 && phase.name === 'data'" style="margin-top: 8px; color: #606266; font-size: var(--tims-font-sm);">
                   <template v-if="phase.sub_label === '数据导入'">数据导入 · 已导入表: {{ phase.imported_tables }}/{{ phase.table_count }}</template>
                   <template v-else>表: {{ phase.tables_done }}/{{ phase.table_count }} · 行: {{ phase.rows_done.toLocaleString() }}/{{ phase.rows_total.toLocaleString() }}</template>
                 </div>
-                <div v-else-if="phase.table_count > 0 && phase.name === 'schema'" style="margin-top: 8px; color: #606266; font-size: 13px;">
+                <div v-else-if="phase.table_count > 0 && phase.name === 'schema'" style="margin-top: 8px; color: #606266; font-size: var(--tims-font-sm);">
                   表: {{ phase.tables_done }}/{{ phase.table_count }}
                 </div>
                 <div v-if="phaseLogs[phase.name]?.length" style="margin-top: 8px;">
@@ -397,7 +397,7 @@ function logLevelClass(level: string): string {
             :label="phase.label"
             :name="phase.name"
           >
-            <div v-if="phase.status === 'pending'" style="color: #909399; text-align: center; padding: 30px;">
+            <div v-if="phase.status === 'pending'" style="color: var(--tims-text-2); text-align: center; padding: 30px;">
               该阶段尚未开始
             </div>
             <template v-else>
@@ -439,7 +439,7 @@ function logLevelClass(level: string): string {
                   </el-table-column>
                 </el-table>
               </div>
-              <div v-if="phase.logs?.length === 0 && phaseLogs[phase.name]?.length === 0" style="color: #909399; text-align: center; padding: 20px;">
+              <div v-if="phase.logs?.length === 0 && phaseLogs[phase.name]?.length === 0" style="color: var(--tims-text-2); text-align: center; padding: 20px;">
                 暂无日志
               </div>
               <div v-else-if="phase.logs?.length" class="phase-log-container">
@@ -491,7 +491,7 @@ function logLevelClass(level: string): string {
         </el-select>
       </div>
       <div ref="logContainer" v-loading="logsLoading" class="log-container">
-        <div v-if="filteredLogs.length === 0 && !logsLoading" style="color: #999; text-align: center; padding: 40px;">
+        <div v-if="filteredLogs.length === 0 && !logsLoading" style="color: var(--tims-text-2); text-align: center; padding: 40px;">
           暂无日志
         </div>
         <div v-for="(log, idx) in filteredLogs" :key="idx" class="log-line" :class="logLevelClass(log.level)">
@@ -511,7 +511,7 @@ function logLevelClass(level: string): string {
   border: 1px solid var(--tims-border-ink);
   color: var(--tims-text-inv);
   font-family: var(--tims-font-mono);
-  font-size: 12.5px;
+  font-size: var(--tims-font-xs);
   line-height: 1.7;
   padding: 14px 16px;
   border-radius: var(--tims-radius);
@@ -524,7 +524,7 @@ function logLevelClass(level: string): string {
   border: 1px solid var(--tims-border-ink);
   color: var(--tims-text-inv);
   font-family: var(--tims-font-mono);
-  font-size: 12.5px;
+  font-size: var(--tims-font-xs);
   line-height: 1.7;
   padding: 14px 16px;
   border-radius: var(--tims-radius);
@@ -556,12 +556,12 @@ function logLevelClass(level: string): string {
 .log-caller {
   color: var(--tims-text-inv-2);
   margin-left: 8px;
-  font-size: 11.5px;
+  font-size: var(--tims-font-xs);
 }
 
-.log-info .log-level { color: var(--tims-teal); }
+.log-info .log-level { color: #4fb5b5; } /* #t2 深底日志面板用浅青（深青在暗底不达标） */
 .log-warn .log-level { color: var(--tims-amber); }
-.log-error .log-level { color: var(--tims-brand); }
+.log-error .log-level { color: #ee6a6a; } /* #t2 深底用浅红（品牌加深后 #cc3030 在暗底不足） */
 .log-debug .log-level { color: #7fb069; }
 .log-error { background: rgba(225, 60, 60, 0.10); }
 .log-warn { background: rgba(217, 126, 0, 0.08); }

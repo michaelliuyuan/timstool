@@ -451,7 +451,7 @@ function prevStep() {
         <div style="display: flex; align-items: center; justify-content: space-between;">
           <div style="display: flex; align-items: center;">
             <el-icon size="24" style="margin-right: 8px;"><Connection /></el-icon>
-            <span style="font-size: 15px; font-weight: 600;">连接与迁移配置</span>
+            <span style="font-size: var(--tims-font-md); font-weight: 600;">连接与迁移配置</span>
           </div>
         </div>
       </template>
@@ -551,11 +551,11 @@ function prevStep() {
               <el-button size="small" @click="toggleSelectAll">
                 {{ selectedTables.length === filteredTables.length && filteredTables.length > 0 ? '取消全选' : '全选' }}
               </el-button>
-              <span style="color: #909399; font-size: 13px;">已选 {{ selectedTables.length }} / {{ availableTables.length }} 张表</span>
+              <span style="color: var(--tims-text-2); font-size: var(--tims-font-sm);">已选 {{ selectedTables.length }} / {{ availableTables.length }} 张表</span>
             </el-space>
           </div>
           <div v-if="loadingTables" v-loading="true" style="min-height: 200px;"></div>
-          <div v-else-if="availableTables.length === 0" style="color: #909399; text-align: center; padding: 40px;">
+          <div v-else-if="availableTables.length === 0" style="color: var(--tims-text-2); text-align: center; padding: 40px;">
             暂无表数据，请确认源数据库连接配置
           </div>
           <template v-else>
@@ -571,7 +571,7 @@ function prevStep() {
               <el-table-column prop="name" label="表名" />
               <el-table-column label="预估行数" width="180" align="right">
                 <template #default="{ row }: { row: { row_estimate: number } }">
-                  <span style="color: #909399;">{{ row.row_estimate >= 0 ? row.row_estimate.toLocaleString() : '-' }}</span>
+                  <span style="color: var(--tims-text-2);">{{ row.row_estimate >= 0 ? row.row_estimate.toLocaleString() : '-' }}</span>
                 </template>
               </el-table-column>
             </el-table>
@@ -585,7 +585,7 @@ function prevStep() {
         <div v-show="activeStep === 3">
           <el-form-item label="并发数">
             <el-input-number v-model="form.opts.parallel" :min="1" :max="32" />
-            <span style="color: #909399; font-size: 12px; margin-left: 8px;">同时迁移的表个数</span>
+            <span style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-left: 8px;">同时迁移的表个数</span>
           </el-form-item>
           <el-form-item label="批次大小">
             <el-input-number v-model="form.opts.batch_size" :min="1000" :step="10000" />
@@ -603,14 +603,14 @@ function prevStep() {
               />
               <el-button :loading="validatingLightning" @click="validateLightning">验证</el-button>
             </div>
-            <div :style="{ color: lightningValidated ? '#67c23a' : '#e6a23c', fontSize: '12px', marginTop: '4px' }">
+            <div :style="{ color: lightningValidated ? 'var(--tims-tag-success-text)' : 'var(--tims-tag-warning-text)', fontSize: 'var(--tims-font-xs)', marginTop: '4px' }">
               <template v-if="lightningValidated">验证通过：{{ lightningResolvedPath }}</template>
               <template v-else>开启 Lightning 后必须点击「验证」且通过（远端 Linux 将校验执行权限），才能进入下一步</template>
             </div>
           </el-form-item>
           <el-form-item label="数据临时目录">
             <el-input v-model="form.opts.temp_dir" placeholder="/tmp/timstool" style="width: 350px;" />
-            <div style="color: #909399; font-size: 12px; margin-top: 4px;">
+            <div style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-top: 4px;">
               源端数据导出为 CSV 的临时存储目录，需确保磁盘空间充足（至少能容纳全部待迁移数据）。
             </div>
           </el-form-item>
@@ -636,7 +636,7 @@ function prevStep() {
               <el-radio value="truncate">先清空表（TRUNCATE）</el-radio>
               <el-radio value="drop">先删除表（DROP）</el-radio>
             </el-radio-group>
-            <div style="color: #909399; font-size: 12px; margin-top: 4px;">
+            <div style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-top: 4px;">
               重复迁移时如何处理目标库已有数据。选择"先清空表"会删除表内数据但保留结构，"先删除表"会完全重建表。
             </div>
           </el-form-item>
@@ -656,8 +656,8 @@ function prevStep() {
                   background: form.opts.compare_mode === m.value ? m.color + '10' : '#fff',
                 }"
               >
-                <div style="font-weight: bold; font-size: 14px;">{{ m.label }}</div>
-                <div style="color: #909399; font-size: 12px; margin-top: 4px;">{{ m.desc }}</div>
+                <div style="font-weight: bold; font-size: var(--tims-font-sm);">{{ m.label }}</div>
+                <div style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-top: 4px;">{{ m.desc }}</div>
               </div>
             </div>
           </el-form-item>
@@ -666,7 +666,7 @@ function prevStep() {
           </el-form-item>
           <el-form-item v-if="form.opts.compare_mode === 'checksum'" label="分块大小">
             <el-input-number v-model="form.opts.checksum_chunk_size" :min="1000" :step="10000" />
-            <span style="color: #909399; font-size: 12px; margin-left: 8px;">每块的行数</span>
+            <span style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-left: 8px;">每块的行数</span>
           </el-form-item>
           <el-form-item v-if="form.opts.compare_mode === 'checksum'" label="并行数">
             <el-input-number v-model="form.opts.checksum_parallel" :min="1" :max="16" />
@@ -760,8 +760,9 @@ function prevStep() {
   box-shadow: 0 0 0 4px var(--tims-brand-soft);
 }
 :deep(.el-step__title.is-process) { color: var(--tims-brand); font-weight: 600; }
-:deep(.el-step__head.is-finish) { color: var(--tims-teal); border-color: var(--tims-teal); }
-:deep(.el-step__title.is-finish) { color: var(--tims-teal); }
+/* #t2 对比度二轮：完成态步骤改深青文字色 */
+:deep(.el-step__head.is-finish) { color: var(--tims-tag-success-text); border-color: var(--tims-tag-success-text); }
+:deep(.el-step__title.is-finish) { color: var(--tims-tag-success-text); }
 :deep(.el-step__head.is-finish .el-step__icon) {
   animation: step-check 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
 }

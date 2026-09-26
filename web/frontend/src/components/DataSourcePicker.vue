@@ -58,12 +58,12 @@ function onSelect(val: string | undefined) {
 }
 .ds-picker-meta {
   float: right;
-  color: var(--tims-text-2, #909399);
-  font-size: 12px;
+  color: var(--tims-text-2, #6b7280);
+  font-size: var(--tims-font-xs);
 }
 .ds-picker-hint {
-  color: var(--tims-text-2, #909399);
-  font-size: 12px;
+  color: var(--tims-text-2, #6b7280);
+  font-size: var(--tims-font-xs);
   line-height: 1.4;
   margin-top: 4px;
 }
