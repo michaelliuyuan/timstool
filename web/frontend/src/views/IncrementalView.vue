@@ -147,6 +147,11 @@ function openEdit(j: IncrementalJob) {
   form.conflict_strategy = j.conflict_strategy
   form.tables = j.tables.map(t => ({ table: t.table, watermark_column: t.watermark_column, initial_watermark: t.initial_watermark || '', columns: [] }))
   resetTablePicker()
+  // #t1 fix: the source_ref watch only fires on value CHANGE — reopening
+  // the edit dialog for the same source leaves the table list empty (no
+  // missing-table flags, no type-aware watermark controls). Load it
+  // explicitly; openCreate clears source_ref so it needs nothing.
+  if (form.source_ref) loadTableList()
   batchMode.value = false
   dialogVisible.value = true
 }
