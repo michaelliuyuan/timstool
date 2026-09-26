@@ -390,13 +390,39 @@ async function saveMigrationOptions() {
   }
 }
 
+// Validate a subset of form fields; an empty list (datasource-ref mode)
+// passes trivially — no manual-entry fields exist for that step.
+async function validateFields(fields: string[]): Promise<boolean> {
+  if (!fields.length) return true
+  try {
+    await formRef.value?.validateField(fields)
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function nextStep() {
-  // S1-UI-08: run the :rules validation on the connection steps — required
-  // fields must pass before the step gates (green light etc.) are consulted.
-  if (activeStep.value <= 1) {
-    const valid = await formRef.value?.validate().then(() => true).catch(() => false)
-    if (!valid) {
-      ElMessage.warning('请完整填写连接信息（必填项不能为空）')
+  // Step-scoped validation (wizard "next-step" fix): validate ONLY the
+  // fields of the step the user is leaving. The old whole-form validate()
+  // also ran required rules of step-2 (target) fields while the user was
+  // still on step 1 — a hidden v-show container — so an empty target
+  // database blocked advancing with a misleading "请完整填写连接信息"
+  // error (deadlock: the user cannot fill step-2 fields before passing
+  // step 1). With a datasource ref selected the manual-entry fields are
+  // exempt (server-side credentials); the green-light gates below still
+  // enforce a successful connection test in both modes.
+  if (activeStep.value === 0) {
+    const fields = sourceRef.value ? [] : ['source.host', 'source.database']
+    if (!(await validateFields(fields))) {
+      ElMessage.warning('请完整填写源数据库连接信息（必填项不能为空）')
+      return
+    }
+  }
+  if (activeStep.value === 1) {
+    const fields = targetRef.value ? [] : ['target.host', 'target.database']
+    if (!(await validateFields(fields))) {
+      ElMessage.warning('请完整填写目标数据库连接信息（必填项不能为空）')
       return
     }
   }
