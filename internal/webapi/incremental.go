@@ -282,10 +282,14 @@ func validateIncJobBody(name string, sourceRef, targetRef string, tables []incTa
 		if !incIdentifierOK(t.WatermarkColumn) {
 			return fmt.Errorf("invalid watermark column %q", t.WatermarkColumn)
 		}
-		if seen[t.Table] {
+		// #t1: case-insensitive dedup — PG unquoted identifiers fold to
+		// lowercase, so ord_hdr and ORD_HDR are the same table. Quoted
+		// case-sensitive twins are out of scope by this early check
+		// (ruling tradeoff, see commit message).
+		if seen[strings.ToLower(t.Table)] {
 			return fmt.Errorf("duplicate table %q", t.Table)
 		}
-		seen[t.Table] = true
+		seen[strings.ToLower(t.Table)] = true
 	}
 	return nil
 }

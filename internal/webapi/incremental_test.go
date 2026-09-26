@@ -154,6 +154,17 @@ func TestIncrementalJobAPIValidation(t *testing.T) {
 		t.Fatalf("empty tables / bad batch must be 400, got %d", w.Code)
 	}
 
+	// #t1: case-variant duplicates (ord_hdr vs ORD_HDR) are the same PG
+	// unquoted identifier — must be rejected 400 before any connect.
+	w, req = doReq("POST", "/api/v1/incremental/jobs",
+		`{"name": "j3", "source_ref": "`+srcID+`", "target_ref": "`+tgtID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [`+
+			`{"table": "ord_hdr", "watermark_column": "update_time", "initial_watermark": ""},`+
+			`{"table": "ORD_HDR", "watermark_column": "id", "initial_watermark": ""}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "duplicate table") {
+		t.Fatalf("case-variant duplicate table must be 400 duplicate table: %d %s", w.Code, w.Body.String())
+	}
+
 	// Happy path: create 鈫?list 鈫?update (config edit keeps state) 鈫?delete.
 	w, req = doReq("POST", "/api/v1/incremental/jobs", validBody(srcID, "replace", "users", "update_time"))
 	s.handleCreateIncrementalJob(w, req)

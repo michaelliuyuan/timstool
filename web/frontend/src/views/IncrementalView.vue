@@ -152,6 +152,14 @@ function openEdit(j: IncrementalJob) {
   // missing-table flags, no type-aware watermark controls). Load it
   // explicitly; openCreate clears source_ref so it needs nothing.
   if (form.source_ref) loadTableList()
+  // #t1: backfilled rows carry no column info — the type-aware watermark
+  // control would degrade to a plain text box until the user manually
+  // clicked "fetch columns". Load columns for configured rows only (empty
+  // rows fire no request); a failed load silently falls back to the text
+  // box, same as before.
+  form.tables.forEach((t, i) => {
+    if (t.watermark_column) loadColumns(i, true)
+  })
   batchMode.value = false
   dialogVisible.value = true
 }
@@ -213,20 +221,23 @@ function onTableChanged(i: number) {
   if (row.table.trim()) loadColumns(i)
 }
 
-async function loadColumns(i: number) {
+async function loadColumns(i: number, silent = false) {
   const row = form.tables[i]
   if (!form.source_ref || !row.table) {
-    ElMessage.warning('请先选择源数据源并填写表名')
+    if (!silent) ElMessage.warning('请先选择源数据源并填写表名')
     return
   }
   try {
     const { data } = await apiClient.getSourceTableColumns(form.source_ref, row.table)
     row.columns = data.columns || []
-    if (row.columns.length > 0 && !row.columns.some(c => c.comparable)) {
+    if (row.columns.length > 0 && !row.columns.some(c => c.comparable) && !silent) {
       ElMessage.warning('该表没有可比类型的水位列（timestamp/date/int/bigint）')
     }
   } catch (e: any) {
-    ElMessage.error(`获取列失败: ${e.response?.data?.error || e.message}`)
+    // silent=true is the edit-backfill auto-load: a ghost table (deleted
+    // from source) keeps the red missing-tag path; a raw error toast per
+    // row would be noise.
+    if (!silent) ElMessage.error(`获取列失败: ${e.response?.data?.error || e.message}`)
   }
 }
 
@@ -565,7 +576,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
             <div v-if="batchMode" class="batch-panel">
               <el-form-item label="选择表">
                 <el-select v-model="batchTables" multiple filterable :loading="loadingTables" placeholder="可搜索多选（显示行数估计）" style="width: 100%;">
-                  <el-option v-for="t in tableList" :key="t.name" :value="t.name" :label="`${t.name}（约 ${t.row_estimate.toLocaleString()} 行）`" />
+                  <el-option v-for="t in tableList" :key="t.name" :value="t.name" :label="t.row_estimate >= 0 ? `${t.name}（约 ${t.row_estimate.toLocaleString()} 行）` : t.name" />
                 </el-select>
               </el-form-item>
               <el-form-item>
@@ -615,7 +626,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
             <div v-for="(t, i) in form.tables" :key="i" class="inc-table-row">
               <el-select v-model="t.table" filterable allow-create default-first-option clearable
                          :loading="loadingTables" placeholder="搜索或手输表名" style="width: 220px;" @change="onTableChanged(i)">
-                <el-option v-for="tb in tableList" :key="tb.name" :value="tb.name" :label="`${tb.name}（约 ${tb.row_estimate.toLocaleString()} 行）`" />
+                <el-option v-for="tb in tableList" :key="tb.name" :value="tb.name" :label="tb.row_estimate >= 0 ? `${tb.name}（约 ${tb.row_estimate.toLocaleString()} 行）` : tb.name" />
               </el-select>
               <el-tag v-if="t.missing" type="danger" size="small" style="margin-left: 4px;">不在源库表清单</el-tag>
               <el-button size="small" style="margin: 0 4px 0 8px;" @click="loadColumns(i)">获取列</el-button>
