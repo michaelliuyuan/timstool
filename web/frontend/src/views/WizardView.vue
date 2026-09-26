@@ -555,7 +555,7 @@ function prevStep() {
             </el-button>
             <template v-if="targetTestResult">
               <el-tag :type="targetTestResult.mysql_ok === false || (!targetTestResult.mysql_ok && !targetTestResult.ok) ? 'danger' : 'success'" style="margin-left: 12px;">
-                MySQL {{ (targetTestResult.mysql_ok ?? targetTestResult.ok) ? `连接成功 (${targetTestResult.version?.substring(0, 50)})` : targetTestResult.error }}
+                TiDB {{ (targetTestResult.mysql_ok ?? targetTestResult.ok) ? `连接成功 (${targetTestResult.version?.replace(/^TiDB\s+/i, '').substring(0, 50)})` : targetTestResult.error }}
               </el-tag>
               <el-tag v-if="targetTestResult.pd_ok !== undefined" :type="targetTestResult.pd_ok ? 'success' : 'danger'" style="margin-left: 4px;">
                 PD {{ targetTestResult.pd_ok ? `通过${targetTestResult.pd_cluster_id ? ' (cluster ' + targetTestResult.pd_cluster_id + ')' : ''}` : targetTestResult.pd_error }}
