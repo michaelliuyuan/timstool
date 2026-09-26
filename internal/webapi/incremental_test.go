@@ -2,9 +2,13 @@ package webapi
 
 import (
 	"database/sql"
-	"net/http"
+	"encoding/json"
+	httptest "net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+
+	"net/http"
 )
 
 // F-04 anchors: watermark SQL construction, state-advance semantics, the
@@ -221,6 +225,64 @@ func TestIncrementalJobAPIValidation(t *testing.T) {
 		if e.ID == id {
 			t.Fatal("job still present after delete")
 		}
+	}
+}
+
+// #t1 batch column endpoint: validation happens before any connect, so the
+// no-DB error paths are fully exercisable without a live source.
+func TestIncrementalColumnsBatchValidation(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "cb-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "cb-bad", "type": "mysql",
+		"fields": {"host": "10.0.0.2", "port": 3306, "user": "u", "password": "pw", "database": "db3"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	mysqlID := dsBody(t, w)["id"].(string)
+
+	post := func(body string) *httptest.ResponseRecorder {
+		w, req := doReq("POST", "/api/v1/incremental/columns-batch", body)
+		s.handleIncrementalColumnsBatch(w, req)
+		return w
+	}
+
+	// Missing source_ref / empty tables → 400.
+	if w := post(`{"source_ref": "", "tables": ["users"]}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("missing source_ref must be 400: %d %s", w.Code, w.Body.String())
+	}
+	if w := post(`{"source_ref": "` + srcID + `", "tables": []}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("empty tables must be 400: %d %s", w.Code, w.Body.String())
+	}
+	// Non-postgres source → 400 with the D4 message.
+	if w := post(`{"source_ref": "` + mysqlID + `", "tables": ["users"]}`); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "PostgreSQL") {
+		t.Fatalf("mysql source must be rejected 400: %d %s", w.Code, w.Body.String())
+	}
+	// Injection-shaped / duplicate table names → 400 before any connect.
+	if w := post(`{"source_ref": "` + srcID + `", "tables": ["users; DROP TABLE x"]}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("bad identifier must be 400: %d %s", w.Code, w.Body.String())
+	}
+	if w := post(`{"source_ref": "` + srcID + `", "tables": ["users", "users"]}`); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "重复") {
+		t.Fatalf("duplicate table must be 400: %d %s", w.Code, w.Body.String())
+	}
+	// Cap: more than 200 tables → 400.
+	tooMany := make([]string, incColumnsBatchLimit+1)
+	for i := range tooMany {
+		tooMany[i] = "t" + strconv.Itoa(i)
+	}
+	b, _ := json.Marshal(map[string]any{"source_ref": srcID, "tables": tooMany})
+	if w := post(string(b)); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "上限") {
+		t.Fatalf("over-cap must be 400: %d %s", w.Code, w.Body.String())
+	}
+	// Valid shape but unreachable host: validation passed, connect fails → 502
+	// (proves the request reached the connection stage, not a validation 400).
+	if w := post(`{"source_ref": "` + srcID + `", "tables": ["users"]}`); w.Code != http.StatusBadGateway {
+		t.Fatalf("unreachable source must be 502, got %d %s", w.Code, w.Body.String())
 	}
 }
 

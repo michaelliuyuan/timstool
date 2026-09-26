@@ -488,6 +488,18 @@ export const apiClient = {
       { params: { source_ref: ref } },
     ),
 
+  // #t1 batch column listing: one source connection for the multi-table
+  // binding flow; per-table results carry their own error (missing table,
+  // query failure) so the UI can flag individual tables red.
+  columnsBatch: (ref: string, tables: string[]) =>
+    api.post<{
+      tables: {
+        table: string
+        columns: { name: string; data_type: string; comparable: boolean; indexed: boolean }[]
+        error?: string
+      }[]
+    }>('/incremental/columns-batch', { source_ref: ref, tables }),
+
   // Compatibility assessment (S1-UI-08): body is { source_ref } or the inline
   // PG form; format 'html' returns the report as text instead of JSON.
   assess: (body: Record<string, any>, format?: string) =>

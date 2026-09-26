@@ -472,6 +472,47 @@ func (s *Server) handleDeleteIncrementalJob(w http.ResponseWriter, r *http.Reque
 	s.writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
 }
 
+// incColumnView is the JSON shape of a column's watermark eligibility.
+type incColumnView struct {
+	Name       string `json:"name"`
+	DataType   string `json:"data_type"`
+	Comparable bool   `json:"comparable"`
+	Indexed    bool   `json:"indexed"`
+}
+
+// queryIncColumns runs the watermark-eligibility column query for one table
+// (shared by the single-table and batch endpoints).
+func queryIncColumns(ctx context.Context, db *sql.DB, schema, table string) ([]incColumnView, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT c.column_name, c.data_type,
+		       (SELECT COUNT(*) FROM pg_index i
+		         JOIN pg_class tc ON tc.oid = i.indrelid
+		         JOIN pg_namespace ns ON ns.oid = tc.relnamespace
+		         JOIN pg_attribute a ON a.attrelid = tc.oid AND a.attname = c.column_name
+		         JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ord) ON true
+		        WHERE ns.nspname = c.table_schema AND tc.relname = c.table_name
+		          AND k.attnum = a.attnum AND k.ord = 1) AS indexed_first
+		FROM information_schema.columns c
+		WHERE c.table_schema = $1 AND c.table_name = $2
+		ORDER BY c.ordinal_position`, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols := []incColumnView{}
+	for rows.Next() {
+		var c incColumnView
+		var idxed int
+		if err := rows.Scan(&c.Name, &c.DataType, &idxed); err != nil {
+			return nil, err
+		}
+		c.Comparable = incWatermarkTypes[c.DataType]
+		c.Indexed = idxed > 0
+		cols = append(cols, c)
+	}
+	return cols, rows.Err()
+}
+
 // handleIncrementalColumns lists a table's columns with watermark eligibility
 // and an index flag (no index on the watermark column ⇒ full scans ⇒ warn).
 func (s *Server) handleIncrementalColumns(w http.ResponseWriter, r *http.Request) {
@@ -505,44 +546,9 @@ func (s *Server) handleIncrementalColumns(w http.ResponseWriter, r *http.Request
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	rows, err := db.QueryContext(ctx, `
-		SELECT c.column_name, c.data_type,
-		       (SELECT COUNT(*) FROM pg_index i
-		         JOIN pg_class tc ON tc.oid = i.indrelid
-		         JOIN pg_namespace ns ON ns.oid = tc.relnamespace
-		         JOIN pg_attribute a ON a.attrelid = tc.oid AND a.attname = c.column_name
-		         JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ord) ON true
-		        WHERE ns.nspname = c.table_schema AND tc.relname = c.table_name
-		          AND k.attnum = a.attnum AND k.ord = 1) AS indexed_first
-		FROM information_schema.columns c
-		WHERE c.table_schema = $1 AND c.table_name = $2
-		ORDER BY c.ordinal_position`, sc.Schema, table)
+	cols, err := queryIncColumns(ctx, db, sc.Schema, table)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "list columns failed: "+err.Error())
-		return
-	}
-	defer rows.Close()
-
-	type colView struct {
-		Name       string `json:"name"`
-		DataType   string `json:"data_type"`
-		Comparable bool   `json:"comparable"`
-		Indexed    bool   `json:"indexed"`
-	}
-	cols := []colView{}
-	for rows.Next() {
-		var c colView
-		var idxed int
-		if err := rows.Scan(&c.Name, &c.DataType, &idxed); err != nil {
-			s.writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		c.Comparable = incWatermarkTypes[c.DataType]
-		c.Indexed = idxed > 0
-		cols = append(cols, c)
-	}
-	if err := rows.Err(); err != nil {
-		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if len(cols) == 0 {
@@ -550,6 +556,87 @@ func (s *Server) handleIncrementalColumns(w http.ResponseWriter, r *http.Request
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"columns": cols})
+}
+
+// incColumnsBatchLimit caps the batch endpoint: one information_schema round
+// trip per table, so bound the fan-out.
+const incColumnsBatchLimit = 200
+
+// handleIncrementalColumnsBatch (#t1) returns the watermark-eligibility
+// column list for many tables over ONE source connection — the batch-binding
+// UI flow would otherwise open one connection per table.
+func (s *Server) handleIncrementalColumnsBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SourceRef string   `json:"source_ref"`
+		Tables    []string `json:"tables"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.SourceRef == "" {
+		s.writeError(w, http.StatusBadRequest, "source_ref is required")
+		return
+	}
+	if len(req.Tables) == 0 {
+		s.writeError(w, http.StatusBadRequest, "tables is required")
+		return
+	}
+	if len(req.Tables) > incColumnsBatchLimit {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("tables 数超过上限 %d", incColumnsBatchLimit))
+		return
+	}
+	seen := map[string]bool{}
+	for _, t := range req.Tables {
+		if !incIdentifierOK(t) {
+			s.writeError(w, http.StatusBadRequest, "invalid table name: "+t)
+			return
+		}
+		if seen[t] {
+			s.writeError(w, http.StatusBadRequest, "表重复: "+t)
+			return
+		}
+		seen[t] = true
+	}
+	e, err := s.resolveDataSourceRef(req.SourceRef)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+		return
+	}
+	if e.Type != "postgres" {
+		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
+		return
+	}
+	sc := dataSourceToSourceConfig(e)
+	db, err := openPGTestConn(sc.DSN())
+	if err != nil {
+		s.writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	type tableResult struct {
+		Table   string          `json:"table"`
+		Columns []incColumnView `json:"columns"`
+		Error   string          `json:"error,omitempty"`
+	}
+	out := make([]tableResult, 0, len(req.Tables))
+	for _, t := range req.Tables {
+		cols, err := queryIncColumns(ctx, db, sc.Schema, t)
+		if err != nil {
+			out = append(out, tableResult{Table: t, Error: err.Error()})
+			continue
+		}
+		if len(cols) == 0 {
+			out = append(out, tableResult{Table: t, Error: "表在源库中不存在"})
+			continue
+		}
+		out = append(out, tableResult{Table: t, Columns: cols})
+	}
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{"tables": out})
 }
 
 // --- run engine ---

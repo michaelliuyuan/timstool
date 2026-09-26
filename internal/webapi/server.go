@@ -317,6 +317,9 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 				r.Post("/run", s.handleRunIncrementalJob)
 			})
 			r.Get("/sources/tables/{table}/columns", s.handleIncrementalColumns)
+			// #t1 batch column listing: one source connection for the
+			// multi-table binding flow (single-conn fan-out, capped at 200).
+			r.Post("/incremental/columns-batch", s.handleIncrementalColumnsBatch)
 		})
 
 		// F-10 long-running endpoints: 120s deadline, three-layer aligned —
