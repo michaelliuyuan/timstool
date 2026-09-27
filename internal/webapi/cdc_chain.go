@@ -142,6 +142,9 @@ func (s *Server) startCDCChainAfterSuccess(taskID string, cfg *config.Config) {
 			ok = false
 			msg = fmt.Sprintf("CDC 自动衔接失败：%v（slot 已保留 WAL，请手动启动 CDC，无数据丢失）", err)
 		} else {
+			if s.cdcWatchdog != nil {
+				s.cdcWatchdog.NotifyStarted()
+			}
 			lsn := cfg.Migration.ChainStartLSN
 			if lsn == "" {
 				lsn = "slot 创建点位（见任务日志）"

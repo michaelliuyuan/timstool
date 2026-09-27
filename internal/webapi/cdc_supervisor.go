@@ -406,3 +406,25 @@ func (s *CDCSupervisor) Adopt(statusPath string, stale time.Duration, alive func
 	s.state = StateAdopted
 	s.startedAt = time.Now()
 }
+
+// abandonAdopted drops a dead adopted child so a subsequent Start can spawn a
+// fresh one (P1 watchdog: adopted children have no supervise loop, so their
+// death otherwise leaves the supervisor stuck in adopted forever). The alive
+// probe is injected (the package default is a no-op true on Windows).
+func (s *CDCSupervisor) abandonAdopted(alive func(int) bool) {
+	if alive == nil {
+		alive = pidAlive
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != StateAdopted {
+		return
+	}
+	if s.pid > 0 && alive(s.pid) {
+		return // still alive — keep the adoption
+	}
+	s.adopted = false
+	s.pid = 0
+	s.state = StateStopped
+	s.startedAt = time.Time{}
+}

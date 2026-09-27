@@ -56,6 +56,10 @@ type Server struct {
 	// supervise / restart / stop / adopt. nil when CDC control is not wired.
 	cdcSupervisor *CDCSupervisor
 
+	// cdcWatchdog revives the CDC child when it dies while desired (P1 #t5):
+	// adopted-child death, restart-cap exhaustion, and startup rebuild.
+	cdcWatchdog *cdcWatchdog
+
 	// cdcCfgFilePath is the config.yaml the CDC child loads (-c). Wired by
 	// cmd/web; falls back to the supervisor's copy (A1 connection card).
 	cdcCfgFilePath string
@@ -201,6 +205,11 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 	// 领养监控 — detect via status file + PID, no zombie/duplicate).
 	if cdcSupervisor != nil {
 		cdcSupervisor.Adopt(cdcStatusFile, cdcStale, pidAlive)
+		// P1 watchdog (#t5): in-process liveness guard — revives adopted
+		// deaths, restart-cap failures, and rebuilds a CDC that died with
+		// the previous web process. 30s tick = revive backoff.
+		s.cdcWatchdog = newCDCWatchdog(cdcSupervisor, cdcStatusFile, cdcStale, 30*time.Second, zap.L())
+		go s.cdcWatchdog.Run()
 	}
 
 	// Compare tasks: a persisted "running" state means the previous process

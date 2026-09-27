@@ -30,6 +30,10 @@ type CDCStatusResponse struct {
 	// Control is the supervisor's lifecycle view (CONTROL channel, #t55):
 	// state/pid/restarts/uptime/adopted. Omitted when CDC control isn't wired.
 	Control *CDCControlStatus `json:"control,omitempty"`
+
+	// Watchdog is the P1 revive-guard face: revives / last revive time and
+	// trigger state. Omitted when the watchdog isn't wired.
+	Watchdog *CDCWatchdogStatus `json:"watchdog,omitempty"`
 }
 
 // cdcStatusView is the web's computed view of the CDC process, read from the
@@ -151,6 +155,10 @@ func (s *Server) handleCDCStatus(w http.ResponseWriter, r *http.Request) {
 		cs := s.cdcSupervisor.Status()
 		resp.Control = &cs
 	}
+	if s.cdcWatchdog != nil {
+		ws := s.cdcWatchdog.Status()
+		resp.Watchdog = &ws
+	}
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
@@ -177,6 +185,9 @@ func (s *Server) handleCDCStart(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok": true, "state": string(st.State), "pid": st.PID, "message": "CDC started",
 	})
+	if s.cdcWatchdog != nil {
+		s.cdcWatchdog.NotifyStarted()
+	}
 }
 
 // handleCDCStop gracefully stops the CDC child (CONTROL channel, #t55). Idempotent.
@@ -188,6 +199,9 @@ func (s *Server) handleCDCStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st := s.cdcSupervisor.Stop(r.Context())
+	if s.cdcWatchdog != nil {
+		s.cdcWatchdog.NotifyStopped()
+	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok": true, "state": string(st.State), "pid": st.PID, "message": "CDC stopped",
 	})
