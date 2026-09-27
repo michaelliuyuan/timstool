@@ -193,6 +193,23 @@ func (t *DDLTracker) TeardownEventTrigger(ctx context.Context) error {
 	return nil
 }
 
+// toolBookkeepingPrefix namespaces every PG object the tool creates for its
+// own machinery (ddl log table, event triggers, capture functions).
+const toolBookkeepingPrefix = "pg2tidb_"
+
+// isToolBookkeepingObject reports whether a captured DDL entry targets one of
+// the tool's own PG objects. PG's object_identity is schema-qualified and may
+// be quoted ("public.pg2tidb_ddl_log", "\"odd\".pg2tidb_ddl_log"), so the
+// check unquotes and matches the trailing name segment against the pg2tidb_
+// prefix. Such entries are never replicated to the target.
+func isToolBookkeepingObject(objectName string) bool {
+	s := strings.ToLower(strings.TrimSpace(objectName))
+	if i := strings.LastIndexByte(s, '.'); i >= 0 {
+		s = s[i+1:]
+	}
+	return strings.HasPrefix(strings.Trim(s, `"`), toolBookkeepingPrefix)
+}
+
 // FetchNewDDL queries the DDL log for entries since the last checkpoint.
 func (t *DDLTracker) FetchNewDDL(ctx context.Context, sinceID int64) ([]DDLEntry, error) {
 	rows, err := t.db.QueryContext(ctx, `
@@ -216,6 +233,17 @@ func (t *DDLTracker) FetchNewDDL(ctx context.Context, sinceID int64) ([]DDLEntry
 		}
 		e.ID = id
 		e.LSN = fmt.Sprintf("ddl_%d", id)
+
+		// The tool's own PG bookkeeping (pg2tidb_ddl_log table, event
+		// triggers, capture functions) must NEVER replicate to the target:
+		// its DDL is PG-shaped (e.g. `status TEXT NOT NULL DEFAULT ...`,
+		// TiDB err 1101) and the target has no such objects. Unfiltered,
+		// every SetupEventTrigger run re-logs its own migration ALTER,
+		// which fails non-degradably on TiDB and halts the runner in a
+		// revive-halt crash loop (P1 production incident, 2026-09-27).
+		if isToolBookkeepingObject(e.ObjectName) {
+			continue
+		}
 
 		// Transform DDL for TiDB
 		if t.filter.Allow(e.Schema, e.ObjectName) {

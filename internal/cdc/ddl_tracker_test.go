@@ -45,6 +45,41 @@ func TestDDLTransform_TypeMappingAndIdempotency(t *testing.T) {
 	}
 }
 
+// TestIsToolBookkeepingObject anchors the self-DDL replay filter (P1
+// production incident 2026-09-27): the tool's own migration ALTER on
+// pg2tidb_ddl_log was captured by its own event trigger and replayed to TiDB,
+// where `status TEXT NOT NULL DEFAULT` fails with 1101 (non-degradable) and
+// halts the runner in a revive-halt crash loop. All pg2tidb_* objects —
+// schema-qualified, quoted, upper-cased — must be filtered; user tables must
+// not be.
+func TestIsToolBookkeepingObject(t *testing.T) {
+	for _, name := range []string{
+		"pg2tidb_ddl_log",
+		"public.pg2tidb_ddl_log",
+		`"public".pg2tidb_ddl_log`,
+		"PG2TIDB_DDL_LOG",
+		"public.PG2TIDB_DDL_Trigger",
+		"pg2tidb_ddl_capture",
+		" pg2tidb_ddl_log ",
+	} {
+		if !isToolBookkeepingObject(name) {
+			t.Errorf("isToolBookkeepingObject(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{
+		"users",
+		"public.users",
+		`"public"."users"`,
+		"order_items",
+		"xpg2tidb_foo", // prefix must anchor at the name segment, not a substring
+		"",
+	} {
+		if isToolBookkeepingObject(name) {
+			t.Errorf("isToolBookkeepingObject(%q) = true, want false", name)
+		}
+	}
+}
+
 // TestCheckpoint_LastDDLID round-trips the DDL id through the checkpoint
 // manager (at-least-once resume, #t59).
 func TestCheckpoint_LastDDLID(t *testing.T) {
