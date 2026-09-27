@@ -198,10 +198,13 @@ func (s *Server) handleCDCStop(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	st := s.cdcSupervisor.Stop(r.Context())
+	// L2-1 (adversarial): clear desired BEFORE stopping so a concurrent
+	// watchdog tick cannot revive mid-Stop (double guard: revive() also
+	// re-checks desired before spawning).
 	if s.cdcWatchdog != nil {
 		s.cdcWatchdog.NotifyStopped()
 	}
+	st := s.cdcSupervisor.Stop(r.Context())
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok": true, "state": string(st.State), "pid": st.PID, "message": "CDC stopped",
 	})

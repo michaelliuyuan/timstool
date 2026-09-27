@@ -11,10 +11,10 @@ import (
 )
 
 func newTestWatchdog(sv *CDCSupervisor, statusFile string) *cdcWatchdog {
-	w := newCDCWatchdog(sv, statusFile, 30*time.Second, 20*time.Millisecond, nil)
 	// Deterministic liveness in tests: the sentinel 4194303 is "dead",
 	// every other pid (the fake children) "alive".
-	w.pidAlive = func(pid int) bool { return pid != 4194303 }
+	probe := func(pid int) bool { return pid != 4194303 }
+	w := newCDCWatchdog(sv, statusFile, 30*time.Second, 20*time.Millisecond, probe, nil)
 	w.revCh = make(chan struct{}, 8)
 	return w
 }
@@ -188,6 +188,68 @@ func TestWatchdogReviveBackoff(t *testing.T) {
 	w.revive("failed") // within the backoff window: must be a no-op
 	if ws := w.Status(); ws.Revives != 1 || !ws.LastReviveAt.Equal(first) {
 		t.Fatalf("backoff violated: %+v", ws)
+	}
+}
+
+// L2-1 (adversarial): revive() must re-check desired right before spawning.
+// Race: a tick read desired=true, then an explicit Stop cleared it — the
+// late revive must be suppressed, not resurrect the child the operator
+// just stopped.
+func TestWatchdogReviveRechecksDesired(t *testing.T) {
+	sv := newTestSupervisor(t, true)
+	spawned := 0
+	sv.SetFactory(func() (supervisedProcess, error) {
+		spawned++
+		return newFakeProc(600 + spawned), nil
+	})
+	w := newTestWatchdog(sv, "")
+	w.NotifyStarted()
+	// Simulate the race: tick already decided to revive (desired was true at
+	// tick start), Stop lands in between.
+	w.NotifyStopped()
+	w.revive("stopped")
+	if spawned != 0 {
+		t.Fatalf("revive after NotifyStopped spawned a child (spawned=%d)", spawned)
+	}
+	if ws := w.Status(); ws.Revives != 0 {
+		t.Fatalf("revives = %d, want 0", ws.Revives)
+	}
+	// And the ordered path still revives.
+	w.NotifyStarted()
+	w.revive("stopped")
+	if spawned != 1 || w.Status().Revives != 1 {
+		t.Fatalf("desired revive did not happen (spawned=%d revives=%d)", spawned, w.Status().Revives)
+	}
+}
+
+// L2-2 (adversarial): the startup rebuild decision must probe the recorded
+// PID. A fresh status file whose PID is still alive (cross-user orphan that
+// Adopt skipped, or PID reuse) must NOT mark desired — rebuilding would
+// double-consume the CDC slot.
+func TestWatchdogStartupNoRebuildWhenRecordedPIDAlive(t *testing.T) {
+	dir := t.TempDir()
+	statusFile := filepath.Join(dir, "status.json")
+	st := cdc.CDCStatusFile{
+		State:     cdc.CDCSelfRunning,
+		PID:       424242, // alive per the test probe
+		Timestamp: time.Now(),
+	}
+	if err := cdc.WriteStatusFile(statusFile, st); err != nil {
+		t.Fatal(err)
+	}
+	sv := newTestSupervisor(t, true)
+	spawned := 0
+	sv.SetFactory(func() (supervisedProcess, error) {
+		spawned++
+		return newFakeProc(700 + spawned), nil
+	})
+	w := newTestWatchdog(sv, statusFile)
+	if w.desired {
+		t.Fatal("watchdog marked desired while the recorded PID is alive")
+	}
+	w.tick()
+	if spawned != 0 || w.Status().Revives != 0 {
+		t.Fatalf("watchdog rebuilt a live-PID CDC (spawned=%d revives=%d)", spawned, w.Status().Revives)
 	}
 }
 

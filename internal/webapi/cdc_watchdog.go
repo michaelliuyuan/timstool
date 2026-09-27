@@ -52,11 +52,14 @@ type cdcWatchdog struct {
 
 // newCDCWatchdog builds the watchdog and computes the initial desired flag
 // (P1 gap 3: rebuild at web startup). Call after Supervisor.Adopt.
-func newCDCWatchdog(sv *CDCSupervisor, statusFile string, stale time.Duration, interval time.Duration, log *zap.Logger) *cdcWatchdog {
+func newCDCWatchdog(sv *CDCSupervisor, statusFile string, stale time.Duration, interval time.Duration, alive func(int) bool, log *zap.Logger) *cdcWatchdog {
+	if alive == nil {
+		alive = pidAlive
+	}
 	w := &cdcWatchdog{
 		sv:         sv,
 		interval:   interval,
-		pidAlive:   pidAlive,
+		pidAlive:   alive,
 		log:        log,
 		statusFile: statusFile,
 		stale:      stale,
@@ -72,8 +75,13 @@ func newCDCWatchdog(sv *CDCSupervisor, statusFile string, stale time.Duration, i
 		// children; a stale-but-not-halted record means the previous CDC
 		// died with the previous web — rebuild it (ruling ③).
 		if sv.cfg.Enable && statusFile != "" {
+			// L2-2 (adversarial): only rebuild when the recorded PID is
+			// really dead. A live PID (cross-user orphan Adopt skipped, or
+			// PID reuse inside the freshness window) means a CDC is already
+			// consuming this slot — spawning another would double-consume.
 			if f, err := cdc.ReadStatusFile(statusFile); err == nil && f.PID > 0 &&
-				f.State != cdc.CDCSelfHalted && time.Since(f.Timestamp) <= stale {
+				f.State != cdc.CDCSelfHalted && time.Since(f.Timestamp) <= stale &&
+				!alive(f.PID) {
 				w.desired = true
 				if w.log != nil {
 					w.log.Info("cdc watchdog: previous CDC died with the web process; will rebuild",
@@ -169,6 +177,16 @@ func (w *cdcWatchdog) revive(fromState string) {
 	if !w.lastAt.IsZero() && time.Since(w.lastAt) < w.interval {
 		w.mu.Unlock()
 		return // backoff: at most one revive per interval (crash-storm guard)
+	}
+	w.mu.Unlock()
+
+	// L2-1 (adversarial): re-check desired under the lock right before
+	// spawning — an explicit Stop that raced this tick (desired read at
+	// tick start) must win and suppress the revive.
+	w.mu.Lock()
+	if !w.desired {
+		w.mu.Unlock()
+		return
 	}
 	w.mu.Unlock()
 

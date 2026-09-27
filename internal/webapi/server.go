@@ -208,7 +208,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		// P1 watchdog (#t5): in-process liveness guard — revives adopted
 		// deaths, restart-cap failures, and rebuilds a CDC that died with
 		// the previous web process. 30s tick = revive backoff.
-		s.cdcWatchdog = newCDCWatchdog(cdcSupervisor, cdcStatusFile, cdcStale, 30*time.Second, zap.L())
+		s.cdcWatchdog = newCDCWatchdog(cdcSupervisor, cdcStatusFile, cdcStale, 30*time.Second, pidAlive, zap.L())
 		go s.cdcWatchdog.Run()
 	}
 
