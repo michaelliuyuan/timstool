@@ -80,6 +80,41 @@ func TestIsToolBookkeepingObject(t *testing.T) {
 	}
 }
 
+// TestDDLLogSQLDualLegal anchors the P1 hotfix: the tool's own CREATE/ALTER
+// migration DDL is captured by its own event trigger and replayed to TiDB,
+// so no TEXT column may carry a DEFAULT (TiDB err 1101, non-degradable halt).
+func TestDDLLogSQLDualLegal(t *testing.T) {
+	for name, sql := range map[string]string{"create": ddlLogCreateSQL, "migrate": ddlLogMigrateSQL} {
+		up := strings.ToUpper(sql)
+		if strings.Contains(up, "TEXT NOT NULL DEFAULT") || strings.Contains(up, "TEXT DEFAULT") {
+			t.Errorf("%s SQL has a DEFAULT on a TEXT column (TiDB 1101): %s", name, sql)
+		}
+		if strings.Contains(up, "STATUS TEXT,") == false && name == "migrate" {
+			t.Errorf("migrate SQL lost the bare `status TEXT` column: %s", sql)
+		}
+	}
+}
+
+// TestShouldApplyDDL_SkipsToolBookkeeping anchors the stored-row unlock path:
+// pre-fix ddl_log rows (object pg2tidb_ddl_log) whose ddl_command still
+// carries the TiDB-illegal `TEXT NOT NULL DEFAULT` shape must be SKIPPED
+// (not applied, not fatal) so the id cursor advances and the chain unblocks.
+func TestShouldApplyDDL_SkipsToolBookkeeping(t *testing.T) {
+	old := DDLEntry{
+		Schema:     "public",
+		ObjectName: "public.pg2tidb_ddl_log",
+		ObjectType: "table",
+		DDL:        "ALTER TABLE public.pg2tidb_ddl_log ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'applied'",
+	}
+	if shouldApplyDDL(old) {
+		t.Fatal("tool bookkeeping DDL must not be applied to the target")
+	}
+	user := DDLEntry{ObjectName: "public.users", ObjectType: "table", DDL: "ALTER TABLE public.users ADD COLUMN c int"}
+	if !shouldApplyDDL(user) {
+		t.Fatal("user table DDL must still be applied")
+	}
+}
+
 // TestCheckpoint_LastDDLID round-trips the DDL id through the checkpoint
 // manager (at-least-once resume, #t59).
 func TestCheckpoint_LastDDLID(t *testing.T) {
