@@ -24,6 +24,17 @@ func TestProgressRegistrationNames(t *testing.T) {
 	if got := progressRegistrationNames(tables, []string{"zz"}); len(got) != 0 {
 		t.Errorf("include {zz}: got %v, want empty", got)
 	}
+	// Exclude pin (DDL 范围口径, 23e9a24): CollectTables filters excluded
+	// tables BEFORE registration (contains() at collector.go), so with
+	// exclude={"b"} the collected+registered set is N-1 and "b" produces
+	// no checkpoint entry — schema and data sets stay aligned end to end.
+	collected := []TableInfo{{Name: "a"}, {Name: "c"}} // b excluded upstream
+	if got := progressRegistrationNames(collected, nil); len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Errorf("exclude scenario: got %v, want [a c]", got)
+	}
+	if contains([]string{"b"}, "b") != true || contains([]string{"b"}, "a") != false {
+		t.Error("contains() exclude semantics broken")
+	}
 }
 
 func TestMapType(t *testing.T) {
