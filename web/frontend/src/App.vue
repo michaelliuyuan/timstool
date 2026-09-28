@@ -100,7 +100,7 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
             <i class="tims-heartbeat-dot"></i>
             <span class="tims-mono">{{ runningCount > 0 ? `${runningCount} 运行` : backendUp ? '空闲' : '离线' }}</span>
           </span>
-          <span class="tims-version tims-mono">V3.4</span>
+          <span class="tims-version tims-mono">V3.5</span>
         </div>
       </header>
       <main class="tims-workspace">
