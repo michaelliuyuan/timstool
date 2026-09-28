@@ -732,6 +732,11 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
   color: var(--el-color-danger);
 }
 
+.el-dropdown-menu__item.row-del:hover,
+.el-dropdown-menu__item.row-del:focus {
+  color: var(--el-color-danger);
+}
+
 .wm-hint {
   font-size: 12px;
   color: var(--tims-text-2);

@@ -303,4 +303,9 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
 .row-del {
   color: var(--el-color-danger);
 }
+
+.el-dropdown-menu__item.row-del:hover,
+.el-dropdown-menu__item.row-del:focus {
+  color: var(--el-color-danger);
+}
 </style>
