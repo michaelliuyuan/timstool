@@ -481,7 +481,22 @@ function onRowCommand(command: string, row: IncrementalJob) {
   else if (command === 'remove') removeJob(row)
 }
 
-const strategyLabels: Record<string, string> = { replace: 'REPLACE INTO', ignore: 'INSERT IGNORE', error: '报错停止' }
+const strategyLabels: Record<string, string> = { replace: '替换写入', ignore: '忽略冲突', error: '报错停止' }
+const strategySqlTerms: Record<string, string> = { replace: 'REPLACE INTO', ignore: 'INSERT IGNORE', error: '报错停止' }
+
+function fmtSyncTime(iso: string): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return '—'
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const sameYear = d.getFullYear() === new Date().getFullYear()
+  const md = `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return sameYear ? md : `${d.getFullYear()}-${md}`
+}
+
+function lastSyncAt(row: IncrementalJob): string {
+  return Object.values(row.states || {}).map((s: any) => s.last_sync_at || '').filter(Boolean).sort().pop() || ''
+}
 
 // Initial-watermark form item: shared tooltip + hint text (#t1-C).
 const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）该值的行；仅第一轮生效，此后自动按上次水位续传。留空 = 从列的最小值开始全量补齐。'
@@ -514,25 +529,45 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
             </el-button>
           </div>
         </template>
-        <el-table-column prop="name" label="名称" min-width="140" />
+        <el-table-column prop="name" label="名称" min-width="160" show-overflow-tooltip />
         <el-table-column label="表" min-width="200">
           <template #default="{ row }">
-            <span v-for="(t, i) in row.tables" :key="t.table">
-              {{ t.table }}<el-tag v-if="row.states?.[t.table]?.failed" size="small" type="danger" style="margin-left: 4px;">异常</el-tag>{{ i < row.tables.length - 1 ? '、' : '' }}
-            </span>
+            <div class="tbl-tags">
+              <template v-for="t in row.tables.slice(0, 2)" :key="t.table">
+                <el-tag size="small" :type="row.states?.[t.table]?.failed ? 'danger' : undefined">{{ t.table }}</el-tag>
+              </template>
+              <el-popover v-if="row.tables.length > 2" trigger="hover" :width="320" placement="bottom">
+                <template #reference>
+                  <el-tag size="small" type="info">+{{ row.tables.length - 2 }}</el-tag>
+                </template>
+                <div class="tbl-pop">
+                  <div v-for="t in row.tables" :key="t.table" class="tbl-pop-row">
+                    <span class="tbl-dot" :class="row.states?.[t.table]?.failed ? 'is-failed' : 'is-ok'"></span>
+                    <span class="tbl-pop-name">{{ t.table }}</span>
+                    <span class="tbl-pop-meta">{{ (row.states?.[t.table]?.total_rows || 0).toLocaleString() }} 行</span>
+                    <span class="tbl-pop-meta">{{ row.states?.[t.table]?.last_sync_at ? fmtSyncTime(row.states[t.table].last_sync_at) : '—' }}</span>
+                  </div>
+                </div>
+              </el-popover>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="冲突策略" width="120">
-          <template #default="{ row }">{{ strategyLabels[row.conflict_strategy] || row.conflict_strategy }}</template>
+        <el-table-column label="冲突策略" width="96">
+          <template #default="{ row }">
+            <el-tooltip :content="strategySqlTerms[row.conflict_strategy] || row.conflict_strategy" placement="top">
+              <el-tag size="small">{{ strategyLabels[row.conflict_strategy] || row.conflict_strategy }}</el-tag>
+            </el-tooltip>
+          </template>
         </el-table-column>
-        <el-table-column label="累计同步行数" width="120">
+        <el-table-column label="累计同步行数" width="120" align="right">
           <template #default="{ row }">{{ Object.values(row.states || {}).reduce((n: number, s: any) => n + (s.total_rows || 0), 0).toLocaleString() }}</template>
         </el-table-column>
-        <el-table-column label="最近同步" width="160">
+        <el-table-column label="最近同步" width="110">
           <template #default="{ row }">
-            <span v-if="row.tables.length">
-              {{ Object.values(row.states || {}).map((s: any) => s.last_sync_at || '').filter(Boolean).sort().pop() || '—' }}
-            </span>
+            <el-tooltip v-if="lastSyncAt(row)" :content="lastSyncAt(row)" placement="top">
+              <span>{{ fmtSyncTime(lastSyncAt(row)) }}</span>
+            </el-tooltip>
+            <span v-else>—</span>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="240" fixed="right">
@@ -680,7 +715,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
       </template>
     </el-dialog>
 
-    <el-drawer v-model="historyVisible" :title="`运行历史 — ${historyJob?.name || ''}`" size="720px">
+    <el-drawer v-model="historyVisible" :title="`运行历史 — ${historyJob?.name || ''}`" :size="'min(720px, 92vw)'">
       <el-empty v-if="!historyJob?.history?.length" description="暂无运行记录" />
       <el-collapse v-else>
         <el-collapse-item v-for="h in historyJob.history" :key="h.run_id" :title="`${h.started_at} · ${h.duration_ms} ms`">
@@ -730,6 +765,55 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
 
 .row-del {
   color: var(--el-color-danger);
+}
+
+.tbl-tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 4px;
+  overflow: hidden;
+}
+
+.tbl-pop {
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.tbl-pop-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+.tbl-pop-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tbl-pop-meta {
+  color: var(--tims-text-2);
+  white-space: nowrap;
+}
+
+.tbl-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.tbl-dot.is-ok {
+  background: var(--el-color-success);
+}
+
+.tbl-dot.is-failed {
+  background: var(--el-color-danger);
 }
 
 .el-dropdown-menu__item.row-del:hover,
