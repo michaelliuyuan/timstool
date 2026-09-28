@@ -87,6 +87,9 @@ func TestScanFunctionsModernUsesProkind(t *testing.T) {
 	if !strings.Contains(lastQuery, "prokind") {
 		t.Errorf("modern server must use prokind query, got: %s", lastQuery)
 	}
+	if n := strings.Count(lastQuery, "ORDER BY"); n != 1 {
+		t.Errorf("modern query must have exactly one ORDER BY, got %d: %s", n, lastQuery)
+	}
 	if len(fns) != 1 || fns[0].Name != "f1" {
 		t.Errorf("expected one function row, got %+v", fns)
 	}
@@ -104,6 +107,9 @@ func TestScanFunctionsLegacyOmitsProkind(t *testing.T) {
 	}
 	if !strings.Contains(lastQuery, "FALSE") {
 		t.Errorf("legacy query must select literal FALSE, got: %s", lastQuery)
+	}
+	if n := strings.Count(lastQuery, "ORDER BY"); n != 1 {
+		t.Errorf("legacy query must have exactly one ORDER BY, got %d: %s", n, lastQuery)
 	}
 	if len(fns) != 1 || fns[0].IsProcedure {
 		t.Errorf("legacy functions must have IsProcedure=false, got %+v", fns)

@@ -264,7 +264,6 @@ func (s *Scanner) scanFunctions(ctx context.Context) ([]FunctionInfo, error) {
 		WHERE n.nspname = $1
 			AND l.lanname IN ('plpgsql', 'sql')
 		ORDER BY p.proname
-		ORDER BY p.proname
 	`
 	if s.serverVersionNum(ctx) < 110000 {
 		query = `
