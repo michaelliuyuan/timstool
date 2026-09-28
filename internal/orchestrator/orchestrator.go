@@ -396,7 +396,14 @@ func (o *Orchestrator) runSchema(ctx context.Context) PipelineResult {
 		o.cpMgr.SetPhase("schema")
 	}
 
-	err := o.schemaMig.Run(ctx, common.SchemaOpts{})
+	// Tables/ExcludeTables align the schema PROGRESS registration set with
+	// the data migration set (①b): pre-registered entries for tables data
+	// will never process would keep tables_done < tables_total forever.
+	// DDL build/execute range inside schema.Run is unchanged.
+	err := o.schemaMig.Run(ctx, common.SchemaOpts{
+		Tables:        o.cfg.Migration.Tables,
+		ExcludeTables: o.cfg.Migration.ExcludeTables,
+	})
 
 	result := PipelineResult{
 		Phase:   PhaseSchema,

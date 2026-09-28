@@ -5,6 +5,27 @@ import (
 	"testing"
 )
 
+// TestProgressRegistrationNames anchors the ①b fix: the schema progress
+// registration set must align with the DATA migration set. With a whitelist
+// (opts.Tables non-empty) only the intersection is registered — a
+// whitelisted-out table must not produce a checkpoint entry, or data-phase
+// tables_done would never reach tables_total. Empty whitelist ⇒ all
+// collected tables (CollectTables already applied ExcludeTables).
+func TestProgressRegistrationNames(t *testing.T) {
+	tables := []TableInfo{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+
+	if got := progressRegistrationNames(tables, nil); len(got) != 3 {
+		t.Errorf("empty include: got %v, want all 3", got)
+	}
+	got := progressRegistrationNames(tables, []string{"a", "c", "zz"})
+	if len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Errorf("include {a,c,zz}: got %v, want [a c] (intersection only, zz dropped)", got)
+	}
+	if got := progressRegistrationNames(tables, []string{"zz"}); len(got) != 0 {
+		t.Errorf("include {zz}: got %v, want empty", got)
+	}
+}
+
 func TestMapType(t *testing.T) {
 	tests := []struct {
 		pgType   PGType

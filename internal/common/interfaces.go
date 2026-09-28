@@ -26,6 +26,7 @@ type SchemaOpts struct {
 	DryRun        bool
 	OutputFile    string
 	Schemas       []string
+	Tables        []string // include list for PROGRESS registration only; empty ⇒ all (DDL build/execute range is unchanged)
 	ExcludeTables []string
 }
 

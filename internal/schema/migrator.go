@@ -43,6 +43,31 @@ func (m *Migrator) SetProgressReporter(r ProgressReporter) {
 	m.rpt = r
 }
 
+// progressRegistrationNames picks the checkpoint-registration subset of the
+// collected tables: empty include list ⇒ all collected tables; non-empty ⇒
+// the intersection. tables comes back from CollectTables already
+// exclude-filtered, matching the data side's exclude semantics (①b).
+func progressRegistrationNames(tables []TableInfo, include []string) []string {
+	if len(include) == 0 {
+		names := make([]string, len(tables))
+		for i, t := range tables {
+			names[i] = t.Name
+		}
+		return names
+	}
+	set := make(map[string]struct{}, len(include))
+	for _, t := range include {
+		set[t] = struct{}{}
+	}
+	var names []string
+	for _, t := range tables {
+		if _, ok := set[t.Name]; ok {
+			names = append(names, t.Name)
+		}
+	}
+	return names
+}
+
 func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 	logger := zap.L()
 	logger.Info("starting schema migration")
@@ -70,15 +95,19 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 	}
 	logger.Info("collected tables", zap.Int("count", len(tables)))
 
-	// Register every table up front so the UI's schema tables_total is
-	// correct from the start (0/N), then mark each as its DDL is built.
+	// Register tables up front so the UI's schema tables_total is correct
+	// from the start (0/N), then mark each as its DDL is built. The
+	// registration set aligns with the DATA migration set (①b): a table
+	// that data will never process (whitelisted out or excluded) must not
+	// be pre-registered, or tables_done would never reach tables_total.
+	// DDL build/execute range above is unchanged; build-loop marks for
+	// unregistered tables are no-ops (UpdateTable errors on missing).
 	if m.rpt != nil && len(tables) > 0 {
-		names := make([]string, len(tables))
-		for i, t := range tables {
-			names[i] = t.Name
-		}
-		if err := m.rpt.RegisterSchemaTables(names); err != nil {
-			logger.Warn("schema progress: register tables failed", zap.Error(err))
+		names := progressRegistrationNames(tables, opts.Tables)
+		if len(names) > 0 {
+			if err := m.rpt.RegisterSchemaTables(names); err != nil {
+				logger.Warn("schema progress: register tables failed", zap.Error(err))
+			}
 		}
 	}
 
