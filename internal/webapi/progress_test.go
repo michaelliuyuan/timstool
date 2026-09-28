@@ -41,9 +41,11 @@ func TestComputeTaskProgress(t *testing.T) {
 		importMode    string
 		want          float64
 	}{
-		// schema 阶段：粗粒度，接近 0~5%。
-		{"schema half tables", "schema", 5, 10, 0, 0, 0, "", 0.5},
+		// schema 阶段：表比率走加权模型（schema 权重 5%），UX-0931。
+		{"schema half tables", "schema", 5, 10, 0, 0, 0, "", 0.05 * 0.5},
 		{"schema none", "schema", 0, 10, 0, 0, 0, "", 0},
+		{"schema all tables", "schema", 10, 10, 0, 0, 0, "", 0.05},
+		{"precheck all tables", "precheck", 10, 10, 0, 0, 0, "", 0.05},
 		// 导出中：≤52.5%。
 		{"export half rows", "data-export", 0, 10, 500, 1000, 0, "", 0.05 + 0.475*0.5},
 		{"export done", "data-export", 10, 10, 1000, 1000, 0, "", 0.525},
@@ -73,6 +75,19 @@ func TestComputeTaskProgress(t *testing.T) {
 		if !almostEqual(got, c.want) {
 			t.Errorf("%s: computeTaskProgress = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+func TestSchemaToDataProgressNoRegression(t *testing.T) {
+	// UX-0931: schema completion (5%) must equal the data phase entry point
+	// (5%) — the overall progress never regresses 100%→5% at the switch.
+	schemaDone := computeTaskProgress("schema", 10, 10, 0, 0, 0, "")
+	dataStart := computeTaskProgress("data", 0, 10, 0, 1000, 0, "")
+	if !almostEqual(schemaDone, 0.05) || !almostEqual(dataStart, 0.05) {
+		t.Fatalf("schema=%v data=%v, want both 0.05 (continuous)", schemaDone, dataStart)
+	}
+	if dataStart < schemaDone-1e-9 {
+		t.Fatalf("progress regressed at phase switch: %v -> %v", schemaDone, dataStart)
 	}
 }
 

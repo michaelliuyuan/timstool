@@ -1652,12 +1652,16 @@ func computeTaskProgress(rawPhase string, tablesDone, tablesTotal int, rowsDone,
 	case "validate", "completed":
 		return 1.0
 	case "schema", "precheck", "":
+		// UX-0931: route the schema-phase table ratio through the same
+		// weighted model as the data phases (schema weight 5%), so the
+		// overall progress climbs 0→5% during schema and continues 5%→100%
+		// into data — never regressing 100%→5% at the phase switch.
 		if tablesTotal > 0 {
 			p := float64(tablesDone) / float64(tablesTotal)
 			if p > 1.0 {
 				p = 1.0
 			}
-			return p
+			return weightedProgress(p, 0, 0)
 		}
 		return 0
 	}
