@@ -3,6 +3,10 @@ package schema
 import (
 	"strings"
 	"testing"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // TestProgressRegistrationNames anchors the ①b fix: the schema progress
@@ -79,7 +83,11 @@ func TestMapTypeWithPrecision(t *testing.T) {
 	}{
 		{PGNumeric, 10, 2, "DECIMAL(10,2)"},
 		{PGNumeric, 10, 0, "DECIMAL(10)"},
-		{PGNumeric, 0, 0, "DECIMAL"},
+		// BUG-0932: unbounded numeric maps to the fidelity default, never
+		// bare DECIMAL (= decimal(10,0) on TiDB, silently rounds decimals).
+		{PGNumeric, 0, 0, "DECIMAL(65,30)"},
+		{PGDecimal, 0, 0, "DECIMAL(65,30)"},
+		{PGNumeric, 12, 2, "DECIMAL(12,2)"},
 		{PGVarchar, 255, 0, "VARCHAR(255)"},
 		{PGChar, 10, 0, "CHAR(10)"},
 		{PGInteger, 0, 0, "INT"},
@@ -342,6 +350,57 @@ func TestBuildColumnDDLStripsTextFamilyDefault(t *testing.T) {
 	}
 	if len(b2.strippedDefaults) != 0 {
 		t.Errorf("timestamp must not record a strip, got %+v", b2.strippedDefaults)
+	}
+}
+
+// TestUnboundedNumericFidelityMapping anchors BUG-0932: an unbounded PG
+// numeric column must map to DECIMAL(65,30) (never bare DECIMAL =
+// decimal(10,0) on TiDB) and emit a per-column warning.
+func TestUnboundedNumericFidelityMapping(t *testing.T) {
+	core, logs := observer.New(zapcore.WarnLevel)
+	prev := zap.ReplaceGlobals(zap.New(core))
+	defer prev()
+
+	b := NewDDLBuilder()
+	col := Column{
+		TableName: "t1", ColumnName: "amount", PGType: PGNumeric,
+		IsNullable: true,
+	}
+	ddl, err := b.buildColumnDDL(col)
+	if err != nil {
+		t.Fatalf("buildColumnDDL: %v", err)
+	}
+	if !strings.Contains(ddl, "DECIMAL(65,30)") {
+		t.Errorf("unbounded numeric must map to DECIMAL(65,30), got: %s", ddl)
+	}
+	if strings.Contains(ddl, "DECIMAL(10,0)") {
+		t.Errorf("must never emit decimal(10,0), got: %s", ddl)
+	}
+	found := false
+	for _, e := range logs.All() {
+		if e.Message == "unbounded numeric mapped to DECIMAL(65,30) fidelity default" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected fidelity-mapping warn for t1.amount, got logs: %v", logs.All())
+	}
+
+	// explicit precision must NOT warn.
+	logs.TakeAll()
+	col2 := Column{
+		TableName: "t1", ColumnName: "rate", PGType: PGNumeric,
+		NumericPrec: 12, NumericScale: 2, IsNullable: true,
+	}
+	ddl, err = b.buildColumnDDL(col2)
+	if err != nil {
+		t.Fatalf("buildColumnDDL: %v", err)
+	}
+	if !strings.Contains(ddl, "DECIMAL(12,2)") {
+		t.Errorf("numeric(12,2) must stay DECIMAL(12,2), got: %s", ddl)
+	}
+	if n := len(logs.All()); n != 0 {
+		t.Errorf("explicit precision must not warn, got %d entries", n)
 	}
 }
 

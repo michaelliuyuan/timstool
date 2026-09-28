@@ -134,7 +134,11 @@ func MapTypeWithPrecision(pgType PGType, precision, scale int) string {
 		} else if precision > 0 {
 			return fmt.Sprintf("DECIMAL(%d)", precision)
 		}
-		return "DECIMAL"
+		// BUG-0932: PG unbounded numeric (atttypmod=-1, collector COALESCE
+		// lands 0/0). A bare DECIMAL means decimal(10,0) on MySQL/TiDB and
+		// silently rounds away decimals — map to the family maximum
+		// DECIMAL(65,30) instead (fidelity-preserving default).
+		return "DECIMAL(65,30)"
 	case PGChar:
 		if precision > 0 {
 			return fmt.Sprintf("CHAR(%d)", precision)

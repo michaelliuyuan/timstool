@@ -3,6 +3,8 @@ package schema
 import (
 	"fmt"
 	"strings"
+
+	"go.uber.org/zap"
 )
 
 type DDLBuilder struct {
@@ -93,6 +95,17 @@ func (b *DDLBuilder) buildColumnDDL(col Column) (string, error) {
 	mysqlType := MapTypeWithPrecision(col.PGType, precision, col.NumericScale)
 	if mysqlType == "" {
 		mysqlType = "TEXT"
+	}
+
+	// BUG-0932: unbounded PG numeric/decimal maps to the fidelity default
+	// DECIMAL(65,30) — warn per column (same channel/format as the 0930
+	// stripped-default warnings; visible in the schema phase tab).
+	if (col.PGType == PGNumeric || col.PGType == PGDecimal) &&
+		col.NumericPrec == 0 && col.NumericScale == 0 {
+		zap.L().Warn("unbounded numeric mapped to DECIMAL(65,30) fidelity default",
+			zap.String("table", col.TableName),
+			zap.String("column", col.ColumnName),
+			zap.String("pg_type", string(col.PGType)))
 	}
 
 	if col.ColumnName == "" {
