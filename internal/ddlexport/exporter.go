@@ -71,6 +71,25 @@ type Exporter struct {
 	db       *sql.DB
 	opts     Options
 	manifest Manifest
+	// pgVersion is the cached server_version_num (0 = not probed/unknown).
+	// pg_proc.prokind exists only on PG 11+ (BUG-0934): legacy servers need
+	// queries without that column and have no procedures at all.
+	pgVersion int
+}
+
+// serverVersionNum probes (once) and caches SHOW server_version_num; a
+// probe failure returns 0 (callers then keep the modern query and the
+// original error surfaces there).
+func (e *Exporter) serverVersionNum(ctx context.Context) int {
+	if e.pgVersion != 0 {
+		return e.pgVersion
+	}
+	var v int
+	if err := e.db.QueryRowContext(ctx, `SHOW server_version_num`).Scan(&v); err != nil {
+		return 0
+	}
+	e.pgVersion = v
+	return v
 }
 
 // NewExporter creates an exporter bound to an open PG connection.
@@ -294,11 +313,23 @@ ORDER BY s.sequencename`, []interface{}{schemaName}, func(row *sql.Rows) (string
 	}
 
 	if t.Functions {
-		ddl, n, err := e.renderRows(ctx, "functions", `
+		// BUG-0934: PG ≤ 10 has no pg_proc.prokind — filter by language
+		// (plpgsql/sql) instead; everything matched is a function there.
+		funcQuery := `
 SELECT p.proname, pg_get_functiondef(p.oid)
 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+JOIN pg_language l ON l.oid = p.prolang
 WHERE n.nspname = $1 AND p.prokind = 'f'
-ORDER BY p.proname`, []interface{}{schemaName}, func(row *sql.Rows) (string, error) {
+ORDER BY p.proname`
+		if e.serverVersionNum(ctx) < 110000 {
+			funcQuery = `
+SELECT p.proname, pg_get_functiondef(p.oid)
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+JOIN pg_language l ON l.oid = p.prolang
+WHERE n.nspname = $1 AND l.lanname IN ('plpgsql', 'sql')
+ORDER BY p.proname`
+		}
+		ddl, n, err := e.renderRows(ctx, "functions", funcQuery, []interface{}{schemaName}, func(row *sql.Rows) (string, error) {
 			var name, def sql.NullString
 			if err := row.Scan(&name, &def); err != nil {
 				return "", err
@@ -316,25 +347,29 @@ ORDER BY p.proname`, []interface{}{schemaName}, func(row *sql.Rows) (string, err
 	}
 
 	if t.Procedures {
-		ddl, n, err := e.renderRows(ctx, "procedures", `
+		// BUG-0934: procedures exist only on PG 11+ — skip the catalog
+		// query entirely on legacy servers (empty section, zero rows).
+		if e.serverVersionNum(ctx) >= 110000 {
+			ddl, n, err := e.renderRows(ctx, "procedures", `
 SELECT p.proname, pg_get_functiondef(p.oid)
 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
 WHERE n.nspname = $1 AND p.prokind = 'p'
 ORDER BY p.proname`, []interface{}{schemaName}, func(row *sql.Rows) (string, error) {
-			var name, def sql.NullString
-			if err := row.Scan(&name, &def); err != nil {
-				return "", err
+				var name, def sql.NullString
+				if err := row.Scan(&name, &def); err != nil {
+					return "", err
+				}
+				if !def.Valid || def.String == "" {
+					return "", nil
+				}
+				return terminated(def.String), nil
+			})
+			if err != nil {
+				return nil, err
 			}
-			if !def.Valid || def.String == "" {
-				return "", nil
-			}
-			return terminated(def.String), nil
-		})
-		if err != nil {
-			return nil, err
+			files["procedures.sql"] = ddl
+			e.countN(schemaName, "procedures.sql", n)
 		}
-		files["procedures.sql"] = ddl
-		e.countN(schemaName, "procedures.sql", n)
 	}
 
 	if t.Triggers {

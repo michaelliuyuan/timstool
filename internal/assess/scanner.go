@@ -13,6 +13,10 @@ import (
 type Scanner struct {
 	db     *sql.DB
 	schema string
+	// pgVersion is the cached server_version_num (0 = not probed yet).
+	// PG 11 added pg_proc.prokind; on older servers the functions query
+	// must use a legacy form without that column (BUG-0934).
+	pgVersion int
 }
 
 // NewScanner creates a new Scanner.
@@ -224,8 +228,26 @@ func (s *Scanner) scanViews(ctx context.Context) ([]ViewInfo, error) {
 	return views, nil
 }
 
+// serverVersionNum probes (once) and caches SHOW server_version_num.
+// A probe failure returns 0 — callers then take the modern path and the
+// original error surfaces from the actual query.
+func (s *Scanner) serverVersionNum(ctx context.Context) int {
+	if s.pgVersion != 0 {
+		return s.pgVersion
+	}
+	var v int
+	if err := s.db.QueryRowContext(ctx, `SHOW server_version_num`).Scan(&v); err != nil {
+		return 0
+	}
+	s.pgVersion = v
+	return v
+}
+
 func (s *Scanner) scanFunctions(ctx context.Context) ([]FunctionInfo, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	// BUG-0934: pg_proc.prokind exists only on PG 11+. On legacy servers
+	// use a query without that column; PG ≤ 10 has no procedures, so
+	// IsProcedure is constant false there.
+	query := `
 		SELECT
 			n.nspname,
 			p.proname,
@@ -242,7 +264,29 @@ func (s *Scanner) scanFunctions(ctx context.Context) ([]FunctionInfo, error) {
 		WHERE n.nspname = $1
 			AND l.lanname IN ('plpgsql', 'sql')
 		ORDER BY p.proname
-	`, s.schema)
+		ORDER BY p.proname
+	`
+	if s.serverVersionNum(ctx) < 110000 {
+		query = `
+		SELECT
+			n.nspname,
+			p.proname,
+			COALESCE(pg_get_function_result(p.oid), 'void'),
+			CASE WHEN l.lanname = 'plpgsql' THEN 'plpgsql'
+				  WHEN l.lanname = 'sql' THEN 'sql'
+				  ELSE l.lanname::text END,
+			p.prosrc,
+			FALSE,
+			COALESCE(pg_get_functiondef(p.oid), '')
+		FROM pg_proc p
+		JOIN pg_namespace n ON p.pronamespace = n.oid
+		JOIN pg_language l ON p.prolang = l.oid
+		WHERE n.nspname = $1
+			AND l.lanname IN ('plpgsql', 'sql')
+		ORDER BY p.proname
+	`
+	}
+	rows, err := s.db.QueryContext(ctx, query, s.schema)
 	if err != nil {
 		return nil, err
 	}
