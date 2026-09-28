@@ -29,20 +29,12 @@ func (b *DDLBuilder) StrippedDefaults() []StrippedDefault {
 }
 
 // blocksColumnDefault reports whether the mapped TiDB type belongs to the
-// TEXT/BLOB/JSON families that cannot carry a literal DEFAULT (err 1101).
-// CURRENT_TIMESTAMP-style keyword defaults are legal only on TIMESTAMP/
-// DATETIME columns; on blocked families they are stripped too (adversarial
-// angle 2: PG text DEFAULT CURRENT_TIMESTAMP must not slip through).
+// TEXT/BLOB/JSON families that cannot carry ANY DEFAULT (err 1101) —
+// literal or keyword (CURRENT_TIMESTAMP included). TIMESTAMP/DATETIME and
+// other families never match the substrings and keep their defaults.
 func blocksColumnDefault(mysqlType, def string) bool {
 	t := strings.ToUpper(mysqlType)
-	blocked := strings.Contains(t, "TEXT") || strings.Contains(t, "BLOB") || strings.Contains(t, "JSON")
-	if !blocked {
-		return false
-	}
-	if strings.Contains(t, "TIMESTAMP") || strings.Contains(t, "DATETIME") {
-		return false
-	}
-	return true
+	return strings.Contains(t, "TEXT") || strings.Contains(t, "BLOB") || strings.Contains(t, "JSON")
 }
 
 func NewDDLBuilder() *DDLBuilder {

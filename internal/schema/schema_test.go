@@ -325,6 +325,24 @@ func TestBuildColumnDDLStripsTextFamilyDefault(t *testing.T) {
 	if len(b.strippedDefaults) != 1 || b.strippedDefaults[0].Default != "CURRENT_TIMESTAMP" {
 		t.Errorf("text+CURRENT_TIMESTAMP must record strip, got %+v", b.strippedDefaults)
 	}
+
+	// regression guard: timestamp + CURRENT_TIMESTAMP(6) → KEPT (not a
+	// blocked family; keyword defaults are legal on TIMESTAMP/DATETIME).
+	b2 := NewDDLBuilder()
+	col2 := Column{
+		TableName: "t1", ColumnName: "created_at", PGType: PGTimestamp,
+		IsNullable: true, DefaultValue: "CURRENT_TIMESTAMP(6)",
+	}
+	ddl, err = b2.buildColumnDDL(col2)
+	if err != nil {
+		t.Fatalf("buildColumnDDL: %v", err)
+	}
+	if !strings.Contains(strings.ToUpper(ddl), "DEFAULT CURRENT_TIMESTAMP") {
+		t.Errorf("timestamp+CURRENT_TIMESTAMP(6) must keep DEFAULT, got: %s", ddl)
+	}
+	if len(b2.strippedDefaults) != 0 {
+		t.Errorf("timestamp must not record a strip, got %+v", b2.strippedDefaults)
+	}
 }
 
 func TestQuoteIdentifier(t *testing.T) {
