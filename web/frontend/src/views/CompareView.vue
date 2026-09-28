@@ -391,7 +391,11 @@ function downloadBlob(content: BlobPart, mime: string, fileName: string) {
 }
 
 function csvCell(v: unknown): string {
-  const s = v === undefined || v === null ? '' : String(v)
+  let s = v === undefined || v === null ? '' : String(v)
+  // Excel formula-injection guard: a cell starting with =/+/@ (or a '-'
+  // not part of a plain negative number) would be interpreted as a
+  // formula in Excel — prefix a single quote to defuse it.
+  if (/^[=+@]/.test(s) || (/^-/.test(s) && !/^-?\d+(\.\d+)?$/.test(s))) s = `'` + s
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
 }
 
