@@ -372,6 +372,117 @@ function diffHeat(n: number | undefined): string {
   return 'diff-high'
 }
 
+// ---- report export (FEAT-0933, client-side CSV + HTML) ----
+
+function reportFileName(ext: string) {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  return `compare-report-${activeTask.value?.id ?? 'x'}-${ts}.${ext}`
+}
+
+function downloadBlob(content: BlobPart, mime: string, fileName: string) {
+  const url = URL.createObjectURL(new Blob([content], { type: mime }))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = fileName
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function csvCell(v: unknown): string {
+  const s = v === undefined || v === null ? '' : String(v)
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+
+function exportCsv() {
+  const r = activeReport.value
+  if (!r) return
+  const lines: string[] = []
+  lines.push(['总体状态', csvCell(r.overall_status)].join(','))
+  lines.push(['开始时间', csvCell(r.start_time)].join(','))
+  lines.push(['结束时间', csvCell(r.end_time)].join(','))
+  lines.push(['耗时', csvCell(r.duration)].join(','))
+  if (r.summary) lines.push(['摘要', csvCell(r.summary)].join(','))
+  lines.push('')
+  lines.push(
+    ['总表数', '通过', '失败', '警告', '跳过', '源总行数', '目标总行数', '差异总行数'].map(csvCell).join(','),
+  )
+  lines.push(
+    [
+      r.stats.total_tables, r.stats.pass_tables, r.stats.fail_tables,
+      r.stats.warn_tables, r.stats.skip_tables,
+      r.stats.total_source_rows, r.stats.total_target_rows, r.stats.total_diff_rows,
+    ].map(csvCell).join(','),
+  )
+  lines.push('')
+  lines.push(
+    ['表名', '状态', '源行数', '目标行数', '差异行数', '耗时', '错误', '建议'].map(csvCell).join(','),
+  )
+  for (const t of r.tables) {
+    lines.push(
+      [t.table_name, t.status, t.source_rows, t.target_rows, t.diff_rows, t.duration, t.error, t.suggestion]
+        .map(csvCell).join(','),
+    )
+  }
+  // UTF-8 BOM so Excel opens Chinese cells correctly.
+  downloadBlob('\uFEFF' + lines.join('\r\n'), 'text/csv;charset=utf-8', reportFileName('csv'))
+}
+
+function esc(s: unknown): string {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+function exportHtml() {
+  const r = activeReport.value
+  if (!r) return
+  const rows = r.tables
+    .map(
+      (t) => `<tr class="st-${esc(t.status)}">
+<td>${esc(t.table_name)}</td><td>${esc(t.status)}</td>
+<td class="num">${esc(t.source_rows)}</td><td class="num">${esc(t.target_rows)}</td>
+<td class="num">${esc(t.diff_rows)}</td><td>${esc(t.duration)}</td>
+<td>${esc(t.error || '')}</td><td>${esc(t.suggestion || '')}</td></tr>`,
+    )
+    .join('\n')
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>数据比对报告 ${esc(activeTask.value?.name || '')}</title>
+<style>
+body{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:24px;color:#1f2d3d}
+h1{font-size:20px} h2{font-size:15px;margin-top:24px}
+.meta td,.stats td{padding:4px 14px 4px 0}
+table.detail{border-collapse:collapse;width:100%;font-size:13px}
+table.detail th,table.detail td{border:1px solid #dcdfe6;padding:6px 10px;text-align:left}
+table.detail th{background:#f5f7fa}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.st-pass td:first-child{border-left:3px solid #67c23a}
+.st-fail td:first-child{border-left:3px solid #f56c6c}
+.st-warn td:first-child{border-left:3px solid #e6a23c}
+.st-skip td:first-child{border-left:3px solid #909399}
+footer{margin-top:20px;color:#909399;font-size:12px}
+</style></head><body>
+<h1>数据比对报告 — ${esc(activeTask.value?.name || '')}</h1>
+<table class="meta">
+<tr><td>任务 ID</td><td>${esc(activeTask.value?.id || '')}</td><td>模式</td><td>${esc(activeTask.value?.mode || '')}</td></tr>
+<tr><td>总体状态</td><td>${esc(r.overall_status)}</td><td>耗时</td><td>${esc(r.duration)}</td></tr>
+<tr><td>开始时间</td><td>${esc(r.start_time)}</td><td>结束时间</td><td>${esc(r.end_time)}</td></tr>
+</table>
+<h2>汇总</h2>
+<table class="stats">
+<tr><td>总表数 <b>${r.stats.total_tables}</b></td><td>通过 <b>${r.stats.pass_tables}</b></td><td>失败 <b>${r.stats.fail_tables}</b></td><td>警告 <b>${r.stats.warn_tables}</b></td><td>跳过 <b>${r.stats.skip_tables}</b></td></tr>
+<tr><td>源总行数 <b>${r.stats.total_source_rows}</b></td><td>目标总行数 <b>${r.stats.total_target_rows}</b></td><td>差异总行数 <b>${r.stats.total_diff_rows}</b></td></tr>
+</table>
+${r.summary ? `<p>${esc(r.summary)}</p>` : ''}
+<h2>逐表明细</h2>
+<table class="detail">
+<thead><tr><th>表名</th><th>状态</th><th>源行数</th><th>目标行数</th><th>差异行数</th><th>耗时</th><th>错误</th><th>建议</th></tr></thead>
+<tbody>
+${rows}
+</tbody></table>
+<footer>由 TimsTool 生成 · ${new Date().toLocaleString()}（浏览器打印可另存为 PDF）</footer>
+</body></html>`
+  downloadBlob(html, 'text/html;charset=utf-8', reportFileName('html'))
+}
+
 onMounted(async () => {
   await loadSources()
   loadDataSources()
@@ -542,6 +653,10 @@ onUnmounted(() => {
       <el-alert v-if="activeTask.error" type="error" :closable="false" :title="activeTask.error" style="margin-bottom: 12px;" />
 
       <template v-if="activeReport">
+        <div style="margin-bottom: 12px; text-align: right;">
+          <el-button size="small" @click="exportCsv">导出 CSV</el-button>
+          <el-button size="small" @click="exportHtml">导出 HTML</el-button>
+        </div>
         <div class="tims-gauge-row">
           <div class="tims-gauge">
             <span class="tims-gauge-label">总表数</span>
