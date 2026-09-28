@@ -375,7 +375,9 @@ function diffHeat(n: number | undefined): string {
 // ---- report export (FEAT-0933, client-side CSV + HTML) ----
 
 function reportFileName(ext: string) {
-  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  const d = new Date()
+  const p = (n: number) => String(n).padStart(2, '0')
+  const ts = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
   return `compare-report-${activeTask.value?.id ?? 'x'}-${ts}.${ext}`
 }
 
@@ -424,7 +426,11 @@ function exportCsv() {
     )
   }
   // UTF-8 BOM so Excel opens Chinese cells correctly.
-  downloadBlob('\uFEFF' + lines.join('\r\n'), 'text/csv;charset=utf-8', reportFileName('csv'))
+  try {
+    downloadBlob('\uFEFF' + lines.join('\r\n'), 'text/csv;charset=utf-8', reportFileName('csv'))
+  } catch (e: any) {
+    ElMessage.error(`导出 CSV 失败：${e?.message || e}`)
+  }
 }
 
 function esc(s: unknown): string {
@@ -480,7 +486,11 @@ ${rows}
 </tbody></table>
 <footer>由 TimsTool 生成 · ${new Date().toLocaleString()}（浏览器打印可另存为 PDF）</footer>
 </body></html>`
-  downloadBlob(html, 'text/html;charset=utf-8', reportFileName('html'))
+  try {
+    downloadBlob(html, 'text/html;charset=utf-8', reportFileName('html'))
+  } catch (e: any) {
+    ElMessage.error(`导出 HTML 失败：${e?.message || e}`)
+  }
 }
 
 onMounted(async () => {
