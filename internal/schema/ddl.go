@@ -7,6 +7,37 @@ import (
 
 type DDLBuilder struct {
 	statements []string
+	// strippedDefaults records every TEXT/BLOB/JSON-family column whose
+	// literal DEFAULT was stripped (BUG-0930 commit 1): TiDB/MySQL reject
+	// literal defaults on these families (err 1101), so the default is
+	// dropped with a warning instead of failing the whole schema phase.
+	strippedDefaults []StrippedDefault
+}
+
+// StrippedDefault is one stripped column default, for warnings and the
+// migration report (visible compensation list).
+type StrippedDefault struct {
+	Table   string
+	Column  string
+	Default string
+	NotNull bool // NOT NULL + DEFAULT both set: after stripping, inserts omitting the column will fail
+}
+
+// StrippedDefaults returns the recorded strip list (caller consumes).
+func (b *DDLBuilder) StrippedDefaults() []StrippedDefault {
+	return b.strippedDefaults
+}
+
+// blocksColumnDefault reports whether the mapped TiDB type belongs to the
+// TEXT/BLOB/JSON families that cannot carry a literal DEFAULT (err 1101).
+// CURRENT_TIMESTAMP-style keyword defaults are exempt (never literal).
+func blocksColumnDefault(mysqlType, def string) bool {
+	up := strings.ToUpper(strings.TrimSpace(def))
+	if strings.Contains(up, "CURRENT_TIMESTAMP") {
+		return false
+	}
+	t := strings.ToUpper(mysqlType)
+	return strings.Contains(t, "TEXT") || strings.Contains(t, "BLOB") || strings.Contains(t, "JSON")
 }
 
 func NewDDLBuilder() *DDLBuilder {
@@ -87,7 +118,19 @@ func (b *DDLBuilder) buildColumnDDL(col Column) (string, error) {
 	} else if col.DefaultValue != "" {
 		def := convertDefaultValue(col.DefaultValue, col.PGType)
 		if def != "" {
-			parts = append(parts, "DEFAULT "+def)
+			if blocksColumnDefault(mysqlType, def) {
+				// BUG-0930: TiDB 1101 guard — strip the literal default
+				// on TEXT/BLOB/JSON-family columns instead of emitting DDL
+				// that fails the whole schema phase.
+				b.strippedDefaults = append(b.strippedDefaults, StrippedDefault{
+					Table:   col.TableName,
+					Column:  col.ColumnName,
+					Default: def,
+					NotNull: !col.IsNullable,
+				})
+			} else {
+				parts = append(parts, "DEFAULT "+def)
+			}
 		}
 	}
 

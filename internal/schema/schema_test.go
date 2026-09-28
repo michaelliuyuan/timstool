@@ -252,6 +252,63 @@ func TestConvertDefaultValue(t *testing.T) {
 	}
 }
 
+// TestBuildColumnDDLStripsTextFamilyDefault anchors BUG-0930 commit 1: a
+// literal DEFAULT on a column mapped to the TEXT/BLOB/JSON family must be
+// STRIPPED (recorded for warning/report) instead of emitted — TiDB rejects
+// it with 1101 and the whole schema phase fails. varchar(n) defaults stay.
+func TestBuildColumnDDLStripsTextFamilyDefault(t *testing.T) {
+	buildCol := func(pgType PGType, maxLength int, nullable bool) (string, []StrippedDefault) {
+		b := NewDDLBuilder()
+		col := Column{
+			TableName: "t1", ColumnName: "status", PGType: pgType,
+			MaxLength: maxLength, IsNullable: nullable, DefaultValue: "'applied'",
+		}
+		ddl, err := b.buildColumnDDL(col)
+		if err != nil {
+			t.Fatalf("buildColumnDDL: %v", err)
+		}
+		return ddl, b.strippedDefaults
+	}
+
+	// text + default → stripped, NOT NULL flag recorded.
+	ddl, sd := buildCol(PGText, 0, false)
+	if strings.Contains(strings.ToUpper(ddl), "DEFAULT") {
+		t.Errorf("text+default must strip DEFAULT, got: %s", ddl)
+	}
+	if len(sd) != 1 || sd[0].Table != "t1" || sd[0].Column != "status" || sd[0].Default != "'applied'" || !sd[0].NotNull {
+		t.Errorf("stripped record = %+v, want one NOT NULL entry for t1.status", sd)
+	}
+
+	// varchar(n) + default → KEPT (legal on VARCHAR).
+	ddl, sd = buildCol(PGVarchar, 64, true)
+	if !strings.Contains(ddl, "DEFAULT 'applied'") {
+		t.Errorf("varchar(n)+default must keep DEFAULT, got: %s", ddl)
+	}
+	if len(sd) != 0 {
+		t.Errorf("varchar must not record a strip, got %+v", sd)
+	}
+
+	// bytea → BLOB, json → JSON, xml → LONGTEXT: same family strip.
+	for _, pt := range []PGType{PGBytea, PGJSON, PGXML} {
+		ddl, sd = buildCol(pt, 0, true)
+		if strings.Contains(strings.ToUpper(ddl), "DEFAULT") {
+			t.Errorf("%s+default must strip DEFAULT, got: %s", pt, ddl)
+		}
+		if len(sd) != 1 {
+			t.Errorf("%s must record one strip, got %+v", pt, sd)
+		}
+	}
+
+	// unknown PG type falls back to TEXT → same strip.
+	ddl, sd = buildCol(PGType("weird_type"), 0, true)
+	if !strings.Contains(strings.ToUpper(ddl), "TEXT") || strings.Contains(strings.ToUpper(ddl), "DEFAULT") {
+		t.Errorf("unknown-type fallback TEXT must strip DEFAULT, got: %s", ddl)
+	}
+	if len(sd) != 1 {
+		t.Errorf("unknown-type must record one strip, got %+v", sd)
+	}
+}
+
 func TestQuoteIdentifier(t *testing.T) {
 	if QuoteIdentifier("table") != "`table`" {
 		t.Error("should backtick-quote identifier")

@@ -162,6 +162,7 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 	}
 
 	var deferredFKs []string
+	strippedBefore := 0
 
 	for _, table := range schemaInfo.Tables {
 		policy := m.cfg.Migration.TargetPolicy
@@ -204,6 +205,29 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 			continue
 		}
 		logger.Info(fmt.Sprintf("built table DDL: %s", table.Name))
+
+		// BUG-0930: surface stripped TEXT/BLOB/JSON-family defaults for
+		// this table — per-column warning + one visible report row.
+		if stripped := builder.strippedDefaults[strippedBefore:]; len(stripped) > 0 {
+			var notes []string
+			for _, sd := range stripped {
+				if sd.NotNull {
+					logger.Warn("schema DDL: stripped literal DEFAULT on TEXT/BLOB/JSON column (NOT NULL — post-migration INSERTs omitting this column WILL FAIL)",
+						zap.String("table", sd.Table), zap.String("column", sd.Column), zap.String("default", sd.Default))
+					notes = append(notes, fmt.Sprintf("%s=%s [NOT NULL: INSERT without this column will fail]", sd.Column, sd.Default))
+				} else {
+					logger.Warn("schema DDL: stripped literal DEFAULT on TEXT/BLOB/JSON column",
+						zap.String("table", sd.Table), zap.String("column", sd.Column), zap.String("default", sd.Default))
+					notes = append(notes, fmt.Sprintf("%s=%s", sd.Column, sd.Default))
+				}
+			}
+			rpt.AddTableReport(reporter.TableReport{
+				TableName:  table.Name,
+				Status:     reporter.StatusWarn,
+				Suggestion: "TiDB 1101: stripped literal DEFAULT on TEXT/BLOB/JSON column(s): " + strings.Join(notes, "; "),
+			})
+			strippedBefore = len(builder.strippedDefaults)
+		}
 
 		for _, idx := range table.Indexes {
 			if idx.IsPrimary {
