@@ -34,6 +34,10 @@ const availableTables = ref<{name: string; row_estimate: number}[]>([])
 const loadingTables = ref(false)
 const tableSearch = ref('')
 const selectedTables = ref<string[]>([])
+// BUG-0930: explicit exclude entry — excluded tables skip BOTH schema DDL
+// and data (aligned with CLI --exclude-tables). Structurally disjoint from
+// selectedTables: selecting a row clears its exclusion.
+const excludedTables = ref<string[]>([])
 const tableRef = ref<any>(null)
 
 const form = reactive({
@@ -247,6 +251,7 @@ async function loadTables() {
   loadingTables.value = true
   availableTables.value = []
   selectedTables.value = []
+  excludedTables.value = []
   try {
     // F-02: a datasource ref lists tables server-side (no credentials here).
     // P2-4: mysql refs route through the multi-source adapter endpoint —
@@ -291,6 +296,21 @@ const filteredTables = computed(() => {
 
 function handleTableSelection(rows: { name: string; row_estimate: number }[]) {
   selectedTables.value = rows.map(r => r.name)
+  // Structural no-intersection: a checked table can never stay excluded.
+  const sel = new Set(selectedTables.value)
+  excludedTables.value = excludedTables.value.filter(t => !sel.has(t))
+}
+
+function isExcluded(name: string) {
+  return excludedTables.value.includes(name)
+}
+
+function toggleExclude(name: string, val: boolean) {
+  if (val) {
+    if (!excludedTables.value.includes(name)) excludedTables.value.push(name)
+  } else {
+    excludedTables.value = excludedTables.value.filter(t => t !== name)
+  }
 }
 
 function toggleSelectAll() {
@@ -318,7 +338,7 @@ async function submit() {
         batch_size: form.opts.batch_size,
         temp_dir: form.opts.temp_dir,
         tables: selectedTables.value,
-        exclude_tables: [],
+        exclude_tables: excludedTables.value,
         use_lightning: form.opts.use_lightning,
         lightning_path: form.opts.use_lightning ? (lightningResolvedPath.value || form.opts.lightning_path.trim()) : '',
         skip_precheck: form.opts.skip_precheck,
@@ -600,9 +620,29 @@ function prevStep() {
                   <span style="color: var(--tims-text-2);">{{ row.row_estimate >= 0 ? row.row_estimate.toLocaleString() : '-' }}</span>
                 </template>
               </el-table-column>
+              <el-table-column label="排除迁移" width="120" align="center">
+                <template #default="{ row }: { row: { name: string } }">
+                  <el-switch
+                    :model-value="isExcluded(row.name)"
+                    :disabled="selectedTables.includes(row.name)"
+                    @update:model-value="(v: any) => toggleExclude(row.name, !!v)"
+                  />
+                </template>
+              </el-table-column>
             </el-table>
             <div v-if="selectedTables.length === 0 && availableTables.length > 0" style="margin-top: 8px;">
               <el-alert type="info" :closable="false" title="未选择任何表，将迁移所有表" />
+            </div>
+            <div style="margin-top: 8px;">
+              <el-alert type="info" :closable="false">
+                <template #title>
+                  勾选 = 选择要迁移数据的表（未勾选的表仍会在目标端建表结构）；
+                  打开「排除迁移」开关 = 该表的结构与数据完全不迁移。
+                </template>
+                <div v-if="excludedTables.length > 0" style="font-size: var(--tims-font-xs);">
+                  已排除 {{ excludedTables.length }} 张表；被其他表外键引用的表不建议排除（会导致 Schema 阶段失败）。
+                </div>
+              </el-alert>
             </div>
           </template>
         </div>

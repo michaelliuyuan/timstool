@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 
@@ -15,6 +16,42 @@ import (
 // reports its own tables_total/tables_done + per-table list, while the data
 // phase stays empty until the schema phase is over (no 0/N preview from
 // schema-registered entries).
+// TestCreateTaskRejectsTablesExcludeIntersection anchors BUG-0930 commit 2:
+// a table present in BOTH tables and exclude_tables is a contradictory
+// config (data-side include would win while schema DDL is excluded →
+// mid-run failure) and must be rejected 400 at creation.
+func TestCreateTaskRejectsTablesExcludeIntersection(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "ix-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "ix-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+
+	newTask := func(opts string) *httptest.ResponseRecorder {
+		w, req := doReq("POST", "/api/v1/tasks", fmt.Sprintf(`{"name": "ix", "source_ref": %q, "target_ref": %q, "opts": %s}`, srcID, tgtID, opts))
+		s.handleCreateTask(w, req)
+		return w
+	}
+
+	// Overlap → 400.
+	if w := newTask(`{"tables": ["a", "b"], "exclude_tables": ["b", "c"]}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("overlap config = %d %s, want 400", w.Code, w.Body.String())
+	}
+	// Disjoint sets still create fine.
+	if w := newTask(`{"tables": ["a"], "exclude_tables": ["b"]}`); w.Code != http.StatusOK && w.Code != http.StatusCreated {
+		t.Fatalf("disjoint config = %d %s, want 2xx", w.Code, w.Body.String())
+	}
+}
+
 func TestTaskPhases_SchemaPhaseReporting(t *testing.T) {
 	s, _ := newTestServer(t)
 

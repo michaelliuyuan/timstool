@@ -1122,6 +1122,23 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		req.Name = fmt.Sprintf("Migration %s", time.Now().Format("2006-01-02 15:04:05"))
 	}
 
+	// BUG-0930: reject contradictory table sets at creation — a table in
+	// both the include list and the exclude list is always a misconfig
+	// (data-side include wins but schema DDL is excluded → mid-run failure).
+	if len(req.Opts.Tables) > 0 && len(req.Opts.ExcludeTables) > 0 {
+		exSet := make(map[string]struct{}, len(req.Opts.ExcludeTables))
+		for _, t := range req.Opts.ExcludeTables {
+			exSet[t] = struct{}{}
+		}
+		for _, t := range req.Opts.Tables {
+			if _, ok := exSet[t]; ok {
+				s.writeError(w, http.StatusBadRequest,
+					fmt.Sprintf("tables 与 exclude_tables 存在交集（表 %s 同时被勾选和排除），请修正后重试", t))
+				return
+			}
+		}
+	}
+
 	task := &store.Task{
 		ID:   uuid.New().String()[:8],
 		Name: req.Name,
