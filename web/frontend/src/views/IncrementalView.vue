@@ -476,6 +476,11 @@ function openHistory(j: IncrementalJob) {
   historyVisible.value = true
 }
 
+function onRowCommand(command: string, row: IncrementalJob) {
+  if (command === 'edit') openEdit(row)
+  else if (command === 'remove') removeJob(row)
+}
+
 const strategyLabels: Record<string, string> = { replace: 'REPLACE INTO', ignore: 'INSERT IGNORE', error: '报错停止' }
 
 // Initial-watermark form item: shared tooltip + hint text (#t1-C).
@@ -530,12 +535,21 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
             </span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="280" fixed="right">
+        <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
-            <el-button type="primary" size="small" :loading="running === row.id" @click="runJob(row)">立即同步</el-button>
-            <el-button size="small" @click="openHistory(row)">运行历史</el-button>
-            <el-button size="small" @click="openEdit(row)">编辑</el-button>
-            <el-button size="small" type="danger" @click="removeJob(row)">删除</el-button>
+            <div class="row-actions">
+              <el-button type="primary" size="small" :loading="running === row.id" @click="runJob(row)">立即同步</el-button>
+              <el-button size="small" link @click="openHistory(row)">运行历史</el-button>
+              <el-dropdown trigger="click" @command="(c: string) => onRowCommand(c, row)">
+                <el-button size="small" link>更多<el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="edit">编辑</el-dropdown-item>
+                    <el-dropdown-item command="remove" divided class="row-del">删除</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+            </div>
           </template>
         </el-table-column>
       </el-table>
@@ -701,6 +715,21 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
 .row-hint {
   width: 100%;
   padding-left: 2px;
+}
+
+.row-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 8px;
+}
+
+.row-actions .el-button + .el-button {
+  margin-left: 0;
+}
+
+.row-del {
+  color: var(--el-color-danger);
 }
 
 .wm-hint {

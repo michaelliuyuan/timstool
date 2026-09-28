@@ -165,6 +165,11 @@ function fmtTime(s?: string): string {
   return isNaN(d.getTime()) ? '-' : d.toLocaleString()
 }
 
+function onRowCommand(command: string, row: DataSource) {
+  if (command === 'edit') openEdit(row)
+  else if (command === 'remove') removeDS(row)
+}
+
 const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.localeCompare(b.name)))
 </script>
 
@@ -211,11 +216,20 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
             <span v-else class="ds-dim">未测试</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="200" align="right">
+        <el-table-column label="操作" width="180" align="right">
           <template #default="{ row }">
-            <el-button size="small" :loading="testingId === row.id" @click="testDS(row)">测试连接</el-button>
-            <el-button size="small" @click="openEdit(row)">编辑</el-button>
-            <el-button size="small" type="danger" plain @click="removeDS(row)">删除</el-button>
+            <div class="row-actions">
+              <el-button size="small" :loading="testingId === row.id" @click="testDS(row)">测试连接</el-button>
+              <el-dropdown trigger="click" @command="(c: string) => onRowCommand(c, row)">
+                <el-button size="small" link>更多<el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item command="edit">编辑</el-dropdown-item>
+                    <el-dropdown-item command="remove" divided class="row-del">删除</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
+            </div>
           </template>
         </el-table-column>
       </el-table>
@@ -273,4 +287,20 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
 .ds-test-result { margin-top: 8px; font-size: var(--tims-font-xs); }
 .ds-test-result.ok { color: var(--tims-tag-success-text, #0b7a7a); }
 .ds-test-result.bad { color: var(--tims-tag-danger-text, #c02f2f); }
+
+.row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: nowrap;
+  gap: 8px;
+}
+
+.row-actions .el-button + .el-button {
+  margin-left: 0;
+}
+
+.row-del {
+  color: var(--el-color-danger);
+}
 </style>
