@@ -99,9 +99,10 @@ func (b *DDLBuilder) buildColumnDDL(col Column) (string, error) {
 
 	// BUG-0932: unbounded PG numeric/decimal maps to the fidelity default
 	// DECIMAL(65,30) — warn per column (same channel/format as the 0930
-	// stripped-default warnings; visible in the schema phase tab).
-	if (col.PGType == PGNumeric || col.PGType == PGDecimal) &&
-		col.NumericPrec == 0 && col.NumericScale == 0 {
+	// stripped-default warnings; visible in the schema phase tab). The
+	// predicate is the shared isUnboundedNumeric so warn and mapping
+	// cannot drift apart.
+	if isUnboundedNumeric(col.PGType, col.NumericPrec, col.NumericScale) {
 		zap.L().Warn("unbounded numeric mapped to DECIMAL(65,30) fidelity default",
 			zap.String("table", col.TableName),
 			zap.String("column", col.ColumnName),

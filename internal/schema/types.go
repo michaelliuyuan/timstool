@@ -120,6 +120,14 @@ func MapType(pgType PGType) (TypeMapping, bool) {
 	return m, ok
 }
 
+// isUnboundedNumeric reports whether a numeric/decimal column carries no
+// explicit precision (PG atttypmod=-1; the collector COALESCEs the NULLs
+// to 0/0). Single source of truth shared by the type mapping and the DDL
+// warning so the two conditions cannot drift apart.
+func isUnboundedNumeric(pgType PGType, precision, scale int) bool {
+	return (pgType == PGNumeric || pgType == PGDecimal) && precision == 0 && scale == 0
+}
+
 func MapTypeWithPrecision(pgType PGType, precision, scale int) string {
 	m, ok := typeMap[pgType]
 	if !ok || m.SupportLevel == Unsupported {
@@ -134,11 +142,13 @@ func MapTypeWithPrecision(pgType PGType, precision, scale int) string {
 		} else if precision > 0 {
 			return fmt.Sprintf("DECIMAL(%d)", precision)
 		}
-		// BUG-0932: PG unbounded numeric (atttypmod=-1, collector COALESCE
-		// lands 0/0). A bare DECIMAL means decimal(10,0) on MySQL/TiDB and
-		// silently rounds away decimals — map to the family maximum
-		// DECIMAL(65,30) instead (fidelity-preserving default).
-		return "DECIMAL(65,30)"
+		// BUG-0932: unbounded numeric maps to the fidelity default — a
+		// bare DECIMAL means decimal(10,0) on MySQL/TiDB and silently
+		// rounds away decimals. DECIMAL(65,30) is the family maximum.
+		if isUnboundedNumeric(pgType, precision, scale) {
+			return "DECIMAL(65,30)"
+		}
+		return "DECIMAL"
 	case PGChar:
 		if precision > 0 {
 			return fmt.Sprintf("CHAR(%d)", precision)
