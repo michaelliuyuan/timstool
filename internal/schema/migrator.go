@@ -18,12 +18,29 @@ import (
 	"go.uber.org/zap"
 )
 
+// ProgressReporter surfaces per-table schema progress to the checkpoint
+// layer (schema-phase tables_total/tables_done in the UI). Implemented by
+// checkpoint.Manager; the schema marks live in TableCheckpoint.SchemaState,
+// fully separate from the data-resume State cursor.
+type ProgressReporter interface {
+	RegisterSchemaTables(names []string) error
+	MarkSchemaTableCompleted(name string) error
+	MarkSchemaTableFailed(name string, errStr string) error
+}
+
 type Migrator struct {
 	cfg config.Config
+	rpt ProgressReporter
 }
 
 func NewMigrator(cfg config.Config) *Migrator {
 	return &Migrator{cfg: cfg}
+}
+
+// SetProgressReporter wires the optional schema progress sink. Nil (default)
+// disables reporting — CLI/dry-run runs work unchanged.
+func (m *Migrator) SetProgressReporter(r ProgressReporter) {
+	m.rpt = r
 }
 
 func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
@@ -52,6 +69,18 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 		return cerrors.Wrap(cerrors.ErrSchemaFetch, "collect tables", err)
 	}
 	logger.Info("collected tables", zap.Int("count", len(tables)))
+
+	// Register every table up front so the UI's schema tables_total is
+	// correct from the start (0/N), then mark each as its DDL is built.
+	if m.rpt != nil && len(tables) > 0 {
+		names := make([]string, len(tables))
+		for i, t := range tables {
+			names[i] = t.Name
+		}
+		if err := m.rpt.RegisterSchemaTables(names); err != nil {
+			logger.Warn("schema progress: register tables failed", zap.Error(err))
+		}
+	}
 
 	views, err := collector.CollectViews(ctx, schema)
 	if err != nil {
@@ -116,6 +145,9 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 				Status:     reporter.StatusSkip,
 				SourceRows: int64(len(table.Columns)),
 			})
+			if m.rpt != nil {
+				_ = m.rpt.MarkSchemaTableCompleted(table.Name)
+			}
 			continue
 		}
 
@@ -137,6 +169,9 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 				Status:    reporter.StatusFail,
 				Error:     err.Error(),
 			})
+			if m.rpt != nil {
+				_ = m.rpt.MarkSchemaTableFailed(table.Name, err.Error())
+			}
 			continue
 		}
 		logger.Info(fmt.Sprintf("built table DDL: %s", table.Name))
@@ -161,6 +196,9 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 			Status:     reporter.StatusPass,
 			SourceRows: int64(len(table.Columns)),
 		})
+		if m.rpt != nil {
+			_ = m.rpt.MarkSchemaTableCompleted(table.Name)
+		}
 	}
 
 	if len(deferredFKs) > 0 {

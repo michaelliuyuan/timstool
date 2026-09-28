@@ -12,6 +12,12 @@ const task = ref<Task | null>(null)
 const loading = ref(true)
 const ws = ref<WebSocket | null>(null)
 const wsProgress = ref<any>(null)
+// Server-computed elapsed seconds (last WS progress message) + local
+// receive-time, so the display ticks every second without re-differencing
+// the (possibly skewed) browser clock against server-written started_at.
+const serverElapsed = ref<number | null>(null)
+const serverElapsedAt = ref(0)
+const nowTick = ref(Date.now())
 
 const logDrawerVisible = ref(false)
 const logs = ref<TaskLogEntry[]>([])
@@ -69,22 +75,37 @@ const importSubText = computed(() => {
   return `数据导入中（${imported}/${total} 表）`
 })
 
+const elapsedSeconds = computed(() => {
+  if (!task.value?.started_at) return null
+  // Finished: exact server-written interval (clock-skew free).
+  if (task.value.finished_at) {
+    const d = Math.floor((new Date(task.value.finished_at).getTime() - new Date(task.value.started_at).getTime()) / 1000)
+    return Math.max(0, d)
+  }
+  // Running: server-computed base + locally advanced seconds.
+  if (serverElapsed.value !== null) {
+    return Math.max(0, serverElapsed.value + Math.floor((nowTick.value - serverElapsedAt.value) / 1000))
+  }
+  // Fallback (no WS yet): browser clock, clamped non-negative.
+  const d = Math.floor((nowTick.value - new Date(task.value.started_at).getTime()) / 1000)
+  return Math.max(0, d)
+})
+
 const elapsed = computed(() => {
-  if (!task.value?.started_at) return '-'
-  const end = task.value.finished_at ? new Date(task.value.finished_at) : new Date()
-  const start = new Date(task.value.started_at)
-  const diff = Math.floor((end.getTime() - start.getTime()) / 1000)
-  const h = Math.floor(diff / 3600)
-  const m = Math.floor((diff % 3600) / 60)
-  const s = diff % 60
-  return `${h}h ${m}m ${s}s`
+  const s = elapsedSeconds.value
+  if (s === null) return '-'
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  return `${h}h ${m}m ${sec}s`
 })
 
 const rowsPerSec = computed(() => {
   if (!task.value?.started_at || !task.value?.rows_done) return 0
-  const end = task.value.finished_at ? new Date(task.value.finished_at) : new Date()
-  const start = new Date(task.value.started_at)
-  const secs = (end.getTime() - start.getTime()) / 1000
+  let secs = elapsedSeconds.value
+  if (secs === null) {
+    secs = Math.max(0, Math.floor((nowTick.value - new Date(task.value.started_at).getTime()) / 1000))
+  }
   if (secs <= 0) return 0
   return Math.round(task.value.rows_done / secs)
 })
@@ -152,6 +173,10 @@ function connectWS() {
       const data = JSON.parse(event.data)
       if (data.task_id === taskId && task.value) {
         wsProgress.value = data
+        if (typeof data.elapsed_seconds === 'number') {
+          serverElapsed.value = Math.max(0, data.elapsed_seconds)
+          serverElapsedAt.value = Date.now()
+        }
         if (data.phase) task.value.phase = data.phase
         if (data.progress !== undefined) task.value.progress = data.progress
         if (data.tables_done !== undefined) task.value.tables_done = data.tables_done
@@ -166,6 +191,7 @@ function connectWS() {
 }
 
 let pollTimer: any = null
+let tickTimer: any = null
 
 onMounted(() => {
   fetchTask()
@@ -174,12 +200,15 @@ onMounted(() => {
     fetchTask()
     fetchPhases()
   }, 5000)
+  // 1s heartbeat so elapsed (server base + local advance) renders smoothly.
+  tickTimer = setInterval(() => { nowTick.value = Date.now() }, 1000)
   loadLogs()
   fetchPhases()
 })
 
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer)
+  if (tickTimer) clearInterval(tickTimer)
   if (ws.value) ws.value.close()
   if (logWs.value) logWs.value.close()
 })

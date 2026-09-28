@@ -30,6 +30,16 @@ type TableCheckpoint struct {
 	FinishedAt time.Time                `json:"finished_at,omitempty"`
 	Error      string                   `json:"error,omitempty"`
 	Chunks     map[int]*ChunkCheckpoint `json:"chunks,omitempty"`
+
+	// SchemaState tracks per-table SCHEMA migration progress, fully
+	// independent of State: State is the data-resume cursor (resume skips
+	// tables whose State==completed, checkpoint.go IsTableCompleted /
+	// GetPendingTables), so the schema phase must never write it — a table
+	// whose DDL was applied but whose rows were not exported would
+	// otherwise be silently skipped on resume. Schema registration also
+	// never touches RowsTotal so the data-phase row denominators stay
+	// clean (GetOrCreateTable keeps an existing entry's RowsTotal).
+	SchemaState State `json:"schema_state,omitempty"`
 }
 
 type ChunkCheckpoint struct {
@@ -208,6 +218,39 @@ func (m *Manager) MarkTableFailed(tableName string, errStr string) error {
 	})
 }
 
+// RegisterSchemaTables marks all given tables as registered for the SCHEMA
+// phase (tables_total becomes correct immediately). It never touches State /
+// RowsDone / RowsTotal — only SchemaState — so data-phase resume and row
+// denominators are unaffected (see TableCheckpoint.SchemaState).
+func (m *Manager) RegisterSchemaTables(names []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, name := range names {
+		tc, ok := m.data.Tables[name]
+		if !ok {
+			tc = &TableCheckpoint{TableName: name, State: StatePending}
+			m.data.Tables[name] = tc
+		}
+		tc.SchemaState = StatePending
+	}
+	m.save()
+	return nil
+}
+
+// MarkSchemaTableCompleted marks one table's schema DDL as applied.
+func (m *Manager) MarkSchemaTableCompleted(tableName string) error {
+	return m.UpdateTable(tableName, func(tc *TableCheckpoint) {
+		tc.SchemaState = StateCompleted
+	})
+}
+
+// MarkSchemaTableFailed marks one table's schema DDL as failed.
+func (m *Manager) MarkSchemaTableFailed(tableName string, errStr string) error {
+	return m.UpdateTable(tableName, func(tc *TableCheckpoint) {
+		tc.SchemaState = StateFailed
+	})
+}
+
 func (m *Manager) UpdateTableProgress(tableName string, rowsDone int64, bytesDone int64) error {
 	return m.UpdateTable(tableName, func(tc *TableCheckpoint) {
 		// Keep the denominator >= rowsDone so progress stays <= 100%.
@@ -321,6 +364,7 @@ func (m *Manager) ResetAllTables() {
 		tc.State = StatePending
 		tc.RowsDone = 0
 		tc.BytesDone = 0
+		tc.SchemaState = ""
 	}
 	m.save()
 }

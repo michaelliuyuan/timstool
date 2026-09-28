@@ -58,6 +58,12 @@ func (o *Orchestrator) Run(ctx context.Context, pipelineCfg PipelineConfig) ([]P
 		return nil, cerrors.Wrap(cerrors.ErrCheckpointLoad, "init checkpoint", err)
 	}
 
+	// Schema progress: route the checkpoint manager into the schema
+	// migrator (per-table SchemaState marks for the UI's schema phase).
+	if sm, ok := o.schemaMig.(*schema.Migrator); ok {
+		sm.SetProgressReporter(o.cpMgr)
+	}
+
 	if o.cfg.Web.Enable {
 		stateAdapter := &checkpointStateReader{mgr: o.cpMgr}
 		o.webServer = api.NewServer(stateAdapter, o.cfg.Web.Host, o.cfg.Web.Port)
@@ -186,6 +192,13 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	// Phase: schema (observability parity with the PG path — phase log + cpMgr).
 	if o.cpMgr != nil {
 		_ = o.cpMgr.SetPhase("schema")
+		// Register the CIR tables up front (schema tables_total correct from
+		// the start), then mark them per ApplyDDL outcome.
+		names := make([]string, len(cir.Tables))
+		for i, t := range cir.Tables {
+			names[i] = t.Name
+		}
+		_ = o.cpMgr.RegisterSchemaTables(names)
 	}
 	log.Info("Phase: Schema 迁移", zap.String("source", srcType))
 
@@ -199,7 +212,17 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 		log.Info("source-cir: dropped target tables", zap.String("policy", policy))
 	}
 	if err := target.ApplyDDL(ctx, tidb, cir); err != nil {
+		if o.cpMgr != nil {
+			for _, t := range cir.Tables {
+				_ = o.cpMgr.MarkSchemaTableFailed(t.Name, err.Error())
+			}
+		}
 		return nil, fmt.Errorf("source-cir: apply ddl: %w", err)
+	}
+	if o.cpMgr != nil {
+		for _, t := range cir.Tables {
+			_ = o.cpMgr.MarkSchemaTableCompleted(t.Name)
+		}
 	}
 	if policy == "truncate" {
 		if err := target.TruncateTables(ctx, tidb, cir); err != nil {

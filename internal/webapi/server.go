@@ -1513,12 +1513,28 @@ func (s *Server) pollProgress(ctx context.Context, taskID string, checkpointDir 
 
 			var tablesDone, tablesTotal int
 			var rowsDone, rowsTotal int64
-			for _, tc := range tables {
-				tablesTotal++
-				rowsTotal += tc.RowsTotal
-				rowsDone += tc.RowsDone
-				if tc.State == checkpoint.StateCompleted || tc.State == checkpoint.StateFailed {
-					tablesDone++
+			if rawPhase == "schema" {
+				// Schema phase: count ONLY schema-registered tables by
+				// their SchemaState — data rows/states are irrelevant here
+				// (and a resumed task's stale data states must not inflate
+				// the schema counters).
+				for _, tc := range tables {
+					if tc.SchemaState == "" {
+						continue
+					}
+					tablesTotal++
+					if tc.SchemaState == checkpoint.StateCompleted || tc.SchemaState == checkpoint.StateFailed {
+						tablesDone++
+					}
+				}
+			} else {
+				for _, tc := range tables {
+					tablesTotal++
+					rowsTotal += tc.RowsTotal
+					rowsDone += tc.RowsDone
+					if tc.State == checkpoint.StateCompleted || tc.State == checkpoint.StateFailed {
+						tablesDone++
+					}
 				}
 			}
 
@@ -1544,9 +1560,34 @@ func (s *Server) pollProgress(ctx context.Context, taskID string, checkpointDir 
 			if rawPhase == "data-import" {
 				msg["imported_tables"] = importedTables
 			}
+			// Server-side elapsed (kills the browser/server clock-skew class
+			// of bugs): the client renders this instead of differencing its
+			// own clock against started_at.
+			if elapsed, ok := s.taskElapsedSeconds(taskID); ok {
+				msg["elapsed_seconds"] = elapsed
+			}
 			s.BroadcastProgress(taskID, msg)
 		}
 	}
+}
+
+// taskElapsedSeconds returns the task's elapsed seconds computed entirely
+// server-side (finished-started, or now-started while running). Negative
+// values (started_at in the future — clock oddities) are clamped to 0.
+func (s *Server) taskElapsedSeconds(taskID string) (int64, bool) {
+	task, err := s.store.GetTask(taskID)
+	if err != nil || task == nil || task.StartedAt == nil {
+		return 0, false
+	}
+	end := time.Now()
+	if task.FinishedAt != nil {
+		end = *task.FinishedAt
+	}
+	d := end.Sub(*task.StartedAt)
+	if d < 0 {
+		d = 0
+	}
+	return int64(d / time.Second), true
 }
 
 // weightedProgress combines the three migration stages into one total
@@ -2115,7 +2156,10 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 					pi.ImportedTables = cpMgr.GetImportedTables()
 				}
 				tables := cpMgr.GetAllTables()
-				if len(tables) > 0 {
+				// While the schema phase is current, the registered entries
+				// are schema bookkeeping (data State still pending) — the
+				// data tab must stay empty as before, not preview 0/N.
+				if cpPhase != "schema" && len(tables) > 0 {
 					for _, tc := range tables {
 						tableInfo := map[string]interface{}{
 							"name":       tc.TableName,
@@ -2130,6 +2174,26 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 						if tc.State == checkpoint.StateCompleted || tc.State == checkpoint.StateFailed {
 							pi.TablesDone++
 						}
+					}
+				}
+			}
+		}
+		if p.name == "schema" {
+			// Schema phase: fill the per-table list from SchemaState so the
+			// schema tab shows 0/N → N/N plus a per-table status list.
+			cpMgr, cpErr := checkpoint.NewReadOnlyManager(fmt.Sprintf(".checkpoint/%s", taskID))
+			if cpErr == nil {
+				for _, tc := range cpMgr.GetAllTables() {
+					if tc.SchemaState == "" {
+						continue // not schema-registered
+					}
+					pi.Tables = append(pi.Tables, map[string]interface{}{
+						"name":  tc.TableName,
+						"state": string(tc.SchemaState),
+					})
+					pi.TableCount++
+					if tc.SchemaState == checkpoint.StateCompleted || tc.SchemaState == checkpoint.StateFailed {
+						pi.TablesDone++
 					}
 				}
 			}
