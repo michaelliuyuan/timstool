@@ -34,14 +34,17 @@ type expStubConn struct {
 var expMu sync.Mutex
 
 func (expStubConn) Prepare(q string) (driver.Stmt, error) { return nil, errors.New("not implemented") }
-func (expStubConn) Close() error                           { return nil }
-func (expStubConn) Begin() (driver.Tx, error)              { return nil, errors.New("not implemented") }
+func (expStubConn) Close() error                          { return nil }
+func (expStubConn) Begin() (driver.Tx, error)             { return nil, errors.New("not implemented") }
 
 func (c expStubConn) QueryContext(ctx context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
 	expMu.Lock()
 	*c.queries = append(*c.queries, q)
 	expMu.Unlock()
 	if strings.Contains(q, "server_version_num") {
+		if c.version == "fail" {
+			return nil, errors.New("probe boom")
+		}
 		return &expStubRows{cols: []string{"server_version_num"}, rows: [][]driver.Value{{c.version}}}, nil
 	}
 	if strings.Contains(q, "prokind = 'f'") {
@@ -148,5 +151,30 @@ func TestExporterFunctionsModernUsesProkind(t *testing.T) {
 	}
 	if _, ok := files["procedures.sql"]; !ok {
 		t.Error("modern server must emit procedures.sql")
+	}
+}
+
+// Probe failure must keep the modern queries so the original error
+// surfaces from the catalog query itself (no silent legacy downgrade).
+func TestExporterProbeFailureKeepsModern(t *testing.T) {
+	var queries []string
+	e := openExpStub(t, "fail", &queries)
+	if _, err := e.schemaFiles(context.Background(), "public"); err != nil {
+		t.Fatalf("schemaFiles: %v", err)
+	}
+	sawFunc, sawProc := false, false
+	for _, q := range queries {
+		if strings.Contains(q, "prokind = 'f'") {
+			sawFunc = true
+		}
+		if strings.Contains(q, "prokind = 'p'") {
+			sawProc = true
+		}
+	}
+	if !sawFunc || !sawProc {
+		t.Errorf("probe failure must keep modern queries, saw: %v", queries)
+	}
+	if e.pgVersion != 0 {
+		t.Errorf("probe failure must not be cached, got pgVersion=%d", e.pgVersion)
 	}
 }

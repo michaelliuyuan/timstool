@@ -32,6 +32,9 @@ func (stubConn) Begin() (driver.Tx, error)             { return nil, errors.New(
 func (c stubConn) QueryContext(ctx context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
 	lastQuery = q
 	if strings.Contains(q, "server_version_num") {
+		if c.version == "fail" {
+			return nil, errors.New("probe boom")
+		}
 		return &stubRows{cols: []string{"server_version_num"}, rows: [][]driver.Value{{c.version}}}, nil
 	}
 	if strings.Contains(q, "prokind") {
@@ -121,5 +124,21 @@ func TestScanFunctionsLegacyOmitsProkind(t *testing.T) {
 	}
 	if strings.Contains(lastQuery, "prokind") {
 		t.Errorf("cached version must keep legacy query, got: %s", lastQuery)
+	}
+}
+
+// Probe failure must fall back to the modern query so the original error
+// surfaces from the catalog query itself (no silent legacy downgrade).
+func TestScanFunctionsProbeFailureUsesModern(t *testing.T) {
+	db := openStub(t, "fail")
+	s := NewScanner(db, "public")
+	if _, err := s.scanFunctions(context.Background()); err != nil {
+		t.Fatalf("scanFunctions: %v", err)
+	}
+	if !strings.Contains(lastQuery, "prokind") {
+		t.Errorf("probe failure must use the modern query, got: %s", lastQuery)
+	}
+	if s.pgVersion != 0 {
+		t.Errorf("probe failure must not be cached, got pgVersion=%d", s.pgVersion)
 	}
 }
