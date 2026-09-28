@@ -307,6 +307,24 @@ func TestBuildColumnDDLStripsTextFamilyDefault(t *testing.T) {
 	if len(sd) != 1 {
 		t.Errorf("unknown-type must record one strip, got %+v", sd)
 	}
+
+	// adversarial angle 2: PG text DEFAULT CURRENT_TIMESTAMP maps to a TEXT
+	// column — CURRENT_TIMESTAMP is illegal there too (1101), must strip.
+	b := NewDDLBuilder()
+	col := Column{
+		TableName: "t1", ColumnName: "ts_col", PGType: PGText,
+		IsNullable: true, DefaultValue: "CURRENT_TIMESTAMP",
+	}
+	ddl, err := b.buildColumnDDL(col)
+	if err != nil {
+		t.Fatalf("buildColumnDDL: %v", err)
+	}
+	if strings.Contains(strings.ToUpper(ddl), "DEFAULT") {
+		t.Errorf("text+CURRENT_TIMESTAMP must strip DEFAULT, got: %s", ddl)
+	}
+	if len(b.strippedDefaults) != 1 || b.strippedDefaults[0].Default != "CURRENT_TIMESTAMP" {
+		t.Errorf("text+CURRENT_TIMESTAMP must record strip, got %+v", b.strippedDefaults)
+	}
 }
 
 func TestQuoteIdentifier(t *testing.T) {
