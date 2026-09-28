@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -78,16 +79,16 @@ type Exporter struct {
 }
 
 // serverVersionNum probes (once) and caches SHOW server_version_num; a
-// probe failure returns 999999 (uncached) so the modern path is taken and
-// the original error surfaces there (a low sentinel would silently pick
-// legacy on healthy PG 11+ servers).
+// probe failure returns math.MaxInt64 (uncached) so the modern path is
+// taken and the original error surfaces there (a low sentinel would
+// silently pick legacy on healthy PG 11+ servers).
 func (e *Exporter) serverVersionNum(ctx context.Context) int {
 	if e.pgVersion != 0 {
 		return e.pgVersion
 	}
 	var v int
 	if err := e.db.QueryRowContext(ctx, `SHOW server_version_num`).Scan(&v); err != nil {
-		return 999999
+		return math.MaxInt64
 	}
 	e.pgVersion = v
 	return v

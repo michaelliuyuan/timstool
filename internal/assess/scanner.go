@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -229,16 +230,16 @@ func (s *Scanner) scanViews(ctx context.Context) ([]ViewInfo, error) {
 }
 
 // serverVersionNum probes (once) and caches SHOW server_version_num; a
-// probe failure returns 999999 (uncached) so the modern path is taken and
-// the original error surfaces there (a low sentinel would silently pick
-// legacy on healthy PG 11+ servers).
+// probe failure returns math.MaxInt64 (uncached) so the modern path is
+// taken and the original error surfaces there (a low sentinel would
+// silently pick legacy on healthy PG 11+ servers).
 func (s *Scanner) serverVersionNum(ctx context.Context) int {
 	if s.pgVersion != 0 {
 		return s.pgVersion
 	}
 	var v int
 	if err := s.db.QueryRowContext(ctx, `SHOW server_version_num`).Scan(&v); err != nil {
-		return 999999
+		return math.MaxInt64
 	}
 	s.pgVersion = v
 	return v
