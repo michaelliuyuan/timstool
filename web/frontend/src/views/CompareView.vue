@@ -444,51 +444,95 @@ function esc(s: unknown): string {
 function exportHtml() {
   const r = activeReport.value
   if (!r) return
+  // FEAT-0933b: style aligned with the server-rendered report family
+  // (reporter.ReportCSS tokens: ink #0C1222 / workspace #F6F7FB / brand
+  // #E13C3C / teal #0FA3A3 / amber #D97E00; banner + badges + stat cards
+  // + zebra/hover table + print-safe colors).
+  const badge = (s: string) =>
+    `<span class="badge badge-${esc(s)}">${esc(s)}</span>`
+  const overallClass =
+    r.overall_status === 'pass' ? 'overall-pass' : r.overall_status === 'fail' ? 'overall-fail' : 'overall-warn'
   const rows = r.tables
     .map(
-      (t) => `<tr class="st-${esc(t.status)}">
-<td>${esc(t.table_name)}</td><td>${esc(t.status)}</td>
+      (t) => `<tr>
+<td>${esc(t.table_name)}</td><td>${badge(t.status)}</td>
 <td class="num">${esc(t.source_rows)}</td><td class="num">${esc(t.target_rows)}</td>
 <td class="num">${esc(t.diff_rows)}</td><td>${esc(t.duration)}</td>
 <td>${esc(t.error || '')}</td><td>${esc(t.suggestion || '')}</td></tr>`,
     )
     .join('\n')
+  const stat = (label: string, value: number | string, cls = '') =>
+    `<div class="stat"><div class="value ${cls}">${esc(value)}</div><div class="label">${esc(label)}</div></div>`
   const html = `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>数据比对报告 ${esc(activeTask.value?.name || '')}</title>
 <style>
-body{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:24px;color:#1f2d3d}
-h1{font-size:20px} h2{font-size:15px;margin-top:24px}
-.meta td,.stats td{padding:4px 14px 4px 0}
-table.detail{border-collapse:collapse;width:100%;font-size:13px}
-table.detail th,table.detail td{border:1px solid #dcdfe6;padding:6px 10px;text-align:left}
-table.detail th{background:#f5f7fa}
-.num{text-align:right;font-variant-numeric:tabular-nums}
-.st-pass td:first-child{border-left:3px solid #67c23a}
-.st-fail td:first-child{border-left:3px solid #f56c6c}
-.st-warn td:first-child{border-left:3px solid #e6a23c}
-.st-skip td:first-child{border-left:3px solid #909399}
-footer{margin-top:20px;color:#909399;font-size:12px}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Inter','HarmonyOS Sans SC','MiSans','Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif;background:#F6F7FB;color:#2A3040;line-height:1.6;-webkit-font-smoothing:antialiased}
+.container{max-width:1200px;margin:0 auto;padding:24px}
+.num{font-family:'JetBrains Mono','Cascadia Mono',Consolas,ui-monospace,monospace;font-weight:500}
+.banner{background:linear-gradient(135deg,#0C1222,#223052);border-radius:12px;padding:28px 32px;color:#EEF1F8;margin-bottom:20px;box-shadow:0 2px 4px rgba(12,18,34,.06),0 10px 28px rgba(12,18,34,.10)}
+.banner h1{font-size:24px;font-weight:600}
+.banner .sub{font-size:13px;opacity:.75;margin-top:6px}
+.banner .overall{float:right;font-size:15px;font-weight:600;padding:4px 16px;border-radius:999px;background:rgba(255,255,255,.16)}
+.card{background:#FFF;border:1px solid #E6E8F0;border-radius:12px;padding:24px;margin-bottom:20px;box-shadow:0 1px 2px rgba(12,18,34,.04),0 4px 14px rgba(12,18,34,.06)}
+.card h2{font-size:18px;margin-bottom:16px;color:#0C1222;border-bottom:1px solid #E6E8F0;padding-bottom:8px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:16px;margin-bottom:12px}
+.stat{text-align:center;padding:14px 18px;background:#FFF;border:1px solid #E6E8F0;border-radius:12px;box-shadow:0 1px 2px rgba(12,18,34,.04),0 4px 14px rgba(12,18,34,.06)}
+.stat .value{font-family:'JetBrains Mono','Cascadia Mono',Consolas,ui-monospace,monospace;font-weight:500;font-size:26px;line-height:1.15;color:#0C1222}
+.stat .label{font-size:12px;color:#6B7280;margin-top:4px;letter-spacing:.4px}
+.info-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #E6E8F0}
+.info-row:last-child{border-bottom:none}
+.info-label{color:#6B7280;min-width:120px}
+.info-value{font-weight:500;text-align:right}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{background:#F3F4FA;color:#2A3040;padding:10px 12px;text-align:left;font-weight:600;border-bottom:1px solid #E6E8F0}
+td{padding:10px 12px;border-bottom:1px solid #E6E8F0}
+tr:nth-child(even) td{background:#FAFBFD}
+tr:hover td{background:#F6F7FB}
+.badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600}
+.badge-pass{background:rgba(15,163,163,.10);color:#0FA3A3}
+.badge-fail{background:rgba(225,60,60,.09);color:#E13C3C}
+.badge-warn{background:rgba(217,126,0,.10);color:#D97E00}
+.badge-skip{background:#EEF0F5;color:#6B7280}
+.overall-pass{color:#0FA3A3}.overall-fail{color:#E13C3C}.overall-warn{color:#D97E00}
+.c-teal{color:#0FA3A3}.c-brand{color:#E13C3C}
+.footer{text-align:center;color:#97A0B5;font-size:12px;margin-top:24px}
+@media print{body{background:#FFF}.container{padding:0}.card,.stat{box-shadow:none}.banner{box-shadow:none;-webkit-print-color-adjust:exact;print-color-adjust:exact}.badge,tr:nth-child(even) td{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 </style></head><body>
+<div class="container">
+<div class="banner">
+<span class="overall ${overallClass}">${esc(r.overall_status)}</span>
 <h1>数据比对报告 — ${esc(activeTask.value?.name || '')}</h1>
-<table class="meta">
-<tr><td>任务 ID</td><td>${esc(activeTask.value?.id || '')}</td><td>模式</td><td>${esc(activeTask.value?.mode || '')}</td></tr>
-<tr><td>总体状态</td><td>${esc(r.overall_status)}</td><td>耗时</td><td>${esc(r.duration)}</td></tr>
-<tr><td>开始时间</td><td>${esc(r.start_time)}</td><td>结束时间</td><td>${esc(r.end_time)}</td></tr>
-</table>
+<div class="sub">任务 ${esc(activeTask.value?.id || '')} · 模式 ${esc(activeTask.value?.mode || '')} · 耗时 ${esc(r.duration)}</div>
+</div>
+<div class="card">
 <h2>汇总</h2>
-<table class="stats">
-<tr><td>总表数 <b>${r.stats.total_tables}</b></td><td>通过 <b>${r.stats.pass_tables}</b></td><td>失败 <b>${r.stats.fail_tables}</b></td><td>警告 <b>${r.stats.warn_tables}</b></td><td>跳过 <b>${r.stats.skip_tables}</b></td></tr>
-<tr><td>源总行数 <b>${r.stats.total_source_rows}</b></td><td>目标总行数 <b>${r.stats.total_target_rows}</b></td><td>差异总行数 <b>${r.stats.total_diff_rows}</b></td></tr>
-</table>
-${r.summary ? `<p>${esc(r.summary)}</p>` : ''}
+<div class="stats">
+${stat('总表数', r.stats.total_tables)}
+${stat('通过', r.stats.pass_tables, 'c-teal')}
+${stat('失败', r.stats.fail_tables, 'c-brand')}
+${stat('警告', r.stats.warn_tables)}
+${stat('跳过', r.stats.skip_tables)}
+${stat('源总行数', r.stats.total_source_rows)}
+${stat('目标总行数', r.stats.total_target_rows)}
+${stat('差异总行数', r.stats.total_diff_rows, 'c-brand')}
+</div>
+<div class="info-row"><span class="info-label">开始时间</span><span class="info-value">${esc(r.start_time)}</span></div>
+<div class="info-row"><span class="info-label">结束时间</span><span class="info-value">${esc(r.end_time)}</span></div>
+${r.summary ? `<div class="info-row"><span class="info-label">摘要</span><span class="info-value">${esc(r.summary)}</span></div>` : ''}
+</div>
+<div class="card">
 <h2>逐表明细</h2>
-<table class="detail">
+<table>
 <thead><tr><th>表名</th><th>状态</th><th>源行数</th><th>目标行数</th><th>差异行数</th><th>耗时</th><th>错误</th><th>建议</th></tr></thead>
 <tbody>
 ${rows}
 </tbody></table>
-<footer>由 TimsTool 生成 · ${new Date().toLocaleString()}（浏览器打印可另存为 PDF）</footer>
+</div>
+<div class="footer">由 TimsTool 生成 · ${new Date().toLocaleString()}（浏览器打印可另存为 PDF）</div>
+</div>
 </body></html>`
   try {
     downloadBlob(html, 'text/html;charset=utf-8', reportFileName('html'))
