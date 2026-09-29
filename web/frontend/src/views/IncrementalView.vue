@@ -703,9 +703,9 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
                              :label="`${c.column}（${c.score.toFixed(0)} 分 · 覆盖 ${(c.coverage * 100).toFixed(0)}% · 索引 ${(c.indexed_ratio * 100).toFixed(0)}%）`" />
                 </el-select>
               </el-form-item>
-              <el-alert v-if="activeWMCandidate" type="warning" :closable="false" style="margin-bottom: 8px;">
+              <el-alert v-if="activeWMCandidate" :type="activeWMCandidate.warnings.length ? 'warning' : 'success'" :closable="false" style="margin-bottom: 8px;">
                 <template #title>
-                  候选 <b>{{ activeWMCandidate.column }}</b>：{{ activeWMCandidate.reasons.join('；') }}
+                  {{ activeWMCandidate.warnings.length ? '候选' : '已应用' }} <b>{{ activeWMCandidate.column }}</b>：{{ activeWMCandidate.reasons.join('；') }}
                   <template v-if="activeWMCandidate.warnings.length">（{{ activeWMCandidate.warnings.join('；') }}）</template>
                 </template>
                 <div v-if="activeWMCandidate.unmatched_tables.length" style="font-size: var(--tims-font-sm);">
