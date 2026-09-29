@@ -76,6 +76,10 @@ type incRunRecord struct {
 	Tables     []incTableResult `json:"tables"`
 	Status     string           `json:"status,omitempty"` // running|completed|failed (absent on legacy records = completed)
 	Error      string           `json:"error,omitempty"`  // run-level error (e.g. interrupted by restart)
+	// Log summary only (FEAT-INC-LOGS): the events themselves live in
+	// dataDir/incremental_logs/<jobID>/<runID>.json so GET /jobs stays light.
+	LogEvents  int64 `json:"log_events,omitempty"`
+	LogDropped int64 `json:"log_dropped,omitempty"`
 }
 
 const incHistoryCap = 20
@@ -304,6 +308,9 @@ func (s *Server) markInterruptedIncrementalRuns() {
 				list[i].History[j].Status = incRunStatusFailed
 				list[i].History[j].Error = "服务重启，运行中断"
 				dirty = true
+				// Pre-restart log events are unrecoverable: write the
+				// single-event archive so the log endpoint still resolves.
+				s.archiveInterruptedRun(list[i].ID, list[i].History[j].RunID)
 			}
 		}
 	}
@@ -595,6 +602,11 @@ func (s *Server) handleDeleteIncrementalJob(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, http.StatusInternalServerError, "保存失败："+err.Error())
 		return
 	}
+	// Drop the job's log archives with it (delete can only happen outside a
+	// run, so no live collector can be writing into the directory).
+	if err := os.RemoveAll(filepath.Join(s.incrementalLogsRoot(), id)); err != nil {
+		zap.L().Warn("failed to remove incremental log dir", zap.String("job", id), zap.Error(err))
+	}
 	s.writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
 }
 
@@ -784,10 +796,18 @@ func incValueToString(v any) string {
 // and returns the run record. Failures are per-table: one bad table never
 // blocks the others. Runs execute in a background goroutine; concurrency is
 // serialized per job via incRunning (409 on concurrent run/edit/delete).
-func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[string]bool) incRunRecord {
+// lg receives the run's log events (nil-safe).
+func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[string]bool, lg *incLogCollector) incRunRecord {
 	rec := incRunRecord{RunID: uuid.New().String()[:8], StartedAt: time.Now()}
+	nTables := len(job.Tables)
+	if len(subset) > 0 {
+		nTables = len(subset)
+	}
+	lg.add(incLogLevelInfo, "", incLogPhaseStart,
+		fmt.Sprintf("同步开始：%d 张表，批大小 %d，冲突策略 %s（strict=%v）", nTables, job.BatchSize, job.ConflictStrategy, job.StrictMode), "", 0, "", 0)
 	src, err := s.resolveDataSourceRef(job.SourceRef)
 	if err != nil {
+		lg.add(incLogLevelError, "", incLogPhaseFail, "source_ref 解析失败: "+err.Error(), "", 0, "", 0)
 		for _, t := range job.Tables {
 			rec.Tables = append(rec.Tables, incTableResult{Table: t.Table, Error: "source_ref: " + err.Error()})
 		}
@@ -795,6 +815,7 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 	}
 	tgt, err := s.resolveDataSourceRef(job.TargetRef)
 	if err != nil {
+		lg.add(incLogLevelError, "", incLogPhaseFail, "target_ref 解析失败: "+err.Error(), "", 0, "", 0)
 		for _, t := range job.Tables {
 			rec.Tables = append(rec.Tables, incTableResult{Table: t.Table, Error: "target_ref: " + err.Error()})
 		}
@@ -805,6 +826,7 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 
 	pgDB, err := openPGTestConn(sc.DSN())
 	if err != nil {
+		lg.add(incLogLevelError, "", incLogPhaseFail, "连接源端失败: "+err.Error(), "", 0, "", 0)
 		for _, t := range job.Tables {
 			rec.Tables = append(rec.Tables, incTableResult{Table: t.Table, Error: "连接源端失败: " + err.Error()})
 		}
@@ -813,6 +835,7 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 	defer pgDB.Close()
 	myDB, err := openMySQLTestConn(tc.DSN())
 	if err != nil {
+		lg.add(incLogLevelError, "", incLogPhaseFail, "连接目标端失败: "+err.Error(), "", 0, "", 0)
 		for _, t := range job.Tables {
 			rec.Tables = append(rec.Tables, incTableResult{Table: t.Table, Error: "连接目标端失败: " + err.Error()})
 		}
@@ -823,17 +846,30 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 	ctx, cancel := context.WithTimeout(ctx, incRunTimeout)
 	defer cancel()
 
+	failed := 0
 	for _, t := range job.Tables {
 		if len(subset) > 0 && !subset[t.Table] {
 			continue
 		}
-		rec.Tables = append(rec.Tables, s.syncOneTable(ctx, pgDB, myDB, sc, tc, job, t))
+		res := s.syncOneTable(ctx, pgDB, myDB, sc, tc, job, t, lg)
+		if res.Error != "" {
+			failed++
+		}
+		rec.Tables = append(rec.Tables, res)
 	}
 	rec.DurationMs = time.Since(rec.StartedAt).Milliseconds()
+	if failed > 0 {
+		lg.add(incLogLevelWarn, "", incLogPhaseDone,
+			fmt.Sprintf("同步结束：%d/%d 张表失败，耗时 %d ms", failed, nTables, rec.DurationMs), "", 0, "", rec.DurationMs)
+	} else {
+		lg.add(incLogLevelInfo, "", incLogPhaseDone,
+			fmt.Sprintf("同步结束：全部完成，耗时 %d ms", rec.DurationMs), "", 0, "", rec.DurationMs)
+	}
 	return rec
 }
 
-func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig) incTableResult {
+func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, lg *incLogCollector) incTableResult {
+	tableStart := time.Now()
 	st := job.States[t.Table]
 	if st == nil {
 		st = &incTableState{}
@@ -853,6 +889,7 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 	if err != nil {
 		res.Error = "读取源表列信息失败: " + err.Error()
 		st.Failed = res.Error
+		lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, "", time.Since(tableStart).Milliseconds())
 		return res
 	}
 	var cols []string
@@ -863,6 +900,7 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 			rows.Close()
 			res.Error = "读取源表列信息失败: " + err.Error()
 			st.Failed = res.Error
+			lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, "", time.Since(tableStart).Milliseconds())
 			return res
 		}
 		if name == t.WatermarkColumn {
@@ -874,18 +912,23 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 	if len(cols) == 0 {
 		res.Error = fmt.Sprintf("源 schema %q 中不存在表 %q", sc.Schema, t.Table)
 		st.Failed = res.Error
+		lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, "", time.Since(tableStart).Milliseconds())
 		return res
 	}
 	if wmType == "" {
 		res.Error = fmt.Sprintf("表 %q 不存在水位列 %q", t.Table, t.WatermarkColumn)
 		st.Failed = res.Error
+		lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, "", time.Since(tableStart).Milliseconds())
 		return res
 	}
 	if !incWatermarkTypes[wmType] {
 		res.Error = fmt.Sprintf("水位列 %q 类型 %q 不在白名单（timestamp/timestamptz/date/int/bigint）", t.WatermarkColumn, wmType)
 		st.Failed = res.Error
+		lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, "", time.Since(tableStart).Milliseconds())
 		return res
 	}
+	lg.add(incLogLevelInfo, t.Table, incLogPhaseStart,
+		fmt.Sprintf("开始同步：%d 列，水位列 %s（%s）", len(cols), t.WatermarkColumn, wmType), "", 0, res.FromWM, 0)
 
 	// Empty initial watermark ⇒ full backfill from MIN(watermark).
 	minDerived := false
@@ -910,6 +953,8 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 		wm = minWM.String
 		minDerived = true
 		res.FromWM = "(MIN) " + wm
+		lg.add(incLogLevelInfo, t.Table, incLogPhaseStart,
+			"初始水位为空，从 MIN(水位列) 全量回补", "", 0, wm, 0)
 	}
 
 	// Strict-mode >= exceptions: (a) a cursor derived from MIN(col) MUST scan
@@ -921,13 +966,18 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 	geScan := minDerived
 	total := int64(0)
 	lastWM := wm
+	batchNo := 0
+	insertLogged := false
 	for {
 		entryWM := wm
+		batchNo++
+		scanStart := time.Now()
 		selSQL := incBuildSelectSQL(sc.Schema, t.Table, cols, t.WatermarkColumn, job.StrictMode && !geScan)
 		srows, err := pgDB.QueryContext(ctx, selSQL, wm, job.BatchSize)
 		if err != nil {
 			res.Error = "查询源端失败: " + err.Error()
 			st.Failed = res.Error
+			lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, entryWM, time.Since(tableStart).Milliseconds())
 			return res
 		}
 		batch := [][]any{}
@@ -941,6 +991,7 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 				srows.Close()
 				res.Error = "读取源端行失败: " + err.Error()
 				st.Failed = res.Error
+				lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, entryWM, time.Since(tableStart).Milliseconds())
 				return res
 			}
 			batch = append(batch, vals)
@@ -949,20 +1000,47 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 			srows.Close()
 			res.Error = "遍历源端失败: " + err.Error()
 			st.Failed = res.Error
+			lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, entryWM, time.Since(tableStart).Milliseconds())
 			return res
 		}
 		srows.Close()
 		if len(batch) == 0 {
 			break
 		}
+		// D3 frequency control: first 5 batches log the rendered scan SQL in
+		// full; afterwards every 50th logs a summary; drain/jump always full.
+		if incLogShouldFullScan(batchNo) {
+			lg.add(incLogLevelSQL, t.Table, incLogPhaseScan,
+				fmt.Sprintf("第 %d 批扫描（%d 行）", batchNo, len(batch)),
+				incRenderSelectSQL(sc.Schema, t.Table, cols, t.WatermarkColumn, job.StrictMode && !geScan, entryWM, job.BatchSize),
+				int64(len(batch)), entryWM, time.Since(scanStart).Milliseconds())
+		} else if incLogShouldSummaryScan(batchNo) {
+			lg.add(incLogLevelInfo, t.Table, incLogPhaseScan,
+				fmt.Sprintf("第 %d 批扫描（%d 行）", batchNo, len(batch)), "",
+				int64(len(batch)), entryWM, time.Since(scanStart).Milliseconds())
+		}
 
 		written, wErr := incExecShardedInsert(ctx, myDB, tc.Database, t.Table, cols, batch, job.ConflictStrategy)
 		if wErr != nil {
 			res.Error = "写入目标端失败: " + wErr.Error()
 			st.Failed = res.Error
+			lg.add(incLogLevelError, t.Table, incLogPhaseWrite, res.Error, "", written, entryWM, time.Since(tableStart).Milliseconds())
 			return res
 		}
 		total += written
+		shard := incShardRows(len(cols), len(batch))
+		nShards := (len(batch) + shard - 1) / shard
+		if shard < 1 {
+			nShards = 1
+		}
+		var insSQL string
+		if !insertLogged {
+			// INSERT statement shape, first occurrence per table only.
+			insertLogged = true
+			insSQL = incBuildInsertSQL(tc.Database, t.Table, cols, shard, job.ConflictStrategy)
+		}
+		lg.add(incLogLevelInfo, t.Table, incLogPhaseWrite,
+			fmt.Sprintf("写入 %d 行（%d 片）", written, nShards), insSQL, written, "", time.Since(scanStart).Milliseconds())
 		// ORDER BY watermark ⇒ the last row carries the batch MAX.
 		lastWM = incValueToString(batch[len(batch)-1][wmIndex(cols, t.WatermarkColumn)])
 		next, saturated, done := incCursorStep(entryWM, lastWM, len(batch), job.BatchSize)
@@ -970,13 +1048,20 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 			// Same-value saturation: the keyset cannot advance inside this
 			// value's window. Drain every remaining row at this watermark
 			// (streamed, chunked writes), then jump to the next value.
-			n, jump, tableDone, derr := s.incDrainWatermark(ctx, pgDB, myDB, sc, tc, job, t, cols, lastWM)
+			lg.add(incLogLevelSQL, t.Table, incLogPhaseDrain,
+				fmt.Sprintf("整批同值饱和，进入泄流（水位 %s）", lastWM),
+				incRenderDrainSQL(sc.Schema, t.Table, cols, t.WatermarkColumn, lastWM), 0, lastWM, 0)
+			n, jump, tableDone, derr := s.incDrainWatermark(ctx, pgDB, myDB, sc, tc, job, t, cols, lastWM, lg)
 			if derr != nil {
 				res.Error = "泄流同值批次失败: " + derr.Error()
 				st.Failed = res.Error
+				lg.add(incLogLevelError, t.Table, incLogPhaseDrain, res.Error, "", n, lastWM, time.Since(tableStart).Milliseconds())
 				return res
 			}
 			total += n
+			lg.add(incLogLevelSQL, t.Table, incLogPhaseJump,
+				fmt.Sprintf("泄流完成（%d 行），跳转下一水位", n),
+				incRenderNextWatermarkSQL(sc.Schema, t.Table, t.WatermarkColumn, lastWM), n, jump, 0)
 			if tableDone {
 				break
 			}
@@ -998,6 +1083,8 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 	st.Failed = ""
 	res.ToWM = st.LastWatermark
 	res.Rows = total
+	lg.add(incLogLevelInfo, t.Table, incLogPhaseDone,
+		fmt.Sprintf("表同步完成：%d 行，水位 → %s", total, st.LastWatermark), "", total, st.LastWatermark, time.Since(tableStart).Milliseconds())
 	return res
 }
 
@@ -1016,21 +1103,27 @@ func wmIndex(cols []string, wmCol string) int {
 // (semantics identical to the main path). Afterwards the cursor jumps to
 // MIN(watermark) > wm: no such value ⇒ the whole table is synced (done).
 // Memory stays bounded regardless of how many rows share the value.
-func (s *Server) incDrainWatermark(ctx context.Context, pgDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, cols []string, wm string) (rows int64, nextWM string, done bool, err error) {
+func (s *Server) incDrainWatermark(ctx context.Context, pgDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, cols []string, wm string, lg *incLogCollector) (rows int64, nextWM string, done bool, err error) {
 	srows, qErr := pgDB.QueryContext(ctx, incBuildDrainSQL(sc.Schema, t.Table, cols, t.WatermarkColumn), wm)
 	if qErr != nil {
 		return 0, "", false, qErr
 	}
 	batch := [][]any{}
+	flushNo := 0
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
+		flushNo++
 		written, wErr := incExecShardedInsert(ctx, myDB, tc.Database, t.Table, cols, batch, job.ConflictStrategy)
 		if wErr != nil {
 			return wErr
 		}
 		rows += written
+		if flushNo <= incLogFirstFullBatches || flushNo%incLogSummaryEveryNth == 0 {
+			lg.add(incLogLevelInfo, t.Table, incLogPhaseWrite,
+				fmt.Sprintf("泄流第 %d 片写入（%d 行）", flushNo, len(batch)), "", int64(len(batch)), wm, 0)
+		}
 		batch = batch[:0]
 		return nil
 	}
@@ -1130,6 +1223,7 @@ func (s *Server) handleRunIncrementalJob(w http.ResponseWriter, r *http.Request)
 	incRunning[id] = true
 	incMu.Unlock()
 
+	lg := incLogStartRun(stub.RunID)
 	go func() {
 		// A panic in the background run would kill the whole process (no
 		// handler-level Recoverer here); recover and finalize as failed.
@@ -1140,7 +1234,7 @@ func (s *Server) handleRunIncrementalJob(w http.ResponseWriter, r *http.Request)
 				s.finalizeIncRunFailed(id, stub.RunID)
 			}
 		}()
-		rec := s.runIncrementalJob(context.Background(), &job, subset)
+		rec := s.runIncrementalJob(context.Background(), &job, subset, lg)
 		rec.RunID = stub.RunID
 		rec.Status = incRunStatusCompleted
 		s.finalizeIncRun(id, stub.RunID, rec, job.States)
@@ -1157,6 +1251,13 @@ func (s *Server) finalizeIncRun(id, runID string, rec incRunRecord, states map[s
 	incMu.Lock()
 	defer incMu.Unlock()
 	delete(incRunning, id)
+	// Log summary onto the record (events themselves go to the archive file,
+	// keeping GET /jobs light — D5 independent-file variant).
+	if c := incLogGetRun(runID); c != nil {
+		_, dropped, seq := c.snapshot(0)
+		rec.LogEvents = seq
+		rec.LogDropped = dropped
+	}
 	list := s.loadIncrementalJobs()
 	for i := range list {
 		if list[i].ID != id {
@@ -1177,11 +1278,17 @@ func (s *Server) finalizeIncRun(id, runID string, rec incRunRecord, states map[s
 		}
 		break
 	}
+	// Detach the live collector and archive the ring (nil-safe when the run
+	// predates FEAT-INC-LOGS or the collector was never started).
+	s.archiveIncRunLogs(id, runID, rec.Status, incLogEndRun(runID))
 }
 
 // finalizeIncRunFailed closes a run that died unexpectedly: the stub is
 // rewritten to failed with a generic error, States are left untouched.
 func (s *Server) finalizeIncRunFailed(id, runID string) {
+	if c := incLogGetRun(runID); c != nil {
+		c.add(incLogLevelError, "", incLogPhaseFail, "内部错误：同步异常终止（panic 已恢复）", "", 0, "", 0)
+	}
 	s.finalizeIncRun(id, runID, incRunRecord{
 		RunID:     runID,
 		StartedAt: time.Now(),

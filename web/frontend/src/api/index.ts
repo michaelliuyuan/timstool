@@ -114,6 +114,20 @@ export interface IncrementalJobRequest {
   tables: IncrementalTableConfig[]
 }
 
+// FEAT-INC-LOGS: one observable step of a run (see internal/webapi/incremental_logs.go).
+export interface IncrementalLogEvent {
+  seq: number
+  ts: string
+  level: 'info' | 'sql' | 'warn' | 'error'
+  table?: string
+  phase?: 'start' | 'scan' | 'write' | 'drain' | 'jump' | 'done' | 'fail' | 'interrupted'
+  msg?: string
+  sql?: string
+  rows?: number
+  wm?: string
+  cost_ms?: number
+}
+
 export interface TaskPhasesResponse {
   task_id: string
   phase: string
@@ -487,6 +501,17 @@ export const apiClient = {
   // history record. No LONG_TIMEOUT needed: the response is instant.
   runIncrementalJob: (id: string, tables?: string[]) =>
     api.post<{ run_id: string; status: string }>(`/incremental/jobs/${id}/run`, { tables: tables || [] }),
+
+  // FEAT-INC-LOGS: incremental event pull for one run (after=seq protocol).
+  // Live run serves from memory, finished run from the on-disk archive —
+  // one polling loop covers both.
+  getIncrementalRunLogs: (id: string, runId: string, after: number) =>
+    api.get<{
+      events: IncrementalLogEvent[]
+      status: string
+      dropped: number
+      last_seq: number
+    }>(`/incremental/jobs/${id}/runs/${runId}/logs`, { params: { after } }),
 
   // Column listing with watermark eligibility + index flag (F-04): the
   // watermark dropdown marks comparable types and warns on unindexed columns.

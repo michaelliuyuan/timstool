@@ -230,6 +230,9 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 	s.cleanupDataSourceTempFiles()
 	s.cleanupIncrementalTempFiles()
 	s.markInterruptedIncrementalRuns()
+	// FEAT-INC-LOGS: drop log archive dirs of deleted jobs (delete also
+	// removes its own dir inline; this catches crash-orphaned ones).
+	s.sweepIncrementalLogDirs()
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
@@ -325,6 +328,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 				r.Put("/", s.handleUpdateIncrementalJob)
 				r.Delete("/", s.handleDeleteIncrementalJob)
 				r.Post("/run", s.handleRunIncrementalJob)
+				r.Get("/runs/{run_id}/logs", s.handleIncrementalRunLogs)
 			})
 			r.Get("/sources/tables/{table}/columns", s.handleIncrementalColumns)
 			// #t1 batch column listing: one source connection for the

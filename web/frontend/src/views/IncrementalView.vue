@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import apiClient from '../api'
 import type { IncrementalJob } from '../api'
@@ -630,10 +630,103 @@ async function runJob(j: IncrementalJob) {
     runFirstSeen[j.id] = Date.now()
     ensureRunPolling()
     await pollActiveRuns() // immediate refresh so the stub shows up right away
+    openRunLogs(j.id, data.run_id) // D1: auto-open the log drawer on 202
   } catch (e: any) {
     ElMessage.error(`同步失败: ${e.response?.data?.error || e.message}`)
   }
 }
+
+// ---- FEAT-INC-LOGS: 同步日志抽屉 ----
+// after=seq incremental pull: a live run serves from the server's memory
+// collector, a finished one from the on-disk archive — one loop covers both.
+// The 1s timer runs ONLY while the drawer is open AND the run is live.
+const logVisible = ref(false)
+const logJobId = ref('')
+const logRunId = ref('')
+const logEvents = ref<any[]>([])
+const logDropped = ref(0)
+const logStatus = ref('')
+const logFollow = ref(true)
+const logFilterTable = ref('')
+const logFilterLevel = ref('')
+let logTimer: ReturnType<typeof setInterval> | null = null
+let logLastSeq = 0
+const logBox = ref<HTMLElement | null>(null)
+
+const levelTagType: Record<string, any> = { info: 'info', sql: 'primary', warn: 'warning', error: 'danger' }
+const phaseLabels: Record<string, string> = {
+  start: '开始', scan: '扫描', write: '写入', drain: '泄流', jump: '跳转',
+  done: '完成', fail: '失败', interrupted: '中断',
+}
+const logTables = computed(() => Array.from(new Set(logEvents.value.map((e: any) => e.table).filter(Boolean))))
+const filteredLogEvents = computed(() => logEvents.value.filter((e: any) =>
+  (!logFilterTable.value || e.table === logFilterTable.value) &&
+  (!logFilterLevel.value || e.level === logFilterLevel.value)))
+
+function stopLogPolling() {
+  if (logTimer) {
+    clearInterval(logTimer)
+    logTimer = null
+  }
+}
+
+function fmtLogTs(iso: string): string {
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return ''
+  const pad = (n: number, w = 2) => String(n).padStart(w, '0')
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`
+}
+
+async function pullRunLogs() {
+  if (!logVisible.value) return
+  try {
+    const { data } = await apiClient.getIncrementalRunLogs(logJobId.value, logRunId.value, logLastSeq)
+    if (data.events?.length) {
+      logEvents.value = logEvents.value.concat(data.events)
+      logLastSeq = data.events[data.events.length - 1].seq
+      if (logFollow.value) {
+        await nextTick()
+        if (logBox.value) logBox.value.scrollTop = logBox.value.scrollHeight
+      }
+    }
+    logDropped.value = data.dropped || 0
+    logStatus.value = data.status
+    if (data.status === 'running') {
+      if (!logTimer) logTimer = setInterval(pullRunLogs, 1000)
+    } else {
+      stopLogPolling() // terminal: archived logs are fully served already
+    }
+  } catch {
+    // transient pull failure: keep the timer, next tick retries (bounded by
+    // the run deadline semantics of the 3s job poller)
+  }
+}
+
+function openRunLogs(jobId: string, runId: string) {
+  logJobId.value = jobId
+  logRunId.value = runId
+  logEvents.value = []
+  logLastSeq = 0
+  logDropped.value = 0
+  logStatus.value = ''
+  logFollow.value = true
+  logFilterTable.value = ''
+  logFilterLevel.value = ''
+  logVisible.value = true
+  pullRunLogs()
+}
+
+function copyLogSQL(sql: string) {
+  navigator.clipboard?.writeText(sql).then(
+    () => ElMessage.success('SQL 已复制'),
+    () => ElMessage.error('复制失败'),
+  )
+}
+
+watch(logVisible, (v) => {
+  if (!v) stopLogPolling()
+})
+onUnmounted(stopLogPolling)
 
 onUnmounted(stopRunPolling)
 
@@ -913,6 +1006,9 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
             <el-tag v-else-if="h.status === 'failed'" size="small" type="danger">失败</el-tag>
             <el-tag v-else size="small" type="success">已完成</el-tag>
           </template>
+          <div style="margin-bottom: 8px;">
+            <el-button size="small" @click="openRunLogs(historyJob!.id, h.run_id)">日志</el-button>
+          </div>
           <el-table :data="h.tables" size="small">
             <el-table-column prop="table" label="表" width="140" />
             <el-table-column prop="from_watermark" label="起始水位" min-width="160" />
@@ -928,10 +1024,103 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
         </el-collapse-item>
       </el-collapse>
     </el-drawer>
+
+    <el-drawer v-model="logVisible" :title="`同步日志 — ${logRunId}`" :size="'min(760px, 92vw)'">
+      <div class="log-toolbar">
+        <el-tag v-if="logStatus === 'running'" size="small" type="warning">运行中</el-tag>
+        <el-tag v-else-if="logStatus === 'failed'" size="small" type="danger">失败</el-tag>
+        <el-tag v-else-if="logStatus" size="small" type="success">已完成</el-tag>
+        <el-select v-model="logFilterTable" clearable placeholder="按表过滤" size="small" style="width: 180px;">
+          <el-option v-for="t in logTables" :key="t" :value="t" :label="t" />
+        </el-select>
+        <el-select v-model="logFilterLevel" clearable placeholder="按级别过滤" size="small" style="width: 130px;">
+          <el-option value="info" label="info" />
+          <el-option value="sql" label="sql" />
+          <el-option value="warn" label="warn" />
+          <el-option value="error" label="error" />
+        </el-select>
+        <el-switch v-model="logFollow" active-text="跟随" size="small" />
+      </div>
+      <el-alert v-if="logDropped > 0" type="info" :closable="false" style="margin-bottom: 8px;">
+        {{ logDropped }} 条日志因过多被省略（事件环形缓冲已淘汰最早日志）
+      </el-alert>
+      <div ref="logBox" class="log-stream">
+        <div v-for="e in filteredLogEvents" :key="e.seq" class="log-line" :class="`is-${e.level}`">
+          <span class="log-ts">{{ fmtLogTs(e.ts) }}</span>
+          <el-tag size="small" :type="levelTagType[e.level] || 'info'">{{ e.level }}</el-tag>
+          <el-tag v-if="e.table" size="small" type="info" effect="plain">{{ e.table }}</el-tag>
+          <span v-if="e.phase" class="log-phase">{{ phaseLabels[e.phase] || e.phase }}</span>
+          <span class="log-msg">{{ e.msg }}</span>
+          <el-tag v-if="e.rows" size="small" type="success" effect="plain">{{ e.rows.toLocaleString() }} 行</el-tag>
+          <code v-if="e.sql" class="log-sql" title="点击复制" @click="copyLogSQL(e.sql)">{{ e.sql }}</code>
+        </div>
+        <el-empty v-if="!filteredLogEvents.length" description="暂无日志事件" :image-size="60" />
+      </div>
+    </el-drawer>
   </div>
 </template>
 
 <style scoped>
+/* FEAT-INC-LOGS: 同步日志抽屉 */
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.log-stream {
+  height: calc(100vh - 160px);
+  overflow-y: auto;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: var(--tims-radius-s);
+  padding: 8px;
+  font-size: 12px;
+}
+
+.log-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 3px 4px;
+  border-bottom: 1px dashed var(--el-border-color-extra-light);
+}
+
+.log-line.is-error .log-msg { color: var(--el-color-danger); }
+.log-line.is-warn .log-msg { color: var(--el-color-warning); }
+
+.log-ts {
+  color: var(--tims-text-2);
+  font-family: monospace;
+  white-space: nowrap;
+}
+
+.log-phase {
+  color: var(--tims-text-2);
+  white-space: nowrap;
+}
+
+.log-msg {
+  word-break: break-all;
+}
+
+.log-sql {
+  display: block;
+  width: 100%;
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--el-color-primary);
+  background: var(--el-fill-color-light);
+  border-radius: 4px;
+  padding: 4px 6px;
+  margin-top: 2px;
+  word-break: break-all;
+  cursor: pointer;
+  white-space: pre-wrap;
+}
+
 .inc-table-row {
   display: flex;
   align-items: center;
