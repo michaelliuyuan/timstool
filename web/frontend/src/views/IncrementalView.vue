@@ -727,11 +727,11 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
               </el-form-item>
               <el-alert v-if="activeWMCandidate" :type="activeWMCandidate.warnings?.length ? 'warning' : 'success'" :closable="false" style="margin-bottom: 8px;">
                 <template #title>
-                  {{ activeWMCandidate.warnings?.length ? '候选' : '已应用' }} <b>{{ activeWMCandidate.column }}</b>：{{ activeWMCandidate.reasons.join('；') }}
+                  {{ activeWMCandidate.warnings?.length ? '候选' : '已应用' }} <b>{{ activeWMCandidate.column }}</b>：{{ (activeWMCandidate.reasons || []).join('；') }}
                   <template v-if="activeWMCandidate.warnings?.length">（{{ activeWMCandidate.warnings.join('；') }}）</template>
                 </template>
-                <div v-if="activeWMCandidate.unmatched_tables.length" style="font-size: var(--tims-font-sm);">
-                  {{ activeWMCandidate.unmatched_tables.length }} 张表缺该列（{{ activeWMCandidate.unmatched_tables.join('、') }}），请在例外区走逐表配置
+                <div v-if="activeWMCandidate.unmatched_tables?.length" style="font-size: var(--tims-font-sm);">
+                  {{ activeWMCandidate.unmatched_tables.length }} 张表缺该列（{{ (activeWMCandidate.unmatched_tables || []).join('、') }}），请在例外区走逐表配置
                 </div>
               </el-alert>
               <el-form-item>

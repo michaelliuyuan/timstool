@@ -1,6 +1,7 @@
 package webapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -168,6 +169,30 @@ func TestWMScoreIndexAndDefaultBonus(t *testing.T) {
 	}
 	if withBonus[0].Reasons == nil {
 		t.Error("perfect candidate Reasons = nil, want non-nil slice")
+	}
+}
+
+// TestWMZeroWarningCandidateMarshalsEmptyArrays pins the null-crash CLASS
+// (isolation B1) at the marshal level: a zero-warning candidate must
+// serialize `"warnings":[]` — never `"warnings":null` — and the same for
+// reasons, so the UI's .length access is safe for every candidate shape.
+func TestWMZeroWarningCandidateMarshalsEmptyArrays(t *testing.T) {
+	_, cands := scoreWatermarkCandidates(wmCols(
+		[5]string{"a", "updated_at", "timestamp with time zone", "idx", "now"},
+	))
+	if len(cands) != 1 || cands[0].Warnings == nil {
+		t.Fatalf("setup: want one zero-warning candidate, got %+v", cands)
+	}
+	b, err := json.Marshal(cands[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	if !strings.Contains(s, `"warnings":[]`) || strings.Contains(s, `"warnings":null`) {
+		t.Errorf("marshal = %s, want \"warnings\":[] (never null)", s)
+	}
+	if !strings.Contains(s, `"reasons":[`) || strings.Contains(s, `"reasons":null`) {
+		t.Errorf("marshal = %s, want non-null reasons array", s)
 	}
 }
 
