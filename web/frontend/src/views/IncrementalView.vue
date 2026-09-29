@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import apiClient from '../api'
 import type { IncrementalJob } from '../api'
@@ -93,6 +93,7 @@ async function loadJobs() {
   try {
     const { data } = await apiClient.listIncrementalJobs()
     jobs.value = data || []
+    reconcileActiveRuns()
   } catch (e: any) {
     ElMessage.error(`加载失败: ${e.response?.data?.error || e.message}`)
   } finally {
@@ -525,26 +526,73 @@ async function removeJob(j: IncrementalJob) {
 }
 
 // ---- run + history ----
-const running = ref<string | null>(null)
+// Runs are async server-side (202 + background execution): we track the
+// in-flight run_id per job and poll GET /jobs until the newest history
+// record leaves the running state.
+const activeRuns = ref<Record<string, string>>({}) // jobId -> run_id
+let runPollTimer: ReturnType<typeof setInterval> | null = null
 
-async function runJob(j: IncrementalJob) {
-  running.value = j.id
-  try {
-    const { data } = await apiClient.runIncrementalJob(j.id)
-    const errs = data.tables.filter(t => t.error)
-    const rows = data.tables.reduce((n, t) => n + (t.rows || 0), 0)
-    if (errs.length > 0) {
-      ElMessage.warning(`同步完成：${rows} 行，但 ${errs.length} 张表失败（见运行历史）`)
-    } else {
-      ElMessage.success(`同步完成：${rows} 行，耗时 ${data.duration_ms} ms`)
-    }
-    await loadJobs()
-  } catch (e: any) {
-    ElMessage.error(`同步失败: ${e.response?.data?.error || e.message}`)
-  } finally {
-    running.value = null
+function stopRunPolling() {
+  if (runPollTimer) {
+    clearInterval(runPollTimer)
+    runPollTimer = null
   }
 }
+
+function reportRunDone(rec: any) {
+  const errs = (rec.tables || []).filter((t: any) => t.error)
+  const rows = (rec.tables || []).reduce((n: number, t: any) => n + (t.rows || 0), 0)
+  if (rec.status === 'failed') {
+    ElMessage.error(`同步失败: ${rec.error || '运行中断'}`)
+  } else if (errs.length > 0) {
+    ElMessage.warning(`同步完成：${rows} 行，但 ${errs.length} 张表失败（见运行历史）`)
+  } else {
+    ElMessage.success(`同步完成：${rows} 行，耗时 ${rec.duration_ms} ms`)
+  }
+}
+
+// After each loadJobs: adopt running stubs we don't track yet (page refresh
+// / navigation back), and finish tracked runs whose terminal record landed.
+function reconcileActiveRuns() {
+  for (const j of jobs.value) {
+    const newest = j.history?.[0]
+    if (!newest) continue
+    if (newest.status === 'running') {
+      if (!activeRuns.value[j.id]) activeRuns.value[j.id] = newest.run_id
+    } else if (activeRuns.value[j.id] === newest.run_id) {
+      reportRunDone(newest)
+      delete activeRuns.value[j.id]
+    }
+  }
+  if (Object.keys(activeRuns.value).length === 0) stopRunPolling()
+}
+
+async function pollActiveRuns() {
+  try {
+    const { data } = await apiClient.listIncrementalJobs()
+    jobs.value = data || []
+    reconcileActiveRuns()
+  } catch {
+    // transient poll failure: keep the timer, next tick retries
+  }
+}
+
+function ensureRunPolling() {
+  if (!runPollTimer) runPollTimer = setInterval(pollActiveRuns, 3000)
+}
+
+async function runJob(j: IncrementalJob) {
+  try {
+    const { data } = await apiClient.runIncrementalJob(j.id)
+    activeRuns.value[j.id] = data.run_id
+    ensureRunPolling()
+    await pollActiveRuns() // immediate refresh so the stub shows up right away
+  } catch (e: any) {
+    ElMessage.error(`同步失败: ${e.response?.data?.error || e.message}`)
+  }
+}
+
+onUnmounted(stopRunPolling)
 
 const historyVisible = ref(false)
 const historyJob = ref<IncrementalJob | null>(null)
@@ -650,7 +698,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
         <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
             <div class="row-actions">
-              <el-button type="primary" size="small" :loading="running === row.id" @click="runJob(row)">立即同步</el-button>
+              <el-button type="primary" size="small" :loading="!!activeRuns[row.id]" @click="runJob(row)">立即同步</el-button>
               <el-button size="small" link @click="openHistory(row)">运行历史</el-button>
               <el-dropdown trigger="click" @command="(c: string) => onRowCommand(c, row)">
                 <el-button size="small" link>更多<el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
@@ -816,6 +864,12 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
       <el-empty v-if="!historyJob?.history?.length" description="暂无运行记录" />
       <el-collapse v-else>
         <el-collapse-item v-for="h in historyJob.history" :key="h.run_id" :title="`${h.started_at} · ${h.duration_ms} ms`">
+          <template #title>
+            <span style="margin-right: 8px;">{{ h.started_at }} · {{ h.duration_ms }} ms</span>
+            <el-tag v-if="h.status === 'running'" size="small" type="warning">进行中</el-tag>
+            <el-tag v-else-if="h.status === 'failed'" size="small" type="danger">失败</el-tag>
+            <el-tag v-else size="small" type="success">已完成</el-tag>
+          </template>
           <el-table :data="h.tables" size="small">
             <el-table-column prop="table" label="表" width="140" />
             <el-table-column prop="from_watermark" label="起始水位" min-width="160" />

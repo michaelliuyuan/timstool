@@ -85,6 +85,8 @@ export interface IncrementalRunRecord {
   started_at: string
   duration_ms: number
   tables: IncrementalTableResult[]
+  status?: string // running|completed|failed (absent on legacy records = completed)
+  error?: string
 }
 
 export interface IncrementalJob {
@@ -480,8 +482,11 @@ export const apiClient = {
   deleteIncrementalJob: (id: string) =>
     api.delete<{ deleted: boolean }>(`/incremental/jobs/${id}`),
 
+  // Returns 202 {run_id, status:"running"} immediately — the run executes in
+  // the background; the frontend polls GET /incremental/jobs for the terminal
+  // history record. No LONG_TIMEOUT needed: the response is instant.
   runIncrementalJob: (id: string, tables?: string[]) =>
-    api.post<IncrementalRunRecord>(`/incremental/jobs/${id}/run`, { tables: tables || [] }),
+    api.post<{ run_id: string; status: string }>(`/incremental/jobs/${id}/run`, { tables: tables || [] }),
 
   // Column listing with watermark eligibility + index flag (F-04): the
   // watermark dropdown marks comparable types and warns on unindexed columns.

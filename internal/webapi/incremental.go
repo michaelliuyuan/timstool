@@ -74,9 +74,28 @@ type incRunRecord struct {
 	StartedAt  time.Time        `json:"started_at"`
 	DurationMs int64            `json:"duration_ms"`
 	Tables     []incTableResult `json:"tables"`
+	Status     string           `json:"status,omitempty"` // running|completed|failed (absent on legacy records = completed)
+	Error      string           `json:"error,omitempty"`  // run-level error (e.g. interrupted by restart)
 }
 
 const incHistoryCap = 20
+
+// incRunStatus values for incRunRecord.Status.
+const (
+	incRunStatusRunning   = "running"
+	incRunStatusCompleted = "completed"
+	incRunStatusFailed    = "failed"
+)
+
+// incRunTimeout bounds one background run. Runs execute detached from the
+// originating HTTP request (202 + polling), so a client disconnect must not
+// cancel the sync — hence context.Background(), not the request context.
+const incRunTimeout = 10 * time.Minute
+
+// incRunning tracks jobs with a background run in flight (guarded by incMu).
+// A running job rejects concurrent runs, edits and deletes (409): a PUT would
+// swap the States map the engine is writing concurrently.
+var incRunning = map[string]bool{}
 
 // incIdentifierRe is the server-side allow-list for table/column names: a
 // conservative ASCII identifier (quoted anyway, but never accept anything the
@@ -206,6 +225,32 @@ func (s *Server) cleanupIncrementalTempFiles() {
 		if err := os.Remove(m); err != nil {
 			zap.L().Warn("failed to remove orphaned incremental temp file", zap.String("file", m), zap.Error(err))
 		}
+	}
+}
+
+// markInterruptedIncrementalRuns rewrites status=running history stubs left
+// behind by a crash/restart as failed, so the frontend never polls forever.
+// Data-plane semantics are unchanged: already-written batches stay, watermarks
+// do not advance, and REPLACE/IGNORE reruns are idempotent.
+func (s *Server) markInterruptedIncrementalRuns() {
+	incMu.Lock()
+	defer incMu.Unlock()
+	list := s.loadIncrementalJobs()
+	dirty := false
+	for i := range list {
+		for j := range list[i].History {
+			if list[i].History[j].Status == incRunStatusRunning {
+				list[i].History[j].Status = incRunStatusFailed
+				list[i].History[j].Error = "服务重启，运行中断"
+				dirty = true
+			}
+		}
+	}
+	if !dirty {
+		return
+	}
+	if err := s.saveIncrementalJobs(list); err != nil {
+		zap.L().Warn("failed to mark interrupted incremental runs", zap.Error(err))
 	}
 }
 
@@ -407,6 +452,10 @@ func (s *Server) handleUpdateIncrementalJob(w http.ResponseWriter, r *http.Reque
 
 	incMu.Lock()
 	defer incMu.Unlock()
+	if incRunning[id] {
+		s.writeError(w, http.StatusConflict, "该任务已有同步在进行中")
+		return
+	}
 	list := s.loadIncrementalJobs()
 	idx := -1
 	for i := range list {
@@ -455,6 +504,10 @@ func (s *Server) handleDeleteIncrementalJob(w http.ResponseWriter, r *http.Reque
 	id := chi.URLParam(r, "id")
 	incMu.Lock()
 	defer incMu.Unlock()
+	if incRunning[id] {
+		s.writeError(w, http.StatusConflict, "该任务已有同步在进行中")
+		return
+	}
 	list := s.loadIncrementalJobs()
 	out := list[:0]
 	found := false
@@ -660,10 +713,9 @@ func incValueToString(v any) string {
 
 // runIncrementalJob executes one manual sync pass over the (sub)set of tables
 // and returns the run record. Failures are per-table: one bad table never
-// blocks the others.
-// v1 assumption: runs are NOT serialized — two concurrent manual runs of the
-// same job interleave and the later state persist wins (last writer wins).
-func (s *Server) runIncrementalJob(r *http.Request, job *incJob, subset map[string]bool) incRunRecord {
+// blocks the others. Runs execute in a background goroutine; concurrency is
+// serialized per job via incRunning (409 on concurrent run/edit/delete).
+func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[string]bool) incRunRecord {
 	rec := incRunRecord{RunID: uuid.New().String()[:8], StartedAt: time.Now()}
 	src, err := s.resolveDataSourceRef(job.SourceRef)
 	if err != nil {
@@ -699,7 +751,7 @@ func (s *Server) runIncrementalJob(r *http.Request, job *incJob, subset map[stri
 	}
 	defer myDB.Close()
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, incRunTimeout)
 	defer cancel()
 
 	for _, t := range job.Tables {
@@ -992,28 +1044,57 @@ func (s *Server) handleRunIncrementalJob(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, http.StatusNotFound, "job not found")
 		return
 	}
-	job := list[idx]
-	incMu.Unlock()
-
-	rec := s.runIncrementalJob(r, &job, subset)
-
-	// Persist advanced states + history.
-	incMu.Lock()
-	list = s.loadIncrementalJobs()
-	for i := range list {
-		if list[i].ID == id {
-			list[i].States = job.States
-			list[i].History = append([]incRunRecord{rec}, list[i].History...)
-			if len(list[i].History) > incHistoryCap {
-				list[i].History = list[i].History[:incHistoryCap]
-			}
-			list[i].UpdatedAt = time.Now()
-			if err := s.saveIncrementalJobs(list); err != nil {
-				zap.L().Warn("failed to persist incremental job state", zap.String("job", id), zap.Error(err))
-			}
-			s.writeJSON(w, http.StatusOK, rec)
-			break
-		}
+	if incRunning[id] {
+		incMu.Unlock()
+		s.writeError(w, http.StatusConflict, "该任务已有同步在进行中")
+		return
 	}
+	job := list[idx]
+	// Drop a running stub into history immediately and return 202: the run
+	// itself executes detached from this request (client polls GET /jobs).
+	stub := incRunRecord{
+		RunID:     uuid.New().String()[:8],
+		StartedAt: time.Now(),
+		Status:    incRunStatusRunning,
+	}
+	list[idx].History = append([]incRunRecord{stub}, list[idx].History...)
+	if len(list[idx].History) > incHistoryCap {
+		list[idx].History = list[idx].History[:incHistoryCap]
+	}
+	if err := s.saveIncrementalJobs(list); err != nil {
+		incMu.Unlock()
+		s.writeError(w, http.StatusInternalServerError, "保存失败："+err.Error())
+		return
+	}
+	incRunning[id] = true
 	incMu.Unlock()
+
+	go func() {
+		rec := s.runIncrementalJob(context.Background(), &job, subset)
+		rec.RunID = stub.RunID
+		rec.Status = incRunStatusCompleted
+
+		incMu.Lock()
+		delete(incRunning, id)
+		list = s.loadIncrementalJobs()
+		for i := range list {
+			if list[i].ID == id {
+				list[i].States = job.States
+				for j := range list[i].History {
+					if list[i].History[j].RunID == stub.RunID {
+						list[i].History[j] = rec
+						break
+					}
+				}
+				list[i].UpdatedAt = time.Now()
+				if err := s.saveIncrementalJobs(list); err != nil {
+					zap.L().Warn("failed to persist incremental job state", zap.String("job", id), zap.Error(err))
+				}
+				break
+			}
+		}
+		incMu.Unlock()
+	}()
+
+	s.writeJSON(w, http.StatusAccepted, map[string]string{"run_id": stub.RunID, "status": incRunStatusRunning})
 }

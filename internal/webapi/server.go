@@ -229,6 +229,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 	// full plaintext registry.
 	s.cleanupDataSourceTempFiles()
 	s.cleanupIncrementalTempFiles()
+	s.markInterruptedIncrementalRuns()
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)

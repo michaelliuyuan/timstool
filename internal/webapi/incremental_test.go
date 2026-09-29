@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"net/http"
 )
@@ -535,5 +536,189 @@ func TestIncLoopStrictUnchanged(t *testing.T) {
 	// remaining same-value rows are skipped 鈥?10 (first batch) + "w2" only.
 	if wm != "w2" || written != 11 {
 		t.Fatalf("strict: wm=%q written=%d (want w2, 11)", wm, written)
+	}
+}
+
+// --- run async anchors (202 + incRunning + startup cleanup) ---
+
+// waitForIncRun polls the persisted jobs file until the job's newest history
+// record leaves the running state (or the deadline fires).
+func waitForIncRun(t *testing.T, s *Server, id string) incRunRecord {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		incMu.Lock()
+		list := s.loadIncrementalJobs()
+		incMu.Unlock()
+		for i := range list {
+			if list[i].ID == id && len(list[i].History) > 0 {
+				if list[i].History[0].Status != incRunStatusRunning {
+					return list[i].History[0]
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("run did not leave running state in time")
+	return incRunRecord{}
+}
+
+// Anchor 1: POST run returns 202 + run_id immediately; a job whose
+// source_ref no longer resolves (datasource deleted post-create) finishes in
+// the background with per-table errors and a completed terminal record; the
+// running flag is cleared afterwards.
+func TestIncRunAsyncAcceptedAndCompletes(t *testing.T) {
+	s, _ := newTestServer(t)
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "async-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "async-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+
+	w, req = doReq("POST", "/api/v1/incremental/jobs", `{"name": "aj", "source_ref": "`+srcID+
+		`", "target_ref": "`+tgtID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time"}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	id := dsBody(t, w)["id"].(string)
+
+	// Break the source ref after creation: the run must fail per-table, not hang.
+	w, req = doReq("DELETE", "/api/v1/datasources/"+srcID, "")
+	req = withChiParam(req, "id", srcID)
+	s.handleDeleteDataSource(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete datasource: %d %s", w.Code, w.Body.String())
+	}
+
+	w, req = doReq("POST", "/api/v1/incremental/jobs/"+id+"/run", "")
+	req = withChiParam(req, "id", id)
+	s.handleRunIncrementalJob(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("run must be 202: %d %s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil || resp["run_id"] == "" || resp["status"] != "running" {
+		t.Fatalf("202 body must carry run_id+running: %v %v", err, w.Body.String())
+	}
+	runID := resp["run_id"]
+
+	rec := waitForIncRun(t, s, id)
+	if rec.RunID != runID {
+		t.Fatalf("terminal record must keep the stub run_id: %+v", rec)
+	}
+	if rec.Status != incRunStatusCompleted {
+		t.Fatalf("terminal status must be completed: %+v", rec)
+	}
+	if len(rec.Tables) != 1 || rec.Tables[0].Error == "" {
+		t.Fatalf("per-table error must land for unresolved source_ref: %+v", rec.Tables)
+	}
+	incMu.Lock()
+	running := incRunning[id]
+	incMu.Unlock()
+	if running {
+		t.Fatal("incRunning must be cleared after run completion")
+	}
+}
+
+// Anchor 2: a job flagged running rejects a second run and a delete with 409.
+func TestIncRunSecondRunConflict(t *testing.T) {
+	s, _ := newTestServer(t)
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "c-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "c-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/incremental/jobs", `{"name": "cj", "source_ref": "`+srcID+
+		`", "target_ref": "`+tgtID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time"}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	id := dsBody(t, w)["id"].(string)
+
+	incMu.Lock()
+	incRunning[id] = true
+	incMu.Unlock()
+	w, req = doReq("POST", "/api/v1/incremental/jobs/"+id+"/run", "")
+	req = withChiParam(req, "id", id)
+	s.handleRunIncrementalJob(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("second run must be 409: %d %s", w.Code, w.Body.String())
+	}
+	w, req = doReq("DELETE", "/api/v1/incremental/jobs/"+id, "")
+	req = withChiParam(req, "id", id)
+	s.handleDeleteIncrementalJob(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("delete while running must be 409: %d %s", w.Code, w.Body.String())
+	}
+	incMu.Lock()
+	delete(incRunning, id)
+	incMu.Unlock()
+}
+
+// Anchor 3: running stubs persisted before a restart are rewritten as failed
+// at startup; States are untouched.
+func TestIncStartupCleanupRunningStubs(t *testing.T) {
+	s, _ := newTestServer(t)
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "cl-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "cl-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/incremental/jobs", `{"name": "clj", "source_ref": "`+srcID+
+		`", "target_ref": "`+tgtID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time"}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	id := dsBody(t, w)["id"].(string)
+
+	incMu.Lock()
+	list := s.loadIncrementalJobs()
+	for i := range list {
+		if list[i].ID == id {
+			list[i].States["users"] = &incTableState{LastWatermark: "2026-01-01", TotalRows: 3}
+			list[i].History = []incRunRecord{{RunID: "deadbeef", StartedAt: time.Now(), Status: incRunStatusRunning}}
+		}
+	}
+	if err := s.saveIncrementalJobs(list); err != nil {
+		t.Fatal(err)
+	}
+	incMu.Unlock()
+
+	s.markInterruptedIncrementalRuns()
+
+	incMu.Lock()
+	list = s.loadIncrementalJobs()
+	incMu.Unlock()
+	for _, e := range list {
+		if e.ID != id {
+			continue
+		}
+		if len(e.History) != 1 {
+			t.Fatalf("history must keep the stub: %+v", e.History)
+		}
+		if e.History[0].Status != incRunStatusFailed || e.History[0].Error == "" {
+			t.Fatalf("running stub must become failed with error: %+v", e.History[0])
+		}
+		if st := e.States["users"]; st == nil || st.LastWatermark != "2026-01-01" || st.TotalRows != 3 {
+			t.Fatalf("states must be untouched by cleanup: %+v", e.States)
+		}
 	}
 }
