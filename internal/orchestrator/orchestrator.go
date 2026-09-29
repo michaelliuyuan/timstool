@@ -392,7 +392,7 @@ func (o *Orchestrator) runPrecheck(ctx context.Context) PipelineResult {
 	start := time.Now()
 
 	if o.cpMgr != nil {
-		o.cpMgr.SetPhase("precheck")
+		_ = o.cpMgr.SetPhase("precheck")
 		_ = o.cpMgr.StartPhase("precheck")
 	}
 
@@ -412,9 +412,7 @@ func (o *Orchestrator) runPrecheck(ctx context.Context) PipelineResult {
 		return result
 	}
 
-	if o.cpMgr != nil {
-		_ = o.cpMgr.FinishPhase("precheck", nil, false)
-	}
+	o.finishPhase("precheck", nil, false)
 
 	if rpt != nil {
 		log.Info("pre-check completed",
@@ -499,13 +497,11 @@ func (o *Orchestrator) runData(ctx context.Context) PipelineResult {
 
 	if err != nil {
 		log.Error("data migration failed", zap.Error(err))
-		o.finishPhase("data", err, false)
+		o.finishPhaseWithReload("data", err, false)
 		return result
 	}
 
-	if o.cpMgr != nil {
-		_ = o.cpMgr.FinishPhase("data", nil, false)
-	}
+	o.finishPhaseWithReload("data", nil, false)
 
 	if dataResult != nil {
 		log.Info("data migration completed",
@@ -606,6 +602,18 @@ func (o *Orchestrator) finishPhase(name string, err error, warn bool) {
 		return
 	}
 	_ = o.cpMgr.FinishPhase(name, err, warn)
+}
+
+// finishPhaseWithReload is the dual-instance-safe variant for the data
+// phase: the data migrator writes through its own checkpoint.Manager, so
+// this orchestrator's in-memory copy is stale by the time data finishes —
+// reloading before the final save prevents overwriting the data-plane
+// progress (tables/rows/imported) already persisted by the migrator.
+func (o *Orchestrator) finishPhaseWithReload(name string, err error, warn bool) {
+	if o.cpMgr == nil {
+		return
+	}
+	_ = o.cpMgr.FinishPhaseWithReload(name, err, warn)
 }
 
 func (r *checkpointStateReader) GetPhase() string {

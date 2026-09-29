@@ -136,3 +136,118 @@ func TestPhasesLegacyCheckpointCompat(t *testing.T) {
 		t.Errorf("legacy phases = %v, want nil", cp.Phases)
 	}
 }
+
+// TestFinishPhaseWithReloadDualInstance anchors the runData stomp bug:
+// the data migrator writes through its OWN checkpoint.Manager (manager A)
+// while the orchestrator holds a second manager (B) whose in-memory copy
+// went stale when the data phase started. When B finishes the "data"
+// phase, it must NOT overwrite A's persisted data-plane progress.
+// FinishPhaseWithReload reloads from disk first and preserves it; the
+// control case shows plain FinishPhase does stomp (that is why runData
+// must use the reload variant).
+func TestFinishPhaseWithReloadDualInstance(t *testing.T) {
+	seedAndFinish := func(finish func(m *Manager, name string, err error, warn bool) error) *Manager {
+		dir := t.TempDir()
+		// Manager B = the ORCHESTRATOR's instance, created at pipeline
+		// start: it seeds the phases and records the schema outcome, then
+		// never reloads — stale from the schema era onward.
+		b, err := NewManager(dir)
+		if err != nil {
+			t.Fatalf("NewManager(B): %v", err)
+		}
+		if err := b.InitPhases(map[string]bool{"precheck": false, "schema": false, "data": false, "validate": false}); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.StartPhase("schema"); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.FinishPhase("schema", nil, false); err != nil {
+			t.Fatal(err)
+		}
+
+		// Manager A = the DATA MIGRATOR's own instance, created at data
+		// phase start (loads schema-era state), then writes the data
+		// plane: table progress, imported counts, import mode, sub-phase.
+		a, err := NewManager(dir)
+		if err != nil {
+			t.Fatalf("NewManager(A): %v", err)
+		}
+		for _, tbl := range []string{"orders", "customers", "products"} {
+			a.GetOrCreateTable(tbl, 100)
+			if err := a.MarkTableCompleted(tbl, 100); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := a.SetImportedTables(3); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.SetImportMode(ImportModeLightning); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.SetSubPhase("data", "data-import"); err != nil {
+			t.Fatal(err)
+		}
+
+		// Orchestrator's B finishes the data phase from its stale copy.
+		if err := finish(b, "data", nil, false); err != nil {
+			t.Fatal(err)
+		}
+
+		// Verify through a fresh reader of the on-disk file.
+		r, err := NewManager(dir)
+		if err != nil {
+			t.Fatalf("NewManager(reader): %v", err)
+		}
+		return r
+	}
+
+	// Fixed path: reload variant preserves A's data-plane progress.
+	r := seedAndFinish(func(m *Manager, name string, err error, warn bool) error {
+		return m.FinishPhaseWithReload(name, err, warn)
+	})
+	tables := r.GetAllTables()
+	if len(tables) != 3 {
+		t.Errorf("tables after reload-finish = %d, want 3 (stomped?)", len(tables))
+	}
+	for _, tbl := range []string{"orders", "customers", "products"} {
+		tc, ok := tables[tbl]
+		if !ok {
+			t.Fatalf("table %s missing after reload-finish", tbl)
+		}
+		if tc.State != StateCompleted {
+			t.Errorf("%s state = %s, want completed", tbl, tc.State)
+		}
+		if tc.RowsDone != 100 || tc.RowsTotal != 100 {
+			t.Errorf("%s rows = %d/%d, want 100/100", tbl, tc.RowsDone, tc.RowsTotal)
+		}
+	}
+	if got := r.GetImportedTables(); got != 3 {
+		t.Errorf("imported_tables = %d, want 3", got)
+	}
+	if got := r.GetImportMode(); got != ImportModeLightning {
+		t.Errorf("import_mode = %q, want %q", got, ImportModeLightning)
+	}
+	phases := r.GetPhases()
+	if phases["data"].Status != StateCompleted {
+		t.Errorf("data phase = %s, want completed", phases["data"].Status)
+	}
+	if phases["data"].SubPhase != "data-import" {
+		t.Errorf("data sub-phase = %q, want data-import", phases["data"].SubPhase)
+	}
+	if phases["schema"].Status != StateCompleted {
+		t.Errorf("schema phase = %s, want completed (must survive reload)", phases["schema"].Status)
+	}
+
+	// Control: plain FinishPhase (old behavior) stomps the data plane —
+	// pins the exact difference the reload variant exists to fix.
+	r2 := seedAndFinish(func(m *Manager, name string, err error, warn bool) error {
+		return m.FinishPhase(name, err, warn)
+	})
+	tables2 := r2.GetAllTables()
+	if len(tables2) != 0 {
+		t.Errorf("control: tables = %d, want 0 (expected stomp with plain FinishPhase — if this now passes, the anchor's premise changed)", len(tables2))
+	}
+	if got := r2.GetImportedTables(); got != 0 {
+		t.Errorf("control: imported_tables = %d, want 0 (stomped)", got)
+	}
+}

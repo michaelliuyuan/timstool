@@ -389,6 +389,27 @@ func (m *Manager) StartPhase(name string) error {
 func (m *Manager) FinishPhase(name string, err error, warn bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.finishPhaseLocked(name, err, warn)
+	m.save()
+	return nil
+}
+
+// FinishPhaseWithReload is the dual-instance-safe variant of FinishPhase:
+// it reloads the checkpoint from disk before recording the outcome, so a
+// manager holding a stale in-memory copy (e.g. the orchestrator's manager
+// while the data migrator writes through its own instance) does not
+// overwrite the data-plane progress already persisted by the other writer.
+// Mirrors SetPhaseWithReload.
+func (m *Manager) FinishPhaseWithReload(name string, err error, warn bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_ = m.load()
+	m.finishPhaseLocked(name, err, warn)
+	m.save()
+	return nil
+}
+
+func (m *Manager) finishPhaseLocked(name string, err error, warn bool) {
 	if m.data.Phases == nil {
 		m.data.Phases = make(map[string]*PhaseRecord)
 	}
@@ -406,8 +427,6 @@ func (m *Manager) FinishPhase(name string, err error, warn bool) error {
 		rec.Status = StateCompleted
 		rec.Error = ""
 	}
-	m.save()
-	return nil
 }
 
 // SetSubPhase records the current sub-step of a phase (e.g. schema-build /
