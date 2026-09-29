@@ -329,6 +329,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 			// #t1 batch column listing: one source connection for the
 			// multi-table binding flow (single-conn fan-out, capped at 200).
 			r.Post("/incremental/columns-batch", s.handleIncrementalColumnsBatch)
+			r.Post("/incremental/suggest-watermark", s.handleSuggestWatermark)
 		})
 
 		// F-10 long-running endpoints: 120s deadline, three-layer aligned —

@@ -503,6 +503,25 @@ export const apiClient = {
       }[]
     }>('/incremental/columns-batch', { source_ref: ref, tables }),
 
+  // FEAT-WM-AUTO: rank unified watermark column candidates by scoring the
+  // whole source schema's catalog (coverage/name/type/index/DEFAULT now()).
+  suggestWatermark: (ref: string) =>
+    api.post<{
+      total_tables: number
+      candidates: {
+        column: string
+        score: number
+        coverage: number
+        indexed_ratio: number
+        default_now_ratio: number
+        type_histogram: Record<string, number>
+        matched_tables: string[]
+        unmatched_tables: string[]
+        reasons: string[]
+        warnings: string[]
+      }[]
+    }>('/incremental/suggest-watermark', { source_ref: ref }, { timeout: LONG_TIMEOUT }),
+
   // Compatibility assessment (S1-UI-08): body is { source_ref } or the inline
   // PG form; format 'html' returns the report as text instead of JSON.
   assess: (body: Record<string, any>, format?: string) =>

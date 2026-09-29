@@ -351,6 +351,63 @@ function onBatchColumnPicked() {
   }
 }
 
+// ---- FEAT-WM-AUTO: watermark auto-suggest ----
+interface WmCandidate {
+  column: string
+  score: number
+  coverage: number
+  indexed_ratio: number
+  default_now_ratio: number
+  type_histogram: Record<string, number>
+  matched_tables: string[]
+  unmatched_tables: string[]
+  reasons: string[]
+  warnings: string[]
+}
+const wmSuggesting = ref(false)
+const wmCandidates = ref<WmCandidate[]>([])
+const wmSelected = ref('')
+const wmAppliedColumn = ref('')
+
+const activeWMCandidate = computed(() => wmCandidates.value.find(c => c.column === batchColumn.value))
+
+// Apply one candidate: check its matched tables, fill the unified column,
+// then re-run the existing batch validation — everything stays hand-editable.
+function applyWMCandidate(c: WmCandidate) {
+  wmSelected.value = c.column
+  batchTables.value = [...c.matched_tables]
+  batchColumn.value = c.column
+  wmAppliedColumn.value = c.column
+  if (c.warnings.length) ElMessage.warning(c.warnings[0])
+  checkBatch()
+}
+
+async function autoSuggestWM() {
+  if (!form.source_ref) {
+    ElMessage.warning('请先选择源数据源')
+    return
+  }
+  wmSuggesting.value = true
+  try {
+    const { data } = await apiClient.suggestWatermark(form.source_ref)
+    wmCandidates.value = (data.candidates || []) as WmCandidate[]
+    if (wmCandidates.value.length === 0) {
+      ElMessage.warning('源库未找到可比类型（timestamp/date/int/bigint）的候选水位列，请逐表配置')
+      return
+    }
+    applyWMCandidate(wmCandidates.value[0])
+  } catch (e: any) {
+    ElMessage.error(`自动获取失败: ${e.response?.data?.error || e.message}`)
+  } finally {
+    wmSuggesting.value = false
+  }
+}
+
+function onWMCandidatePicked() {
+  const c = wmCandidates.value.find(x => x.column === wmSelected.value)
+  if (c) applyWMCandidate(c)
+}
+
 // ---- save ----
 async function save() {
   if (!form.name.trim() || !form.source_ref || !form.target_ref) {
@@ -637,6 +694,24 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
                   <el-option v-for="t in tableList" :key="t.name" :value="t.name" :label="t.row_estimate >= 0 ? `${t.name}（约 ${t.row_estimate.toLocaleString()} 行）` : t.name" />
                 </el-select>
               </el-form-item>
+              <el-form-item>
+                <el-button type="primary" plain :loading="wmSuggesting" :disabled="!form.source_ref" @click="autoSuggestWM">
+                  ⚡ {{ wmAppliedColumn ? '重新获取' : '自动获取水位列' }}
+                </el-button>
+                <el-select v-if="wmCandidates.length" v-model="wmSelected" size="default" style="width: 280px; margin-left: 8px;" @change="onWMCandidatePicked">
+                  <el-option v-for="c in wmCandidates" :key="c.column" :value="c.column"
+                             :label="`${c.column}（${c.score.toFixed(0)} 分 · 覆盖 ${(c.coverage * 100).toFixed(0)}% · 索引 ${(c.indexed_ratio * 100).toFixed(0)}%）`" />
+                </el-select>
+              </el-form-item>
+              <el-alert v-if="activeWMCandidate" type="warning" :closable="false" style="margin-bottom: 8px;">
+                <template #title>
+                  候选 <b>{{ activeWMCandidate.column }}</b>：{{ activeWMCandidate.reasons.join('；') }}
+                  <template v-if="activeWMCandidate.warnings.length">（{{ activeWMCandidate.warnings.join('；') }}）</template>
+                </template>
+                <div v-if="activeWMCandidate.unmatched_tables.length" style="font-size: var(--tims-font-sm);">
+                  {{ activeWMCandidate.unmatched_tables.length }} 张表缺该列（{{ activeWMCandidate.unmatched_tables.join('、') }}），请在例外区走逐表配置
+                </div>
+              </el-alert>
               <el-form-item>
                 <el-button :loading="batchChecking" :disabled="batchTables.length === 0" @click="checkBatch">校验所选表</el-button>
                 <span style="margin-left: 8px; font-size: var(--tims-font-sm); color: var(--tims-text-2);">单连接批量拉取列信息，校验各表是否都含所选水位列</span>
