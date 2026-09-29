@@ -235,7 +235,11 @@ func scoreWatermarkCandidates(cols []wmCatalogColumn) (total int, cands []wmSugg
 		nowRatio := float64(a.defaultNow) / float64(a.matched)
 		score := 100 * (0.35*cov + 0.25*a.nameWeight + 0.15*avgType + 0.15*idxRatio + 0.10*nowRatio)
 
-		var reasons, warnings []string
+		// reasons/warnings MUST start non-nil: a zero-value nil slice
+		// marshals to JSON null and crashes the UI's .length access
+		// (isolation B1 — a perfect zero-warning candidate took down
+		// auto-apply).
+		reasons, warnings := []string{}, []string{}
 		switch a.nameLabel {
 		case "更新系命名":
 			reasons = append(reasons, "更新系命名：UPDATE 时前进，水位语义最佳")

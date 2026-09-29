@@ -160,6 +160,15 @@ func TestWMScoreIndexAndDefaultBonus(t *testing.T) {
 	if base != 100 {
 		t.Errorf("perfect candidate score = %.1f, want 100", base)
 	}
+	// Isolation B1: a zero-warning (perfect) candidate must still carry a
+	// NON-nil Warnings slice — nil marshals to JSON null and crashed the
+	// UI's warnings.length access on auto-apply.
+	if withBonus[0].Warnings == nil {
+		t.Error("perfect candidate Warnings = nil, want empty non-nil slice (JSON null crash)")
+	}
+	if withBonus[0].Reasons == nil {
+		t.Error("perfect candidate Reasons = nil, want non-nil slice")
+	}
 }
 
 func TestWMScoreNonComparableExcluded(t *testing.T) {

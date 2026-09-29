@@ -398,7 +398,7 @@ function applyWMCandidate(c: WmCandidate) {
   } else {
     batchTables.value = [...safe]
   }
-  if (c.warnings.length) ElMessage.warning(c.warnings[0])
+  if (c.warnings?.length) ElMessage.warning(c.warnings[0])
   if (batchTables.value.length) checkBatch()
 }
 
@@ -725,10 +725,10 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
                              :label="`${c.column}（${c.score.toFixed(0)} 分 · 覆盖 ${(c.coverage * 100).toFixed(0)}% · 索引 ${(c.indexed_ratio * 100).toFixed(0)}%）`" />
                 </el-select>
               </el-form-item>
-              <el-alert v-if="activeWMCandidate" :type="activeWMCandidate.warnings.length ? 'warning' : 'success'" :closable="false" style="margin-bottom: 8px;">
+              <el-alert v-if="activeWMCandidate" :type="activeWMCandidate.warnings?.length ? 'warning' : 'success'" :closable="false" style="margin-bottom: 8px;">
                 <template #title>
-                  {{ activeWMCandidate.warnings.length ? '候选' : '已应用' }} <b>{{ activeWMCandidate.column }}</b>：{{ activeWMCandidate.reasons.join('；') }}
-                  <template v-if="activeWMCandidate.warnings.length">（{{ activeWMCandidate.warnings.join('；') }}）</template>
+                  {{ activeWMCandidate.warnings?.length ? '候选' : '已应用' }} <b>{{ activeWMCandidate.column }}</b>：{{ activeWMCandidate.reasons.join('；') }}
+                  <template v-if="activeWMCandidate.warnings?.length">（{{ activeWMCandidate.warnings.join('；') }}）</template>
                 </template>
                 <div v-if="activeWMCandidate.unmatched_tables.length" style="font-size: var(--tims-font-sm);">
                   {{ activeWMCandidate.unmatched_tables.length }} 张表缺该列（{{ activeWMCandidate.unmatched_tables.join('、') }}），请在例外区走逐表配置
