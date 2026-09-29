@@ -212,6 +212,58 @@ func incAdvanceWatermark(current, streamMax string, rows int64) string {
 	return streamMax
 }
 
+// incMaxPlaceholders caps the bind-parameter count of ONE multi-row INSERT.
+// MySQL/TiDB reject statements above 65535 placeholders (PG error 1390 on the
+// MySQL wire, "Prepared statement contains too many placeholders"), so wide
+// tables × large batches must be written in shards below that ceiling.
+const incMaxPlaceholders = 65000
+
+// incShardRows returns the max rows a single INSERT may carry for cols
+// columns (rows*cols must stay within incMaxPlaceholders). cols<=0 or
+// rows<=0 return rows unchanged — defensive: never shrink a batch when the
+// column count is unknown.
+func incShardRows(cols, rows int) int {
+	if cols <= 0 || rows <= 0 {
+		return rows
+	}
+	n := incMaxPlaceholders / cols
+	if n < 1 {
+		n = 1
+	}
+	if rows > n {
+		return n
+	}
+	return rows
+}
+
+// incExecShardedInsert writes batch rows through incBuildInsertSQL in shards:
+// one multi-row INSERT per shard, never exceeding incMaxPlaceholders bind
+// params. Returns the rows written; a failing shard aborts with its error and
+// already-written shards are kept (same "written batches are kept" semantics
+// as the pre-sharding single-INSERT path). Used by BOTH write points: the
+// main batch path and the same-value drain flush.
+func incExecShardedInsert(ctx context.Context, db *sql.DB, database, table string, cols []string, batch [][]any, strategy string) (int64, error) {
+	shard := incShardRows(len(cols), len(batch))
+	var written int64
+	for start := 0; start < len(batch); start += shard {
+		end := start + shard
+		if end > len(batch) {
+			end = len(batch)
+		}
+		part := batch[start:end]
+		args := make([]any, 0, len(part)*len(cols))
+		for _, row := range part {
+			args = append(args, row...)
+		}
+		insSQL := incBuildInsertSQL(database, table, cols, len(part), strategy)
+		if _, err := db.ExecContext(ctx, insSQL, args...); err != nil {
+			return written, err
+		}
+		written += int64(len(part))
+	}
+	return written, nil
+}
+
 func (s *Server) incrementalJobsFile() string { return s.dataDir + "/incremental_jobs.json" }
 
 // cleanupIncrementalTempFiles removes crash-orphaned temp files at startup
@@ -895,17 +947,13 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 			break
 		}
 
-		args := make([]any, 0, len(batch)*len(cols))
-		for _, row := range batch {
-			args = append(args, row...)
-		}
-		insSQL := incBuildInsertSQL(tc.Database, t.Table, cols, len(batch), job.ConflictStrategy)
-		if _, err := myDB.ExecContext(ctx, insSQL, args...); err != nil {
-			res.Error = "写入目标端失败: " + err.Error()
+		written, wErr := incExecShardedInsert(ctx, myDB, tc.Database, t.Table, cols, batch, job.ConflictStrategy)
+		if wErr != nil {
+			res.Error = "写入目标端失败: " + wErr.Error()
 			st.Failed = res.Error
 			return res
 		}
-		total += int64(len(batch))
+		total += written
 		// ORDER BY watermark ⇒ the last row carries the batch MAX.
 		lastWM = incValueToString(batch[len(batch)-1][wmIndex(cols, t.WatermarkColumn)])
 		next, saturated, done := incCursorStep(entryWM, lastWM, len(batch), job.BatchSize)
@@ -969,15 +1017,11 @@ func (s *Server) incDrainWatermark(ctx context.Context, pgDB, myDB *sql.DB, sc c
 		if len(batch) == 0 {
 			return nil
 		}
-		args := make([]any, 0, len(batch)*len(cols))
-		for _, row := range batch {
-			args = append(args, row...)
+		written, wErr := incExecShardedInsert(ctx, myDB, tc.Database, t.Table, cols, batch, job.ConflictStrategy)
+		if wErr != nil {
+			return wErr
 		}
-		insSQL := incBuildInsertSQL(tc.Database, t.Table, cols, len(batch), job.ConflictStrategy)
-		if _, eErr := myDB.ExecContext(ctx, insSQL, args...); eErr != nil {
-			return eErr
-		}
-		rows += int64(len(batch))
+		rows += written
 		batch = batch[:0]
 		return nil
 	}
