@@ -92,6 +92,8 @@ func TestAttributeStatementToTable(t *testing.T) {
 		{"drop table", "DROP TABLE IF EXISTS `t4`", "t4"},
 		{"create index via ON", "CREATE INDEX `idx_a` ON `t5` (`col`)", "t5"},
 		{"create unique index via ON", "CREATE UNIQUE INDEX `idx_b` ON t6 (col)", "t6"},
+		{"create index if not exists via ON", "CREATE INDEX IF NOT EXISTS `idx_c` ON `t8` (`col`)", "t8"},
+		{"create unique index if not exists via ON", "CREATE UNIQUE INDEX IF NOT EXISTS idx_d ON t9 (col)", "t9"},
 		{"set is unattributed", "SET FOREIGN_KEY_CHECKS = 0", ""},
 		{"comment is unattributed", "-- Table: t7 (SKIPPED: already exists in target)", ""},
 	}
@@ -105,6 +107,10 @@ func TestAttributeStatementToTable(t *testing.T) {
 	// attribution fix lives in attributeStatementToTable, not here.
 	if got := extractObjectName("CREATE INDEX `idx_a` ON `t5` (`col`)"); got != "idx_a" {
 		t.Errorf("extractObjectName(create index) = %q, want idx_a (label semantics)", got)
+	}
+	// Cosmetic fix: IF NOT EXISTS must be skipped, not captured as "IF".
+	if got := extractObjectName("CREATE INDEX IF NOT EXISTS `idx_c` ON `t8` (`col`)"); got != "idx_c" {
+		t.Errorf("extractObjectName(create index if not exists) = %q, want idx_c", got)
 	}
 }
 

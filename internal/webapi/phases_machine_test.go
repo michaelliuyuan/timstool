@@ -40,6 +40,8 @@ type phaseAPI struct {
 	Duration float64 `json:"duration"`
 	Warn     bool    `json:"warn"`
 	Error    string  `json:"error"`
+
+	ImportedTables int `json:"imported_tables"`
 }
 
 func fetchPhases(t *testing.T, s *Server, taskID string) []phaseAPI {
@@ -161,4 +163,79 @@ func TestTaskPhases_LegacyFallbackOrdinalInference(t *testing.T) {
 			t.Errorf("phase %s must never be skipped on the fallback path", p.Name)
 		}
 	}
+}
+
+// TestTaskPhases_MachineSubLabelSoleSource anchors 🟡2: in machine mode the
+// data sub-label comes ONLY from the machine SubPhase — the legacy coarse
+// cpPhase switch must not override it. CIR shape: machine says
+// data-import while coarse phase is still "data" (never "data-import")
+// — the label must still render and ImportedTables must still fill.
+func TestTaskPhases_MachineSubLabelSoleSource(t *testing.T) {
+	s, taskID := createPhaseTestTask(t, "pm-cir-sublabel")
+	t.Chdir(t.TempDir())
+	cpMgr, err := checkpoint.NewManager(filepath.Join(".checkpoint", taskID))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	_ = cpMgr.InitPhases(map[string]bool{"precheck": false, "schema": false, "data": false, "validate": false})
+	_ = cpMgr.StartPhase("schema")
+	_ = cpMgr.FinishPhase("schema", nil, false)
+	_ = cpMgr.StartPhase("data")
+	// CIR pipeline shape: SubPhase set, coarse phase lingers at "data".
+	_ = cpMgr.SetSubPhase("data", "data-import")
+	_ = cpMgr.SetPhase("data")
+	_ = cpMgr.SetImportMode(checkpoint.ImportModeLightning)
+	_ = cpMgr.SetImportedTables(3)
+	for _, tbl := range []string{"orders", "customers", "products"} {
+		cpMgr.GetOrCreateTable(tbl, 100)
+		_ = cpMgr.MarkTableCompleted(tbl, 100)
+	}
+	cpMgr.Flush()
+
+	phases := fetchPhases(t, s, taskID)
+	for _, p := range phases {
+		if p.Name != "data" {
+			continue
+		}
+		if p.SubLabel != "数据导入" {
+			t.Errorf("data sub_label = %q, want 数据导入 (machine SubPhase sole source)", p.SubLabel)
+		}
+		if p.ImportedTables != 3 {
+			t.Errorf("data imported_tables = %d, want 3 (filled in machine mode)", p.ImportedTables)
+		}
+		return
+	}
+	t.Fatal("data phase missing")
+}
+
+// TestTaskPhases_LegacySubLabelSwitchStillWorks: on the legacy fallback
+// path (no phases map) the coarse-phase switch remains the sub-label
+// source — rolling-deploy behavior preserved.
+func TestTaskPhases_LegacySubLabelSwitchStillWorks(t *testing.T) {
+	s, taskID := createPhaseTestTask(t, "pm-legacy-sublabel")
+	t.Chdir(t.TempDir())
+	cpMgr, err := checkpoint.NewManager(filepath.Join(".checkpoint", taskID))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	// Legacy shape: no InitPhases; coarse phase only.
+	_ = cpMgr.SetPhase("data-import")
+	_ = cpMgr.SetImportMode(checkpoint.ImportModeLightning)
+	_ = cpMgr.SetImportedTables(2)
+	cpMgr.Flush()
+
+	phases := fetchPhases(t, s, taskID)
+	for _, p := range phases {
+		if p.Name != "data" {
+			continue
+		}
+		if p.SubLabel != "数据导入" {
+			t.Errorf("data sub_label = %q, want 数据导入 (legacy switch)", p.SubLabel)
+		}
+		if p.ImportedTables != 2 {
+			t.Errorf("data imported_tables = %d, want 2", p.ImportedTables)
+		}
+		return
+	}
+	t.Fatal("data phase missing")
 }

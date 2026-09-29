@@ -254,12 +254,14 @@ func (m *Manager) RegisterSchemaTables(names []string) error {
 }
 
 // MarkSchemaTableCompleted marks one table's schema DDL as applied.
-// Idempotent: a table already marked completed (e.g. its CREATE TABLE
-// succeeded and a later CREATE INDEX on the same table also attributed
-// success) is not rewritten.
+// Idempotent and sticky-on-failure: completed is not rewritten, and a
+// FAILED table is never flipped back to completed by a later successful
+// statement on the same table (e.g. CREATE INDEX failed, deferred
+// ALTER/INDEX then succeeded) — the failure must stay visible. Resetting
+// to pending only happens via RegisterSchemaTables on resume.
 func (m *Manager) MarkSchemaTableCompleted(tableName string) error {
 	return m.UpdateTable(tableName, func(tc *TableCheckpoint) {
-		if tc.SchemaState == StateCompleted {
+		if tc.SchemaState == StateCompleted || tc.SchemaState == StateFailed {
 			return
 		}
 		tc.SchemaState = StateCompleted
@@ -267,6 +269,9 @@ func (m *Manager) MarkSchemaTableCompleted(tableName string) error {
 }
 
 // MarkSchemaTableFailed marks one table's schema DDL as failed.
+// No completed guard on purpose: a table whose CREATE TABLE succeeded
+// can still end failed when a later INDEX/ALTER on it failed — failed is
+// the honest terminal state ("the table's full DDL set did not land").
 func (m *Manager) MarkSchemaTableFailed(tableName string, errStr string) error {
 	return m.UpdateTable(tableName, func(tc *TableCheckpoint) {
 		tc.SchemaState = StateFailed

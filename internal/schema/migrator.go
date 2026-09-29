@@ -468,7 +468,7 @@ func extractObjectName(stmt string) string {
 	if strings.HasPrefix(upper, "SET ") || strings.HasPrefix(upper, "--") {
 		return ""
 	}
-	m := regexp.MustCompile("(?i)^(?:DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?|CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?|ALTER\\s+TABLE\\s+|CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+)`?([^`\\s(]+)")
+	m := regexp.MustCompile("(?i)^(?:DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?|CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?|ALTER\\s+TABLE\\s+|CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?)`?([^`\\s(]+)")
 	match := m.FindStringSubmatch(stmt)
 	if len(match) >= 2 {
 		return match[1]

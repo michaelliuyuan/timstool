@@ -81,3 +81,55 @@ func TestSchemaStateFailedAndReset(t *testing.T) {
 		t.Errorf("ResetAllTables did not clear schema state: %+v", a)
 	}
 }
+
+// TestSchemaStateStickyFailed anchors the adversarial finding (UX-0935 🟡1):
+// failed is a sticky terminal state. A later successful statement on the
+// same table (OnError=skip: CREATE INDEX failed, deferred ALTER succeeded)
+// must NOT flip the table green, while completed→failed stays legal (the
+// table's full DDL set did not land). RegisterSchemaTables on resume is
+// the only reset path — stickiness must not block retry.
+func TestSchemaStateStickyFailed(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "checkpoint")
+	m, _ := NewManager(dir)
+
+	if err := m.RegisterSchemaTables([]string{"a", "b"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// fail → complete: stays failed (no green-wash of the index failure).
+	if err := m.MarkSchemaTableFailed("a", "create index boom"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.MarkSchemaTableCompleted("a"); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := m.GetTable("a"); a.SchemaState != StateFailed {
+		t.Errorf("a schema state = %v after completed mark, want failed (sticky)", a.SchemaState)
+	}
+
+	// complete → fail: flips (honest terminal state).
+	if err := m.MarkSchemaTableCompleted("b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.MarkSchemaTableFailed("b", "index boom"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := m.GetTable("b"); b.SchemaState != StateFailed {
+		t.Errorf("b schema state = %v after failed mark, want failed", b.SchemaState)
+	}
+
+	// Resume: RegisterSchemaTables resets sticky failed → pending, and a
+	// retry can then legitimately complete.
+	if err := m.RegisterSchemaTables([]string{"a"}); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := m.GetTable("a"); a.SchemaState != StatePending {
+		t.Errorf("a schema state = %v after re-register, want pending (resume unblocked)", a.SchemaState)
+	}
+	if err := m.MarkSchemaTableCompleted("a"); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := m.GetTable("a"); a.SchemaState != StateCompleted {
+		t.Errorf("a schema state = %v after retry, want completed", a.SchemaState)
+	}
+}

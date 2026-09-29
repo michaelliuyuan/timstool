@@ -2198,16 +2198,31 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 
 		if p.name == "data" && cpErr == nil {
 			cpPhase := cpMgr.GetPhase()
-			switch cpPhase {
-			case "data-export":
-				pi.SubLabel = "数据导出"
-			case "data-import":
-				pi.SubLabel = "数据导入"
+			// SubLabel source of truth: in machine mode it comes solely
+			// from the machine's SubPhase (set above); this legacy
+			// coarse-phase switch may only assign it on the legacy
+			// fallback path. ImportedTables fills in both modes — in
+			// machine mode keyed off the machine SubPhase (the CIR
+			// pipeline keeps the coarse phase at "data" while its
+			// SubPhase already says data-import), on legacy keyed off
+			// the coarse phase.
+			fillImported := cpPhase == "data-import"
+			if useMachine {
+				if rec, ok := phaseRecs["data"]; ok && rec.SubPhase == "data-import" {
+					fillImported = true
+				}
+			}
+			if fillImported {
+				if !useMachine {
+					pi.SubLabel = "数据导入"
+				}
 				// TablesDone counts export-time completed states,
 				// which stay "completed" through the whole Lightning
 				// import — the real import progress is the checkpoint's
 				// imported-table counter (same source as the top bar).
 				pi.ImportedTables = cpMgr.GetImportedTables()
+			} else if !useMachine && cpPhase == "data-export" {
+				pi.SubLabel = "数据导出"
 			}
 			tables := cpMgr.GetAllTables()
 			// While the schema phase is current, the registered entries

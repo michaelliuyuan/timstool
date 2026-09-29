@@ -318,10 +318,21 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 		}
 		if o.cpMgr != nil {
 			_ = o.cpMgr.SetSubPhase("data", "data-import")
+			// Align the coarse phase + import mode with the PG data
+			// migrator (data/migrator.go:199) so pollProgress and the
+			// phases API normalize the CIR path identically.
+			_ = o.cpMgr.SetPhase("data-import")
+			_ = o.cpMgr.SetImportMode(checkpoint.ImportModeLightning)
 		}
 		if err := target.RunLightningImport(ctx, tempDir, o.cfg.Target); err != nil {
 			o.finishPhase("data", err, false)
 			return nil, fmt.Errorf("source-cir: lightning import (dumpling): %w", err)
+		}
+		// CIR has no per-table import callback; one honest terminal
+		// write of N/N (same display the PG lightning path shows before
+		// its first table) — progress jumps to 100% monotonically.
+		if o.cpMgr != nil {
+			_ = o.cpMgr.SetImportedTables(len(cir.Tables))
 		}
 	}
 	o.finishPhase("data", nil, false)
@@ -462,12 +473,27 @@ func (o *Orchestrator) runSchema(ctx context.Context) PipelineResult {
 		return result
 	}
 
-	if o.cpMgr != nil {
-		_ = o.cpMgr.FinishPhase("schema", nil, false)
-	}
+	// OnError=skip lets runDDL swallow per-statement failures (aggregate
+	// err == nil) while individual tables sit failed in the checkpoint —
+	// surface that as completed-with-warn instead of a silent green.
+	// The orchestrator's checkpoint copy is fresh during the schema
+	// phase (single writer), so a plain read is safe here.
+	o.finishPhase("schema", nil, o.schemaHasFailedTables())
 
 	log.Info("schema migration completed", zap.String("duration", time.Since(start).String()))
 	return result
+}
+
+func (o *Orchestrator) schemaHasFailedTables() bool {
+	if o.cpMgr == nil {
+		return false
+	}
+	for _, tc := range o.cpMgr.GetAllTables() {
+		if tc.SchemaState == checkpoint.StateFailed {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *Orchestrator) runData(ctx context.Context) PipelineResult {
