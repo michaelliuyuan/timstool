@@ -530,6 +530,11 @@ async function removeJob(j: IncrementalJob) {
 // in-flight run_id per job and poll GET /jobs until the newest history
 // record leaves the running state.
 const activeRuns = ref<Record<string, string>>({}) // jobId -> run_id
+// First-seen timestamp per tracked run: after the deadline (server incRunTimeout
+// 10min + slack) we stop polling instead of hanging forever on a run whose
+// terminal record never lands (lost finalize / persistent poll failure).
+const RUN_DEADLINE_MS = 11 * 60 * 1000
+const runFirstSeen: Record<string, number> = {}
 let runPollTimer: ReturnType<typeof setInterval> | null = null
 
 function stopRunPolling() {
@@ -552,16 +557,47 @@ function reportRunDone(rec: any) {
 }
 
 // After each loadJobs: adopt running stubs we don't track yet (page refresh
-// / navigation back), and finish tracked runs whose terminal record landed.
+// / navigation back), finish tracked runs whose terminal record landed, and
+// drop entries that can never resolve (deleted job / deadline exceeded).
 function reconcileActiveRuns() {
+  const byId = new Map(jobs.value.map((j) => [j.id, j]))
+  // Deleted mid-run: the job (and its history) is gone — stop tracking.
+  for (const id of Object.keys(activeRuns.value)) {
+    if (!byId.has(id)) {
+      delete activeRuns.value[id]
+      delete runFirstSeen[id]
+    }
+  }
   for (const j of jobs.value) {
+    const tracked = activeRuns.value[j.id]
+    if (tracked) {
+      // Match by run_id across the FULL history: another tab's run may have
+      // pushed our terminal record below history[0] between polls.
+      const rec = (j.history || []).find((h: any) => h.run_id === tracked)
+      if (rec && rec.status && rec.status !== 'running') {
+        reportRunDone(rec)
+        delete activeRuns.value[j.id]
+        delete runFirstSeen[j.id]
+        continue
+      }
+    }
     const newest = j.history?.[0]
     if (!newest) continue
     if (newest.status === 'running') {
-      if (!activeRuns.value[j.id]) activeRuns.value[j.id] = newest.run_id
-    } else if (activeRuns.value[j.id] === newest.run_id) {
-      reportRunDone(newest)
-      delete activeRuns.value[j.id]
+      if (!activeRuns.value[j.id]) {
+        activeRuns.value[j.id] = newest.run_id
+        runFirstSeen[j.id] = Date.now()
+      }
+    }
+  }
+  // Deadline: a run whose terminal record never arrives gives up with a
+  // warning instead of polling forever (loading state is released too).
+  const now = Date.now()
+  for (const id of Object.keys(activeRuns.value)) {
+    if (runFirstSeen[id] && now - runFirstSeen[id] > RUN_DEADLINE_MS) {
+      ElMessage.warning('同步状态未知，已停止轮询，请查看运行历史')
+      delete activeRuns.value[id]
+      delete runFirstSeen[id]
     }
   }
   if (Object.keys(activeRuns.value).length === 0) stopRunPolling()
@@ -585,6 +621,7 @@ async function runJob(j: IncrementalJob) {
   try {
     const { data } = await apiClient.runIncrementalJob(j.id)
     activeRuns.value[j.id] = data.run_id
+    runFirstSeen[j.id] = Date.now()
     ensureRunPolling()
     await pollActiveRuns() // immediate refresh so the stub shows up right away
   } catch (e: any) {

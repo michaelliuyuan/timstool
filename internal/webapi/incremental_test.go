@@ -3,13 +3,13 @@ package webapi
 import (
 	"database/sql"
 	"encoding/json"
+	"net/http"
 	httptest "net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	"net/http"
 )
 
 // F-04 anchors: watermark SQL construction, state-advance semantics, the
@@ -719,6 +719,133 @@ func TestIncStartupCleanupRunningStubs(t *testing.T) {
 		}
 		if st := e.States["users"]; st == nil || st.LastWatermark != "2026-01-01" || st.TotalRows != 3 {
 			t.Fatalf("states must be untouched by cleanup: %+v", e.States)
+		}
+	}
+}
+
+// Anchor 4: a persisted "states":null job (old/hand-edited file) is normalized
+// to a non-nil map on load, and a background run over it completes without
+// panicking on the first States write.
+func TestIncLoadNullStatesNormalized(t *testing.T) {
+	s, _ := newTestServer(t)
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "ns-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "ns-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/incremental/jobs", `{"name": "nsj", "source_ref": "`+srcID+
+		`", "target_ref": "`+tgtID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time"}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	id := dsBody(t, w)["id"].(string)
+
+	// Force a literal "states": null back onto disk (States has no omitempty,
+	// so nil marshals as null), then re-load and require a non-nil map.
+	incMu.Lock()
+	list := s.loadIncrementalJobs()
+	for i := range list {
+		if list[i].ID == id {
+			list[i].States = nil
+		}
+	}
+	if err := s.saveIncrementalJobs(list); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(s.incrementalJobsFile())
+	if err != nil || !strings.Contains(string(raw), `"states": null`) {
+		t.Fatalf("fixture must carry literal states:null: %v %s", err, raw)
+	}
+	list = s.loadIncrementalJobs()
+	incMu.Unlock()
+	for i := range list {
+		if list[i].ID == id && list[i].States == nil {
+			t.Fatal("loadIncrementalJobs must normalize states:null to a non-nil map")
+		}
+	}
+
+	// The run engine must survive the first States write on such a job. Break
+	// the source ref first so the run fails per-table quickly (no live DB in
+	// unit tests) instead of blocking on a connection attempt.
+	w, req = doReq("DELETE", "/api/v1/datasources/"+srcID, "")
+	req = withChiParam(req, "id", srcID)
+	s.handleDeleteDataSource(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete datasource: %d %s", w.Code, w.Body.String())
+	}
+	w, req = doReq("POST", "/api/v1/incremental/jobs/"+id+"/run", "")
+	req = withChiParam(req, "id", id)
+	s.handleRunIncrementalJob(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("run must be 202: %d %s", w.Code, w.Body.String())
+	}
+	rec := waitForIncRun(t, s, id)
+	if rec.Status != incRunStatusCompleted {
+		t.Fatalf("run over states:null job must complete: %+v", rec)
+	}
+}
+
+// Anchor 5: the panic-finalize helper rewrites a running stub to failed with a
+// generic error, clears the running flag and leaves States untouched.
+func TestIncFinalizeFailedAfterPanic(t *testing.T) {
+	s, _ := newTestServer(t)
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "pf-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "pf-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/incremental/jobs", `{"name": "pfj", "source_ref": "`+srcID+
+		`", "target_ref": "`+tgtID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time"}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	id := dsBody(t, w)["id"].(string)
+
+	incMu.Lock()
+	list := s.loadIncrementalJobs()
+	for i := range list {
+		if list[i].ID == id {
+			list[i].States["users"] = &incTableState{LastWatermark: "2026-02-02", TotalRows: 7}
+			list[i].History = []incRunRecord{{RunID: "panica11", StartedAt: time.Now(), Status: incRunStatusRunning}}
+		}
+	}
+	if err := s.saveIncrementalJobs(list); err != nil {
+		t.Fatal(err)
+	}
+	incRunning[id] = true
+	incMu.Unlock()
+
+	s.finalizeIncRunFailed(id, "panica11")
+
+	incMu.Lock()
+	running := incRunning[id]
+	list = s.loadIncrementalJobs()
+	incMu.Unlock()
+	if running {
+		t.Fatal("finalizeIncRunFailed must clear incRunning")
+	}
+	for _, e := range list {
+		if e.ID != id {
+			continue
+		}
+		if len(e.History) != 1 || e.History[0].Status != incRunStatusFailed || e.History[0].Error == "" {
+			t.Fatalf("stub must be rewritten to failed with an error: %+v", e.History)
+		}
+		if e.History[0].RunID != "panica11" {
+			t.Fatalf("finalize must keep the run_id: %+v", e.History[0])
+		}
+		if st := e.States["users"]; st == nil || st.LastWatermark != "2026-02-02" || st.TotalRows != 7 {
+			t.Fatalf("states must be untouched by panic finalize: %+v", e.States)
 		}
 	}
 }

@@ -265,6 +265,14 @@ func (s *Server) loadIncrementalJobs() []incJob {
 			zap.String("file", s.incrementalJobsFile()), zap.Error(err))
 		return nil
 	}
+	// Normalize a null/absent states map to an empty non-nil map: older or
+	// hand-edited files may carry "states": null, and a nil map would panic
+	// the background run engine on its first States write (syncOneTable).
+	for i := range list {
+		if list[i].States == nil {
+			list[i].States = map[string]*incTableState{}
+		}
+	}
 	return list
 }
 
@@ -1070,31 +1078,61 @@ func (s *Server) handleRunIncrementalJob(w http.ResponseWriter, r *http.Request)
 	incMu.Unlock()
 
 	go func() {
+		// A panic in the background run would kill the whole process (no
+		// handler-level Recoverer here); recover and finalize as failed.
+		defer func() {
+			if r := recover(); r != nil {
+				zap.L().Error("incremental run panicked",
+					zap.String("job", id), zap.Any("panic", r))
+				s.finalizeIncRunFailed(id, stub.RunID)
+			}
+		}()
 		rec := s.runIncrementalJob(context.Background(), &job, subset)
 		rec.RunID = stub.RunID
 		rec.Status = incRunStatusCompleted
-
-		incMu.Lock()
-		delete(incRunning, id)
-		list = s.loadIncrementalJobs()
-		for i := range list {
-			if list[i].ID == id {
-				list[i].States = job.States
-				for j := range list[i].History {
-					if list[i].History[j].RunID == stub.RunID {
-						list[i].History[j] = rec
-						break
-					}
-				}
-				list[i].UpdatedAt = time.Now()
-				if err := s.saveIncrementalJobs(list); err != nil {
-					zap.L().Warn("failed to persist incremental job state", zap.String("job", id), zap.Error(err))
-				}
-				break
-			}
-		}
-		incMu.Unlock()
+		s.finalizeIncRun(id, stub.RunID, rec, job.States)
 	}()
 
 	s.writeJSON(w, http.StatusAccepted, map[string]string{"run_id": stub.RunID, "status": incRunStatusRunning})
+}
+
+// finalizeIncRun replaces the running stub (matched by RunID) with rec under
+// incMu: reload the latest list, merge the engine's States and persist. Shared
+// by the normal completion path and the panic path. If the job vanished (e.g.
+// deleted mid-run) only the in-memory running flag is cleared.
+func (s *Server) finalizeIncRun(id, runID string, rec incRunRecord, states map[string]*incTableState) {
+	incMu.Lock()
+	defer incMu.Unlock()
+	delete(incRunning, id)
+	list := s.loadIncrementalJobs()
+	for i := range list {
+		if list[i].ID != id {
+			continue
+		}
+		if states != nil {
+			list[i].States = states
+		}
+		for j := range list[i].History {
+			if list[i].History[j].RunID == runID {
+				list[i].History[j] = rec
+				break
+			}
+		}
+		list[i].UpdatedAt = time.Now()
+		if err := s.saveIncrementalJobs(list); err != nil {
+			zap.L().Warn("failed to persist incremental job state", zap.String("job", id), zap.Error(err))
+		}
+		break
+	}
+}
+
+// finalizeIncRunFailed closes a run that died unexpectedly: the stub is
+// rewritten to failed with a generic error, States are left untouched.
+func (s *Server) finalizeIncRunFailed(id, runID string) {
+	s.finalizeIncRun(id, runID, incRunRecord{
+		RunID:     runID,
+		StartedAt: time.Now(),
+		Status:    incRunStatusFailed,
+		Error:     "内部错误：同步异常终止",
+	}, nil)
 }
