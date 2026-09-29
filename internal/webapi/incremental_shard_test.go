@@ -11,6 +11,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 
@@ -261,5 +262,59 @@ func TestIncShardMidFailureKeepsWrittenShards(t *testing.T) {
 	}
 	if got := f.execCalls(); got != 2 {
 		t.Fatalf("must stop at the failing shard: %d execs", got)
+	}
+}
+
+// T5: error-strategy variant of T4 — a mid-shard failure with rows already
+// written carries the actionable duplicate-key hint (written count included).
+func TestIncShardMidFailureErrorStrategyHint(t *testing.T) {
+	const ncols = 66
+	cols := shardCols(ncols)
+	batch := make([][]any, 2000)
+	for i := range batch {
+		batch[i] = make([]any, ncols)
+		for j := range batch[i] {
+			batch[i][j] = i
+		}
+	}
+	f := &shardFakeDB{failOn: 2}
+	db := openShardDB(f)
+	defer db.Close()
+
+	written, err := incExecShardedInsert(context.Background(), db, "tgtdb", "big", cols, batch, "error")
+	if err == nil {
+		t.Fatal("error strategy mid-shard failure must surface")
+	}
+	if !strings.Contains(err.Error(), "boom: injected shard failure") {
+		t.Fatalf("original error must be wrapped verbatim: %v", err)
+	}
+	if !strings.Contains(err.Error(), "984") || !strings.Contains(err.Error(), "撞主键") {
+		t.Fatalf("hint must carry written count and duplicate-key guidance: %v", err)
+	}
+	if written != 984 {
+		t.Fatalf("written shards must be kept: %d (want 984)", written)
+	}
+}
+
+// T6: replace control — idempotent strategies keep the bare error format
+// (no hint) so retry semantics stay silent-clean.
+func TestIncShardMidFailureReplaceKeepsBareError(t *testing.T) {
+	const ncols = 66
+	cols := shardCols(ncols)
+	batch := make([][]any, 2000)
+	for i := range batch {
+		batch[i] = make([]any, ncols)
+		for j := range batch[i] {
+			batch[i][j] = i
+		}
+	}
+	for _, strategy := range []string{"replace", "ignore"} {
+		f := &shardFakeDB{failOn: 2}
+		db := openShardDB(f)
+		_, err := incExecShardedInsert(context.Background(), db, "tgtdb", "big", cols, batch, strategy)
+		db.Close()
+		if err == nil || err.Error() != "boom: injected shard failure" {
+			t.Fatalf("%s must keep the bare error format: %v", strategy, err)
+		}
 	}
 }

@@ -257,6 +257,15 @@ func incExecShardedInsert(ctx context.Context, db *sql.DB, database, table strin
 		}
 		insSQL := incBuildInsertSQL(database, table, cols, len(part), strategy)
 		if _, err := db.ExecContext(ctx, insSQL, args...); err != nil {
+			// Non-idempotent (error) strategy + partial writes: unlike the
+			// pre-sharding single atomic INSERT, earlier shards are already
+			// committed while the watermark did not advance — a plain rerun
+			// would hit duplicate keys. Attach an actionable hint; the
+			// idempotent strategies (replace/ignore) rerun cleanly and keep
+			// the original error format.
+			if written > 0 && strategy != "replace" && strategy != "ignore" {
+				return written, fmt.Errorf("%w；已先行写入 %d 行且水位未推进，error 冲突策略直接重跑会撞主键，请清理目标端已写行或改用 replace/ignore 后重跑", err, written)
+			}
 			return written, err
 		}
 		written += int64(len(part))
