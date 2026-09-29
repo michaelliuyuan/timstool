@@ -3,6 +3,7 @@ package webapi
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -124,9 +125,10 @@ func TestWMScoreCoveragePenalty(t *testing.T) {
 	if full.Coverage != 1.0 || len(full.MatchedTables) != 2 {
 		t.Errorf("sync_ts coverage/matched = %v/%v, want 1.0/2", full.Coverage, full.MatchedTables)
 	}
-	if len(partial.UnmatchedTables) != 1 && partial.Score > full.Score {
-		t.Errorf("ordering sanity failed")
-	}
+	// NB: partial (dictionary name, cov 0.5) may still outrank full
+	// (non-dictionary, cov 1.0) — the 0.25 name weight legitimately
+	// outweighs a 0.175 coverage delta. The dead ordering assertion that
+	// used to sit here was removed (leader c-fix).
 }
 
 func TestWMScoreTypeGradingAndDateWarning(t *testing.T) {
@@ -218,5 +220,75 @@ func TestSuggestWatermarkEndpointValidation(t *testing.T) {
 	s.handleSuggestWatermark(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("mysql source = %d %s, want 400 (PG-only)", w.Code, w.Body.String())
+	}
+}
+
+// TestWMNameClassIDFamily anchors the adversarial 🟡4 fix: the id-family
+// check runs on the RAW name with a required separator — user_id still
+// classifies as auto-increment-ish, but guid/valid/grid/userid (normalized
+// form ends in "id") must NOT.
+func TestWMNameClassIDFamily(t *testing.T) {
+	for _, hit := range []string{"id", "user_id", "order-id", "ID", "User_ID"} {
+		if w, label := wmNameClass(hit); label != "自增系命名" || w != 0.1 {
+			t.Errorf("wmNameClass(%q) = %v/%q, want 0.1/自增系命名", hit, w, label)
+		}
+	}
+	for _, miss := range []string{"guid", "valid", "grid", "userid", "updated_at"} {
+		if _, label := wmNameClass(miss); label == "自增系命名" {
+			t.Errorf("wmNameClass(%q) must not classify as id-family", miss)
+		}
+	}
+}
+
+// TestWMDefaultNowRegexVariants anchors the 🟡7 fix: auto-maintenance
+// defaults in all supported spellings match; a quoted string LITERAL
+// 'now()'::text (a constant default, not auto-maintained) must not.
+func TestWMDefaultNowRegexVariants(t *testing.T) {
+	hits := []string{
+		"now()", "CURRENT_TIMESTAMP", "LOCALTIMESTAMP",
+		"transaction_timestamp()::timestamp", "now()::timestamptz",
+	}
+	for _, h := range hits {
+		if !wmDefaultNowRe.MatchString(h) {
+			t.Errorf("wmDefaultNowRe must match %q", h)
+		}
+	}
+	misses := []string{
+		`'now()'::text`, `'current_timestamp'::character varying`,
+		"'today'::date", "nextval('seq')",
+	}
+	for _, m := range misses {
+		if wmDefaultNowRe.MatchString(m) {
+			t.Errorf("wmDefaultNowRe must NOT match literal %q", m)
+		}
+	}
+}
+
+// TestWMTypeWeightSingleSource pins the single-source decision: every type
+// in incWatermarkTypes must carry a weight here, and nothing outside it
+// may — the two sets can never drift apart again.
+func TestWMTypeWeightSingleSource(t *testing.T) {
+	for dt := range incWatermarkTypes {
+		if w, _ := wmTypeWeight(dt); w <= 0 {
+			t.Errorf("incWatermarkTypes member %q has no wmTypeWeight — sets drifted", dt)
+		}
+	}
+	if w, _ := wmTypeWeight("text"); w != 0 {
+		t.Errorf("text must stay incomparable, got %v", w)
+	}
+}
+
+// TestWMCatalogSQLGuards pins the structural guards of the catalog query
+// (adversarial 🟡1/🟡8): partition children are excluded from the table
+// universe and only VALID indexes set the indexed flag. String-level
+// anchor — the SQL's live semantics are covered by isolation scenarios.
+func TestWMCatalogSQLGuards(t *testing.T) {
+	for _, guard := range []string{
+		"NOT t.relispartition", "i.indisvalid",
+		"t.relkind IN ('r', 'p')",
+	} {
+		if !strings.Contains(wmCatalogSQL, guard) {
+			t.Errorf("wmCatalogSQL missing guard %q", guard)
+		}
 	}
 }

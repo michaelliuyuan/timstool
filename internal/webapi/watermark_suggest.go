@@ -46,24 +46,38 @@ var wmSystemSchemas = map[string]bool{
 	"pg_catalog": true, "information_schema": true, "pg_toast": true,
 }
 
-var wmDefaultNowRe = regexp.MustCompile(`(?i)now\(\)|current_timestamp`)
+// wmDefaultNowRe detects automatically-maintained timestamp defaults.
+// The (^|[^']) guard rejects string LITERALS like 'now()'::text (a quoted
+// default is a constant, not auto-maintenance); RE2 has no lookbehind, so
+// the preceding-character class stands in.
+var wmDefaultNowRe = regexp.MustCompile(`(?i)(^|[^'])(now\(\)|current_timestamp|localtimestamp|transaction_timestamp\(\))`)
 
 // queryWMCatalog fetches all columns of all user tables in one query.
-func queryWMCatalog(ctx context.Context, db *sql.DB, schema string) ([]wmCatalogColumn, error) {
-	rows, err := db.QueryContext(ctx, `
+// relispartition=false excludes partition CHILDREN (relkind 'r' rows that
+// are partitions of a 'p' parent) so the catalog counts logical tables,
+// not one entry per partition; indisvalid skips failed/leftover invalid
+// indexes from the index flag.
+// wmCatalogSQL is a named const so tests can pin its structural guards
+// (partition exclusion, valid-index-only) — the SQL's real semantics are
+// covered by isolation testing against a live PG.
+const wmCatalogSQL = `
 		SELECT c.table_name, c.column_name, c.data_type,
 		       COALESCE(c.column_default, ''),
 		       EXISTS (SELECT 1 FROM pg_index i
 		                JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ord) ON true
 		                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-		               WHERE i.indrelid = t.oid AND a.attname = c.column_name)
+		               WHERE i.indrelid = t.oid AND i.indisvalid AND a.attname = c.column_name)
 		FROM information_schema.columns c
 		JOIN pg_class t ON t.relname = c.table_name
 		JOIN pg_namespace n ON n.oid = t.relnamespace AND n.nspname = c.table_schema
 		WHERE c.table_schema = $1
 		  AND t.relkind IN ('r', 'p')
+		  AND NOT t.relispartition
 		  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-		ORDER BY c.table_name, c.ordinal_position`, schema)
+		ORDER BY c.table_name, c.ordinal_position`
+
+func queryWMCatalog(ctx context.Context, db *sql.DB, schema string) ([]wmCatalogColumn, error) {
+	rows, err := db.QueryContext(ctx, wmCatalogSQL, schema)
 	if err != nil {
 		return nil, err
 	}
@@ -105,23 +119,32 @@ var wmCreatedNames = map[string]bool{
 	"creationtime": true, "created": true,
 }
 
-// wmNameClass returns (weight, label) for a column name.
+// wmNameClass returns (weight, label) for a column name. The id-family
+// check runs on the RAW lowercased name (requiring a separator before
+// "id") — the normalized form would also catch valid/grid/guid/userid,
+// which are not auto-increment semantics.
 func wmNameClass(name string) (float64, string) {
 	n := wmNameNorm(name)
+	raw := strings.ToLower(name)
 	switch {
 	case wmStrongNames[n]:
 		return 1.0, "更新系命名"
 	case wmCreatedNames[n]:
 		return 0.4, "创建系命名"
-	case n == "id" || strings.HasSuffix(n, "id"):
+	case raw == "id" || strings.HasSuffix(raw, "_id") || strings.HasSuffix(raw, "-id"):
 		return 0.1, "自增系命名"
 	default:
 		return 0.0, ""
 	}
 }
 
-// wmTypeWeight grades comparable watermark types.
+// wmTypeWeight grades comparable watermark types. Membership is anchored
+// to the single incWatermarkTypes source (same package) so the two sets
+// can never drift; this switch only assigns the relative weight.
 func wmTypeWeight(dataType string) (float64, string) {
+	if !incWatermarkTypes[dataType] {
+		return 0, ""
+	}
 	switch dataType {
 	case "timestamp with time zone":
 		return 1.0, "timestamptz"

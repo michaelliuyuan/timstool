@@ -171,6 +171,11 @@ const tablesLoaded = ref(false)
 
 watch(() => form.source_ref, v => {
   resetTablePicker()
+  // Watermark suggestions are per-source: never let one source's
+  // candidates/applied state leak across a source switch.
+  wmCandidates.value = []
+  wmSelected.value = ''
+  wmAppliedColumn.value = ''
   if (v) loadTableList()
 })
 
@@ -371,15 +376,30 @@ const wmAppliedColumn = ref('')
 
 const activeWMCandidate = computed(() => wmCandidates.value.find(c => c.column === batchColumn.value))
 
-// Apply one candidate: check its matched tables, fill the unified column,
-// then re-run the existing batch validation — everything stays hand-editable.
+// Same conservative ASCII identifier rule the batch endpoint enforces
+// (incIdentifierRe) — names outside it would 400 on checkBatch.
+const WM_IDENT_MAX = 200
+const wmIdentOK = (s: string) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s)
+
+// Apply one candidate: fill the unified column, check its matched tables
+// (filtered to endpoint-safe identifiers, capped at the batch limit), then
+// re-run the existing batch validation — everything stays hand-editable.
 function applyWMCandidate(c: WmCandidate) {
   wmSelected.value = c.column
-  batchTables.value = [...c.matched_tables]
   batchColumn.value = c.column
   wmAppliedColumn.value = c.column
+  const badNames = c.matched_tables.filter(t => !wmIdentOK(t))
+  if (badNames.length) {
+    ElMessage.warning(`${badNames.length} 张表名含特殊字符（${badNames.slice(0, 3).join('、')}${badNames.length > 3 ? '…' : ''}），未自动勾选，请在例外区走逐表配置`)
+  }
+  const safe = c.matched_tables.filter(wmIdentOK)
+  if (safe.length > WM_IDENT_MAX) {
+    ElMessage.warning(`${c.matched_tables.length} 表超批量上限 ${WM_IDENT_MAX}，已填统一水位列但未自动勾表，请手选或分批`)
+  } else {
+    batchTables.value = [...safe]
+  }
   if (c.warnings.length) ElMessage.warning(c.warnings[0])
-  checkBatch()
+  if (batchTables.value.length) checkBatch()
 }
 
 async function autoSuggestWM() {
@@ -695,9 +715,11 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
                 </el-select>
               </el-form-item>
               <el-form-item>
-                <el-button type="primary" plain :loading="wmSuggesting" :disabled="!form.source_ref" @click="autoSuggestWM">
-                  ⚡ {{ wmAppliedColumn ? '重新获取' : '自动获取水位列' }}
-                </el-button>
+                <el-tooltip content="按表结构打分自动选取统一水位列：将覆盖当前表选择与统一水位列，一切仍可手改" placement="top">
+                  <el-button type="primary" plain :loading="wmSuggesting" :disabled="!form.source_ref" @click="autoSuggestWM">
+                    ⚡ {{ wmAppliedColumn ? '重新获取并应用' : '自动获取并应用 Top1' }}
+                  </el-button>
+                </el-tooltip>
                 <el-select v-if="wmCandidates.length" v-model="wmSelected" size="default" style="width: 280px; margin-left: 8px;" @change="onWMCandidatePicked">
                   <el-option v-for="c in wmCandidates" :key="c.column" :value="c.column"
                              :label="`${c.column}（${c.score.toFixed(0)} 分 · 覆盖 ${(c.coverage * 100).toFixed(0)}% · 索引 ${(c.indexed_ratio * 100).toFixed(0)}%）`" />
