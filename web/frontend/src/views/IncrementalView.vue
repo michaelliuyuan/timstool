@@ -600,7 +600,13 @@ function reconcileActiveRuns() {
       delete runFirstSeen[id]
     }
   }
-  if (Object.keys(activeRuns.value).length === 0) stopRunPolling()
+  // Any path that fills activeRuns (incl. adoption after a page refresh) must
+  // keep the poll timer alive; empty stops it. ensureRunPolling is idempotent.
+  if (Object.keys(activeRuns.value).length === 0) {
+    stopRunPolling()
+  } else {
+    ensureRunPolling()
+  }
 }
 
 async function pollActiveRuns() {
