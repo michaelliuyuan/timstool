@@ -80,6 +80,7 @@ func (m *Migrator) Run(ctx context.Context, opts common.DataOpts) (*common.DataR
 		return nil, cerrors.Wrap(cerrors.ErrCheckpointLoad, "init checkpoint", err)
 	}
 	m.cpMgr.SetPhase("data-export")
+	_ = m.cpMgr.SetSubPhase("data", "data-export")
 
 	if err := os.MkdirAll(opts.TempDir, 0755); err != nil {
 		return nil, cerrors.Wrap(cerrors.ErrDataExport, "create temp dir", err)
@@ -197,6 +198,7 @@ func (m *Migrator) Run(ctx context.Context, opts common.DataOpts) (*common.DataR
 		m.cpMgr.SetImportMode(checkpoint.ImportModeLightning)
 		m.cpMgr.SetImportedTables(0)
 		m.cpMgr.SetPhase("data-import")
+		_ = m.cpMgr.SetSubPhase("data", "data-import")
 		m.cpMgr.Flush()
 
 		if err := m.importViaLightning(ctx, opts, tables); err != nil {

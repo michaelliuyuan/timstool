@@ -244,6 +244,7 @@ body {
 .phase-dot--running { background: var(--tims-amber); animation: tims-pulse 1.2s ease-in-out infinite; }
 .phase-dot--failed { background: var(--tims-brand); }
 .phase-dot--pending { background: transparent; border: 1.5px solid #c0c4cc; }
+.phase-dot--skipped { background: transparent; border: 1.5px dashed #c0c4cc; }
 
 @keyframes tims-pulse {
   0%, 100% { opacity: 1; }

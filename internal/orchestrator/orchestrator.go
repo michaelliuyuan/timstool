@@ -64,6 +64,15 @@ func (o *Orchestrator) Run(ctx context.Context, pipelineCfg PipelineConfig) ([]P
 		sm.SetProgressReporter(o.cpMgr)
 	}
 
+	// P1 phase lifecycle state machine: pre-seed pending/skipped for all
+	// four phases so the UI can show 已跳过 from the very first poll.
+	_ = o.cpMgr.InitPhases(map[string]bool{
+		"precheck": pipelineCfg.SkipPrecheck,
+		"schema":   pipelineCfg.SkipSchema,
+		"data":     pipelineCfg.SkipData,
+		"validate": pipelineCfg.SkipValidate,
+	})
+
 	if o.cfg.Web.Enable {
 		stateAdapter := &checkpointStateReader{mgr: o.cpMgr}
 		o.webServer = api.NewServer(stateAdapter, o.cfg.Web.Host, o.cfg.Web.Port)
@@ -85,6 +94,9 @@ func (o *Orchestrator) Run(ctx context.Context, pipelineCfg PipelineConfig) ([]P
 	}
 	log.Info("migration routing", zap.String("source", srcType), zap.String("path", route))
 	if srcType != "postgres" {
+		// Source-CIR path has no precheck phase — record it skipped so
+		// the phase machine covers the same four phases.
+		_ = o.cpMgr.InitPhases(map[string]bool{"precheck": true})
 		return o.runSourceCIR(ctx)
 	}
 
@@ -192,6 +204,7 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	// Phase: schema (observability parity with the PG path — phase log + cpMgr).
 	if o.cpMgr != nil {
 		_ = o.cpMgr.SetPhase("schema")
+		_ = o.cpMgr.StartPhase("schema")
 		// Register the CIR tables up front (schema tables_total correct from
 		// the start), then mark them per ApplyDDL outcome.
 		names := make([]string, len(cir.Tables))
@@ -207,6 +220,7 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	policy := o.cfg.Migration.TargetPolicy
 	if policy == "drop" {
 		if err := target.DropTables(ctx, tidb, cir); err != nil {
+			o.finishPhase("schema", err, false)
 			return nil, fmt.Errorf("source-cir: drop tables (policy=drop): %w", err)
 		}
 		log.Info("source-cir: dropped target tables", zap.String("policy", policy))
@@ -217,6 +231,7 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 				_ = o.cpMgr.MarkSchemaTableFailed(t.Name, err.Error())
 			}
 		}
+		o.finishPhase("schema", err, false)
 		return nil, fmt.Errorf("source-cir: apply ddl: %w", err)
 	}
 	if o.cpMgr != nil {
@@ -226,19 +241,24 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	}
 	if policy == "truncate" {
 		if err := target.TruncateTables(ctx, tidb, cir); err != nil {
+			o.finishPhase("schema", err, false)
 			return nil, fmt.Errorf("source-cir: truncate tables (policy=truncate): %w", err)
 		}
 		log.Info("source-cir: truncated target tables", zap.String("policy", policy))
 	}
+	o.finishPhase("schema", nil, false)
 	log.Info("source-cir schema applied", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)))
 
 	// Phase: data (#t81 Step 2 — CIR rows via DataReader -> TSV CSV -> lightning -> TiDB).
 	if o.cpMgr != nil {
 		_ = o.cpMgr.SetPhase("data")
+		_ = o.cpMgr.StartPhase("data")
+		_ = o.cpMgr.SetSubPhase("data", "data-export")
 	}
 	log.Info("Phase: 数据迁移", zap.String("source", srcType))
 	tempDir, err := os.MkdirTemp("", "timstool-cir-load-*")
 	if err != nil {
+		o.finishPhase("data", err, false)
 		return nil, fmt.Errorf("source-cir: create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tempDir)
@@ -273,6 +293,7 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 				_ = o.cpMgr.MarkTableCompleted(name, rows)
 			}
 		}); err != nil {
+			o.finishPhase("data", err, false)
 			return nil, fmt.Errorf("source-cir: load data: %w", err)
 		}
 	} else {
@@ -295,10 +316,15 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 			}
 			log.Info("source-cir: dumpling exported table", zap.String("table", t.Name), zap.Int64("rows", rows))
 		}
+		if o.cpMgr != nil {
+			_ = o.cpMgr.SetSubPhase("data", "data-import")
+		}
 		if err := target.RunLightningImport(ctx, tempDir, o.cfg.Target); err != nil {
+			o.finishPhase("data", err, false)
 			return nil, fmt.Errorf("source-cir: lightning import (dumpling): %w", err)
 		}
 	}
+	o.finishPhase("data", nil, false)
 	log.Info("source-cir data loaded", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)), zap.String("export", exportMode))
 
 	// Phase: validate (#t81 Step 3 + #t82 value-level). CompareMode "quick" →
@@ -307,6 +333,7 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	// corrupts every value while row counts still match).
 	if o.cpMgr != nil {
 		_ = o.cpMgr.SetPhase("validate")
+		_ = o.cpMgr.StartPhase("validate")
 	}
 	log.Info("Phase: 数据验证", zap.String("source", srcType))
 	sampleSize := 0
@@ -346,6 +373,11 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	if o.cpMgr != nil {
 		_ = o.cpMgr.SetPhaseWithReload("completed")
 	}
+	if validateSuccess {
+		o.finishPhase("validate", nil, false)
+	} else {
+		o.finishPhase("validate", fmt.Errorf("source-cir: validation failed"), false)
+	}
 
 	return []PipelineResult{
 		{Phase: PhaseSchema, Success: true},
@@ -361,6 +393,7 @@ func (o *Orchestrator) runPrecheck(ctx context.Context) PipelineResult {
 
 	if o.cpMgr != nil {
 		o.cpMgr.SetPhase("precheck")
+		_ = o.cpMgr.StartPhase("precheck")
 	}
 
 	rpt, err := o.prechecker.Run(ctx, common.PrecheckOpts{
@@ -375,7 +408,12 @@ func (o *Orchestrator) runPrecheck(ctx context.Context) PipelineResult {
 
 	if err != nil {
 		log.Error("pre-check failed", zap.Error(err))
+		o.finishPhase("precheck", err, false)
 		return result
+	}
+
+	if o.cpMgr != nil {
+		_ = o.cpMgr.FinishPhase("precheck", nil, false)
 	}
 
 	if rpt != nil {
@@ -394,6 +432,7 @@ func (o *Orchestrator) runSchema(ctx context.Context) PipelineResult {
 
 	if o.cpMgr != nil {
 		o.cpMgr.SetPhase("schema")
+		_ = o.cpMgr.StartPhase("schema")
 	}
 
 	// Tables/ExcludeTables align the schema PROGRESS registration set with
@@ -414,10 +453,19 @@ func (o *Orchestrator) runSchema(ctx context.Context) PipelineResult {
 	if err != nil {
 		if cerrors.ShouldAbort(err, cerrors.StrategyAbort) {
 			log.Error("schema migration failed", zap.Error(err))
+			o.finishPhase("schema", err, false)
 			return result
 		}
 		log.Warn("schema migration had errors (continuing)", zap.Error(err))
 		result.Success = true
+		// Error tolerated by OnError=continue: record completed-with-warn
+		// so the UI shows 带警告完成 instead of a silent green.
+		o.finishPhase("schema", nil, true)
+		return result
+	}
+
+	if o.cpMgr != nil {
+		_ = o.cpMgr.FinishPhase("schema", nil, false)
 	}
 
 	log.Info("schema migration completed", zap.String("duration", time.Since(start).String()))
@@ -431,6 +479,7 @@ func (o *Orchestrator) runData(ctx context.Context) PipelineResult {
 
 	if o.cpMgr != nil {
 		o.cpMgr.SetPhase("data")
+		_ = o.cpMgr.StartPhase("data")
 	}
 
 	dataResult, err := o.dataMig.Run(ctx, common.DataOpts{
@@ -450,7 +499,12 @@ func (o *Orchestrator) runData(ctx context.Context) PipelineResult {
 
 	if err != nil {
 		log.Error("data migration failed", zap.Error(err))
+		o.finishPhase("data", err, false)
 		return result
+	}
+
+	if o.cpMgr != nil {
+		_ = o.cpMgr.FinishPhase("data", nil, false)
 	}
 
 	if dataResult != nil {
@@ -474,6 +528,7 @@ func (o *Orchestrator) runValidate(ctx context.Context) PipelineResult {
 		// use SetPhase, the orchestrator's stale in-memory state (with no
 		// tables) would overwrite the data migrator's progress.
 		o.cpMgr.SetPhaseWithReload("validate")
+		_ = o.cpMgr.StartPhase("validate")
 	}
 
 	// Resolve effective mode: never allow empty mode
@@ -517,6 +572,7 @@ func (o *Orchestrator) runValidate(ctx context.Context) PipelineResult {
 
 	if err != nil {
 		log.Error("data validation failed", zap.Error(err))
+		o.finishPhase("validate", err, false)
 		return result
 	}
 
@@ -530,14 +586,26 @@ func (o *Orchestrator) runValidate(ctx context.Context) PipelineResult {
 			log.Error("data validation failed",
 				zap.Int("fail", rpt.Stats.FailTables),
 				zap.Int("total", rpt.Stats.TotalTables))
+			o.finishPhase("validate", result.Error, false)
+			return result
 		}
 	}
 
+	o.finishPhase("validate", nil, false)
 	return result
 }
 
 type checkpointStateReader struct {
 	mgr *checkpoint.Manager
+}
+
+// finishPhase is the nil-safe FinishPhase wrapper used on every return
+// path so the phase machine can never be left "running" forever.
+func (o *Orchestrator) finishPhase(name string, err error, warn bool) {
+	if o.cpMgr == nil {
+		return
+	}
+	_ = o.cpMgr.FinishPhase(name, err, warn)
 }
 
 func (r *checkpointStateReader) GetPhase() string {

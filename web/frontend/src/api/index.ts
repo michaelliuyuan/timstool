@@ -52,6 +52,9 @@ export interface PhaseInfo {
   imported_tables: number
   rows_total: number
   rows_done: number
+  duration?: number
+  warn?: boolean
+  error?: string
   logs?: { level: string; message: string; timestamp: string }[]
 }
 

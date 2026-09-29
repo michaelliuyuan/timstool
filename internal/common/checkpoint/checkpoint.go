@@ -71,6 +71,22 @@ type Checkpoint struct {
 	Tables         map[string]*TableCheckpoint `json:"tables"`
 	ImportedTables int                         `json:"imported_tables"`
 	ImportMode     string                      `json:"import_mode"`
+	// Phases is the per-phase lifecycle state machine (P1). Historical
+	// checkpoints written before the field exist simply lack it (nil map)
+	// — consumers must fall back to ordinal inference then.
+	Phases map[string]*PhaseRecord `json:"phases,omitempty"`
+}
+
+// PhaseRecord tracks one pipeline phase's lifecycle (P1): pending →
+// running → completed/failed, or skipped outright.
+type PhaseRecord struct {
+	Name       string    `json:"name"`
+	Status     State     `json:"status"`
+	SubPhase   string    `json:"sub_phase,omitempty"`
+	StartedAt  time.Time `json:",omitempty"`
+	FinishedAt time.Time `json:",omitempty"`
+	Error      string    `json:"error,omitempty"`
+	Warn       bool      `json:"warn,omitempty"`
 }
 
 // Import modes recorded in the checkpoint so progress consumers (webapi)
@@ -238,8 +254,14 @@ func (m *Manager) RegisterSchemaTables(names []string) error {
 }
 
 // MarkSchemaTableCompleted marks one table's schema DDL as applied.
+// Idempotent: a table already marked completed (e.g. its CREATE TABLE
+// succeeded and a later CREATE INDEX on the same table also attributed
+// success) is not rewritten.
 func (m *Manager) MarkSchemaTableCompleted(tableName string) error {
 	return m.UpdateTable(tableName, func(tc *TableCheckpoint) {
+		if tc.SchemaState == StateCompleted {
+			return
+		}
 		tc.SchemaState = StateCompleted
 	})
 }
@@ -321,6 +343,104 @@ func (m *Manager) SetPhaseWithReload(phase string) error {
 	return nil
 }
 
+// InitPhases seeds the phase state machine: every given phase starts
+// pending, except those flagged skip which are immediately recorded as
+// skipped (they will never run in this pipeline).
+func (m *Manager) InitPhases(skip map[string]bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.data.Phases == nil {
+		m.data.Phases = make(map[string]*PhaseRecord)
+	}
+	for name, isSkip := range skip {
+		st := StatePending
+		if isSkip {
+			st = StateSkipped
+		}
+		m.data.Phases[name] = &PhaseRecord{Name: name, Status: st}
+	}
+	m.save()
+	return nil
+}
+
+// StartPhase marks a phase running.
+func (m *Manager) StartPhase(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.data.Phases == nil {
+		m.data.Phases = make(map[string]*PhaseRecord)
+	}
+	rec, ok := m.data.Phases[name]
+	if !ok {
+		rec = &PhaseRecord{Name: name}
+		m.data.Phases[name] = rec
+	}
+	rec.Status = StateRunning
+	rec.StartedAt = time.Now()
+	rec.FinishedAt = time.Time{}
+	rec.Error = ""
+	rec.Warn = false
+	m.save()
+	return nil
+}
+
+// FinishPhase records the phase outcome: err == nil → completed (warn
+// flags "completed with warnings"), err != nil → failed with the error.
+func (m *Manager) FinishPhase(name string, err error, warn bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.data.Phases == nil {
+		m.data.Phases = make(map[string]*PhaseRecord)
+	}
+	rec, ok := m.data.Phases[name]
+	if !ok {
+		rec = &PhaseRecord{Name: name, StartedAt: time.Now()}
+		m.data.Phases[name] = rec
+	}
+	rec.FinishedAt = time.Now()
+	rec.Warn = warn
+	if err != nil {
+		rec.Status = StateFailed
+		rec.Error = err.Error()
+	} else {
+		rec.Status = StateCompleted
+		rec.Error = ""
+	}
+	m.save()
+	return nil
+}
+
+// SetSubPhase records the current sub-step of a phase (e.g. schema-build /
+// schema-execute / data-export / data-import) for precise UI labels.
+func (m *Manager) SetSubPhase(phase, sub string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.data.Phases == nil {
+		m.data.Phases = make(map[string]*PhaseRecord)
+	}
+	rec, ok := m.data.Phases[phase]
+	if !ok {
+		rec = &PhaseRecord{Name: phase, Status: StateRunning, StartedAt: time.Now()}
+		m.data.Phases[phase] = rec
+	}
+	rec.SubPhase = sub
+	m.save()
+	return nil
+}
+
+// GetPhases returns a copy of the phase state machine (nil map for
+// historical checkpoints written before the field existed).
+func (m *Manager) GetPhases() map[string]*PhaseRecord {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make(map[string]*PhaseRecord, len(m.data.Phases))
+	for k, v := range m.data.Phases {
+		cp := *v
+		result[k] = &cp
+	}
+	return result
+}
+
 func (m *Manager) IsTableCompleted(tableName string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -392,6 +512,7 @@ func (m *Manager) Reset() error {
 	defer m.mu.Unlock()
 	m.data.Tables = make(map[string]*TableCheckpoint)
 	m.data.Phase = ""
+	m.data.Phases = nil
 	m.save()
 	return nil
 }

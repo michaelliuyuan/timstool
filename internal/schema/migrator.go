@@ -26,6 +26,9 @@ type ProgressReporter interface {
 	RegisterSchemaTables(names []string) error
 	MarkSchemaTableCompleted(name string) error
 	MarkSchemaTableFailed(name string, errStr string) error
+	// SetSubPhase surfaces the current schema sub-step (schema-build /
+	// schema-execute) so the UI can label progress precisely.
+	SetSubPhase(phase, sub string) error
 }
 
 type Migrator struct {
@@ -161,6 +164,13 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 			"SET FOREIGN_KEY_CHECKS = 0")
 	}
 
+	// Sub-phase label: DDL build (per-table marks below only cover the
+	// "already exists" skip and build-failure cases; success marks moved
+	// to executeDDL so tables_done reflects REAL execution).
+	if m.rpt != nil {
+		_ = m.rpt.SetSubPhase("schema", "schema-build")
+	}
+
 	var deferredFKs []string
 	strippedBefore := 0
 
@@ -249,9 +259,8 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 			Status:     reporter.StatusPass,
 			SourceRows: int64(len(table.Columns)),
 		})
-		if m.rpt != nil {
-			_ = m.rpt.MarkSchemaTableCompleted(table.Name)
-		}
+		// P0: no completed mark here — the table's DDL has only been
+		// BUILT. executeDDL marks completion per statement attribution.
 	}
 
 	if len(deferredFKs) > 0 {
@@ -292,6 +301,9 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 
 	if !opts.DryRun && opts.OutputFile == "" {
 		zap.L().Info("executing DDL on TiDB", zap.Int("statements", len(builder.Statements())))
+		if m.rpt != nil {
+			_ = m.rpt.SetSubPhase("schema", "schema-execute")
+		}
 		if err := m.executeDDL(ctx, builder.Statements()); err != nil {
 			zap.L().Error("DDL execution failed, full SQL", zap.String("ddl", truncate(sql, 5000)))
 			return cerrors.Wrap(cerrors.ErrSchemaApply, "execute DDL", err)
@@ -314,6 +326,12 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 	return nil
 }
 
+// ddlExec is the execution seam used by runDDL (tests substitute a fake;
+// production passes *sql.DB).
+type ddlExec interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
+
 // executeDDL runs each pre-built statement individually. Statements arrive
 // as a slice (not a joined blob) so semicolons inside view bodies, DEFAULT
 // literals or comments can never split a statement in half (F-05).
@@ -323,7 +341,10 @@ func (m *Migrator) executeDDL(ctx context.Context, statements []string) error {
 		return fmt.Errorf("connect to TiDB: %w", err)
 	}
 	defer tidbDB.Close()
+	return m.runDDL(ctx, tidbDB, statements)
+}
 
+func (m *Migrator) runDDL(ctx context.Context, tidbDB ddlExec, statements []string) error {
 	executed := 0
 	failed := 0
 	for _, stmt := range statements {
@@ -350,6 +371,9 @@ func (m *Migrator) executeDDL(ctx context.Context, statements []string) error {
 		if objectName != "" {
 			label = fmt.Sprintf("%s %s", action, objectName)
 		}
+		// P0: attribute the statement to a registered table so the UI's
+		// schema tables_done climbs with REAL execution, not DDL build.
+		table := attributeStatementToTable(action, stmt)
 
 		var lastErr error
 		maxRetries := 3
@@ -374,6 +398,9 @@ func (m *Migrator) executeDDL(ctx context.Context, statements []string) error {
 				failed++
 				zap.L().Error(fmt.Sprintf("DDL failed: %s (after %d attempts)", label, maxRetries), zap.Error(err))
 				zap.L().Error(fmt.Sprintf("Failed DDL: %s", truncate(stmt, 500)))
+				if m.rpt != nil && table != "" {
+					_ = m.rpt.MarkSchemaTableFailed(table, err.Error())
+				}
 				if m.cfg.Migration.OnError != "skip" {
 					return fmt.Errorf("execute DDL: %w", err)
 				}
@@ -386,10 +413,34 @@ func (m *Migrator) executeDDL(ctx context.Context, statements []string) error {
 		if lastErr != nil {
 			_ = lastErr
 		}
+		// Duplicate-skips (lastErr==nil via the break above) count as
+		// success; failed statements already marked failed above.
+		if m.rpt != nil && table != "" && lastErr == nil {
+			_ = m.rpt.MarkSchemaTableCompleted(table)
+		}
 		executed++
 	}
 	zap.L().Info(fmt.Sprintf("DDL execution completed: %d executed, %d failed", executed, failed))
 	return nil
+}
+
+// attributeStatementToTable maps a DDL statement to the registered table
+// whose schema progress it advances. CREATE/ALTER/DROP TABLE name the table
+// directly; CREATE [UNIQUE] INDEX names the INDEX, so the table comes from
+// the ON clause. SET / comments / unattributable statements return "".
+func attributeStatementToTable(action, stmt string) string {
+	switch action {
+	case "CREATE TABLE", "ALTER TABLE", "DROP TABLE":
+		return extractObjectName(stmt)
+	case "CREATE INDEX", "CREATE UNIQUE INDEX":
+		m := regexp.MustCompile(`(?i)\bON\s+` + "`" + `?([^\s(` + "`" + `]+)`)
+		if match := m.FindStringSubmatch(stmt); len(match) >= 2 {
+			return match[1]
+		}
+		return ""
+	default:
+		return ""
+	}
 }
 
 func extractDDLAction(stmt string) string {

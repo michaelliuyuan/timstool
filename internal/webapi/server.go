@@ -2122,14 +2122,36 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 		ImportedTables int                      `json:"imported_tables"`
 		RowsTotal      int64                    `json:"rows_total"`
 		RowsDone       int64                    `json:"rows_done"`
+		Duration       float64                  `json:"duration,omitempty"`
+		Warn           bool                     `json:"warn,omitempty"`
+		Error          string                   `json:"error,omitempty"`
 		Logs           []map[string]interface{} `json:"logs,omitempty"`
 	}
+
+	// P1: ONE read-only checkpoint manager for the whole handler — the
+	// previous per-phase NewReadOnlyManager pair could observe two
+	// different on-disk states inside a single request (torn read).
+	cpMgr, cpErr := checkpoint.NewReadOnlyManager(fmt.Sprintf(".checkpoint/%s", taskID))
+	var phaseRecs map[string]*checkpoint.PhaseRecord
+	if cpErr == nil {
+		phaseRecs = cpMgr.GetPhases()
+	}
+	// Historical checkpoints (written before the phase machine existed)
+	// have no phases map — fall back to the ordinal inference below.
+	useMachine := len(phaseRecs) > 0
 
 	phaseNames := []struct{ name, label string }{
 		{"precheck", "预检查"},
 		{"schema", "Schema 迁移"},
 		{"data", "数据迁移"},
 		{"validate", "数据验证"},
+	}
+
+	subPhaseLabels := map[string]string{
+		"schema-build":   "构建 DDL",
+		"schema-execute": "执行 DDL",
+		"data-export":    "数据导出",
+		"data-import":    "数据导入",
 	}
 
 	var phases []PhaseInfo
@@ -2140,7 +2162,20 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 			Status: "pending",
 		}
 
-		if task.Status == "completed" {
+		if useMachine {
+			// The phase state machine is the single source of truth.
+			if rec, ok := phaseRecs[p.name]; ok && rec.Status != "" {
+				pi.Status = string(rec.Status)
+				if lbl, ok := subPhaseLabels[rec.SubPhase]; ok {
+					pi.SubLabel = lbl
+				}
+				pi.Warn = rec.Warn
+				pi.Error = rec.Error
+				if !rec.StartedAt.IsZero() && !rec.FinishedAt.IsZero() {
+					pi.Duration = rec.FinishedAt.Sub(rec.StartedAt).Seconds()
+				}
+			}
+		} else if task.Status == "completed" {
 			pi.Status = "completed"
 		} else if task.Phase == p.name {
 			if task.Status == "running" {
@@ -2161,61 +2196,55 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if p.name == "data" {
-			cpMgr, cpErr := checkpoint.NewReadOnlyManager(fmt.Sprintf(".checkpoint/%s", taskID))
-			if cpErr == nil {
-				cpPhase := cpMgr.GetPhase()
-				switch cpPhase {
-				case "data-export":
-					pi.SubLabel = "数据导出"
-				case "data-import":
-					pi.SubLabel = "数据导入"
-					// TablesDone counts export-time completed states,
-					// which stay "completed" through the whole Lightning
-					// import — the real import progress is the checkpoint's
-					// imported-table counter (same source as the top bar).
-					pi.ImportedTables = cpMgr.GetImportedTables()
-				}
-				tables := cpMgr.GetAllTables()
-				// While the schema phase is current, the registered entries
-				// are schema bookkeeping (data State still pending) — the
-				// data tab must stay empty as before, not preview 0/N.
-				if cpPhase != "schema" && len(tables) > 0 {
-					for _, tc := range tables {
-						tableInfo := map[string]interface{}{
-							"name":       tc.TableName,
-							"state":      string(tc.State),
-							"rows_done":  tc.RowsDone,
-							"rows_total": tc.RowsTotal,
-						}
-						pi.Tables = append(pi.Tables, tableInfo)
-						pi.TableCount++
-						pi.RowsTotal += tc.RowsTotal
-						pi.RowsDone += tc.RowsDone
-						if tc.State == checkpoint.StateCompleted || tc.State == checkpoint.StateFailed {
-							pi.TablesDone++
-						}
+		if p.name == "data" && cpErr == nil {
+			cpPhase := cpMgr.GetPhase()
+			switch cpPhase {
+			case "data-export":
+				pi.SubLabel = "数据导出"
+			case "data-import":
+				pi.SubLabel = "数据导入"
+				// TablesDone counts export-time completed states,
+				// which stay "completed" through the whole Lightning
+				// import — the real import progress is the checkpoint's
+				// imported-table counter (same source as the top bar).
+				pi.ImportedTables = cpMgr.GetImportedTables()
+			}
+			tables := cpMgr.GetAllTables()
+			// While the schema phase is current, the registered entries
+			// are schema bookkeeping (data State still pending) — the
+			// data tab must stay empty as before, not preview 0/N.
+			if cpPhase != "schema" && len(tables) > 0 {
+				for _, tc := range tables {
+					tableInfo := map[string]interface{}{
+						"name":       tc.TableName,
+						"state":      string(tc.State),
+						"rows_done":  tc.RowsDone,
+						"rows_total": tc.RowsTotal,
+					}
+					pi.Tables = append(pi.Tables, tableInfo)
+					pi.TableCount++
+					pi.RowsTotal += tc.RowsTotal
+					pi.RowsDone += tc.RowsDone
+					if tc.State == checkpoint.StateCompleted || tc.State == checkpoint.StateFailed {
+						pi.TablesDone++
 					}
 				}
 			}
 		}
-		if p.name == "schema" {
+		if p.name == "schema" && cpErr == nil {
 			// Schema phase: fill the per-table list from SchemaState so the
 			// schema tab shows 0/N → N/N plus a per-table status list.
-			cpMgr, cpErr := checkpoint.NewReadOnlyManager(fmt.Sprintf(".checkpoint/%s", taskID))
-			if cpErr == nil {
-				for _, tc := range cpMgr.GetAllTables() {
-					if tc.SchemaState == "" {
-						continue // not schema-registered
-					}
-					pi.Tables = append(pi.Tables, map[string]interface{}{
-						"name":  tc.TableName,
-						"state": string(tc.SchemaState),
-					})
-					pi.TableCount++
-					if tc.SchemaState == checkpoint.StateCompleted || tc.SchemaState == checkpoint.StateFailed {
-						pi.TablesDone++
-					}
+			for _, tc := range cpMgr.GetAllTables() {
+				if tc.SchemaState == "" {
+					continue // not schema-registered
+				}
+				pi.Tables = append(pi.Tables, map[string]interface{}{
+					"name":  tc.TableName,
+					"state": string(tc.SchemaState),
+				})
+				pi.TableCount++
+				if tc.SchemaState == checkpoint.StateCompleted || tc.SchemaState == checkpoint.StateFailed {
+					pi.TablesDone++
 				}
 			}
 		}

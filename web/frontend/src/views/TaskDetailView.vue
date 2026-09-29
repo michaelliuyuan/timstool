@@ -56,6 +56,31 @@ const phaseMap: Record<string, string> = {
 
 const phases = ['precheck', 'schema', 'data', 'validate']
 
+// Phase status → tag type/label, covering the P1 state machine values
+// (pending/running/completed/failed/skipped) plus the warn overlay.
+function phaseStatusMeta(status: string, warn?: boolean): { type: string; label: string } {
+  if (status === 'completed') {
+    return warn ? { type: 'warning', label: '带警告完成' } : { type: 'success', label: '已完成' }
+  }
+  switch (status) {
+    case 'running': return { type: '', label: '进行中' }
+    case 'failed': return { type: 'danger', label: '失败' }
+    case 'skipped': return { type: 'info', label: '已跳过' }
+    default: return { type: 'info', label: '等待中' }
+  }
+}
+
+// Phase duration formatter: 12s / 1m03s / 2h05m.
+function fmtPhaseDuration(sec?: number): string {
+  if (!sec || sec <= 0) return ''
+  const h = Math.floor(sec / 3600)
+  const m = Math.floor((sec % 3600) / 60)
+  const s = Math.floor(sec % 60)
+  if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`
+  if (m > 0) return `${m}m${String(s).padStart(2, '0')}s`
+  return `${s}s`
+}
+
 const statusInfo = computed(() => {
   if (!task.value) return { type: 'info', label: '-' }
   return statusMap[task.value.status] || { type: 'info', label: task.value.status }
@@ -394,15 +419,19 @@ function logLevelClass(level: string): string {
                 v-for="phase in phaseData"
                 :key="phase.name"
                 :type="phase.status === 'completed' ? 'success' : phase.status === 'running' ? 'primary' : phase.status === 'failed' ? 'danger' : 'info'"
-                :hollow="phase.status === 'pending'"
+                :hollow="phase.status === 'pending' || phase.status === 'skipped'"
                 :timestamp="phase.sub_label ? `${phase.label}（${phase.sub_label}）` : phase.label"
                 placement="top"
               >
                 <div style="display: flex; align-items: center; gap: 8px;">
                   <span :class="['phase-dot', `phase-dot--${phase.status}`]" aria-hidden="true"></span>
-                  <el-tag :type="phase.status === 'completed' ? 'success' : phase.status === 'running' ? '' : phase.status === 'failed' ? 'danger' : 'info'" size="small">
-                    {{ phase.status === 'completed' ? '已完成' : phase.status === 'running' ? '进行中' : phase.status === 'failed' ? '失败' : '等待中' }}
+                  <el-tag :type="phaseStatusMeta(phase.status, phase.warn).type" size="small">
+                    {{ phaseStatusMeta(phase.status, phase.warn).label }}
                   </el-tag>
+                  <span v-if="fmtPhaseDuration(phase.duration)" style="color: var(--tims-text-2); font-size: var(--tims-font-sm);">{{ fmtPhaseDuration(phase.duration) }}</span>
+                  <el-tooltip v-if="phase.error" :content="phase.error" placement="top">
+                    <el-icon style="color: var(--el-color-danger);"><Warning /></el-icon>
+                  </el-tooltip>
                 </div>
                 <div v-if="phase.table_count > 0 && phase.name === 'data'" style="margin-top: 8px; color: #606266; font-size: var(--tims-font-sm);">
                   <template v-if="phase.sub_label === '数据导入'">数据导入 · 已导入表: {{ phase.imported_tables }}/{{ phase.table_count }}</template>
@@ -428,6 +457,9 @@ function logLevelClass(level: string): string {
           >
             <div v-if="phase.status === 'pending'" style="color: var(--tims-text-2); text-align: center; padding: 30px;">
               该阶段尚未开始
+            </div>
+            <div v-else-if="phase.status === 'skipped'" style="color: var(--tims-text-2); text-align: center; padding: 30px;">
+              该阶段已跳过
             </div>
             <template v-else>
               <div v-if="phase.table_count > 0 && phase.name === 'data'" style="margin-bottom: 16px;">
