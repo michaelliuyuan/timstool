@@ -680,6 +680,55 @@ func queryIncColumns(ctx context.Context, db *sql.DB, schema, table string) ([]i
 	return cols, rows.Err()
 }
 
+// incKeyInfo discloses whether a source table has a dedup-capable key
+// (FEAT-INC-KEY-WARN): REPLACE/IGNORE conflict strategies rely on a unique
+// key on the target, which mirrors the source layout — warn when absent.
+type incKeyInfo struct {
+	HasPK     bool `json:"has_pk"`
+	HasUnique bool `json:"has_unique"`
+}
+
+// incTableKeysSQL is a named const so tests can pin its structural guards
+// (valid-index-only, non-partial, non-expression, partition exclusion) —
+// real semantics are covered by isolation testing against a live PG.
+// One catalog round trip covers the whole batch (≤ incColumnsBatchLimit).
+const incTableKeysSQL = `
+		SELECT tc.relname,
+		       bool_or(i.indisprimary) AS has_pk,
+		       bool_or(i.indisunique AND NOT i.indisprimary
+		               AND i.indpred IS NULL AND i.indexprs IS NULL) AS has_unique
+		FROM pg_index i
+		JOIN pg_class tc ON tc.oid = i.indrelid
+		JOIN pg_namespace ns ON ns.oid = tc.relnamespace
+		WHERE ns.nspname = $1 AND tc.relname = ANY($2)
+		  AND i.indisvalid AND tc.relispartition = false
+		GROUP BY tc.relname`
+
+// queryIncTableKeys returns the key disclosure per table. Tables absent
+// from the map have no qualifying key (missing table, plain heap, only
+// partial/expression/invalid indexes).
+func queryIncTableKeys(ctx context.Context, db *sql.DB, schema string, tables []string) (map[string]incKeyInfo, error) {
+	if len(tables) == 0 {
+		return map[string]incKeyInfo{}, nil
+	}
+	// pgx stdlib encodes []string natively as a text[] argument for ANY($2).
+	rows, err := db.QueryContext(ctx, incTableKeysSQL, schema, tables)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]incKeyInfo{}
+	for rows.Next() {
+		var name string
+		var ki incKeyInfo
+		if err := rows.Scan(&name, &ki.HasPK, &ki.HasUnique); err != nil {
+			return nil, err
+		}
+		out[name] = ki
+	}
+	return out, rows.Err()
+}
+
 // handleIncrementalColumns lists a table's columns with watermark eligibility
 // and an index flag (no index on the watermark column ⇒ full scans ⇒ warn).
 func (s *Server) handleIncrementalColumns(w http.ResponseWriter, r *http.Request) {
@@ -722,7 +771,15 @@ func (s *Server) handleIncrementalColumns(w http.ResponseWriter, r *http.Request
 		s.writeError(w, http.StatusNotFound, "table not found in source schema")
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{"columns": cols})
+	keys, err := queryIncTableKeys(ctx, db, sc.Schema, []string{table})
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "query table keys failed: "+err.Error())
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"columns":  cols,
+		"key_info": keys[table], // absent ⇒ zero-value {false,false} ⇒ "no key"
+	})
 }
 
 // incColumnsBatchLimit caps the batch endpoint: one information_schema round
@@ -788,7 +845,15 @@ func (s *Server) handleIncrementalColumnsBatch(w http.ResponseWriter, r *http.Re
 	type tableResult struct {
 		Table   string          `json:"table"`
 		Columns []incColumnView `json:"columns"`
+		KeyInfo *incKeyInfo     `json:"key_info,omitempty"`
 		Error   string          `json:"error,omitempty"`
+	}
+	// One catalog round trip covers the whole batch (FEAT-INC-KEY-WARN):
+	// missing tables simply stay absent from the map ⇒ no key.
+	keys, err := queryIncTableKeys(ctx, db, sc.Schema, req.Tables)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "query table keys failed: "+err.Error())
+		return
 	}
 	out := make([]tableResult, 0, len(req.Tables))
 	for _, t := range req.Tables {
@@ -801,7 +866,8 @@ func (s *Server) handleIncrementalColumnsBatch(w http.ResponseWriter, r *http.Re
 			out = append(out, tableResult{Table: t, Error: "表在源库中不存在"})
 			continue
 		}
-		out = append(out, tableResult{Table: t, Columns: cols})
+		ki := keys[t] // zero-value {false,false} when absent
+		out = append(out, tableResult{Table: t, Columns: cols, KeyInfo: &ki})
 	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"tables": out})
 }

@@ -21,11 +21,15 @@ import { useDataSources } from '../composables/useDataSources'
 // with persistent hints + validation.
 
 interface ColInfo { name: string; data_type: string; comparable: boolean; indexed: boolean }
+// FEAT-INC-KEY-WARN: source-side dedup-key disclosure (REPLACE/IGNORE
+// strategies rely on unique keys to dedup on rerun/watermark backfill).
+interface KeyInfo { has_pk: boolean; has_unique: boolean }
 interface TableRow {
   table: string
   watermark_column: string
   initial_watermark: string
   columns: ColInfo[]
+  key_info?: KeyInfo
   missing?: boolean // not present in the source's current table list (edit backfill)
 }
 
@@ -239,8 +243,12 @@ async function loadColumns(i: number, silent = false) {
   try {
     const { data } = await apiClient.getSourceTableColumns(form.source_ref, row.table)
     row.columns = data.columns || []
+    row.key_info = data.key_info
     if (row.columns.length > 0 && !row.columns.some(c => c.comparable) && !silent) {
       ElMessage.warning('该表没有可比类型的水位列（timestamp/date/int/bigint）')
+    }
+    if (row.key_info && !row.key_info.has_pk && !row.key_info.has_unique && !silent) {
+      ElMessage.warning(`表「${row.table}」源端无主键/唯一索引：重跑或水位回补会写入重复数据（replace/ignore 冲突策略去重依赖唯一键），且需确保目标端已同步建键（去重实际由目标端唯一键强制）`)
     }
   } catch (e: any) {
     // silent=true is the edit-backfill auto-load: a ghost table (deleted
@@ -271,7 +279,7 @@ const batchMode = ref(false)
 const batchTables = ref<string[]>([])
 const batchColumn = ref('')
 const batchInitialWM = ref('')
-const batchPreview = ref<Record<string, { columns: ColInfo[]; error?: string }>>({})
+const batchPreview = ref<Record<string, { columns: ColInfo[]; key_info?: KeyInfo; error?: string }>>({})
 const batchChecking = ref(false)
 
 // Drop preview rows for deselected tables; keep the rest (removing one
@@ -292,11 +300,15 @@ async function checkBatch() {
   batchChecking.value = true
   try {
     const { data } = await apiClient.columnsBatch(form.source_ref, batchTables.value)
-    const map: Record<string, { columns: ColInfo[]; error?: string }> = {}
-    for (const t of data.tables || []) map[t.table] = { columns: t.columns || [], error: t.error }
+    const map: Record<string, { columns: ColInfo[]; key_info?: KeyInfo; error?: string }> = {}
+    for (const t of data.tables || []) map[t.table] = { columns: t.columns || [], key_info: t.key_info, error: t.error }
     batchPreview.value = map
     const bad = Object.entries(map).filter(([, v]) => v.error).length
     if (bad > 0) ElMessage.warning(`${bad} 张表校验失败，已在预览区标红`)
+    const noKey = noKeyBatchTables.value
+    if (noKey.length > 0) {
+      ElMessage.warning(`${noKey.length} 张表源端无主键/唯一索引：重跑或水位回补会写入重复数据（replace/ignore 冲突策略去重依赖唯一键），且需确保目标端已同步建键（去重实际由目标端唯一键强制）`)
+    }
   } catch (e: any) {
     ElMessage.error(`批量校验失败: ${e.response?.data?.error || e.message}`)
   } finally {
@@ -337,9 +349,17 @@ function batchMoveToSingle(name: string) {
     ElMessage.warning(`表「${name}」已在单独配置中`)
     return
   }
-  form.tables.push({ table: name, watermark_column: '', initial_watermark: '', columns: batchPreview.value[name]?.columns || [] })
+  form.tables.push({ table: name, watermark_column: '', initial_watermark: '', columns: batchPreview.value[name]?.columns || [], key_info: batchPreview.value[name]?.key_info })
   batchRemoveTable(name)
 }
+
+// FEAT-INC-KEY-WARN: checked tables whose source has neither a PK nor a
+// qualifying unique index (absent key_info on a checked table = no key).
+const noKeyBatchTables = computed<string[]>(() =>
+  batchTables.value.filter(t => {
+    const p = batchPreview.value[t]
+    return !!p && !p.error && !(p.key_info?.has_pk || p.key_info?.has_unique)
+  }))
 
 const batchColumnType = computed(() => {
   for (const p of Object.values(batchPreview.value)) {
@@ -487,6 +507,15 @@ async function save() {
         ElMessage.warning(`表「${t.table.trim()}」初始水位晚于当前时间，首次同步可能拉不到任何行`)
       }
     }
+  }
+  // FEAT-INC-KEY-WARN: save-time summary warning over all KNOWN key states
+  // (disclosure only — never blocks the save).
+  const noKeyKnown = new Set<string>(noKeyBatchTables.value)
+  for (const t of form.tables) {
+    if (t.key_info && !t.key_info.has_pk && !t.key_info.has_unique) noKeyKnown.add(t.table)
+  }
+  if (noKeyKnown.size > 0) {
+    ElMessage.warning(`${noKeyKnown.size} 张表源端无主键/唯一索引：重跑或水位回补会写入重复数据（replace/ignore 冲突策略去重依赖唯一键），且需确保目标端已同步建键（去重实际由目标端唯一键强制）`)
   }
   saving.value = true
   try {
@@ -928,7 +957,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
                   </div>
                 </el-form-item>
                 <el-form-item label="校验预览">
-                  <el-table :data="batchTables.map(t => ({ name: t, state: batchTableState(t) }))" size="small" max-height="240">
+                  <el-table :data="batchTables.map(t => ({ name: t, state: batchTableState(t), key: batchPreview[t]?.key_info }))" size="small" max-height="240">
                     <el-table-column prop="name" label="表" min-width="160" />
                     <el-table-column label="状态" min-width="200">
                       <template #default="{ row }">
@@ -939,6 +968,14 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
                         </span>
                       </template>
                     </el-table-column>
+                    <el-table-column label="主键/唯一索引" width="120">
+                      <template #default="{ row }">
+                        <span v-if="!row.key" style="color: var(--tims-text-2);">—</span>
+                        <span v-else-if="row.key.has_pk" style="color: var(--el-color-success);">✓ 主键</span>
+                        <span v-else-if="row.key.has_unique" style="color: var(--el-color-success);">✓ 唯一索引</span>
+                        <span v-else style="color: var(--el-color-danger);">✗ 无</span>
+                      </template>
+                    </el-table-column>
                     <el-table-column label="操作" width="180">
                       <template #default="{ row }">
                         <el-button size="small" text type="danger" @click="batchRemoveTable(row.name)">移除</el-button>
@@ -946,6 +983,11 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
                       </template>
                     </el-table-column>
                   </el-table>
+                  <el-alert v-if="noKeyBatchTables.length > 0" type="warning" :closable="false" style="margin-top: 8px;">
+                    <template #title>
+                      {{ noKeyBatchTables.length }} 张表源端无主键/唯一索引（{{ noKeyBatchTables.join('、') }}）：重跑或水位回补会写入重复数据（replace/ignore 冲突策略去重依赖唯一键）；需确保目标端已同步建键（去重实际由目标端唯一键强制）。
+                    </template>
+                  </el-alert>
                 </el-form-item>
               </template>
               <el-divider content-position="left">例外表（单独配置）</el-divider>
@@ -957,6 +999,9 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
                 <el-option v-for="tb in tableList" :key="tb.name" :value="tb.name" :label="tb.row_estimate >= 0 ? `${tb.name}（约 ${tb.row_estimate.toLocaleString()} 行）` : tb.name" />
               </el-select>
               <el-tag v-if="t.missing" type="danger" size="small" style="margin-left: 4px;">不在源库表清单</el-tag>
+              <el-tag v-if="t.key_info" :type="t.key_info.has_pk || t.key_info.has_unique ? 'success' : 'danger'" size="small" style="margin-left: 4px;">
+                {{ t.key_info.has_pk ? '主键' : t.key_info.has_unique ? '唯一索引' : '无主键/唯一索引' }}
+              </el-tag>
               <el-button size="small" style="margin: 0 4px 0 8px;" @click="loadColumns(i)">获取列</el-button>
               <el-select v-if="t.columns.length" v-model="t.watermark_column" placeholder="水位列" style="width: 260px;" @change="onColumnPicked(i)">
                 <el-option v-for="c in t.columns" :key="c.name" :value="c.name" :label="`${c.name}（${c.data_type}${c.indexed ? '' : ' · 无索引'}）`" :disabled="!c.comparable" />

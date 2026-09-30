@@ -518,7 +518,7 @@ export const apiClient = {
   // Column listing with watermark eligibility + index flag (F-04): the
   // watermark dropdown marks comparable types and warns on unindexed columns.
   getSourceTableColumns: (ref: string, table: string) =>
-    api.get<{ columns: { name: string; data_type: string; comparable: boolean; indexed: boolean }[] }>(
+    api.get<{ columns: { name: string; data_type: string; comparable: boolean; indexed: boolean }[]; key_info?: { has_pk: boolean; has_unique: boolean } }>(
       `/sources/tables/${encodeURIComponent(table)}/columns`,
       { params: { source_ref: ref } },
     ),
@@ -531,6 +531,7 @@ export const apiClient = {
       tables: {
         table: string
         columns: { name: string; data_type: string; comparable: boolean; indexed: boolean }[]
+        key_info?: { has_pk: boolean; has_unique: boolean }
         error?: string
       }[]
     }>('/incremental/columns-batch', { source_ref: ref, tables }),
