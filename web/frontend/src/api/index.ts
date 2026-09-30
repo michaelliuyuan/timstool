@@ -95,6 +95,7 @@ export interface IncrementalJob {
   source_ref: string
   target_ref: string
   batch_size: number
+  parallelism?: number
   strict_mode: boolean
   conflict_strategy: 'replace' | 'ignore' | 'error'
   tables: IncrementalTableConfig[]
@@ -109,6 +110,7 @@ export interface IncrementalJobRequest {
   source_ref: string
   target_ref: string
   batch_size: number
+  parallelism?: number
   strict_mode: boolean
   conflict_strategy: 'replace' | 'ignore' | 'error'
   tables: IncrementalTableConfig[]

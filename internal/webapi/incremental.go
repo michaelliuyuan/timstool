@@ -52,8 +52,9 @@ type incJob struct {
 	SourceRef        string                    `json:"source_ref"`
 	TargetRef        string                    `json:"target_ref"`
 	BatchSize        int                       `json:"batch_size"`
-	StrictMode       bool                      `json:"strict_mode"`       // ">" instead of ">=" (may lose same-second late rows)
-	ConflictStrategy string                    `json:"conflict_strategy"` // replace | ignore | error
+	Parallelism      int                       `json:"parallelism,omitempty"` // tables synced concurrently (normalized 1-16, default 4)
+	StrictMode       bool                      `json:"strict_mode"`           // ">" instead of ">=" (may lose same-second late rows)
+	ConflictStrategy string                    `json:"conflict_strategy"`     // replace | ignore | error
 	Tables           []incTableConfig          `json:"tables"`
 	States           map[string]*incTableState `json:"states"`
 	History          []incRunRecord            `json:"history,omitempty"` // newest first, capped
@@ -91,15 +92,34 @@ const (
 	incRunStatusFailed    = "failed"
 )
 
-// incRunTimeout bounds one background run. Runs execute detached from the
-// originating HTTP request (202 + polling), so a client disconnect must not
-// cancel the sync — hence context.Background(), not the request context.
-const incRunTimeout = 10 * time.Minute
+// Table-sync parallelism bounds. Zero/absent values (legacy jobs, or clients
+// that omit the field) normalize to the default; explicit out-of-range values
+// are rejected with 400.
+const (
+	incParallelismDefault = 4
+	incParallelismMax     = 16
+)
+
+// normalizeIncParallelism maps a raw parallelism value onto the valid range:
+// 0/absent -> default (D2: legacy jobs load as the default, not serial).
+func normalizeIncParallelism(v int) int {
+	if v <= 0 {
+		return incParallelismDefault
+	}
+	if v > incParallelismMax {
+		return incParallelismMax
+	}
+	return v
+}
 
 // incRunning tracks jobs with a background run in flight (guarded by incMu).
 // A running job rejects concurrent runs, edits and deletes (409): a PUT would
 // swap the States map the engine is writing concurrently.
 var incRunning = map[string]bool{}
+
+// incRunCtxHook is a test seam: when set, every background run's context is
+// passed through it (used to anchor that the run ctx carries no deadline).
+var incRunCtxHook func(context.Context)
 
 // incIdentifierRe is the server-side allow-list for table/column names: a
 // conservative ASCII identifier (quoted anyway, but never accept anything the
@@ -336,10 +356,12 @@ func (s *Server) loadIncrementalJobs() []incJob {
 	// Normalize a null/absent states map to an empty non-nil map: older or
 	// hand-edited files may carry "states": null, and a nil map would panic
 	// the background run engine on its first States write (syncOneTable).
+	// Legacy jobs without a parallelism field normalize to the default (D2).
 	for i := range list {
 		if list[i].States == nil {
 			list[i].States = map[string]*incTableState{}
 		}
+		list[i].Parallelism = normalizeIncParallelism(list[i].Parallelism)
 	}
 	return list
 }
@@ -375,7 +397,7 @@ func (s *Server) saveIncrementalJobs(list []incJob) error {
 
 // --- validation ---
 
-func validateIncJobBody(name string, sourceRef, targetRef string, tables []incTableConfig, strategy string, batchSize int) error {
+func validateIncJobBody(name string, sourceRef, targetRef string, tables []incTableConfig, strategy string, batchSize, parallelism int) error {
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("name is required")
 	}
@@ -394,6 +416,11 @@ func validateIncJobBody(name string, sourceRef, targetRef string, tables []incTa
 	}
 	if batchSize < 1 || batchSize > 100000 {
 		return fmt.Errorf("batch_size must be in 1-100000")
+	}
+	// 0/absent means "use the server default"; any other out-of-range value
+	// is an explicit client mistake and gets a 400.
+	if parallelism < 0 || parallelism > incParallelismMax {
+		return fmt.Errorf("parallelism must be in 1-%d", incParallelismMax)
 	}
 	seen := map[string]bool{}
 	for _, t := range tables {
@@ -432,10 +459,11 @@ func (s *Server) handleCreateIncrementalJob(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	job.Name = strings.TrimSpace(job.Name)
-	if err := validateIncJobBody(job.Name, job.SourceRef, job.TargetRef, job.Tables, job.ConflictStrategy, job.BatchSize); err != nil {
+	if err := validateIncJobBody(job.Name, job.SourceRef, job.TargetRef, job.Tables, job.ConflictStrategy, job.BatchSize, job.Parallelism); err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	job.Parallelism = normalizeIncParallelism(job.Parallelism)
 	// D4: PostgreSQL sources only in v1; target must be tidb (applier SQL is MySQL-flavoured).
 	src, err := s.resolveDataSourceRef(job.SourceRef)
 	if err != nil {
@@ -501,10 +529,11 @@ func (s *Server) handleUpdateIncrementalJob(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	job.Name = strings.TrimSpace(job.Name)
-	if err := validateIncJobBody(job.Name, job.SourceRef, job.TargetRef, job.Tables, job.ConflictStrategy, job.BatchSize); err != nil {
+	if err := validateIncJobBody(job.Name, job.SourceRef, job.TargetRef, job.Tables, job.ConflictStrategy, job.BatchSize, job.Parallelism); err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	job.Parallelism = normalizeIncParallelism(job.Parallelism)
 	// D4 double-gate on update too (F-02 dual-path gate parity): a PUT must
 	// not be able to swap refs past the create-side type checks.
 	src, err := s.resolveDataSourceRef(job.SourceRef)
@@ -566,7 +595,7 @@ func (s *Server) handleUpdateIncrementalJob(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	e.Name, e.SourceRef, e.TargetRef = job.Name, job.SourceRef, job.TargetRef
-	e.BatchSize, e.StrictMode, e.ConflictStrategy = job.BatchSize, job.StrictMode, job.ConflictStrategy
+	e.BatchSize, e.StrictMode, e.ConflictStrategy, e.Parallelism = job.BatchSize, job.StrictMode, job.ConflictStrategy, job.Parallelism
 	e.Tables, e.States = job.Tables, states
 	e.UpdatedAt = time.Now()
 	if err := s.saveIncrementalJobs(list); err != nil {
@@ -798,13 +827,16 @@ func incValueToString(v any) string {
 // serialized per job via incRunning (409 on concurrent run/edit/delete).
 // lg receives the run's log events (nil-safe).
 func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[string]bool, lg *incLogCollector) incRunRecord {
+	if incRunCtxHook != nil {
+		incRunCtxHook(ctx)
+	}
 	rec := incRunRecord{RunID: uuid.New().String()[:8], StartedAt: time.Now()}
 	nTables := len(job.Tables)
 	if len(subset) > 0 {
 		nTables = len(subset)
 	}
 	lg.add(incLogLevelInfo, "", incLogPhaseStart,
-		fmt.Sprintf("同步开始：%d 张表，批大小 %d，冲突策略 %s（strict=%v）", nTables, job.BatchSize, job.ConflictStrategy, job.StrictMode), "", 0, "", 0)
+		fmt.Sprintf("同步开始：%d 张表，批大小 %d，冲突策略 %s（strict=%v），并行度 %d", nTables, job.BatchSize, job.ConflictStrategy, job.StrictMode, normalizeIncParallelism(job.Parallelism)), "", 0, "", 0)
 	src, err := s.resolveDataSourceRef(job.SourceRef)
 	if err != nil {
 		lg.add(incLogLevelError, "", incLogPhaseFail, "source_ref 解析失败: "+err.Error(), "", 0, "", 0)
@@ -843,19 +875,55 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 	}
 	defer myDB.Close()
 
-	ctx, cancel := context.WithTimeout(ctx, incRunTimeout)
-	defer cancel()
+	// No run-level deadline: runs execute detached from any request and the
+	// old shared 10-minute cap starved trailing tables after a big table
+	// consumed the budget (root cause of the misleading "读取源表列信息失败:
+	// context deadline exceeded" reports). Context cancellation is still
+	// honored if a parent context ever supplies one.
 
-	failed := 0
+	// --- worker pool execution model (FEAT-INC-PARALLEL) ---
+	// Concurrency-safety contract:
+	//   * job.States is only read here, in the scheduler, before any worker
+	//     starts (concurrent map access would be a race); workers receive the
+	//     pre-resolved *incTableState pointers and never touch the map.
+	//   * rec.Tables results come back in original table order; each worker
+	//     writes only its own index — no append, no lock, stable order.
+	//   * Persistence stays single-pointed: workers never persist; jobs-file
+	//     writes happen only in the run-start stub and the finalize path
+	//     (positive ①).
+	var tasks []incRunTableTask
 	for _, t := range job.Tables {
 		if len(subset) > 0 && !subset[t.Table] {
 			continue
 		}
-		res := s.syncOneTable(ctx, pgDB, myDB, sc, tc, job, t, lg)
+		st := job.States[t.Table]
+		if st == nil {
+			st = &incTableState{}
+			job.States[t.Table] = st
+		}
+		tasks = append(tasks, incRunTableTask{t: t, st: st})
+	}
+	workers := normalizeIncParallelism(job.Parallelism)
+	rec.Tables = incRunTableTasks(tasks, workers,
+		func(task incRunTableTask) incTableResult {
+			res := s.syncOneTable(ctx, pgDB, myDB, sc, tc, job, task.t, task.st, lg)
+			res.Table = task.t.Table
+			return res
+		},
+		func(task incRunTableTask, dur time.Duration, r interface{}) incTableResult {
+			zap.L().Error("incremental table sync panicked",
+				zap.String("job", job.ID), zap.String("table", task.t.Table), zap.Any("panic", r))
+			errMsg := "内部错误：表同步异常终止"
+			task.st.Failed = errMsg
+			lg.add(incLogLevelError, task.t.Table, incLogPhaseFail, errMsg, "", 0, "", dur.Milliseconds())
+			return incTableResult{Table: task.t.Table, FromWM: task.st.LastWatermark, Error: errMsg}
+		})
+
+	failed := 0
+	for _, res := range rec.Tables {
 		if res.Error != "" {
 			failed++
 		}
-		rec.Tables = append(rec.Tables, res)
 	}
 	rec.DurationMs = time.Since(rec.StartedAt).Milliseconds()
 	if failed > 0 {
@@ -868,13 +936,62 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 	return rec
 }
 
-func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, lg *incLogCollector) incTableResult {
-	tableStart := time.Now()
-	st := job.States[t.Table]
-	if st == nil {
-		st = &incTableState{}
-		job.States[t.Table] = st
+// incRunTableTask is one scheduled table sync: the config plus its
+// pre-resolved state pointer (resolved by the scheduler before any worker
+// starts, so concurrent workers never race on the job.States map).
+type incRunTableTask struct {
+	t  incTableConfig
+	st *incTableState
+}
+
+// incRunTableTasks executes the tasks over a worker pool of at most `workers`
+// goroutines and returns the results in the original task order (each worker
+// writes only its own index — stable order, no locks). Each worker recovers
+// its own panics via panicRes (adversarial must-fix: a panic must not cross
+// goroutines and kill the process) and keeps draining so the run finishes.
+func incRunTableTasks(tasks []incRunTableTask, workers int, runOne func(t incRunTableTask) incTableResult, panicRes func(t incRunTableTask, dur time.Duration, r interface{}) incTableResult) []incTableResult {
+	out := make([]incTableResult, len(tasks))
+	if len(tasks) == 0 {
+		return out
 	}
+	if workers > len(tasks) {
+		workers = len(tasks)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	taskCh := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range taskCh {
+				func() {
+					start := time.Now()
+					defer func() {
+						if r := recover(); r != nil {
+							out[idx] = panicRes(tasks[idx], time.Since(start), r)
+						}
+					}()
+					out[idx] = runOne(tasks[idx])
+				}()
+			}
+		}()
+	}
+	for i := range tasks {
+		taskCh <- i
+	}
+	close(taskCh)
+	wg.Wait()
+	return out
+}
+
+// syncOneTable syncs one table. st is the pre-resolved per-table state
+// pointer (resolved by the scheduler — job.States is not consulted here so
+// concurrent workers never race on the map).
+func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, st *incTableState, lg *incLogCollector) incTableResult {
+	tableStart := time.Now()
 	res := incTableResult{Table: t.Table, FromWM: st.LastWatermark}
 
 	wm := st.LastWatermark

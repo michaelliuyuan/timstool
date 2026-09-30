@@ -110,6 +110,7 @@ const form = reactive({
   source_ref: '',
   target_ref: '',
   batch_size: 1000,
+  parallelism: 4,
   strict_mode: false,
   conflict_strategy: 'replace' as 'replace' | 'ignore' | 'error',
   tables: [] as TableRow[],
@@ -130,6 +131,7 @@ function openCreate() {
   form.source_ref = ''
   form.target_ref = ''
   form.batch_size = 1000
+  form.parallelism = 4
   form.strict_mode = false
   form.conflict_strategy = 'replace'
   form.tables = []
@@ -144,6 +146,7 @@ function openEdit(j: IncrementalJob) {
   form.source_ref = j.source_ref
   form.target_ref = j.target_ref
   form.batch_size = j.batch_size
+  form.parallelism = j.parallelism || 4
   form.strict_mode = j.strict_mode
   form.conflict_strategy = j.conflict_strategy
   form.tables = j.tables.map(t => ({ table: t.table, watermark_column: t.watermark_column, initial_watermark: t.initial_watermark || '', columns: [] }))
@@ -492,6 +495,7 @@ async function save() {
       source_ref: form.source_ref,
       target_ref: form.target_ref,
       batch_size: form.batch_size,
+      parallelism: form.parallelism,
       strict_mode: form.strict_mode,
       conflict_strategy: form.conflict_strategy,
       tables: rows.map(t => ({ table: t.table, watermark_column: t.watermark_column, initial_watermark: t.initial_watermark || '' })),
@@ -530,11 +534,6 @@ async function removeJob(j: IncrementalJob) {
 // in-flight run_id per job and poll GET /jobs until the newest history
 // record leaves the running state.
 const activeRuns = ref<Record<string, string>>({}) // jobId -> run_id
-// First-seen timestamp per tracked run: after the deadline (server incRunTimeout
-// 10min + slack) we stop polling instead of hanging forever on a run whose
-// terminal record never lands (lost finalize / persistent poll failure).
-const RUN_DEADLINE_MS = 11 * 60 * 1000
-const runFirstSeen: Record<string, number> = {}
 let runPollTimer: ReturnType<typeof setInterval> | null = null
 
 function stopRunPolling() {
@@ -565,7 +564,6 @@ function reconcileActiveRuns() {
   for (const id of Object.keys(activeRuns.value)) {
     if (!byId.has(id)) {
       delete activeRuns.value[id]
-      delete runFirstSeen[id]
     }
   }
   for (const j of jobs.value) {
@@ -577,7 +575,6 @@ function reconcileActiveRuns() {
       if (rec && rec.status && rec.status !== 'running') {
         reportRunDone(rec)
         delete activeRuns.value[j.id]
-        delete runFirstSeen[j.id]
         continue
       }
     }
@@ -586,18 +583,7 @@ function reconcileActiveRuns() {
     if (newest.status === 'running') {
       if (!activeRuns.value[j.id]) {
         activeRuns.value[j.id] = newest.run_id
-        runFirstSeen[j.id] = Date.now()
       }
-    }
-  }
-  // Deadline: a run whose terminal record never arrives gives up with a
-  // warning instead of polling forever (loading state is released too).
-  const now = Date.now()
-  for (const id of Object.keys(activeRuns.value)) {
-    if (runFirstSeen[id] && now - runFirstSeen[id] > RUN_DEADLINE_MS) {
-      ElMessage.warning('同步状态未知，已停止轮询，请查看运行历史')
-      delete activeRuns.value[id]
-      delete runFirstSeen[id]
     }
   }
   // Any path that fills activeRuns (incl. adoption after a page refresh) must
@@ -627,7 +613,6 @@ async function runJob(j: IncrementalJob) {
   try {
     const { data } = await apiClient.runIncrementalJob(j.id)
     activeRuns.value[j.id] = data.run_id
-    runFirstSeen[j.id] = Date.now()
     ensureRunPolling()
     await pollActiveRuns() // immediate refresh so the stub shows up right away
     openRunLogs(j.id, data.run_id) // D1: auto-open the log drawer on 202
@@ -879,6 +864,10 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
         </el-form-item>
         <el-form-item label="批大小">
           <el-input-number v-model="form.batch_size" :min="1" :max="100000" :step="500" controls-position="right" />
+        </el-form-item>
+        <el-form-item label="并行度">
+          <el-input-number v-model="form.parallelism" :min="1" :max="16" :step="1" controls-position="right" />
+          <span style="margin-left: 12px; font-size: var(--tims-font-sm); color: var(--tims-text-2);">多张表并行同步的并发数（1-16，默认 4）</span>
         </el-form-item>
         <el-form-item label="严格模式">
           <el-switch v-model="form.strict_mode" />
