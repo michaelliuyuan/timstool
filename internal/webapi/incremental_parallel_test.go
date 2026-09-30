@@ -117,6 +117,8 @@ func TestIncPoolConcurrencyBound(t *testing.T) {
 			tasks[i] = incRunTableTask{t: incTableConfig{Table: "t" + string(rune('a'+i))}, st: &incTableState{}}
 		}
 		gate := make(chan struct{})
+		var gateOnce sync.Once
+		release := func() { gateOnce.Do(func() { close(gate) }) }
 		var started int64
 		results := incRunTableTasks(tasks, tc.workers, func(t incRunTableTask) incTableResult {
 			n := atomic.AddInt64(&inFlight, 1)
@@ -126,7 +128,7 @@ func TestIncPoolConcurrencyBound(t *testing.T) {
 			}
 			mu.Unlock()
 			if atomic.AddInt64(&started, 1) >= int64(tc.workers) && tc.workers < tc.tables {
-				closeOnce(gate) // release the first `workers` tasks together
+				release() // release the first `workers` tasks together (double-close safe)
 			}
 			if tc.workers < tc.tables {
 				<-gate
@@ -145,14 +147,6 @@ func TestIncPoolConcurrencyBound(t *testing.T) {
 		if tc.workers < tc.tables && peak < int64(tc.workers) {
 			t.Fatalf("workers=%d tables=%d: pool never reached parallelism (peak %d)", tc.workers, tc.tables, peak)
 		}
-	}
-}
-
-func closeOnce(ch chan struct{}) {
-	select {
-	case <-ch:
-	default:
-		close(ch)
 	}
 }
 
