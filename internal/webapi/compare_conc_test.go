@@ -52,6 +52,14 @@ func TestCompareTaskConcurrencyFold(t *testing.T) {
 	if cfg.Concurrency != 8 {
 		t.Fatalf("last case must be the clamped 8, got %d", cfg.Concurrency)
 	}
+
+	// Negative concurrency is rejected at create too (⚠️1: same surface as PUT).
+	s, _ := newTestServer(t)
+	w, req := doReq("POST", "/api/v1/compare/tasks", `{"source":{"host":"s"},"target":{"host":"t"},"concurrency":-1}`)
+	s.handleCreateCompare(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("negative concurrency at create must 400, got %d", w.Code)
+	}
 }
 
 // A2: options persistence — set / clear-by-0 / preserve-when-absent, plus

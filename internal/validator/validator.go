@@ -384,7 +384,8 @@ func (v *Validator) validateTableUnit(ctx context.Context, pgDB *sql.DB, tidbCon
 	return fn(tidbConn)
 }
 
-func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string) reporter.TableReport {	tr := reporter.TableReport{TableName: table, Status: reporter.StatusPass}
+func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string) reporter.TableReport {
+	tr := reporter.TableReport{TableName: table, Status: reporter.StatusPass}
 
 	schema := v.sourceSchema()
 	if schema == "" {

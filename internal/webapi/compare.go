@@ -44,9 +44,9 @@ type CompareTaskRequest struct {
 	Mode              string                  `json:"mode"`       // quick | sample | checksum (= watermark.base_mode when watermark active)
 	SampleRatio       float64                 `json:"sample_ratio"`
 	ChecksumChunkSize int64                   `json:"checksum_chunk_size"`
-	ChecksumParallel  int                     `json:"checksum_parallel"` // deprecated (#t4): kept for compat, folded into Concurrency
-	Parallel          int                     `json:"parallel"`          // deprecated (#t4): kept for compat, folded into Concurrency
-	Concurrency       int                     `json:"concurrency"`       // #t4 unified budget 1-8 (0 = derive from legacy knobs)
+	ChecksumParallel  int                     `json:"checksum_parallel"`   // deprecated (#t4): kept for compat, folded into Concurrency
+	Parallel          int                     `json:"parallel"`            // deprecated (#t4): kept for compat, folded into Concurrency
+	Concurrency       int                     `json:"concurrency"`         // #t4 unified budget 1-8 (0 = derive from legacy knobs)
 	Tables            []string                `json:"tables"`              // empty = all tables
 	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"` // #t3 optional filter group
 }
@@ -156,9 +156,9 @@ type compareOptionsBody struct {
 	Mode              string                  `json:"mode"`
 	SampleRatio       float64                 `json:"sample_ratio"`
 	ChecksumChunkSize int64                   `json:"checksum_chunk_size"`
-	ChecksumParallel  int                     `json:"checksum_parallel"` // deprecated (#t4)
-	Parallel          int                     `json:"parallel"`          // deprecated (#t4)
-	Concurrency       int                     `json:"concurrency"`       // #t4 present-and-0 clears to auto
+	ChecksumParallel  int                     `json:"checksum_parallel"`   // deprecated (#t4)
+	Parallel          int                     `json:"parallel"`            // deprecated (#t4)
+	Concurrency       int                     `json:"concurrency"`         // #t4 present-and-0 clears to auto
 	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"` // present-and-null clears
 }
 
@@ -446,7 +446,12 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 
 	// #t4: fold the deprecated parallel / checksum_parallel knobs into the
 	// unified concurrency budget (an explicit concurrency wins; the result
-	// is the effective value stored on the task, clamped to 1-8).
+	// is the effective value stored on the task, clamped to 1-8). Negative
+	// values are rejected (same validation surface as PUT options).
+	if req.Concurrency < 0 {
+		s.writeError(w, http.StatusBadRequest, "concurrency must be >= 0")
+		return
+	}
 	conc := validator.ResolveConcurrency(req.Concurrency, req.Parallel, req.ChecksumParallel)
 
 	// B2: single-running invariant — check + persist + claim must be one

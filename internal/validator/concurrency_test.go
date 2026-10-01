@@ -1,4 +1,4 @@
-﻿package validator
+package validator
 
 import (
 	"context"
@@ -25,15 +25,15 @@ func TestResolveConcurrency(t *testing.T) {
 	cases := []struct {
 		conc, par, chunk, want int
 	}{
-		{0, 0, 0, 4},    // nothing set 鈫?default
-		{6, 2, 3, 6},    // explicit wins over both legacy knobs
-		{0, 2, 3, 3},    // legacy max(chunk) wins
-		{0, 5, 2, 5},    // legacy max(parallel) wins
-		{0, 1, 1, 1},    // lower bound
-		{0, 32, 0, 8},   // legacy over cap clamps
-		{99, 0, 0, 8},   // explicit over cap clamps
-		{8, 1, 1, 8},    // explicit at cap kept
-		{-1, 0, 0, 4},   // garbage 鈫?default
+		{0, 0, 0, 4},  // nothing set 鈫?default
+		{6, 2, 3, 6},  // explicit wins over both legacy knobs
+		{0, 2, 3, 3},  // legacy max(chunk) wins
+		{0, 5, 2, 5},  // legacy max(parallel) wins
+		{0, 1, 1, 1},  // lower bound
+		{0, 32, 0, 8}, // legacy over cap clamps
+		{99, 0, 0, 8}, // explicit over cap clamps
+		{8, 1, 1, 8},  // explicit at cap kept
+		{-1, 0, 0, 4}, // garbage 鈫?default
 	}
 	for i, c := range cases {
 		if got := ResolveConcurrency(c.conc, c.par, c.chunk); got != c.want {
