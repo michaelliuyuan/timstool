@@ -20,6 +20,7 @@ func TestCompareTaskConcurrencyFold(t *testing.T) {
 		{`{"source":{"host":"s"},"target":{"host":"t"},"concurrency":6}`, 6},
 		{`{"source":{"host":"s"},"target":{"host":"t"},"parallel":2,"checksum_parallel":5}`, 5},
 		{`{"source":{"host":"s"},"target":{"host":"t"},"parallel":3}`, 3},
+		{`{"source":{"host":"s"},"target":{"host":"t"},"parallel":0,"checksum_parallel":0}`, 4}, // 0/absent = unset → default 4 (appendix ①)
 		{`{"source":{"host":"s"},"target":{"host":"t"}}`, 4},
 		{`{"source":{"host":"s"},"target":{"host":"t"},"concurrency":32}`, 8},
 		{`{"source":{"host":"s"},"target":{"host":"t"},"parallel":64}`, 8},

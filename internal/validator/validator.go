@@ -243,32 +243,7 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 			var tr reporter.TableReport
 			switch mode {
 			case "quick", "sample":
-				// 1 table validation = 1 work unit: the dedicated UTC
-				// TiDB conn lives entirely inside the budget slot.
-				release, aerr := sem.acquire(ctx)
-				if aerr != nil {
-					tr = reporter.TableReport{TableName: tableName, Status: reporter.StatusFail,
-						Error: fmt.Sprintf("cancelled before start: %v", aerr)}
-					break
-				}
-				tidbConn, connErr := getTiDBConn(ctx, tidbDB)
-				if connErr != nil {
-					release()
-					tr = reporter.TableReport{TableName: tableName, Status: reporter.StatusFail,
-						Error: fmt.Sprintf("get TiDB connection: %v", connErr)}
-					break
-				}
-				if mode == "quick" {
-					tr = v.validateTableUnit(ctx, pgDB, tidbConn, tableName, wm, func(c *sql.Conn) reporter.TableReport {
-						return v.validateRowCount(ctx, pgDB, c, tableName)
-					})
-				} else {
-					tr = v.validateTableUnit(ctx, pgDB, tidbConn, tableName, wm, func(c *sql.Conn) reporter.TableReport {
-						return v.validateSampling(ctx, pgDB, c, tidbDB, tableName, opts.SampleRatio)
-					})
-				}
-				tidbConn.Close()
-				release()
+				tr = v.runTableUnit(ctx, pgDB, tidbDB, sem, tableName, wm, mode, opts.SampleRatio)
 			case "checksum":
 				// Watermark column precheck first (1 slot, pool-backed PG
 				// query inside the slot), then the chunked comparison which
@@ -355,6 +330,41 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 	}
 
 	return rpt, nil
+}
+
+// runTableUnit runs ONE budget work unit for quick/sample modes (#t4): the
+// slot is acquired first, the dedicated UTC TiDB conn + the optional
+// watermark precheck (pool-backed PG query) + the validation body all happen
+// inside the slot, then conn and slot are released. Watermark predicate
+// construction itself is untouched (#t3 paths preserved verbatim).
+func (v *Validator) runTableUnit(ctx context.Context, pgDB, tidbDB *sql.DB, sem concSem,
+	table string, wm *config.WatermarkFilter, mode string, sampleRatio float64) reporter.TableReport {
+	// 1 table validation = 1 work unit: the dedicated UTC TiDB conn lives
+	// entirely inside the budget slot.
+	release, aerr := sem.acquire(ctx)
+	if aerr != nil {
+		return reporter.TableReport{TableName: table, Status: reporter.StatusFail,
+			Error: fmt.Sprintf("cancelled before start: %v", aerr)}
+	}
+	tidbConn, connErr := getTiDBConn(ctx, tidbDB)
+	if connErr != nil {
+		release()
+		return reporter.TableReport{TableName: table, Status: reporter.StatusFail,
+			Error: fmt.Sprintf("get TiDB connection: %v", connErr)}
+	}
+	var tr reporter.TableReport
+	if mode == "quick" {
+		tr = v.validateTableUnit(ctx, pgDB, tidbConn, table, wm, func(c *sql.Conn) reporter.TableReport {
+			return v.validateRowCount(ctx, pgDB, c, table)
+		})
+	} else {
+		tr = v.validateTableUnit(ctx, pgDB, tidbConn, table, wm, func(c *sql.Conn) reporter.TableReport {
+			return v.validateSampling(ctx, pgDB, c, tidbDB, table, sampleRatio)
+		})
+	}
+	tidbConn.Close()
+	release()
+	return tr
 }
 
 // validateTableUnit runs one single-slot work unit for quick/sample modes:
