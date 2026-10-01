@@ -69,7 +69,6 @@ const form = reactive({
 		compare_mode: 'sample',
 		sample_ratio: 0.01,
 		checksum_chunk_size: 50000,
-		checksum_parallel: 4,
   },
 })
 
@@ -350,7 +349,6 @@ async function submit() {
         compare_mode: form.opts.compare_mode,
         sample_ratio: form.opts.sample_ratio,
         checksum_chunk_size: form.opts.checksum_chunk_size,
-        checksum_parallel: form.opts.checksum_parallel,
       },
     })
     ElMessage.success('迁移任务创建成功')
@@ -649,9 +647,9 @@ function prevStep() {
 
         <!-- Step 3: Options -->
         <div v-show="activeStep === 3">
-          <el-form-item label="并发数">
-            <el-input-number v-model="form.opts.parallel" :min="1" :max="32" />
-            <span style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-left: 8px;">同时迁移的表个数</span>
+          <el-form-item label="总并发数">
+            <el-input-number v-model="form.opts.parallel" :min="1" :max="8" />
+            <span style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-left: 8px;">同时迁移/比对的表个数与并发查询数（1–8，比对与迁移共用）</span>
           </el-form-item>
           <el-form-item label="批次大小">
             <el-input-number v-model="form.opts.batch_size" :min="1000" :step="10000" />
@@ -734,9 +732,6 @@ function prevStep() {
             <el-input-number v-model="form.opts.checksum_chunk_size" :min="1000" :step="10000" />
             <span style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-left: 8px;">每块的行数</span>
           </el-form-item>
-          <el-form-item v-if="form.opts.compare_mode === 'checksum'" label="并行数">
-            <el-input-number v-model="form.opts.checksum_parallel" :min="1" :max="16" />
-          </el-form-item>
           <el-divider>跳过阶段（高级）</el-divider>
           <el-form-item label="跳过预检">
             <el-switch v-model="form.opts.skip_precheck" />
@@ -756,7 +751,7 @@ function prevStep() {
         <div v-show="activeStep === 4">
           <el-descriptions title="迁移配置确认" :column="2" border>
             <el-descriptions-item label="任务名称">{{ form.name || '自动生成' }}</el-descriptions-item>
-            <el-descriptions-item label="并发数">{{ form.opts.parallel }}</el-descriptions-item>
+            <el-descriptions-item label="总并发数">{{ form.opts.parallel }}</el-descriptions-item>
             <el-descriptions-item label="源数据库">
               <template v-if="sourceDS">数据源「{{ sourceDS.name }}」{{ sourceDS.fields?.host }}:{{ sourceDS.fields?.port }}/{{ sourceDS.fields?.database }}</template>
               <template v-else>{{ form.source.host }}:{{ form.source.port }}/{{ form.source.database }}</template>

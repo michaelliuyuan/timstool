@@ -60,7 +60,19 @@ type CompareConfig struct {
 	ChecksumChunkSize int64 `yaml:"checksum_chunk_size" json:"checksumChunkSize"`
 
 	// ChecksumParallel for checksum mode: number of concurrent chunks.
+	// Deprecated (#t4): superseded by Concurrency — still honored as a
+	// legacy fallback when Concurrency is unset.
 	ChecksumParallel int `yaml:"checksum_parallel" json:"checksumParallel"`
+
+	// Concurrency is the unified total-concurrency budget (#t4): the number
+	// of database query work units (table validations and checksum chunks
+	// alike) that may execute at the same time across BOTH pools. It is also
+	// the hard cap for connection acquisition — every conn is obtained
+	// inside a budget slot, which structurally prevents the pool-vs-WaitGroup
+	// deadlock the nested (table-level × chunk-level) semaphores caused.
+	// 0 = derive from legacy migration.parallel / checksum_parallel; clamped
+	// to [1,8] (both pools are capped at 8).
+	Concurrency int `yaml:"concurrency" json:"concurrency"`
 
 	// Watermark scopes the comparison to rows whose watermark column is
 	// within bounds on BOTH sides (#t3), eliminating the permanent-diff

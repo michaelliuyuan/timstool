@@ -73,7 +73,7 @@ func TestChecksumCountErrorDoesNotPass(t *testing.T) {
 	tidbDB := sql.OpenDB(&fakeConnector{failQueries: false})
 	defer tidbDB.Close()
 
-	tr := v.validateChecksumChunked(context.Background(), pgDB, tidbDB, "t1")
+	tr := v.validateChecksumChunked(context.Background(), pgDB, tidbDB, "t1", make(concSem, 4))
 
 	if tr.Status != reporter.StatusFail {
 		t.Fatalf("COUNT failure must fail the table, got status=%s error=%q", tr.Status, tr.Error)

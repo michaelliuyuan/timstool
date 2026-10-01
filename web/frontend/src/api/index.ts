@@ -214,7 +214,8 @@ export interface CreateTaskRequest {
     compare_mode: string
     sample_ratio: number
     checksum_chunk_size: number
-    checksum_parallel: number
+    /** #t4 deprecated — compare concurrency now derives from parallel. */
+    checksum_parallel?: number
   }
 }
 
@@ -257,8 +258,11 @@ export interface CompareTask {
   mode: string
   sample_ratio: number
   checksum_chunk_size: number
+  /** #t4 deprecated legacy knobs (kept for display of old tasks). */
   checksum_parallel: number
   parallel: number
+  /** #t4 unified total concurrency budget (effective value). */
+  concurrency: number
   tables: string[]
   /** #t3 watermark filter group (absent = unfiltered compare). */
   watermark?: { column: string; value: string; op: string; base_mode: string }
@@ -281,8 +285,12 @@ export interface CreateCompareRequest {
   mode: string
   sample_ratio: number
   checksum_chunk_size: number
-  checksum_parallel: number
-  parallel: number
+  /** #t4 deprecated — folded into concurrency server-side. */
+  checksum_parallel?: number
+  /** #t4 deprecated — folded into concurrency server-side. */
+  parallel?: number
+  /** #t4 unified total concurrency budget (1-8; 0/absent = derive from legacy knobs). */
+  concurrency?: number
   tables: string[]
   /** #t3 optional watermark filter; when set, mode is the filter's base_mode. */
   watermark?: { column: string; value: string; op: string; base_mode: string }
@@ -297,6 +305,7 @@ export interface CompareOptions {
   checksum_chunk_size?: number
   checksum_parallel?: number
   parallel?: number
+  concurrency?: number
   /** #t3 present-and-null clears the saved group (partial-merge by presence). */
   watermark?: { column: string; value: string; op: string; base_mode: string } | null
 }
@@ -334,6 +343,8 @@ export interface CompareOptions {
   checksum_chunk_size?: number
   checksum_parallel?: number
   parallel?: number
+  /** #t4 unified total concurrency budget. */
+  concurrency?: number
 }
 
 export const apiClient = {

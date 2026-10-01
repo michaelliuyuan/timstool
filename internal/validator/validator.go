@@ -85,6 +85,57 @@ func (v *Validator) parallelism() int {
 	return v.cfg.Migration.Parallel
 }
 
+// MaxConcBudget is the hard cap for the unified concurrency budget. Both DB
+// pools are capped at 8 open conns, so a budget above 8 could re-create the
+// pool-exhaustion deadlock (#t4 root cause).
+const MaxConcBudget = 8
+
+// ResolveConcurrency maps the unified budget plus the two legacy knobs onto
+// one effective value (#t4): an explicit concurrency wins; otherwise the
+// larger of the legacy table-level parallel and chunk-level parallel is
+// adopted; the result is clamped into [1, MaxConcBudget] with a default of 4.
+// Exported so webapi folds deprecated request knobs into the same value.
+func ResolveConcurrency(concurrency, legacyParallel, legacyChunkParallel int) int {
+	c := concurrency
+	if c <= 0 {
+		c = legacyParallel
+		if legacyChunkParallel > c {
+			c = legacyChunkParallel
+		}
+	}
+	if c <= 0 {
+		c = 4
+	}
+	if c > MaxConcBudget {
+		c = MaxConcBudget
+	}
+	return c
+}
+
+// concurrency returns the effective unified concurrency budget for Run.
+func (v *Validator) concurrency() int {
+	cc := v.compareCfg()
+	return ResolveConcurrency(cc.Concurrency, v.parallelism(), cc.ChecksumParallel)
+}
+
+// concSem is the single-layer global work-unit semaphore (#t4). Every DB
+// connection acquisition (dedicated TiDB conns and pool-backed queries)
+// happens while holding a slot, and no goroutine waits on the sem while
+// holding a connection — the invariant that structurally rules out the
+// old pool-vs-WaitGroup deadlock.
+type concSem chan struct{}
+
+// acquire blocks until a slot is free or ctx is done. Holding the returned
+// release func's result is required: acquire MUST be followed by release.
+func (s concSem) acquire(ctx context.Context) (func(), error) {
+	select {
+	case s <- struct{}{}:
+		return func() { <-s }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // OnTableDone registers a per-table progress callback used by Run (and thus
 // RunWithDSNs). Safe to call before starting a run.
 func (v *Validator) OnTableDone(fn func(done, total int, tr reporter.TableReport)) {
@@ -170,67 +221,78 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 		return nil, cerrors.Wrap(cerrors.ErrValidateRowCount, "get table list", err)
 	}
 
-	parallel := v.parallelism()
-	if parallel <= 0 {
-		parallel = 4
-	}
+	// #t4: single unified concurrency budget. Table goroutines no longer
+	// hold a semaphore slot (and a TiDB conn) for the whole table: quick and
+	// sample validations are one work unit each; checksum mode acquires a
+	// slot for the count phase and one slot per chunk, so a table worker
+	// never waits on the sem while holding a connection.
+	budget := v.concurrency()
+	logger.Info("validation concurrency budget",
+		zap.Int("budget", budget), zap.Int("tables", len(tables)))
 
 	var mu sync.Mutex
-	sem := make(chan struct{}, parallel)
+	sem := make(concSem, budget)
 	var wg sync.WaitGroup
 	var tablesDone int32
 
 	for _, table := range tables {
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(tableName string) {
 			defer wg.Done()
-			defer func() { <-sem }()
-
-			// Get a dedicated TiDB connection with UTC timezone for this goroutine.
-			// This ensures all queries on this connection return TIMESTAMP values
-			// in UTC, matching PostgreSQL's timestamptz output.
-			tidbConn, connErr := getTiDBConn(ctx, tidbDB)
-			if connErr != nil {
-				mu.Lock()
-				rpt.AddTableReport(reporter.TableReport{
-					TableName: tableName,
-					Status:    reporter.StatusFail,
-					Error:     fmt.Sprintf("get TiDB connection: %v", connErr),
-				})
-				mu.Unlock()
-				return
-			}
-			defer tidbConn.Close()
 
 			var tr reporter.TableReport
-			if wm != nil {
-				if werr := checkWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), tableName, wm); werr != nil {
-					tr = reporter.TableReport{
-						TableName: tableName,
-						Status:    reporter.StatusFail,
-						Error:     werr.Error(),
-					}
-					mu.Lock()
-					rpt.AddTableReport(tr)
-					mu.Unlock()
-					if v.onTableDone != nil {
-						done := int(atomic.AddInt32(&tablesDone, 1))
-						v.onTableDone(done, len(tables), tr)
-					}
-					return
-				}
-			}
 			switch mode {
-			case "quick":
-				tr = v.validateRowCount(ctx, pgDB, tidbConn, tableName)
-			case "sample":
-				tr = v.validateSampling(ctx, pgDB, tidbConn, tidbDB, tableName, opts.SampleRatio)
+			case "quick", "sample":
+				// 1 table validation = 1 work unit: the dedicated UTC
+				// TiDB conn lives entirely inside the budget slot.
+				release, aerr := sem.acquire(ctx)
+				if aerr != nil {
+					tr = reporter.TableReport{TableName: tableName, Status: reporter.StatusFail,
+						Error: fmt.Sprintf("cancelled before start: %v", aerr)}
+					break
+				}
+				tidbConn, connErr := getTiDBConn(ctx, tidbDB)
+				if connErr != nil {
+					release()
+					tr = reporter.TableReport{TableName: tableName, Status: reporter.StatusFail,
+						Error: fmt.Sprintf("get TiDB connection: %v", connErr)}
+					break
+				}
+				if mode == "quick" {
+					tr = v.validateTableUnit(ctx, pgDB, tidbConn, tableName, wm, func(c *sql.Conn) reporter.TableReport {
+						return v.validateRowCount(ctx, pgDB, c, tableName)
+					})
+				} else {
+					tr = v.validateTableUnit(ctx, pgDB, tidbConn, tableName, wm, func(c *sql.Conn) reporter.TableReport {
+						return v.validateSampling(ctx, pgDB, c, tidbDB, tableName, opts.SampleRatio)
+					})
+				}
+				tidbConn.Close()
+				release()
 			case "checksum":
-				// L2: use the chunked parallel hash comparison (honors
-				// ChecksumChunkSize / ChecksumParallel); it falls back to
-				// hash_group for keyless tables internally.
-				tr = v.validateChecksumChunked(ctx, pgDB, tidbDB, tableName)
+				// Watermark column precheck first (1 slot, pool-backed PG
+				// query inside the slot), then the chunked comparison which
+				// manages its own per-unit slots (count = 1 unit, each
+				// chunk = 1 unit) — no slot held across waits.
+				if wm != nil {
+					release, aerr := sem.acquire(ctx)
+					if aerr != nil {
+						tr = reporter.TableReport{TableName: tableName, Status: reporter.StatusFail,
+							Error: fmt.Sprintf("cancelled before start: %v", aerr)}
+						break
+					}
+					werr := checkWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), tableName, wm)
+					release()
+					if werr != nil {
+						tr = reporter.TableReport{
+							TableName: tableName,
+							Status:    reporter.StatusFail,
+							Error:     werr.Error(),
+						}
+						break
+					}
+				}
+				tr = v.validateChecksumChunked(ctx, pgDB, tidbDB, tableName, sem)
 			default:
 				tr = reporter.TableReport{
 					TableName: tableName,
@@ -295,8 +357,24 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 	return rpt, nil
 }
 
-func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string) reporter.TableReport {
-	tr := reporter.TableReport{TableName: table, Status: reporter.StatusPass}
+// validateTableUnit runs one single-slot work unit for quick/sample modes:
+// the optional watermark column precheck (pool-backed PG query) plus the mode
+// body, all while the caller holds a budget slot and the dedicated TiDB conn.
+func (v *Validator) validateTableUnit(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string,
+	wm *config.WatermarkFilter, fn func(*sql.Conn) reporter.TableReport) reporter.TableReport {
+	if wm != nil {
+		if werr := checkWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), table, wm); werr != nil {
+			return reporter.TableReport{
+				TableName: table,
+				Status:    reporter.StatusFail,
+				Error:     werr.Error(),
+			}
+		}
+	}
+	return fn(tidbConn)
+}
+
+func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string) reporter.TableReport {	tr := reporter.TableReport{TableName: table, Status: reporter.StatusPass}
 
 	schema := v.sourceSchema()
 	if schema == "" {

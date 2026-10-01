@@ -15,17 +15,30 @@ import (
 
 // validateChecksumChunked computes row hashes for each chunk of the table
 // in parallel, then compares PG and TiDB chunk by chunk.
-func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *sql.DB, table string) reporter.TableReport {
+//
+// #t4: connection orchestration is single-layer. The caller holds NO budget
+// slot; this function acquires one for the count phase and one per chunk via
+// the shared global sem, so no goroutine ever waits on the sem while holding
+// a connection (the old table-level × chunk-level nesting deadlocked when
+// outer workers held all 8 pool conns waiting for inner chunks).
+func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *sql.DB, table string, sem concSem) reporter.TableReport {
 	tr := reporter.TableReport{TableName: table, Status: reporter.StatusPass}
 
+	// Unit 1: exact row count + chunk-key detection, inside one slot.
+	release, aerr := sem.acquire(ctx)
+	if aerr != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("checksum: cancelled before start: %v", aerr)
+		return tr
+	}
 	// Get a dedicated TiDB connection with UTC timezone for row count.
 	tidbConn, connErr := getTiDBConn(ctx, tidbDB)
 	if connErr != nil {
+		release()
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("checksum: get TiDB connection: %v", connErr)
 		return tr
 	}
-	defer tidbConn.Close()
 
 	// First do exact row count
 	tr = v.validateRowCount(ctx, pgDB, tidbConn, table)
@@ -33,11 +46,15 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	// falling through would hit the SourceRows==0 branch below and report a
 	// count ERROR as PASS (F-05).
 	if tr.Status == reporter.StatusFail {
+		tidbConn.Close()
+		release()
 		return tr
 	}
 
 	if tr.SourceRows == 0 {
 		tr.Status = reporter.StatusPass
+		tidbConn.Close()
+		release()
 		return tr
 	}
 
@@ -54,19 +71,21 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	} else if keyInfo != nil && keyInfo.HasUniqueIndex {
 		orderByCols = strings.Join(keyInfo.UniqueColumns, ", ")
 	} else {
-		// No key 鈥?fall back to hash_group comparison (already implemented)
+		// No key — fall back to hash_group comparison (already implemented),
+		// still inside the same slot (1 unit: the dedicated conn is held).
 		logger := zap.L()
 		logger.Info("checksum mode: no PK/unique for chunking, falling back to hash_group", zap.String("table", table))
-		return v.validateSamplingWithHashGroup(ctx, pgDB, tidbConn, table, 1.0, tr, schema)
+		out := v.validateSamplingWithHashGroup(ctx, pgDB, tidbConn, table, 1.0, tr, schema)
+		tidbConn.Close()
+		release()
+		return out
 	}
+	tidbConn.Close()
+	release()
 
 	chunkSize := v.compareCfg().ChecksumChunkSize
 	if chunkSize <= 0 {
 		chunkSize = 50000
-	}
-	parallel := v.compareCfg().ChecksumParallel
-	if parallel <= 0 {
-		parallel = 4
 	}
 
 	totalRows := tr.SourceRows
@@ -98,18 +117,26 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 		}
 	}
 
-	// Process chunks in parallel
+	// Process chunks in parallel — each chunk is ONE global work unit: both
+	// the PG pool-backed query and the dedicated TiDB conn happen inside the
+	// slot (#t4).
 	var mu sync.Mutex
 	var mismatchDetails []string
-	sem := make(chan struct{}, parallel)
 	var wg sync.WaitGroup
 
 	for i, chunk := range chunks {
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(idx int, ch chunkRange) {
 			defer wg.Done()
-			defer func() { <-sem }()
+
+			release, aerr := sem.acquire(ctx)
+			if aerr != nil {
+				mu.Lock()
+				mismatchDetails = append(mismatchDetails, fmt.Sprintf("chunk %d: cancelled: %v", idx, aerr))
+				mu.Unlock()
+				return
+			}
+			defer release()
 
 			pgHash, err := v.computeChunkHashPG(ctx, pgDB, schema, table, orderByCols, ch)
 			if err != nil {

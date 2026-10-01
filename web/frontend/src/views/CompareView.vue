@@ -37,8 +37,8 @@ const form = reactive({
   mode: 'sample',
   sample_ratio: 0.01,
   checksum_chunk_size: 50000,
-  checksum_parallel: 4,
-  parallel: 4,
+  // #t4: unified total concurrency budget (was parallel + checksum_parallel)
+  concurrency: 4,
 })
 
 const compareModes = [
@@ -274,8 +274,15 @@ function applyCompareOptions(opts: CompareOptions) {
   const num = (v: number | undefined) => (v !== undefined && v !== null ? v : null)
   const sr = num(opts.sample_ratio); if (sr !== null) form.sample_ratio = sr
   const cs = num(opts.checksum_chunk_size); if (cs !== null) form.checksum_chunk_size = cs
-  const cp = num(opts.checksum_parallel); if (cp !== null) form.checksum_parallel = cp
-  const p = num(opts.parallel); if (p !== null) form.parallel = p
+  // #t4: unified budget; legacy saves map through the same max() the backend uses.
+  const c = num(opts.concurrency)
+  if (c !== null && c > 0) {
+    form.concurrency = Math.min(Math.max(c, 1), 8)
+  } else {
+    const lp = num(opts.parallel) ?? 0
+    const lcp = num(opts.checksum_parallel) ?? 0
+    if (lp > 0 || lcp > 0) form.concurrency = Math.min(Math.max(lp, lcp), 8)
+  }
 }
 
 async function loadSavedConnection() {
@@ -297,8 +304,7 @@ async function saveCompareParams() {
       mode: form.mode === 'watermark' ? wmConfig.base_mode : form.mode,
       sample_ratio: form.sample_ratio,
       checksum_chunk_size: form.checksum_chunk_size,
-      checksum_parallel: form.checksum_parallel,
-      parallel: form.parallel,
+      concurrency: form.concurrency,
       // present-and-null clears (partial-merge by presence)
       watermark: form.mode === 'watermark'
         ? { column: wmConfig.column, value: wmConfig.value, op: wmConfig.op, base_mode: wmConfig.base_mode }
@@ -410,8 +416,7 @@ async function startCompare() {
       mode,
       sample_ratio: form.sample_ratio,
       checksum_chunk_size: form.checksum_chunk_size,
-      checksum_parallel: form.checksum_parallel,
-      parallel: form.parallel,
+      concurrency: form.concurrency,
       tables: selectedTables.value,
       watermark,
     })
@@ -759,9 +764,6 @@ onUnmounted(() => {
         <el-form-item v-if="form.mode === 'checksum' || (form.mode === 'watermark' && wmConfig.base_mode === 'checksum')" label="分块大小">
           <el-input-number v-model="form.checksum_chunk_size" :min="1000" :step="10000" />
         </el-form-item>
-        <el-form-item v-if="form.mode === 'checksum' || (form.mode === 'watermark' && wmConfig.base_mode === 'checksum')" label="并行数">
-          <el-input-number v-model="form.checksum_parallel" :min="1" :max="32" />
-        </el-form-item>
         <template v-if="form.mode === 'watermark'">
           <el-form-item label="底层算法">
             <el-radio-group v-model="wmConfig.base_mode">
@@ -795,15 +797,9 @@ onUnmounted(() => {
             </div>
           </el-form-item>
         </template>
-        <el-form-item v-if="form.mode === 'checksum'" label="分块大小">
-          <el-input-number v-model="form.checksum_chunk_size" :min="1000" :step="10000" />
-        </el-form-item>
-        <el-form-item v-if="form.mode === 'checksum'" label="并行数">
-          <el-input-number v-model="form.checksum_parallel" :min="1" :max="32" />
-        </el-form-item>
-        <el-form-item label="并发数">
-          <el-input-number v-model="form.parallel" :min="1" :max="32" />
-          <span style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-left: 8px;">同时比对的表个数</span>
+        <el-form-item label="总并发数">
+          <el-input-number v-model="form.concurrency" :min="1" :max="8" />
+          <span style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-left: 8px;">任务同时执行的数据库查询数（所有模式共用，1–8）</span>
         </el-form-item>
 
         <el-form-item label="选择表">
