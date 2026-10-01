@@ -176,11 +176,21 @@ func quoteOrderByCols(orderBy string, quote func(string) string) string {
 }
 
 // computeChunkHashPG computes an aggregate hash for a chunk of PG rows.
+// With a watermark filter active the chunk rows are the FILTERED universe
+// (validateRowCount already counted with the same predicate, so chunk
+// boundaries derived from that count stay consistent on both sides).
 func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema, table, orderBy string, ch chunkRange) (string, error) {
-	query := fmt.Sprintf("SELECT * FROM %s.%s ORDER BY %s LIMIT %d OFFSET %d",
-		quotePG(schema), quotePG(table), quoteOrderByCols(orderBy, quotePG), ch.limit, ch.offset)
-
-	rows, err := pgDB.QueryContext(ctx, query)
+	var rows *sql.Rows
+	var err error
+	if wm := v.wmFilter(); wm != nil {
+		query := fmt.Sprintf("SELECT * FROM %s.%s WHERE %s ORDER BY %s LIMIT %d OFFSET %d",
+			quotePG(schema), quotePG(table), wmWherePG(wm), quoteOrderByCols(orderBy, quotePG), ch.limit, ch.offset)
+		rows, err = pgDB.QueryContext(ctx, query, wm.Value)
+	} else {
+		query := fmt.Sprintf("SELECT * FROM %s.%s ORDER BY %s LIMIT %d OFFSET %d",
+			quotePG(schema), quotePG(table), quoteOrderByCols(orderBy, quotePG), ch.limit, ch.offset)
+		rows, err = pgDB.QueryContext(ctx, query)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -249,9 +259,6 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 // computeChunkHashTiDB computes an aggregate hash for a chunk of TiDB rows.
 // It gets its own dedicated connection with UTC timezone for parallel goroutines.
 func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, table, orderBy string, ch chunkRange) (string, error) {
-	query := fmt.Sprintf("SELECT * FROM %s ORDER BY %s LIMIT %d OFFSET %d",
-		quoteMySQL(table), quoteOrderByCols(orderBy, quoteMySQL), ch.limit, ch.offset)
-
 	// Get dedicated connection with UTC timezone for this goroutine.
 	conn, err := getTiDBConn(ctx, tidbDB)
 	if err != nil {
@@ -259,7 +266,16 @@ func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, ta
 	}
 	defer conn.Close()
 
-	rows, err := conn.QueryContext(ctx, query)
+	var rows *sql.Rows
+	if wm := v.wmFilter(); wm != nil {
+		query := fmt.Sprintf("SELECT * FROM %s WHERE %s ORDER BY %s LIMIT %d OFFSET %d",
+			quoteMySQL(table), wmWhereMySQL(wm), quoteOrderByCols(orderBy, quoteMySQL), ch.limit, ch.offset)
+		rows, err = conn.QueryContext(ctx, query, wm.Value)
+	} else {
+		query := fmt.Sprintf("SELECT * FROM %s ORDER BY %s LIMIT %d OFFSET %d",
+			quoteMySQL(table), quoteOrderByCols(orderBy, quoteMySQL), ch.limit, ch.offset)
+		rows, err = conn.QueryContext(ctx, query)
+	}
 	if err != nil {
 		return "", err
 	}

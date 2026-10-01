@@ -36,39 +36,41 @@ const (
 
 // CompareTaskRequest is the POST /compare/tasks body.
 type CompareTaskRequest struct {
-	Name              string              `json:"name"`
-	Source            config.SourceConfig `json:"source"`
-	Target            config.TargetConfig `json:"target"`
-	SourceRef         string              `json:"source_ref"` // datasource id (F-02)
-	TargetRef         string              `json:"target_ref"` // datasource id (tidb)
-	Mode              string              `json:"mode"`       // quick | sample | checksum
-	SampleRatio       float64             `json:"sample_ratio"`
-	ChecksumChunkSize int64               `json:"checksum_chunk_size"`
-	ChecksumParallel  int                 `json:"checksum_parallel"`
-	Parallel          int                 `json:"parallel"`
-	Tables            []string            `json:"tables"` // empty = all tables
+	Name              string                  `json:"name"`
+	Source            config.SourceConfig     `json:"source"`
+	Target            config.TargetConfig     `json:"target"`
+	SourceRef         string                  `json:"source_ref"` // datasource id (F-02)
+	TargetRef         string                  `json:"target_ref"` // datasource id (tidb)
+	Mode              string                  `json:"mode"`       // quick | sample | checksum (= watermark.base_mode when watermark active)
+	SampleRatio       float64                 `json:"sample_ratio"`
+	ChecksumChunkSize int64                   `json:"checksum_chunk_size"`
+	ChecksumParallel  int                     `json:"checksum_parallel"`
+	Parallel          int                     `json:"parallel"`
+	Tables            []string                `json:"tables"`              // empty = all tables
+	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"` // #t3 optional filter group
 }
 
 // CompareTask is the persisted (password-redacted) compare task state.
 type CompareTask struct {
-	ID                string              `json:"id"`
-	Name              string              `json:"name"`
-	Status            string              `json:"status"`
-	Source            config.SourceConfig `json:"source"` // password redacted on disk
-	Target            config.TargetConfig `json:"target"` // password redacted on disk
-	Mode              string              `json:"mode"`
-	SampleRatio       float64             `json:"sample_ratio"`
-	ChecksumChunkSize int64               `json:"checksum_chunk_size"`
-	ChecksumParallel  int                 `json:"checksum_parallel"`
-	Parallel          int                 `json:"parallel"`
-	Tables            []string            `json:"tables"`
-	TablesDone        int                 `json:"tables_done"`
-	TablesTotal       int                 `json:"tables_total"`
-	CurrentTable      string              `json:"current_table,omitempty"`
-	Error             string              `json:"error,omitempty"`
-	CreatedAt         time.Time           `json:"created_at"`
-	StartedAt         *time.Time          `json:"started_at,omitempty"`
-	FinishedAt        *time.Time          `json:"finished_at,omitempty"`
+	ID                string                  `json:"id"`
+	Name              string                  `json:"name"`
+	Status            string                  `json:"status"`
+	Source            config.SourceConfig     `json:"source"` // password redacted on disk
+	Target            config.TargetConfig     `json:"target"` // password redacted on disk
+	Mode              string                  `json:"mode"`
+	SampleRatio       float64                 `json:"sample_ratio"`
+	ChecksumChunkSize int64                   `json:"checksum_chunk_size"`
+	ChecksumParallel  int                     `json:"checksum_parallel"`
+	Parallel          int                     `json:"parallel"`
+	Tables            []string                `json:"tables"`
+	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`
+	TablesDone        int                     `json:"tables_done"`
+	TablesTotal       int                     `json:"tables_total"`
+	CurrentTable      string                  `json:"current_table,omitempty"`
+	Error             string                  `json:"error,omitempty"`
+	CreatedAt         time.Time               `json:"created_at"`
+	StartedAt         *time.Time              `json:"started_at,omitempty"`
+	FinishedAt        *time.Time              `json:"finished_at,omitempty"`
 }
 
 // compareState guards the single-running-compare invariant and serializes
@@ -146,14 +148,51 @@ func (s *Server) persistCompareTask(task *CompareTask) error {
 // connection profile (dataDir/compare-options.json). Passwords are NEVER
 // persisted nor returned: PUT ignores them, GET always returns them empty.
 type compareOptionsBody struct {
-	SourceType        string              `json:"source_type"`
-	Source            config.SourceConfig `json:"source"` // password never stored
-	Target            config.TargetConfig `json:"target"` // password never stored
-	Mode              string              `json:"mode"`
-	SampleRatio       float64             `json:"sample_ratio"`
-	ChecksumChunkSize int64               `json:"checksum_chunk_size"`
-	ChecksumParallel  int                 `json:"checksum_parallel"`
-	Parallel          int                 `json:"parallel"`
+	SourceType        string                  `json:"source_type"`
+	Source            config.SourceConfig     `json:"source"` // password never stored
+	Target            config.TargetConfig     `json:"target"` // password never stored
+	Mode              string                  `json:"mode"`
+	SampleRatio       float64                 `json:"sample_ratio"`
+	ChecksumChunkSize int64                   `json:"checksum_chunk_size"`
+	ChecksumParallel  int                     `json:"checksum_parallel"`
+	Parallel          int                     `json:"parallel"`
+	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"` // present-and-null clears
+}
+
+// normalizeWatermarkFilter validates and canonicalizes a watermark filter
+// group (#t3): column passes the same identifier allow-list as incremental
+// table/column names; op defaults to "<="; base_mode defaults to checksum.
+// nil stays nil (filter off, zero regression).
+func normalizeWatermarkFilter(wm *config.WatermarkFilter) (*config.WatermarkFilter, error) {
+	if wm == nil {
+		return nil, nil
+	}
+	out := *wm
+	out.Column = strings.TrimSpace(out.Column)
+	out.Value = strings.TrimSpace(out.Value)
+	if out.Column == "" || out.Value == "" {
+		return nil, fmt.Errorf("watermark: column 与 value 必须同时提供")
+	}
+	if !incIdentifierOK(out.Column) {
+		return nil, fmt.Errorf("watermark.column: 非法列名 %q", out.Column)
+	}
+	switch out.Op {
+	case "", "<=", "<":
+	default:
+		return nil, fmt.Errorf(`watermark.op must be "<=" or "<"`)
+	}
+	switch out.BaseMode {
+	case "", "quick", "sample", "checksum":
+	default:
+		return nil, fmt.Errorf(`watermark.base_mode must be one of quick/sample/checksum`)
+	}
+	if out.Op == "" {
+		out.Op = "<="
+	}
+	if out.BaseMode == "" {
+		out.BaseMode = "checksum"
+	}
+	return &out, nil
 }
 
 func (s *Server) compareOptionsFile() string {
@@ -254,6 +293,16 @@ func (s *Server) handlePutCompareOptions(w http.ResponseWriter, r *http.Request)
 	apply("checksum_chunk_size", func() { merged.ChecksumChunkSize = req.ChecksumChunkSize })
 	apply("checksum_parallel", func() { merged.ChecksumParallel = req.ChecksumParallel })
 	apply("parallel", func() { merged.Parallel = req.Parallel })
+	// #t3: present-and-null CLEARS the saved watermark group; present with
+	// a body validates + normalizes it; absent keeps the saved value.
+	if _, ok := presence["watermark"]; ok {
+		norm, werr := normalizeWatermarkFilter(req.Watermark)
+		if werr != nil {
+			s.writeError(w, http.StatusBadRequest, werr.Error())
+			return
+		}
+		merged.Watermark = norm
+	}
 	// Passwords never survive a save, regardless of what was sent.
 	merged.Source.Password = ""
 	merged.Target.Password = ""
@@ -359,9 +408,20 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "source.type: 比对源端类型必须是 postgres")
 		return
 	}
+	wm, werr := normalizeWatermarkFilter(req.Watermark)
+	if werr != nil {
+		s.writeError(w, http.StatusBadRequest, werr.Error())
+		return
+	}
+	req.Watermark = wm
 	switch req.Mode {
 	case "":
-		req.Mode = "sample"
+		// #t3: a watermark task's mode IS the filter's base algorithm.
+		if wm != nil {
+			req.Mode = wm.BaseMode
+		} else {
+			req.Mode = "sample"
+		}
 	case "quick", "sample", "checksum":
 	default:
 		s.writeError(w, http.StatusBadRequest, "mode must be one of quick/sample/checksum")
@@ -394,6 +454,7 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 		ChecksumParallel:  req.ChecksumParallel,
 		Parallel:          req.Parallel,
 		Tables:            req.Tables,
+		Watermark:         req.Watermark,
 		CreatedAt:         now,
 		StartedAt:         &now, // M2: set before the goroutine spawns (no data race on the response)
 	}
@@ -427,17 +488,24 @@ func buildCompareRunParams(task *CompareTask, reportFile string) (float64, commo
 	if sampleRatio <= 0 {
 		sampleRatio = 0.01
 	}
+	mode := task.Mode
+	// #t3 belt-and-braces: a watermark task's mode is the filter's base
+	// algorithm (create maps it; this keeps hand-built tasks honest too).
+	if mode == "" && task.Watermark != nil && task.Watermark.BaseMode != "" {
+		mode = task.Watermark.BaseMode
+	}
 	opts := common.ValidateOpts{
-		Mode:        task.Mode,
+		Mode:        mode,
 		SampleRatio: sampleRatio,
 		Tables:      task.Tables,
 		ReportFile:  reportFile,
 	}
 	compareCfg := config.CompareConfig{
-		CompareMode:       task.Mode,
+		CompareMode:       mode,
 		SampleRatio:       sampleRatio,
 		ChecksumChunkSize: task.ChecksumChunkSize,
 		ChecksumParallel:  task.ChecksumParallel,
+		Watermark:         task.Watermark,
 	}
 	return sampleRatio, opts, compareCfg
 }

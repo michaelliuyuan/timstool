@@ -260,6 +260,8 @@ export interface CompareTask {
   checksum_parallel: number
   parallel: number
   tables: string[]
+  /** #t3 watermark filter group (absent = unfiltered compare). */
+  watermark?: { column: string; value: string; op: string; base_mode: string }
   tables_done: number
   tables_total: number
   current_table?: string
@@ -282,6 +284,21 @@ export interface CreateCompareRequest {
   checksum_parallel: number
   parallel: number
   tables: string[]
+  /** #t3 optional watermark filter; when set, mode is the filter's base_mode. */
+  watermark?: { column: string; value: string; op: string; base_mode: string }
+}
+
+export interface CompareOptions {
+  source_type?: string
+  source?: Record<string, any>
+  target?: Record<string, any>
+  mode?: string
+  sample_ratio?: number
+  checksum_chunk_size?: number
+  checksum_parallel?: number
+  parallel?: number
+  /** #t3 present-and-null clears the saved group (partial-merge by presence). */
+  watermark?: { column: string; value: string; op: string; base_mode: string } | null
 }
 
 // F-02 unified datasource registry. Passwords are write-only: they are sent

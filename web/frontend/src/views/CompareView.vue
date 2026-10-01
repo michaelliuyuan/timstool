@@ -2,7 +2,7 @@
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import apiClient from '../api'
-import type { CompareTask, CompareReport, CompareOptions } from '../api'
+import type { CompareTask, CompareReport, CompareOptions, CreateCompareRequest } from '../api'
 import ConnectionForm from '../components/ConnectionForm.vue'
 import DataSourcePicker from '../components/DataSourcePicker.vue'
 import PageHeader from '../components/PageHeader.vue'
@@ -45,7 +45,87 @@ const compareModes = [
   { value: 'quick', label: '快速', color: '#0fa3a3', desc: '仅行数估算，最快' },
   { value: 'sample', label: '采样', color: '#2c4a8f', desc: '行数+随机采样（推荐）' },
   { value: 'checksum', label: '校验', color: '#d97e00', desc: '行数+分块Hash' },
+  { value: 'watermark', label: '水位', color: '#7a4fd3', desc: '按水位列过滤后比对' },
 ]
+
+// ---- #t3 watermark filter group ----
+// "水位" is a filter DIMENSION, not a fourth algorithm: picking the card
+// reveals a config area with the underlying algorithm (base_mode), the
+// unified watermark column, the comparison operator and a type-aware value.
+const wmConfig = reactive({
+  base_mode: 'checksum',
+  column: '',
+  op: '<=',
+  value: '',
+})
+const wmBaseModes = [
+  { value: 'quick', label: '快速（行数）' },
+  { value: 'sample', label: '采样' },
+  { value: 'checksum', label: '校验（推荐）' },
+]
+const wmCommonColumns = ref<{ name: string; data_type: string; indexed: boolean }[]>([])
+const wmLoadingCols = ref(false)
+
+async function loadWmColumns() {
+  if (!sourceRef.value) {
+    ElMessage.warning('手填连接模式下请直接输入水位列名（运行期会逐表校验）')
+    return
+  }
+  if (selectedTables.value.length === 0) {
+    ElMessage.warning('请先选择表，再获取共用水位列')
+    return
+  }
+  wmLoadingCols.value = true
+  try {
+    const { data } = await apiClient.columnsBatch(sourceRef.value, selectedTables.value)
+    let inter: Map<string, { data_type: string; indexed: boolean }> | null = null
+    for (const t of (data.tables || [])) {
+      if (t.error) continue
+      const m = new Map<string, { data_type: string; indexed: boolean }>()
+      for (const c of (t.columns || [])) if (c.comparable) m.set(c.name, { data_type: c.data_type, indexed: c.indexed })
+      if (inter === null) inter = m
+      else for (const k of [...inter.keys()]) if (!m.has(k)) inter.delete(k)
+    }
+    wmCommonColumns.value = inter ? [...inter.entries()].map(([name, v]) => ({ name, ...v })) : []
+    if (wmCommonColumns.value.length === 0) {
+      ElMessage.warning('所选表没有可比类型的共用水位列（交集为空），请手输列名或调整表选择')
+    }
+  } catch (e: any) {
+    ElMessage.error(`获取共用水位列失败: ${e.response?.data?.error || e.message}`)
+  } finally {
+    wmLoadingCols.value = false
+  }
+}
+
+const wmSelectedCol = computed(() => wmCommonColumns.value.find(c => c.name === wmConfig.column))
+const wmKind = computed<'datetime' | 'date' | 'int' | 'text'>(() => {
+  const dt = wmSelectedCol.value?.data_type || ''
+  if (dt.includes('timestamp')) return 'datetime'
+  if (dt === 'date') return 'date'
+  if (dt === 'integer' || dt === 'bigint') return 'int'
+  return 'text'
+})
+const wmIsTimestamptz = computed(() => (wmSelectedCol.value?.data_type || '').includes('time zone'))
+
+// 手填模式（无 columns-batch 元数据）时按值形态推断控件。
+const wmKindInferred = computed(() => {
+  if (wmSelectedCol.value) return wmKind.value
+  if (/^\d+$/.test(wmConfig.value)) return 'int'
+  if (/^\d{4}-\d{2}-\d{2}$/.test(wmConfig.value)) return 'date'
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(wmConfig.value)) return 'datetime'
+  return 'text'
+})
+
+function validateWmValue(): string {
+  const v = wmConfig.value.trim()
+  if (!v) return '请填写水位值'
+  if (wmKindInferred.value === 'int' && !/^-?\d+$/.test(v)) return '整数水位列的值必须是整数'
+  if (wmKindInferred.value === 'datetime' && !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v)) return '时间水位格式应为 YYYY-MM-DD HH:mm:ss'
+  if (wmKindInferred.value === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(v)) return '日期水位格式应为 YYYY-MM-DD'
+  const t = Date.parse(v.replace(' ', 'T') + (wmIsTimestamptz.value ? 'Z' : ''))
+  if (!Number.isNaN(t) && t > Date.now()) return '水位值晚于当前时间，两侧可能都比不出任何行'
+  return ''
+}
 
 // ---- table selection ----
 const availableTables = ref<{ name: string; row_estimate: number }[]>([])
@@ -180,7 +260,17 @@ const optionsLoaded = ref(false)
 function applyCompareOptions(opts: CompareOptions) {
   if (!opts) return
   // Connection fields in the payload (legacy saves) are intentionally ignored.
-  if (opts.mode && ['quick', 'sample', 'checksum'].includes(opts.mode)) form.mode = opts.mode
+  // #t3: a saved watermark group restores the "水位" card + its config.
+  if (opts.watermark) {
+    const w = opts.watermark
+    wmConfig.base_mode = ['quick', 'sample', 'checksum'].includes(w.base_mode) ? w.base_mode : 'checksum'
+    wmConfig.column = w.column || ''
+    wmConfig.op = w.op === '<' ? '<' : '<='
+    wmConfig.value = w.value || ''
+    form.mode = 'watermark'
+  } else if (opts.mode && ['quick', 'sample', 'checksum'].includes(opts.mode)) {
+    form.mode = opts.mode
+  }
   const num = (v: number | undefined) => (v !== undefined && v !== null ? v : null)
   const sr = num(opts.sample_ratio); if (sr !== null) form.sample_ratio = sr
   const cs = num(opts.checksum_chunk_size); if (cs !== null) form.checksum_chunk_size = cs
@@ -204,11 +294,15 @@ async function loadSavedConnection() {
 async function saveCompareParams() {
   try {
     await apiClient.saveCompareOptions({
-      mode: form.mode,
+      mode: form.mode === 'watermark' ? wmConfig.base_mode : form.mode,
       sample_ratio: form.sample_ratio,
       checksum_chunk_size: form.checksum_chunk_size,
       checksum_parallel: form.checksum_parallel,
       parallel: form.parallel,
+      // present-and-null clears (partial-merge by presence)
+      watermark: form.mode === 'watermark'
+        ? { column: wmConfig.column, value: wmConfig.value, op: wmConfig.op, base_mode: wmConfig.base_mode }
+        : null,
     } as any)
   } catch {
     // Silent memory: a failed save must never disturb the running compare.
@@ -288,18 +382,38 @@ async function startCompare() {
   }
   starting.value = true
   try {
+    // #t3: the "水位" card maps to mode=base_mode + watermark group.
+    let watermark: CreateCompareRequest['watermark']
+    let mode = form.mode
+    if (form.mode === 'watermark') {
+      wmConfig.column = wmConfig.column.trim()
+      if (!wmConfig.column) {
+        ElMessage.warning('请填写水位列名')
+        starting.value = false
+        return
+      }
+      const verr = validateWmValue()
+      if (verr) {
+        ElMessage.warning(`水位值：${verr}`)
+        starting.value = false
+        return
+      }
+      watermark = { column: wmConfig.column, value: wmConfig.value.trim(), op: wmConfig.op, base_mode: wmConfig.base_mode }
+      mode = wmConfig.base_mode
+    }
     const { data } = await apiClient.createCompare({
       name: form.name || `Compare ${new Date().toLocaleString()}`,
       source_ref: sourceRef.value || undefined,
       target_ref: targetRef.value || undefined,
       source: { ...form.source, type: effectiveSourceType.value },
       target: { ...form.target },
-      mode: form.mode,
+      mode,
       sample_ratio: form.sample_ratio,
       checksum_chunk_size: form.checksum_chunk_size,
       checksum_parallel: form.checksum_parallel,
       parallel: form.parallel,
       tables: selectedTables.value,
+      watermark,
     })
     activeTask.value = data
     activeReport.value = null
@@ -639,9 +753,48 @@ onUnmounted(() => {
             </div>
           </div>
         </el-form-item>
-        <el-form-item v-if="form.mode === 'sample'" label="采样率">
+        <el-form-item v-if="form.mode === 'sample' || (form.mode === 'watermark' && wmConfig.base_mode === 'sample')" label="采样率">
           <el-input-number v-model="form.sample_ratio" :min="0.001" :max="1" :step="0.01" />
         </el-form-item>
+        <el-form-item v-if="form.mode === 'checksum' || (form.mode === 'watermark' && wmConfig.base_mode === 'checksum')" label="分块大小">
+          <el-input-number v-model="form.checksum_chunk_size" :min="1000" :step="10000" />
+        </el-form-item>
+        <el-form-item v-if="form.mode === 'checksum' || (form.mode === 'watermark' && wmConfig.base_mode === 'checksum')" label="并行数">
+          <el-input-number v-model="form.checksum_parallel" :min="1" :max="32" />
+        </el-form-item>
+        <template v-if="form.mode === 'watermark'">
+          <el-form-item label="底层算法">
+            <el-radio-group v-model="wmConfig.base_mode">
+              <el-radio v-for="m in wmBaseModes" :key="m.value" :value="m.value">{{ m.label }}</el-radio>
+            </el-radio-group>
+          </el-form-item>
+          <el-form-item label="水位列">
+            <div style="width: 100%;">
+              <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                <el-select v-if="wmCommonColumns.length" v-model="wmConfig.column" filterable placeholder="所选表共有可比列" style="width: 300px;">
+                  <el-option v-for="c in wmCommonColumns" :key="c.name" :value="c.name"
+                             :label="`${c.name}（${c.data_type}${c.indexed ? '' : ' · 无索引'}）`" />
+                </el-select>
+                <el-input v-else v-model="wmConfig.column" placeholder="水位列名（如 updated_at）" style="width: 300px;" />
+                <el-button size="small" :loading="wmLoadingCols" :disabled="!sourceRef" @click="loadWmColumns">获取共用水位列</el-button>
+                <el-select v-model="wmConfig.op" style="width: 90px;">
+                  <el-option value="<=" label="≤（含边界）" />
+                  <el-option value="<" label="<（严格）" />
+                </el-select>
+                <el-date-picker v-if="wmKindInferred === 'datetime'" v-model="wmConfig.value" type="datetime"
+                                value-format="YYYY-MM-DD HH:mm:ss" placeholder="水位值 YYYY-MM-DD HH:mm:ss" style="width: 230px;" />
+                <el-date-picker v-else-if="wmKindInferred === 'date'" v-model="wmConfig.value" type="date"
+                                value-format="YYYY-MM-DD" placeholder="水位值 YYYY-MM-DD" style="width: 230px;" />
+                <el-input v-else v-model="wmConfig.value" placeholder="水位值" style="width: 230px;" />
+              </div>
+              <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-top: 6px;">
+                两端按同一条件过滤后比对，消除「源端持续写入+同步滞后」的永久差异假象；NULL 水位行两端一致排除。
+                <span v-if="wmIsTimestamptz" style="color: var(--tims-tag-warning-text);">timestamptz 列请输入 UTC 时间。</span>
+                <span v-if="wmSelectedCol && !wmSelectedCol.indexed" style="color: var(--tims-tag-warning-text);">该列无索引，过滤可能全表扫描。</span>
+              </div>
+            </div>
+          </el-form-item>
+        </template>
         <el-form-item v-if="form.mode === 'checksum'" label="分块大小">
           <el-input-number v-model="form.checksum_chunk_size" :min="1000" :step="10000" />
         </el-form-item>
@@ -760,7 +913,10 @@ onUnmounted(() => {
         <el-table-column prop="id" label="ID" width="90" />
         <el-table-column prop="name" label="名称" min-width="160" />
         <el-table-column label="模式" width="90">
-          <template #default="{ row }">{{ row.mode }}</template>
+          <template #default="{ row }">
+            <span>{{ row.mode }}</span>
+            <el-tag v-if="row.watermark" size="small" type="warning" style="margin-left: 4px;">水位</el-tag>
+          </template>
         </el-table-column>
         <el-table-column label="状态" width="90">
           <template #default="{ row }">

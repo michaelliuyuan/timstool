@@ -61,6 +61,23 @@ type CompareConfig struct {
 
 	// ChecksumParallel for checksum mode: number of concurrent chunks.
 	ChecksumParallel int `yaml:"checksum_parallel" json:"checksumParallel"`
+
+	// Watermark scopes the comparison to rows whose watermark column is
+	// within bounds on BOTH sides (#t3), eliminating the permanent-diff
+	// illusion caused by ongoing source writes + sync lag. nil = unfiltered
+	// (zero regression for CLI / migration pipeline paths).
+	Watermark *WatermarkFilter `yaml:"watermark,omitempty" json:"watermark,omitempty"`
+}
+
+// WatermarkFilter is the compare-side watermark filter group. Column passes
+// an identifier allow-list; Value is ALWAYS bound as a query parameter
+// (never concatenated). Timestamptz values follow the UTC input convention
+// (the PG session is forced to UTC while a filter is active).
+type WatermarkFilter struct {
+	Column   string `yaml:"column" json:"column"`
+	Value    string `yaml:"value" json:"value"`
+	Op       string `yaml:"op" json:"op"`               // "<=" (default) | "<"
+	BaseMode string `yaml:"base_mode" json:"base_mode"` // quick | sample | checksum (default checksum)
 }
 
 type SourceConfig struct {

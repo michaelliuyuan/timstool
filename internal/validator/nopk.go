@@ -163,8 +163,15 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 	}
 
 	// Query TiDB for the full table first so we can build a unified skip set.
-	tidbQuery := fmt.Sprintf("SELECT * FROM %s", quoteMySQL(table))
-	tidbRows, err := tidbConn.QueryContext(ctx, tidbQuery)
+	var tidbRows *sql.Rows
+	var err error
+	if wm := v.wmFilter(); wm != nil {
+		tidbRows, err = tidbConn.QueryContext(ctx,
+			fmt.Sprintf("SELECT * FROM %s WHERE %s", quoteMySQL(table), wmWhereMySQL(wm)), wm.Value)
+	} else {
+		tidbRows, err = tidbConn.QueryContext(ctx,
+			fmt.Sprintf("SELECT * FROM %s", quoteMySQL(table)))
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("hash group: query TiDB: %v", err)
@@ -493,8 +500,15 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 	pgAggregate := fmt.Sprintf("%x", md5.Sum([]byte(strings.Join(pgHashes, ","))))
 
 	// Query TiDB full table
-	tidbQuery := fmt.Sprintf("SELECT * FROM %s", quoteMySQL(table))
-	tidbRows, err := tidbConn.QueryContext(ctx, tidbQuery)
+	var tidbRows *sql.Rows
+	var err error
+	if wm := v.wmFilter(); wm != nil {
+		tidbRows, err = tidbConn.QueryContext(ctx,
+			fmt.Sprintf("SELECT * FROM %s WHERE %s", quoteMySQL(table), wmWhereMySQL(wm)), wm.Value)
+	} else {
+		tidbRows, err = tidbConn.QueryContext(ctx,
+			fmt.Sprintf("SELECT * FROM %s", quoteMySQL(table)))
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("aggregate hash: query TiDB: %v", err)
@@ -606,8 +620,15 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 	}
 
 	// Query TiDB full table and assign to buckets
-	tidbQuery := fmt.Sprintf("SELECT * FROM %s", quoteMySQL(table))
-	tidbRows, err := tidbConn.QueryContext(ctx, tidbQuery)
+	var tidbRows *sql.Rows
+	var err error
+	if wm := v.wmFilter(); wm != nil {
+		tidbRows, err = tidbConn.QueryContext(ctx,
+			fmt.Sprintf("SELECT * FROM %s WHERE %s", quoteMySQL(table), wmWhereMySQL(wm)), wm.Value)
+	} else {
+		tidbRows, err = tidbConn.QueryContext(ctx,
+			fmt.Sprintf("SELECT * FROM %s", quoteMySQL(table)))
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("bucket compare: query TiDB: %v", err)

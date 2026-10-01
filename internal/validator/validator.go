@@ -140,7 +140,15 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 
 	rpt := reporter.NewReport("data-validation")
 
-	pgDB, err := sql.Open("pgx", v.sourceDSN())
+	// #t3: while a watermark filter is active the PG session runs in UTC so
+	// timestamptz literals compare symmetrically with the TiDB UTC session.
+	pgDSN := v.sourceDSN()
+	wm := v.wmFilter()
+	if wm != nil {
+		pgDSN = appendPGDSNUTC(pgDSN)
+	}
+
+	pgDB, err := sql.Open("pgx", pgDSN)
 	if err != nil {
 		return nil, cerrors.Wrap(cerrors.ErrSourceConnect, "connect to PostgreSQL", err)
 	}
@@ -196,6 +204,23 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 			defer tidbConn.Close()
 
 			var tr reporter.TableReport
+			if wm != nil {
+				if werr := checkWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), tableName, wm); werr != nil {
+					tr = reporter.TableReport{
+						TableName: tableName,
+						Status:    reporter.StatusFail,
+						Error:     werr.Error(),
+					}
+					mu.Lock()
+					rpt.AddTableReport(tr)
+					mu.Unlock()
+					if v.onTableDone != nil {
+						done := int(atomic.AddInt32(&tablesDone, 1))
+						v.onTableDone(done, len(tables), tr)
+					}
+					return
+				}
+			}
 			switch mode {
 			case "quick":
 				tr = v.validateRowCount(ctx, pgDB, tidbConn, tableName)
@@ -211,6 +236,19 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 					TableName: tableName,
 					Status:    reporter.StatusFail,
 					Error:     fmt.Sprintf("unknown validation mode: %s", mode),
+				}
+			}
+
+			// #t3: stamp the watermark scope on every table report
+			// (SourceRows/TargetRows are already the filtered counts —
+			// validateRowCount runs first in every mode).
+			if wm != nil {
+				note := fmt.Sprintf("水位过滤 %s %s %s（源 %d 行/目标 %d 行）",
+					wm.Column, wmOp(wm), wm.Value, tr.SourceRows, tr.TargetRows)
+				if tr.Suggestion == "" {
+					tr.Suggestion = note
+				} else {
+					tr.Suggestion = note + "；" + tr.Suggestion
 				}
 			}
 
@@ -266,8 +304,16 @@ func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn
 	}
 
 	var sourceCount int64
-	err := pgDB.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", quotePG(schema), quotePG(table))).Scan(&sourceCount)
+	var err error
+	wm := v.wmFilter()
+	if wm != nil {
+		err = pgDB.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s WHERE %s",
+				quotePG(schema), quotePG(table), wmWherePG(wm)), wm.Value).Scan(&sourceCount)
+	} else {
+		err = pgDB.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", quotePG(schema), quotePG(table))).Scan(&sourceCount)
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("source count: %v", err)
@@ -275,8 +321,14 @@ func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn
 	}
 
 	var targetCount int64
-	err = tidbConn.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteMySQL(table))).Scan(&targetCount)
+	if wm != nil {
+		err = tidbConn.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s",
+				quoteMySQL(table), wmWhereMySQL(wm)), wm.Value).Scan(&targetCount)
+	} else {
+		err = tidbConn.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteMySQL(table))).Scan(&targetCount)
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("target count: %v", err)
@@ -364,9 +416,17 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 
 	offset := rand.Int63n(tr.SourceRows - int64(sampleSize) + 1)
 
-	pgQuery := fmt.Sprintf("SELECT * FROM %s.%s ORDER BY 1 LIMIT %d OFFSET %d",
-		quotePG(schema), quotePG(table), sampleSize, offset)
-	pgRows, err := pgDB.QueryContext(ctx, pgQuery)
+	wm := v.wmFilter()
+	var pgRows *sql.Rows
+	if wm != nil {
+		pgQuery := fmt.Sprintf("SELECT * FROM %s.%s WHERE %s ORDER BY 1 LIMIT %d OFFSET %d",
+			quotePG(schema), quotePG(table), wmWherePG(wm), sampleSize, offset)
+		pgRows, err = pgDB.QueryContext(ctx, pgQuery, wm.Value)
+	} else {
+		pgQuery := fmt.Sprintf("SELECT * FROM %s.%s ORDER BY 1 LIMIT %d OFFSET %d",
+			quotePG(schema), quotePG(table), sampleSize, offset)
+		pgRows, err = pgDB.QueryContext(ctx, pgQuery)
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("sample source: %v", err)
@@ -479,6 +539,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 	if len(keyColIndices) > 0 {
 		isCompositePK := len(keyColIndices) > 1
 		var tidbQuery string
+		var tidbArgs []interface{}
 
 		if isCompositePK {
 			var colNames []string
@@ -506,6 +567,10 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 			}
 			tidbQuery = fmt.Sprintf("SELECT * FROM %s WHERE (%s) IN (%s)",
 				quoteMySQL(table), strings.Join(colNames, ","), strings.Join(tupleParts, ","))
+			if wm != nil {
+				tidbQuery += fmt.Sprintf(" AND %s", wmWhereMySQL(wm))
+				tidbArgs = []interface{}{wm.Value}
+			}
 		} else {
 			keyColName := pgCols[keyColIndices[0]].Name()
 			var whereParts []string
@@ -525,9 +590,18 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 			}
 			tidbQuery = fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s)",
 				quoteMySQL(table), quoteMySQL(keyColName), strings.Join(whereParts, ","))
+			if wm != nil {
+				tidbQuery += fmt.Sprintf(" AND %s", wmWhereMySQL(wm))
+				tidbArgs = []interface{}{wm.Value}
+			}
 		}
 
-		tidbRows, err := tidbConn.QueryContext(ctx, tidbQuery)
+		var tidbRows *sql.Rows
+		if len(tidbArgs) > 0 {
+			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery, tidbArgs...)
+		} else {
+			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery)
+		}
 		if err != nil {
 			tr.Status = reporter.StatusFail
 			tr.Error = fmt.Sprintf("sample target: %v", err)
@@ -720,9 +794,16 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 	} else {
 		// Fallback for NULL first column: use positional comparison
 		// (less reliable but necessary when key column is NULL)
-		tidbQuery := fmt.Sprintf("SELECT * FROM %s LIMIT %d OFFSET %d",
-			quoteMySQL(table), sampleSize, offset)
-		tidbRows, err := tidbConn.QueryContext(ctx, tidbQuery)
+		var tidbRows *sql.Rows
+		if wm != nil {
+			tidbQuery := fmt.Sprintf("SELECT * FROM %s WHERE %s LIMIT %d OFFSET %d",
+				quoteMySQL(table), wmWhereMySQL(wm), sampleSize, offset)
+			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery, wm.Value)
+		} else {
+			tidbQuery := fmt.Sprintf("SELECT * FROM %s LIMIT %d OFFSET %d",
+				quoteMySQL(table), sampleSize, offset)
+			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery)
+		}
 		if err != nil {
 			tr.Status = reporter.StatusFail
 			tr.Error = fmt.Sprintf("sample target: %v", err)
@@ -792,9 +873,15 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 
 	// Hash group is an exact strategy 鈥?query the full PG table, not a sample.
 	// Sampling would cause mismatches because TiDB is also queried in full.
-	pgQuery := fmt.Sprintf("SELECT * FROM %s.%s",
-		quotePG(schema), quotePG(table))
-	pgRows, err := pgDB.QueryContext(ctx, pgQuery)
+	var pgRows *sql.Rows
+	var err error
+	if wm := v.wmFilter(); wm != nil {
+		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
+			quotePG(schema), quotePG(table), wmWherePG(wm)), wm.Value)
+	} else {
+		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
+			quotePG(schema), quotePG(table)))
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("sample source (no-PK): %v", err)
@@ -848,8 +935,15 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 
 // validateNoPKWithAggregate wraps full-table PG query + aggregate hash validation.
 func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, tr reporter.TableReport, schema string) reporter.TableReport {
-	pgQuery := fmt.Sprintf("SELECT * FROM %s.%s", quotePG(schema), quotePG(table))
-	pgRows, err := pgDB.QueryContext(ctx, pgQuery)
+	var pgRows *sql.Rows
+	var err error
+	if wm := v.wmFilter(); wm != nil {
+		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
+			quotePG(schema), quotePG(table), wmWherePG(wm)), wm.Value)
+	} else {
+		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
+			quotePG(schema), quotePG(table)))
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("aggregate hash: query PG: %v", err)
@@ -897,8 +991,15 @@ func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB,
 
 // validateNoPKWithBucket wraps full-table PG query + bucket validation.
 func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, tr reporter.TableReport, schema string) reporter.TableReport {
-	pgQuery := fmt.Sprintf("SELECT * FROM %s.%s", quotePG(schema), quotePG(table))
-	pgRows, err := pgDB.QueryContext(ctx, pgQuery)
+	var pgRows *sql.Rows
+	var err error
+	if wm := v.wmFilter(); wm != nil {
+		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
+			quotePG(schema), quotePG(table), wmWherePG(wm)), wm.Value)
+	} else {
+		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
+			quotePG(schema), quotePG(table)))
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("bucket compare: query PG: %v", err)
