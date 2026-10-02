@@ -17,6 +17,11 @@ import (
 
 	"github.com/michaelliuyuan/timstool/internal/common/checkpoint"
 	"github.com/michaelliuyuan/timstool/internal/store"
+
+	// MS-01: capability gates read the source registry, so tests need the
+	// real adapters registered (production gets them from main.go).
+	_ "github.com/michaelliuyuan/timstool/internal/source/mysql"
+	_ "github.com/michaelliuyuan/timstool/internal/source/postgres"
 )
 
 // emptyFS satisfies the embed.FS parameter of NewServer for tests.

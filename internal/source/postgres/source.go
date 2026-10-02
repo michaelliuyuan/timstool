@@ -32,11 +32,14 @@ func init() {
 // (common + source groups; advanced deferred — doc multi-source-web-form-design
 // §5/§7). Labels mirror the legacy PG form for zero visual regression (§9).
 var postgresMeta = source.SourceMeta{
-	Name:         "postgres",
-	DisplayName:  "PostgreSQL",
-	Implemented:  true,
-	DefaultPort:  5432,
-	Capabilities: source.Capabilities{Schema: true, Data: true, CDC: true},
+	Name:        "postgres",
+	DisplayName: "PostgreSQL",
+	Implemented: true,
+	DefaultPort: 5432,
+	Capabilities: source.Capabilities{
+		Schema: true, Data: true, CDC: true,
+		Compare: true, Watermark: true, Assess: true, DDLExport: true,
+	},
 	Fields: []source.FieldSpec{
 		{Key: "host", Label: "主机地址", Type: "text", Required: true, Default: "localhost", Placeholder: "localhost", Group: "common"},
 		{Key: "port", Label: "端口", Type: "number", Required: true, Default: 5432, Group: "common"},

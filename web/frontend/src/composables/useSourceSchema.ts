@@ -1,5 +1,5 @@
 import { ref } from 'vue'
-import type { SourceMeta } from './sourceTypes'
+import type { SourceMeta, Capabilities } from './sourceTypes'
 import apiClient from '../api'
 
 // Module-level cache: GET /api/v1/sources once per page load (doc §7.3). The
@@ -28,5 +28,20 @@ export function useSourceSchema() {
     return byName.value[name]
   }
 
-  return { sources, load, getSource }
+  // MS-01 single truth for UI greying: read the capability matrix, not the
+  // raw type string. Legacy default: a missing/empty kind is postgres with
+  // ALL capabilities (old datasource profiles stay fully enabled).
+  function capable(name: string, cap: keyof Capabilities): boolean {
+    const meta = byName.value[name]
+    if (!meta) return name === '' || name === 'postgres'
+    return meta.capabilities?.[cap] === true
+  }
+
+  // Implemented source kinds for pickers (target-side tidb is excluded — it
+  // lives in the datasource registry, not the source registry).
+  function implementedKinds(): string[] {
+    return sources.value.filter(s => s.implemented).map(s => s.name)
+  }
+
+  return { sources, load, getSource, capable, implementedKinds }
 }

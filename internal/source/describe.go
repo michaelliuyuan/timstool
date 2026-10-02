@@ -29,11 +29,85 @@ type Option struct {
 	Value string `json:"value"`
 }
 
-// Capabilities declares what a source adapter can do.
+// Capabilities declares what a source adapter can do. MS-01 extends the
+// original {schema, data, cdc} trio with function-level bits (compare /
+// watermark / assess / ddl_export) so the UI and the API 400-guards can read
+// ONE truth instead of scattering `type != "postgres"` branches (five-pin
+// architecture v1.0: capability bit is the single truth; the source registry
+// is the only place allowed to branch on type).
 type Capabilities struct {
-	Schema bool `json:"schema"` // can read schema
-	Data   bool `json:"data"`   // can full-export data
-	CDC    bool `json:"cdc"`    // can incremental (PG=true; MySQL CDC deferred)
+	Schema    bool `json:"schema"`     // can read schema
+	Data      bool `json:"data"`       // can full-export data
+	CDC       bool `json:"cdc"`        // can incremental (PG=true; MySQL CDC deferred)
+	Compare   bool `json:"compare"`    // usable as the compare feature's source side
+	Watermark bool `json:"watermark"`  // watermark backfill / incremental sync
+	Assess    bool `json:"assess"`     // compatibility assessment ruleset
+	DDLExport bool `json:"ddl_export"` // DDL export
+}
+
+// Capability is the typed name of one capability bit (single truth: UI
+// greying, backend 400 guards and capability queries all go through Capable).
+type Capability string
+
+const (
+	CapSchema    Capability = "schema"
+	CapData      Capability = "data"
+	CapCDC       Capability = "cdc"
+	CapCompare   Capability = "compare"
+	CapWatermark Capability = "watermark"
+	CapAssess    Capability = "assess"
+	CapDDLExport Capability = "ddl_export"
+)
+
+// NormalizeKind resolves a source kind with the single legacy default:
+// ""/missing means "postgres" (zero-regression: existing datasource profiles
+// and task configs without a type stay PG). A non-empty unknown kind is an
+// error — never silently downgraded.
+func NormalizeKind(kind string) (string, error) {
+	if kind == "" {
+		return "postgres", nil
+	}
+	metaMu.RLock()
+	_, ok := metaRegistry[kind]
+	metaMu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("source: unknown source %q (described: %v)", kind, Described())
+	}
+	return kind, nil
+}
+
+// Capable reports whether the (normalized) source kind has the capability bit
+// set. It is the single truth for UI greying and backend 400 double-guarding;
+// callers must not branch on the raw type string themselves.
+func Capable(kind string, c Capability) (bool, error) {
+	k, err := NormalizeKind(kind)
+	if err != nil {
+		return false, err
+	}
+	metaMu.RLock()
+	m, ok := metaRegistry[k]
+	metaMu.RUnlock()
+	if !ok {
+		return false, fmt.Errorf("source: unknown source %q", k)
+	}
+	switch c {
+	case CapSchema:
+		return m.Capabilities.Schema, nil
+	case CapData:
+		return m.Capabilities.Data, nil
+	case CapCDC:
+		return m.Capabilities.CDC, nil
+	case CapCompare:
+		return m.Capabilities.Compare, nil
+	case CapWatermark:
+		return m.Capabilities.Watermark, nil
+	case CapAssess:
+		return m.Capabilities.Assess, nil
+	case CapDDLExport:
+		return m.Capabilities.DDLExport, nil
+	default:
+		return false, fmt.Errorf("source: unknown capability %q", c)
+	}
 }
 
 // SourceMeta is a source's complete connection description. It drives both the

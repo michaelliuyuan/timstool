@@ -13,10 +13,19 @@ import { reconcileModel } from '../composables/reconcileModel'
 // Standalone data comparison (独立数据比对): configure source + target, pick
 // tables and a compare mode, run the validator directly — no migration.
 
-const { sources, load: loadSources, getSource } = useSourceSchema()
+const { sources, load: loadSources, getSource, capable, implementedKinds } = useSourceSchema()
 const { load: loadDataSources, get: getDataSource } = useDataSources()
 const sourceType = ref('postgres')
 const currentMeta = computed(() => getSource(sourceType.value))
+
+// MS-01 示范落位: the compare capability bit drives UI greying (single truth
+// with the backend 400 guard — source.Capable). PG is unaffected (bit=true);
+// a mysql profile is selectable but visibly gated.
+const sourceCompareCapable = computed(() => capable(effectiveSourceType.value, 'compare'))
+const comparePickerTypes = computed(() => {
+  const kinds = implementedKinds().filter(k => k !== 'tidb')
+  return kinds.length > 0 ? kinds : ['postgres']
+})
 
 // F-02 datasource refs ('' = manual entry).
 const sourceRef = ref('')
@@ -695,9 +704,9 @@ onUnmounted(() => {
       <el-form label-width="120px" :disabled="!optionsLoaded" v-loading="!optionsLoaded">
         <el-row :gutter="24">
           <el-col :span="12">
-            <el-divider content-position="left">源数据库（PostgreSQL）</el-divider>
+            <el-divider content-position="left">源数据库（{{ effectiveSourceType === 'postgres' ? 'PostgreSQL' : effectiveSourceType }}）</el-divider>
             <el-form-item label="数据源">
-              <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
+              <DataSourcePicker v-model="sourceRef" :types="comparePickerTypes" />
             </el-form-item>
             <template v-if="!sourceRef">
             <el-form-item label="数据源类型" v-if="sources.length > 0">
@@ -746,9 +755,12 @@ onUnmounted(() => {
           <div style="display: flex; gap: 12px; flex-wrap: wrap;">
             <div
               v-for="m in compareModes" :key="m.value"
-              @click="form.mode = m.value"
+              @click="sourceCompareCapable && (form.mode = m.value)"
               :style="{
-                padding: '10px 16px', borderRadius: '8px', cursor: 'pointer', textAlign: 'center',
+                padding: '10px 16px', borderRadius: '8px',
+                cursor: sourceCompareCapable ? 'pointer' : 'not-allowed',
+                opacity: sourceCompareCapable ? 1 : 0.45,
+                textAlign: 'center',
                 border: form.mode === m.value ? '2px solid ' + m.color : '2px solid #dcdfe6',
                 background: form.mode === m.value ? m.color + '10' : '#fff',
               }"
@@ -757,6 +769,11 @@ onUnmounted(() => {
               <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2);">{{ m.desc }}</div>
             </div>
           </div>
+          <el-alert
+            v-if="!sourceCompareCapable"
+            type="warning" :closable="false" style="margin-top: 8px; width: 100%;"
+            :title="`当前源类型（${effectiveSourceType}）暂不支持数据比对，等待多源化任务（MS-08）接入后开放`"
+          />
         </el-form-item>
         <el-form-item v-if="form.mode === 'sample' || (form.mode === 'watermark' && wmConfig.base_mode === 'sample')" label="采样率">
           <el-input-number v-model="form.sample_ratio" :min="0.001" :max="1" :step="0.01" />
@@ -830,7 +847,7 @@ onUnmounted(() => {
         </el-form-item>
 
         <el-form-item>
-          <el-button type="primary" :loading="starting" @click="startCompare">
+          <el-button type="primary" :loading="starting" :disabled="!sourceCompareCapable" @click="startCompare">
             开始比对
           </el-button>
         </el-form-item>

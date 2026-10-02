@@ -15,9 +15,26 @@ import (
 
 // handleSources lists all registered sources' metadata for the Web selector +
 // schema-driven form (doc multi-source-web-form-design §6.1). Does not open any
-// connection, so stubs are described too.
+// connection, so stubs are described too. MS-01: the payload now carries the
+// function-level capability matrix (additive JSON — old consumers ignore it).
 func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"sources": source.DescribeAll()})
+}
+
+// requireCapability is the backend 400 double-guard (MS-01, five-pin #2/#4):
+// it reads the SINGLE truth — the registry's capability bit via source.Capable
+// — instead of branching on the raw type string. Returns false (response
+// already written) when the kind is unknown or the bit is off.
+func (s *Server) requireCapability(w http.ResponseWriter, kind string, c source.Capability, msg string) bool {
+	ok, err := source.Capable(kind, c)
+	if err != nil || !ok {
+		// Unknown kinds (e.g. a target-side "tidb" profile used as a source)
+		// and capability-off kinds get the same feature-level 400 — the
+		// message names the supported source, not the registry internals.
+		s.writeError(w, http.StatusBadRequest, msg)
+		return false
+	}
+	return true
 }
 
 // handleSourceConfigSchema returns the connection-form fields for a source type.
@@ -52,8 +69,11 @@ type versioner interface {
 // {success, message, version} result map; stubs get a friendly "not implemented"
 // without a real connection attempt.
 func (s *Server) testSource(ctx context.Context, srcType string, fields map[string]any) map[string]interface{} {
-	if srcType == "" {
-		srcType = "postgres"
+	// MS-01: legacy "" default unified into source.NormalizeKind (single
+	// truth for the "type missing = postgres" rule).
+	srcType, err := source.NormalizeKind(srcType)
+	if err != nil {
+		return map[string]interface{}{"source": srcType, "success": false, "message": err.Error()}
 	}
 	result := map[string]interface{}{"source": srcType}
 
@@ -170,9 +190,11 @@ func (s *Server) handleSourceTables(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	srcType := req.Source
-	if srcType == "" {
-		srcType = "postgres"
+	// MS-01: legacy "" default unified into source.NormalizeKind.
+	srcType, err := source.NormalizeKind(req.Source)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, err.Error())
+		return
 	}
 	// F-02: a source_ref overrides {source, fields} with the stored profile
 	// (server-side password resolution).

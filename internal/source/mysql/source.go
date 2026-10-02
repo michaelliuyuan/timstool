@@ -33,10 +33,13 @@ func init() {
 // doc §5/§7). MySQL has no PG-style schema (schema==database), which is why a
 // pg→mysql switch must drop the schema/sslmode keys.
 var mysqlMeta = source.SourceMeta{
-	Name:         "mysql",
-	DisplayName:  "MySQL",
-	Implemented:  true,
-	DefaultPort:  3306,
+	Name:        "mysql",
+	DisplayName: "MySQL",
+	Implemented: true,
+	DefaultPort: 3306,
+	// MS-01: compare/watermark/assess/ddl_export arrive with MS-08..MS-11;
+	// the bits stay false until then so the UI greys them out and the API
+	// 400-guards reject them (single truth, no scattered type branches).
 	Capabilities: source.Capabilities{Schema: true, Data: true, CDC: false},
 	Fields: []source.FieldSpec{
 		{Key: "host", Label: "主机地址", Type: "text", Required: true, Default: "localhost", Placeholder: "localhost", Group: "common"},

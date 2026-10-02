@@ -30,6 +30,7 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/common/version"
 	"github.com/michaelliuyuan/timstool/internal/lightning"
 	"github.com/michaelliuyuan/timstool/internal/orchestrator"
+	"github.com/michaelliuyuan/timstool/internal/source"
 	"github.com/michaelliuyuan/timstool/internal/store"
 	"go.uber.org/zap"
 )
@@ -1261,8 +1262,7 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 	// starts so the migration window's WAL is retained. Any failure aborts the
 	// start — better not to run than to silently lose the window.
 	if cfg.Migration.CDCChain {
-		if cfg.Source.SourceType() != "postgres" {
-			s.writeError(w, http.StatusBadRequest, "cdc_chain 仅支持 PostgreSQL 源端")
+		if !s.requireCapability(w, cfg.Source.SourceType(), source.CapCDC, "cdc_chain 仅支持 PostgreSQL 源端") {
 			return
 		}
 		lsn, reused, err := s.prepareCDCChain(&cfg)
@@ -2330,8 +2330,7 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 			return
 		}
-		if e.Type != "postgres" {
-			s.writeError(w, http.StatusBadRequest, "source_ref: 兼容评估仅支持 PostgreSQL 数据源")
+		if !s.requireCapability(w, e.Type, source.CapAssess, "source_ref: 兼容评估仅支持 PostgreSQL 数据源") {
 			return
 		}
 		sc := dataSourceToSourceConfig(e)

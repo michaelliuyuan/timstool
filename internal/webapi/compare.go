@@ -18,6 +18,7 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/common"
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/common/reporter"
+	"github.com/michaelliuyuan/timstool/internal/source"
 	"github.com/michaelliuyuan/timstool/internal/validator"
 	"go.uber.org/zap"
 )
@@ -390,11 +391,10 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 			return
 		}
-		if e.Type != "postgres" {
-			// The compare validator speaks the PG wire protocol only
-			// (SourceConfig.DSN is always postgresql://), so non-PG sources
-			// are rejected at the gate instead of failing at runtime (P2-3).
-			s.writeError(w, http.StatusBadRequest, "source_ref: 比对源端数据源类型必须是 postgres")
+		if !s.requireCapability(w, e.Type, source.CapCompare, "source_ref: 比对源端数据源类型必须是 postgres") {
+			// The compare validator's PG implementation is gated by the
+			// registry capability bit (MS-01 single truth); MySQL compare
+			// arrives with MS-08.
 			return
 		}
 		req.Source = dataSourceToSourceConfig(e)
@@ -415,10 +415,9 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "source and target host are required")
 		return
 	}
-	// P2-3 (inline path): non-PG source types are equally unsupported by the
-	// PG-wire-only validator — reject at the gate.
-	if req.Source.Type != "" && req.Source.Type != "postgres" {
-		s.writeError(w, http.StatusBadRequest, "source.type: 比对源端类型必须是 postgres")
+	// P2-3 (inline path): equally gated by the compare capability bit —
+	// Capable("") resolves the legacy default to postgres (MS-01).
+	if !s.requireCapability(w, req.Source.Type, source.CapCompare, "source.type: 比对源端类型必须是 postgres") {
 		return
 	}
 	wm, werr := normalizeWatermarkFilter(req.Watermark)
