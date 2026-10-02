@@ -29,7 +29,20 @@ if ($SkipStatic) { $faces = @($faces | Where-Object { $_ -ne 'static' }) }
 $needBlackBox = @($faces | Where-Object { $_ -ne 'static' }).Count -gt 0
 
 $cfg = Get-GateConfig -ConfigFile $ConfigFile
-Write-Host "pg-gate: faces=[$($faces -join ', ')] repo=$repoRoot"
+
+# anti-misconnect guard (ruling seq 117-1): black-box faces REFUSE to run
+# unless an explicit endpoint ack exists - env PG_GATE_ENDPOINT, or
+# gate.endpoint in the config file. Protects production/other isolation
+# instances from accidental fixture drops. Static face is unaffected.
+$endpointAck = [Environment]::GetEnvironmentVariable('PG_GATE_ENDPOINT')
+if ($null -eq $endpointAck -or $endpointAck.Trim() -eq '') { $endpointAck = "$($cfg.gate.endpoint)" }
+if ($needBlackBox -and ([string]::IsNullOrWhiteSpace("$endpointAck"))) {
+    Write-Host "pg-gate: RED - black-box faces need an explicit endpoint ack: set PG_GATE_ENDPOINT" `
+        "(e.g. 'iso-pg:5433/iso-tidb:4000') or gate.endpoint in the config - refusing to touch an unacknowledged database"
+    exit 1
+}
+
+Write-Host "pg-gate: faces=[$($faces -join ', ')] repo=$repoRoot endpoint=$endpointAck"
 
 $workDir = "$($Cfg.gate.workdir)"
 if ([string]::IsNullOrWhiteSpace($workDir)) {

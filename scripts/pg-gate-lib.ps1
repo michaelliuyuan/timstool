@@ -1,4 +1,4 @@
-# pg-gate-lib.ps1 - shared harness + the five black-box faces (MS-02).
+﻿# pg-gate-lib.ps1 - shared harness + the five black-box faces (MS-02).
 # PowerShell 5.1 compatible. Dot-sourced by pg-gate.ps1; not an entry point.
 # PRODUCTION CODE IS NEVER TOUCHED BY THIS FILE - it only builds, boots a
 # scratch instance and drives it over HTTP.
@@ -127,7 +127,7 @@ cdc:
   publication_name: "pg_gate_pub"
   conflict_strategy: "replace"
   sync_ddl: false
-  tables: ["$($Cfg.pg.schema).orders", "$($Cfg.pg.schema).orders_bulk"]
+  tables: ["$($Cfg.pg.schema).pggate_orders", "$($Cfg.pg.schema).pggate_orders_bulk"]
   checkpoint_file: "$checkpoint"
 "@
     $cfgYaml = Join-Path $WorkDir 'gate-config.yaml'
@@ -198,21 +198,21 @@ function New-PGFixture {
     Invoke-Psql $Cfg @"
 DROP SCHEMA IF EXISTS $($Cfg.pg.schema) CASCADE;
 CREATE SCHEMA $($Cfg.pg.schema);
-CREATE TABLE $($Cfg.pg.schema).orders(
+CREATE TABLE $($Cfg.pg.schema).pggate_orders(
   id bigserial PRIMARY KEY, code text NOT NULL, amount numeric(10,2) NOT NULL,
   status text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
-CREATE INDEX idx_gate_orders_created ON $($Cfg.pg.schema).orders(created_at);
-INSERT INTO $($Cfg.pg.schema).orders(code, amount, status)
+CREATE INDEX idx_gate_pggate_orders_created ON $($Cfg.pg.schema).pggate_orders(created_at);
+INSERT INTO $($Cfg.pg.schema).pggate_orders(code, amount, status)
 SELECT 'ORD' || g, ((g * 17) % 997)::numeric + 0.5,
        CASE WHEN g % 3 = 0 THEN 'paid' WHEN g % 3 = 1 THEN 'new' ELSE 'shipped' END
 FROM generate_series(1, 50) g;
-CREATE TABLE $($Cfg.pg.schema).orders_bulk(
+CREATE TABLE $($Cfg.pg.schema).pggate_orders_bulk(
   id bigserial PRIMARY KEY, code text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now());
-INSERT INTO $($Cfg.pg.schema).orders_bulk(code)
+INSERT INTO $($Cfg.pg.schema).pggate_orders_bulk(code)
 SELECT 'BULK' || g FROM generate_series(1, 2000) g;
-CREATE TABLE $($Cfg.pg.schema).static_kv(k text PRIMARY KEY, v text NOT NULL);
-INSERT INTO $($Cfg.pg.schema).static_kv(k, v)
+CREATE TABLE $($Cfg.pg.schema).pggate_static_kv(k text PRIMARY KEY, v text NOT NULL);
+INSERT INTO $($Cfg.pg.schema).pggate_static_kv(k, v)
 SELECT 'k' || g, 'v' || (g * 7) % 101 FROM generate_series(1, 10) g;
 "@
 }
@@ -355,8 +355,20 @@ function Invoke-FaceStatic {
         $vet = & go vet ./... 2>&1 | Out-String
         if ($vet -match '\S') { throw "go vet not clean: $vet" }
 
+        # gofmt false-red protection (ruling seq 117-4): gofmt must judge a
+        # blob-faithful checkout. core.autocrlf must be false (the canonical
+        # repo's setting); a non-false value means CRLF drift can fake a red.
+        $autocrlf = (& git config core.autocrlf 2>&1 | Out-String).Trim()
+        if ($autocrlf -ne 'false') {
+            Write-Warning "  [static] core.autocrlf='$autocrlf' (expected false): gofmt verdict may be CRLF noise - rerun from an autocrlf=false worktree"
+        }
+
         $fmt = & gofmt -l internal cmd 2>&1 | Out-String
-        if ($fmt.Trim() -ne '') { throw "gofmt not clean: $fmt" }
+        if ($fmt.Trim() -ne '') {
+            Write-Host "  [static] gofmt flagged files; if the tree is clean in git, suspect CRLF drift" `
+                "(git diff --ignore-space-at-eol): diagnostic per docs/PG-GATE.md section 'CRLF false red'"
+            throw "gofmt not clean: $fmt"
+        }
 
         $test = & go test ./... 2>&1 | Out-String
         $fails = @($test -split "`n" | Where-Object { $_ -match '^FAIL' })
@@ -395,13 +407,13 @@ function Invoke-FaceStatic {
 
 function Invoke-FaceWizard {
     param($Cfg)
-    $t = Invoke-BaselineMigration -Cfg $Cfg -Tables @('orders', 'orders_bulk', 'static_kv')
+    $t = Invoke-BaselineMigration -Cfg $Cfg -Tables @('pggate_orders', 'pggate_orders_bulk', 'pggate_static_kv')
     if ($t.status -ne 'completed') { throw "wizard migration failed: $($t.error)" }
     $report = Invoke-GateApi -Method Get -Path "/tasks/$($t.id)/report"
     if ($report.overall_status -ne 'pass') {
         throw "wizard report overall_status=$($report.overall_status), expected pass"
     }
-    $expect = @{ orders = 50; orders_bulk = 2000; static_kv = 10 }
+    $expect = @{ pggate_orders = 50; pggate_orders_bulk = 2000; pggate_static_kv = 10 }
     foreach ($tbl in $report.tables) {
         $short = ($tbl.table_name -split '\.')[-1]
         if (-not $expect.ContainsKey($short)) { continue }
@@ -433,7 +445,7 @@ function Invoke-FaceCompare {
         }
         mode        = 'checksum'
         concurrency = 4
-        tables      = @('orders', 'orders_bulk')
+        tables      = @('pggate_orders', 'pggate_orders_bulk')
     }
     $c = Invoke-GateApi -Method Post -Path '/compare/tasks' -Body $body
     $done = Wait-CompareDone -CompareId $c.id
@@ -442,10 +454,10 @@ function Invoke-FaceCompare {
     if ($report.overall_status -ne 'pass') { throw "checksum compare overall=$($report.overall_status), expected pass" }
 
     # watermark-filtered compare (#t3 face): <= now() keeps every row -> still diff=0
-    $wm = Invoke-Psql $Cfg "SELECT max(created_at) FROM $($Cfg.pg.schema).orders;"
+    $wm = Invoke-Psql $Cfg "SELECT max(created_at) FROM $($Cfg.pg.schema).pggate_orders;"
     $wmVal = "$wm".Trim()
     $body.watermark = @{ column = 'created_at'; op = '<='; value = $wmVal; base_mode = 'checksum' }
-    $body.tables = @('orders')
+    $body.tables = @('pggate_orders')
     $c2 = Invoke-GateApi -Method Post -Path '/compare/tasks' -Body $body
     $done2 = Wait-CompareDone -CompareId $c2.id
     if ($done2.status -ne 'completed') { throw "watermark compare failed: $($done2.error)" }
@@ -484,13 +496,13 @@ function Invoke-FaceWatermark {
 
 function Invoke-FaceIncremental {
     param($Cfg, $Refs, [string]$RepoRoot, [string]$WorkDir, $Inst)
-    # job over orders (50 rows) + orders_bulk (2000 rows, batch 100)
+    # job over pggate_orders (50 rows) + pggate_orders_bulk (2000 rows, batch 100)
     $job = Invoke-GateApi -Method Post -Path '/incremental/jobs' -Body @{
         name = 'pg-gate inc'; source_ref = $Refs.Src; target_ref = $Refs.Tgt
         batch_size = 100; strict_mode = $false; conflict_strategy = 'replace'
         tables = @(
-            @{ table = 'orders'; watermark_column = 'created_at' },
-            @{ table = 'orders_bulk'; watermark_column = 'created_at' }
+            @{ table = 'pggate_orders'; watermark_column = 'created_at' },
+            @{ table = 'pggate_orders_bulk'; watermark_column = 'created_at' }
         )
     }
 
@@ -501,8 +513,8 @@ function Invoke-FaceIncremental {
     $rows = ($h.tables | Measure-Object -Property rows -Sum).Sum
     if ([long]$rows -ne 2050) { throw "incremental backfill rows=$rows, expected 2050 (50+2000)" }
 
-    # 2) delta: 5 new same-second rows on orders
-    Invoke-Psql $Cfg "INSERT INTO $($Cfg.pg.schema).orders(code, amount, status) SELECT 'DELTA' || g, g, 'new' FROM generate_series(1,5) g;"
+    # 2) delta: 5 new same-second rows on pggate_orders
+    Invoke-Psql $Cfg "INSERT INTO $($Cfg.pg.schema).pggate_orders(code, amount, status) SELECT 'DELTA' || g, g, 'new' FROM generate_series(1,5) g;"
     $null = Invoke-GateApi -Method Post -Path "/incremental/jobs/$($job.id)/run"
     $h2 = Wait-IncRunSettled -JobId $job.id
     if ($h2.status -eq 'failed') { throw "incremental delta run failed: $($h2.error)" }
@@ -510,17 +522,36 @@ function Invoke-FaceIncremental {
     if ([long]$rows2 -ne 5) { throw "incremental delta rows=$rows2, expected 5" }
 
     # 3) idempotent re-run: no new data -> 0 rows, watermark unchanged
-    $before = (Get-IncJob $job.id).states.orders.last_watermark
+    $before = (Get-IncJob $job.id).states.pggate_orders.last_watermark
     $null = Invoke-GateApi -Method Post -Path "/incremental/jobs/$($job.id)/run"
     $h3 = Wait-IncRunSettled -JobId $job.id
     if ($h3.status -eq 'failed') { throw "incremental idempotent run failed: $($h3.error)" }
     $rows3 = ($h3.tables | Measure-Object -Property rows -Sum).Sum
     if ([long]$rows3 -ne 0) { throw "incremental idempotent re-run rows=$rows3, expected 0" }
-    $after = (Get-IncJob $job.id).states.orders.last_watermark
+    $after = (Get-IncJob $job.id).states.pggate_orders.last_watermark
     if ("$before".Trim() -ne "$after".Trim()) { throw "watermark drifted on no-op run: '$before' -> '$after'" }
+    # value-level anchor at the idempotent point (ruling seq 117-2: row count
+    # alone cannot catch duplicate+missed canceling out)
+    $idem = Invoke-GateApi -Method Post -Path '/compare/tasks' -Body @{
+        name   = "pg-gate inc idem $(Get-Date -Format HHmmss)"
+        source = @{
+            type = 'postgres'; host = $Cfg.pg.host; port = [int]$Cfg.pg.port
+            user = $Cfg.pg.user; password = $Cfg.pg.password
+            database = $Cfg.pg.database; schema = $Cfg.pg.schema; sslmode = $Cfg.pg.sslmode
+        }
+        target = @{
+            host = $Cfg.tidb.host; port = [int]$Cfg.tidb.port; user = $Cfg.tidb.user
+            password = $Cfg.tidb.password; database = $Cfg.tidb.database
+        }
+        mode = 'quick'; tables = @('pggate_orders')
+    }
+    $idemDone = Wait-CompareDone -CompareId $idem.id
+    if ($idemDone.status -ne 'completed') { throw "idempotency quick compare failed: $($idemDone.error)" }
+    $idemRep = Invoke-GateApi -Method Get -Path "/compare/tasks/$($idem.id)/report"
+    if ($idemRep.overall_status -ne 'pass') { throw "idempotency value-level anchor: quick compare overall=$($idemRep.overall_status)" }
 
     # 4) interrupt/resume: new rows + hard service kill mid-run, restart, re-run
-    Invoke-Psql $Cfg "INSERT INTO $($Cfg.pg.schema).orders_bulk(code) SELECT 'RESUME' || g FROM generate_series(1,300) g;"
+    Invoke-Psql $Cfg "INSERT INTO $($Cfg.pg.schema).pggate_orders_bulk(code) SELECT 'RESUME' || g FROM generate_series(1,300) g;"
     $null = Invoke-GateApi -Method Post -Path "/incremental/jobs/$($job.id)/run"
     $sawRunning = $false
     $deadline = (Get-Date).AddSeconds(20)
@@ -555,13 +586,22 @@ function Invoke-FaceIncremental {
             host = $Cfg.tidb.host; port = [int]$Cfg.tidb.port; user = $Cfg.tidb.user
             password = $Cfg.tidb.password; database = $Cfg.tidb.database
         }
-        mode = 'checksum'; concurrency = 4; tables = @('orders', 'orders_bulk')
+        mode = 'checksum'; concurrency = 4; tables = @('pggate_orders', 'pggate_orders_bulk')
     }
     $done = Wait-CompareDone -CompareId $cmp.id
     if ($done.status -ne 'completed') { throw "post-incremental parity compare failed: $($done.error)" }
     $rep = Invoke-GateApi -Method Get -Path "/compare/tasks/$($cmp.id)/report"
     if ($rep.overall_status -ne 'pass') { throw "post-incremental parity overall=$($rep.overall_status): resume lost or duplicated rows" }
-    Write-Host "  [incremental] backfill 2050 + delta 5 + idempotent 0 + restart-resume + checksum parity pass"
+    # resume double-condition (ruling seq 117-2): total = full expectation AND
+    # zero diff (no duplicate keys, no missed rows) - per table, explicit.
+    $expectFinal = @{ pggate_orders = 55; pggate_orders_bulk = 2300 }
+    foreach ($tbl in $rep.tables) {
+        $short = ($tbl.table_name -split '\.')[-1]
+        if (-not $expectFinal.ContainsKey($short)) { continue }
+        if ([long]$tbl.diff_rows -ne 0) { throw "resume parity: $short diff_rows=$($tbl.diff_rows) (duplicate or missed rows)" }
+        if ([long]$tbl.source_rows -ne $expectFinal[$short]) { throw "resume parity: $short total=$($tbl.source_rows), expected $($expectFinal[$short])" }
+    }
+    Write-Host "  [incremental] backfill 2050 + delta 5 + idempotent 0 (value-level) + restart-resume (totals 55/2300, diff=0) + checksum parity pass"
 }
 
 # ---------------------------------------------------------------------------
@@ -592,7 +632,7 @@ function Invoke-FaceCdc {
     if (-not $running) { throw "cdc did not reach running state in 60s" }
 
     # live apply: one insert must reach TiDB
-    Invoke-Psql $Cfg "INSERT INTO $($Cfg.pg.schema).orders(code, amount, status) VALUES ('CDC_LIVE', 1, 'new');"
+    Invoke-Psql $Cfg "INSERT INTO $($Cfg.pg.schema).pggate_orders(code, amount, status) VALUES ('CDC_LIVE', 1, 'new');"
     $lsnBefore = $null
     try { $lsnBefore = (Invoke-GateApi -Method Get -Path '/cdc/checkpoint').lsn } catch { }
     $applied = $false
@@ -609,7 +649,7 @@ function Invoke-FaceCdc {
                 host = $Cfg.tidb.host; port = [int]$Cfg.tidb.port; user = $Cfg.tidb.user
                 password = $Cfg.tidb.password; database = $Cfg.tidb.database
             }
-            mode = 'quick'; tables = @('orders')
+            mode = 'quick'; tables = @('pggate_orders')
         }
         $d = Wait-CompareDone -CompareId $cmp.id
         if ($d.status -eq 'completed') {
@@ -629,3 +669,5 @@ function Invoke-FaceCdc {
     if ($stop.ok -ne $true) { throw "cdc stop did not return ok:true" }
     Write-Host "  [cdc] config import -> running -> live row applied -> LSN forward -> stop ok"
 }
+
+

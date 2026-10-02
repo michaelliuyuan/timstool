@@ -17,11 +17,21 @@ powershell -File scripts\pg-gate.ps1 -Face static,incremental
 powershell -File scripts\pg-gate.ps1 -ConfigFile scripts\pg-gate.local.json
 $env:PGGATE_PG_PORT = '5433'; powershell -File scripts\pg-gate.ps1 -Face all
 
+# 黑盒面前置：显式端点确认（防误连产线/他人隔离实例）
+$env:PG_GATE_ENDPOINT = 'iso-pg:5433 + iso-tidb:4000'; powershell -File scripts\pg-gate.ps1
+
 # 调试：保留门禁实例（端口/workdir 不销毁）
 powershell -File scripts\pg-gate.ps1 -KeepInstance
 ```
 
 退出码：`0` = 全绿；`1` = 红灯（输出 FAIL 行与原因）。**红灯即停，不进下一单。**
+
+## 防误连守卫（黑盒面）
+
+黑盒五面会 `DROP SCHEMA ... CASCADE` 造数——**未显式确认端点一律拒跑**：须设 `PG_GATE_ENDPOINT`
+环境变量（自由文本，写明你授权触碰的隔离端点，如 `iso-pg:5433 + iso-tidb:4000`）或配置
+`gate.endpoint`；`static` 面单测不受限。fixture 表统一 `pggate_*` 前缀 + 每跑 DROP 重建，
+即使误连也有前缀护栏。**严禁**把端点指向产线 PG/8080 域。
 
 ## 六个面
 
@@ -31,7 +41,7 @@ powershell -File scripts\pg-gate.ps1 -KeepInstance
 | `wizard` | 建迁移任务（quick 路径，无 Lightning）→ completed → report `overall=pass`，3 表 diff=0（50/2000/10 行） | 向导全链（schema+data+比对） |
 | `compare` | checksum 比对 diff=0 + 水位过滤比对（`created_at <= max`）diff=0 | 比对面 + #t3 水位过滤 |
 | `watermark` | suggest-watermark：`total_tables>=3`、top 候选 `created_at` coverage=1.0 + DEFAULT-now 理由；tidb 源 400 守卫仍在位 | 水位建议面 + 冻结守卫负锚 |
-| `incremental` | 空水位全量补齐 2050 → 同秒增量 5 → **幂等二跑 0 行且水位不动** → **中断恢复**（运行中硬杀服务重启再跑）→ checksum 终局比对 pass（不丢不重） | 增量面 + 红队补强专项 |
+| `incremental` | 空水位全量补齐 2050 → 同秒增量 5 → **幂等二跑 0 行+水位不动+值级 quick 比对 pass**（行数+值双锚） → **中断恢复**（运行中硬杀服务重启再跑）→ 终局 checksum 逐表 **总量=期望（55/2300）且 diff=0**（双条件，重复/漏行都拦） | 增量面 + 红队补强专项 |
 | `cdc` | 数据源导入 config → start → running → 源端 INSERT 一行 → TiDB 侧可查（quick 比对 pass）→ checkpoint LSN 不回退 → stop `ok:true` | CDC 面（配置→起链→活数据→停链） |
 
 ## 环境前置（一次性）
@@ -65,7 +75,14 @@ powershell -File scripts\pg-gate.ps1 -KeepInstance
 
 ## 已知边界（记档，非遗漏）
 
+- **脚本宿主口径**：入口为 PowerShell 5.1 脚本（团队作业机即 PS5.1，无 bash 依赖）。
+  未采用 `go test -tags` 封装的记档理由：新增 Go 包会使 `go test ./...` 包数离开 23 包基线、
+  动摇本单「现状固化」口径；如后续要跨宿主（linux CI）再立项 Go 封装，断言口径不变迁移。
+- **gofmt CRLF 假红灯**：gofmt 判定须在 **blob 忠实检出**（`core.autocrlf=false`，权威库
+  worktree 即是）上跑；门禁开头检查 `core.autocrlf`，非 `false` 打 WARNING；若 gofmt 报红而
+  `git diff --ignore-space-at-eol` 为空，即 CRLF 漂移噪声——换 autocrlf=false 的 worktree 重跑，
+  不要改代码迁就。
 - 增量面的"运行中硬杀"若错过窗口（数据太小跑完了），会打 WARNING 但终局 checksum 比对仍
-  断言不丢不重；要确定性复现中断可调大 `orders_bulk` 行数。
+  断言不丢不重；要确定性复现中断可调大 `pggate_orders_bulk` 行数。
 - CDC `stop` 后看门狗可能拉起（生产既有语义），门禁收尾直接杀进程树，不依赖 stop 的终态。
 - 门禁实例的 CDC slot 名固定 `pg_gate_slot`，起链前会清理残留 slot（幂等重跑）。
