@@ -1,16 +1,19 @@
 package source_test
 
-// MS-01 anchors:
-//   A1 鈥?capability-bit snapshots per registered kind (postgres all-true,
-//        mysql schema/data only, stubs all-false). Pins the matrix the UI
-//        greying and the API 400-guards read.
-//   A2 鈥?NormalizeKind single-default semantics: ""鈫抪ostgres, unknown
-//        non-empty鈫抏rror (never silently downgraded), known passes through.
-//   A3 鈥?repo-wide "zero out-of-registry type behavior branch" grep anchor:
-//        equality compares against source-kind literals are allowed ONLY in
-//        the explicit grandfather list (orchestrator dual-path routing #t79,
-//        the two legacy PG-direct endpoints in webapi/server.go). Anything
-//        else fails, so a new 'if type == "mysql"' cannot sneak in unnoticed.
+// MS-01 anchors (ruling seq 82 final):
+//   A1 — capability-bit snapshots per registered kind: postgres all-true,
+//        mysql schema/data only, tidb ALL-false (target-only status quo),
+//        stubs all-false. Pins the matrix the UI greying reads.
+//   A2 — NormalizeKind single-default semantics: ""→postgres, unknown
+//        non-empty→error (never silently downgraded), known (incl. tidb)
+//        passes through.
+//   A3 — frozen-baseline type-branch inventory ("only-decrease, zero at
+//        MS-12"): the ruling pattern is scanned repo-wide (non-test, outside
+//        internal/source — the registry/parse layer is the one allowed
+//        place); context-excluded false positives (column types, role
+//        routing, nil checks...) are filtered; what remains must equal the
+//        frozen fixture EXACTLY — in both directions: a new branch fails,
+//        and so does a removed one whose fixture entry was not pruned.
 
 import (
 	"os"
@@ -22,7 +25,7 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/source"
 )
 
-// A1: capability snapshots (three states: full / partial / stub).
+// A1: capability snapshots.
 func TestCapabilityMatrixSnapshot(t *testing.T) {
 	pg, err := source.Describe("postgres")
 	if err != nil {
@@ -53,6 +56,17 @@ func TestCapabilityMatrixSnapshot(t *testing.T) {
 		}
 	}
 
+	// Ruling seq 82 ①: tidb is a registered kind with EVERY bit false —
+	// target-only today; the flip point is tidb_meta.go and must never be
+	// flipped without removing the three tidb-as-source 400 guards too.
+	td, err := source.Describe("tidb")
+	if err != nil {
+		t.Fatalf("describe tidb: %v", err)
+	}
+	if td.Capabilities != (source.Capabilities{}) {
+		t.Errorf("tidb capabilities = %+v, want all-false (target-only status quo)", td.Capabilities)
+	}
+
 	or, err := source.Describe("oracle")
 	if err != nil {
 		t.Fatalf("describe oracle: %v", err)
@@ -67,8 +81,10 @@ func TestNormalizeKindDefaultAndUnknown(t *testing.T) {
 	if k, err := source.NormalizeKind(""); err != nil || k != "postgres" {
 		t.Errorf(`NormalizeKind("") = %q, %v; want "postgres", nil (legacy default)`, k, err)
 	}
-	if k, err := source.NormalizeKind("mysql"); err != nil || k != "mysql" {
-		t.Errorf(`NormalizeKind("mysql") = %q, %v; want passthrough`, k, err)
+	for _, kind := range []string{"mysql", "tidb", "postgres"} {
+		if k, err := source.NormalizeKind(kind); err != nil || k != kind {
+			t.Errorf("NormalizeKind(%q) = %q, %v; want passthrough", kind, k, err)
+		}
 	}
 	if k, err := source.NormalizeKind("cockroachdb"); err == nil {
 		t.Errorf(`NormalizeKind("cockroachdb") = %q, nil; want error (no silent downgrade)`, k)
@@ -85,6 +101,9 @@ func TestCapableSingleTruth(t *testing.T) {
 	if err != nil || ok {
 		t.Errorf(`Capable("mysql", compare) = %v, %v; want false until MS-08`, ok, err)
 	}
+	if ok, err := source.Capable("tidb", source.CapData); err != nil || ok {
+		t.Errorf(`Capable("tidb", data) = %v, %v; want false/nil (target-only)`, ok, err)
+	}
 	if _, err := source.Capable("nosuch", source.CapCompare); err == nil {
 		t.Error(`Capable("nosuch", compare) succeeded; want error for unknown kind`)
 	}
@@ -93,24 +112,64 @@ func TestCapableSingleTruth(t *testing.T) {
 	}
 }
 
-// A3: grandfather list 鈥?the ONLY non-test sites allowed to branch on a
-// source-kind string literal. Counts are exact: removing a grandfathered
-// branch also fails, forcing this list to stay honest.
-var typeBranchGrandfather = map[string]int{
-	// #t79 dual-path routing: non-PG sources go through the Source+CIR engine
-	// (architecture v1.0 pin #3: routing, not feature gating).
+// A3 frozen baseline (ruling seq 82 ②). Baseline was 27 sites; MS-01 absorbed
+// the two source_handler ""→postgres defaults into NormalizeKind. The fixture
+// below is the post-MS-01 inventory: 26 sites (the ruling's enumeration of 27
+// plus orchestrator.go's dumpling fast-path routing at :269, same #t79
+// dual-path class — pattern-true, so it is frozen in).
+//
+// Only-decrease: MS-03..MS-07 each swap their guards for capability reads and
+// prune their fixture lines; MS-12 asserts the map is empty.
+var typeBranchFixture = map[string]int{
+	// config-level legacy default (unification deferred; data-shaping only).
+	"internal/common/config/config.go": 1,
+	// #t79 dual-path routing (legitimate routing, not feature gating).
 	"internal/orchestrator/orchestrator.go": 3,
-	// Legacy PG-direct endpoints (/test-connection and /config/list-tables
-	// source_ref paths speak the PG wire protocol only; retirement tracked
-	// with the MS-06+ interface work).
-	"internal/webapi/server.go": 2,
+	// CDC source guard + target-tidb guard (M4 binlog work).
+	"internal/webapi/cdc_config.go": 2,
+	// compare source guards (MS-03) + target-tidb guard.
+	"internal/webapi/compare.go": 3,
+	// connection-test target-style routing for tidb profiles.
+	"internal/webapi/datasource.go": 1,
+	// DDL export source guard (MS-07).
+	"internal/webapi/ddl_export_handler.go": 1,
+	// incremental source guards (MS-04) + target-tidb guards.
+	"internal/webapi/incremental.go": 6,
+	// legacy PG-direct endpoints + tidb-as-source guard + target guard +
+	// cdc_chain guard (M4) + assess guard (MS-06).
+	"internal/webapi/server.go": 6,
+	// tidb-as-source guards (kept until the tidb flip point).
+	"internal/webapi/source_handler.go": 2,
+	// watermark suggest guard (MS-05).
+	"internal/webapi/watermark_suggest.go": 1,
 }
 
-// Source kinds only — "tidb" is a TARGET-side datasource type routed by the
-// target-ref gates, not a member of the source registry this anchor protects.
-var typeBranchRe = regexp.MustCompile(`[!=]= "(postgres|mysql|oracle|mssql|db2)"`)
+// Ruling pattern (seq 82): catches .Type/srcType/SourceType() compares plus
+// the `XxxType == ""` legacy-default shape.
+var typeBranchRe = regexp.MustCompile(`\.Type ==|\.Type !=|SourceType\(\) ==|SourceType\(\) !=|srcType ==|srcType !=|Type == ""`)
 
-func TestNoTypeBehaviorBranchOutsideRegistry(t *testing.T) {
+// Context exclusions (ruling seq 82 enumeration) — lines that match the
+// pattern but are NOT source-kind behavior branches.
+var typeBranchExclusions = []string{
+	"col.Type ==",          // cdc/transformer.go: column type mapping
+	"mysqlType == ",        // schema/ddl.go: type-name default
+	"wmType == ",           // incremental.go: watermark kind default
+	".Type != nil",         // cdc_config.go: pointer nil passthrough
+	`req.Type != ""`,       // datasource.go:320 update consistency check
+	`req.Type == "source"`, // server.go: connection-test role routing
+	`req.Type != "source"`, // server.go: connection-test role routing
+}
+
+func isExcluded(line string) bool {
+	for _, ex := range typeBranchExclusions {
+		if strings.Contains(line, ex) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestTypeBranchFrozenBaseline(t *testing.T) {
 	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
@@ -130,16 +189,21 @@ func TestNoTypeBehaviorBranchOutsideRegistry(t *testing.T) {
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
+		rel, _ := filepath.Rel(repoRoot, path)
+		rel = filepath.ToSlash(rel)
+		// The source package IS the registry/parse layer — the one allowed
+		// place for kind branches (five-pin #3).
+		if rel == "internal/source" || strings.HasPrefix(rel, "internal/source/") {
+			return nil
+		}
 		data, rerr := os.ReadFile(path)
 		if rerr != nil {
 			return rerr
 		}
-		rel, _ := filepath.Rel(repoRoot, path)
-		rel = filepath.ToSlash(rel)
 		for _, line := range strings.Split(string(data), "\n") {
 			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "//") {
-				continue // comment lines don't branch
+			if strings.HasPrefix(trimmed, "//") || isExcluded(trimmed) {
+				continue
 			}
 			if typeBranchRe.MatchString(line) {
 				found[rel]++
@@ -151,15 +215,15 @@ func TestNoTypeBehaviorBranchOutsideRegistry(t *testing.T) {
 		t.Fatal(err)
 	}
 	for file, n := range found {
-		if allowed, ok := typeBranchGrandfather[file]; !ok {
-			t.Errorf("out-of-registry type branch in %s (x%d) 鈥?route through source.Capable or the registry", file, n)
+		if allowed, ok := typeBranchFixture[file]; !ok {
+			t.Errorf("NEW type branch in %s (x%d) — route through source.Capable / the registry and prune or justify the fixture", file, n)
 		} else if n != allowed {
-			t.Errorf("grandfathered %s has %d type branches, list says %d 鈥?update the grandfather list if this change is intentional", file, n, allowed)
+			t.Errorf("%s has %d type branches, fixture says %d — if you removed guards, prune the fixture (only-decrease); if you added one, reroute it", file, n, allowed)
 		}
 	}
-	for file, allowed := range typeBranchGrandfather {
+	for file, allowed := range typeBranchFixture {
 		if found[file] == 0 {
-			t.Errorf("grandfathered %s has no type branches left (list says %d) 鈥?prune the entry", file, allowed)
+			t.Errorf("fixture entry %s (x%d) has no branches left — prune it (only-decrease bookkeeping)", file, allowed)
 		}
 	}
 }

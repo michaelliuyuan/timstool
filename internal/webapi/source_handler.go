@@ -21,10 +21,11 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"sources": source.DescribeAll()})
 }
 
-// requireCapability is the backend 400 double-guard (MS-01, five-pin #2/#4):
+// requireCapability is the prepared backend 400 double-guard for MS-03..MS-07:
 // it reads the SINGLE truth — the registry's capability bit via source.Capable
-// — instead of branching on the raw type string. Returns false (response
-// already written) when the kind is unknown or the bit is off.
+// — so each interface task can swap its frozen `type != "postgres"` guard for
+// a capability read in one line (ruling seq 82: baseline only-decrease). Not
+// wired yet on purpose; the frozen guards are the MS-01 baseline.
 func (s *Server) requireCapability(w http.ResponseWriter, kind string, c source.Capability, msg string) bool {
 	ok, err := source.Capable(kind, c)
 	if err != nil || !ok {

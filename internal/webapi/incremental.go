@@ -24,7 +24,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/michaelliuyuan/timstool/internal/common/config"
-	"github.com/michaelliuyuan/timstool/internal/source"
 	"go.uber.org/zap"
 )
 
@@ -471,7 +470,10 @@ func (s *Server) handleCreateIncrementalJob(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return
 	}
-	if !s.requireCapability(w, src.Type, source.CapWatermark, "增量同步 v1 仅支持 PostgreSQL 源数据源") {
+	if src.Type != "postgres" {
+		// MS-04 absorbs this guard into the WatermarkDialect capability read
+		// (ruling seq 82: baseline-frozen, only-decrease).
+		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
 		return
 	}
 	tgt, err := s.resolveDataSourceRef(job.TargetRef)
@@ -541,7 +543,10 @@ func (s *Server) handleUpdateIncrementalJob(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return
 	}
-	if !s.requireCapability(w, src.Type, source.CapWatermark, "增量同步 v1 仅支持 PostgreSQL 源数据源") {
+	if src.Type != "postgres" {
+		// MS-04 absorbs this guard into the WatermarkDialect capability read
+		// (ruling seq 82: baseline-frozen, only-decrease).
+		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
 		return
 	}
 	tgt, err := s.resolveDataSourceRef(job.TargetRef)
@@ -746,7 +751,9 @@ func (s *Server) handleIncrementalColumns(w http.ResponseWriter, r *http.Request
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return
 	}
-	if !s.requireCapability(w, e.Type, source.CapWatermark, "增量同步 v1 仅支持 PostgreSQL 源数据源") {
+	if e.Type != "postgres" {
+		// MS-04 absorbs this guard (ruling seq 82).
+		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
 		return
 	}
 	sc := dataSourceToSourceConfig(e)
@@ -825,7 +832,9 @@ func (s *Server) handleIncrementalColumnsBatch(w http.ResponseWriter, r *http.Re
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return
 	}
-	if !s.requireCapability(w, e.Type, source.CapWatermark, "增量同步 v1 仅支持 PostgreSQL 源数据源") {
+	if e.Type != "postgres" {
+		// MS-04 absorbs this guard (ruling seq 82).
+		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
 		return
 	}
 	sc := dataSourceToSourceConfig(e)

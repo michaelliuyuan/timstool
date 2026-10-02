@@ -11,7 +11,6 @@ import (
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/ddlexport"
-	"github.com/michaelliuyuan/timstool/internal/source"
 	"go.uber.org/zap"
 )
 
@@ -82,7 +81,9 @@ func (s *Server) applySourceRef(w http.ResponseWriter, req *ddlExportRequest) bo
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return false
 	}
-	if !s.requireCapability(w, e.Type, source.CapDDLExport, "source_ref: DDL 导出仅支持 PostgreSQL 数据源") {
+	if e.Type != "postgres" {
+		// MS-07 absorbs this guard (ruling seq 82).
+		s.writeError(w, http.StatusBadRequest, "source_ref: DDL 导出仅支持 PostgreSQL 数据源")
 		return false
 	}
 	sc := dataSourceToSourceConfig(e)

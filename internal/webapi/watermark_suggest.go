@@ -9,8 +9,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/michaelliuyuan/timstool/internal/source"
 )
 
 // --- watermark auto-suggest (FEAT-WM-AUTO) ---
@@ -322,7 +320,9 @@ func (s *Server) handleSuggestWatermark(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return
 	}
-	if !s.requireCapability(w, e.Type, source.CapWatermark, "增量同步 v1 仅支持 PostgreSQL 源数据源") {
+	if e.Type != "postgres" {
+		// MS-05 absorbs this guard (ruling seq 82).
+		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
 		return
 	}
 	sc := dataSourceToSourceConfig(e)
