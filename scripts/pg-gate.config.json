@@ -1,0 +1,26 @@
+{
+  "_comment": "MS-02 pg-gate default config. Copy to pg-gate.local.json and edit, or override per key with PGGATE_<KEY> env vars (dots -> underscores, e.g. PGGATE_PG_HOST). Connection guidance: use a DEDICATED role/database for the gate (MS-01 lesson) — never the postgres superuser; the PG role additionally needs REPLICATION privilege (CDC face) and the fixture schema pg_gate is dropped/recreated on every run.",
+  "pg": {
+    "host": "127.0.0.1",
+    "port": 5433,
+    "user": "pg_gate",
+    "password": "",
+    "database": "pg_gate",
+    "schema": "pg_gate",
+    "sslmode": "disable"
+  },
+  "tidb": {
+    "host": "127.0.0.1",
+    "port": 4000,
+    "user": "root",
+    "password": "",
+    "database": "pg_gate"
+  },
+  "gate": {
+    "port": 18099,
+    "workdir": "",
+    "psql_path": "psql",
+    "expected_artifact_sha256": "D434F824203112BB8584D513A04C531FDEA13B26A7663F92E53551B41D48D54F",
+    "build_env": {}
+  }
+}
