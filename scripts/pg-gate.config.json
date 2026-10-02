@@ -1,12 +1,12 @@
 {
-  "_comment": "MS-02 pg-gate default config. Copy to pg-gate.local.json and edit, or override per key with PGGATE_<KEY> env vars (dots -> underscores, e.g. PGGATE_PG_HOST). BLACK-BOX GUARD: faces other than 'static' refuse to run unless PG_GATE_ENDPOINT (env) or gate.endpoint (here) is explicitly set - acknowledge the isolation endpoints you are allowed to touch (e.g. 'iso-pg:5433 + iso-tidb:4000'). Connection guidance: use a DEDICATED role/database for the gate (MS-01 lesson) - never the postgres superuser; the PG role additionally needs REPLICATION privilege (CDC face). Fixture tables are pggate_*-prefixed and the fixture schema is dropped/recreated (DROP IF EXISTS semantics) on every run.",
+  "_comment": "MS-02 pg-gate default config. Copy to pg-gate.local.json and edit, or override per key with PGGATE_<KEY> env vars (dots -> underscores, e.g. PGGATE_PG_HOST). BLACK-BOX GUARD: faces other than 'static' refuse to run unless PG_GATE_ENDPOINT (env) or gate.endpoint (here) is explicitly set - acknowledge the isolation endpoints you are allowed to touch (e.g. 'iso-pg:15433 + iso-tidb:4000'). Connection guidance: use a DEDICATED role/database for the gate (MS-01 lesson) - never the postgres superuser; the PG role additionally needs REPLICATION privilege (CDC face). NAMING: PostgreSQL RESERVES the pg_ prefix for BOTH role and schema names - the default role/schema are therefore 'pggate' (only the database may be pg_gate). Fixture tables are pggate_*-prefixed and the fixture schema is dropped/recreated (DROP IF EXISTS semantics) on every run.",
   "pg": {
     "host": "127.0.0.1",
     "port": 5433,
-    "user": "pg_gate",
+    "user": "pggate",
     "password": "",
     "database": "pg_gate",
-    "schema": "pg_gate",
+    "schema": "pggate",
     "sslmode": "disable"
   },
   "tidb": {
@@ -14,7 +14,7 @@
     "port": 4000,
     "user": "root",
     "password": "",
-    "database": "pg_gate"
+    "database": "pggate"
   },
   "gate": {
     "port": 18099,

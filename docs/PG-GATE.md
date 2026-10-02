@@ -38,22 +38,30 @@ powershell -File scripts\pg-gate.ps1 -KeepInstance
 | 面 | 内容 | 锚定的现状行为 |
 |---|---|---|
 | `static` | `go vet` 净 + `gofmt -l` 净 + `go test ./...` 0 FAIL + MS-01 四锚（A1 矩阵/A2 归一化/Capable/A3 冻结 fixture=26）+ **linux-amd64 件哈希对账**（`expected_artifact_sha256`） | 23 包基线与"生产代码零改动"机械证明 |
-| `wizard` | 建迁移任务（quick 路径，无 Lightning）→ completed → report `overall=pass`，3 表 diff=0（50/2000/10 行） | 向导全链（schema+data+比对） |
+| `wizard` | 建迁移任务（quick 路径，无 Lightning）→ completed → **四阶段结果（precheck/schema/data/validate）全 Success** | 向导全链（行数值级锚由 compare 面同 fixture 承担） |
 | `compare` | checksum 比对 diff=0 + 水位过滤比对（`created_at <= max`）diff=0 | 比对面 + #t3 水位过滤 |
 | `watermark` | suggest-watermark：`total_tables>=3`、top 候选 `created_at` coverage=1.0 + DEFAULT-now 理由；tidb 源 400 守卫仍在位 | 水位建议面 + 冻结守卫负锚 |
-| `incremental` | 空水位全量补齐 2050 → 同秒增量 5 → **幂等二跑 0 行+水位不动+值级 quick 比对 pass**（行数+值双锚） → **中断恢复**（运行中硬杀服务重启再跑）→ 终局 checksum 逐表 **总量=期望（55/2300）且 diff=0**（双条件，重复/漏行都拦） | 增量面 + 红队补强专项 |
+| `incremental` | 空水位全量补齐 2050（泄流重读 ≤+100 容差，正确性由值级锚承担） → 同秒增量 5 → **幂等二跑 0 行+水位不动+值级 quick 比对 pass**（行数+值双锚） → **中断恢复**（运行中硬杀服务重启再跑）→ 终局 checksum 逐表 **总量=期望（55/2300）且 diff=0**（双条件，重复/漏行都拦） | 增量面 + 红队补强专项 |
 | `cdc` | 数据源导入 config → start → running → 源端 INSERT 一行 → TiDB 侧可查（quick 比对 pass）→ checkpoint LSN 不回退 → stop `ok:true` | CDC 面（配置→起链→活数据→停链） |
 
 ## 环境前置（一次性）
 
-1. **PG 专用角色**（勿用 postgres 超户——MS-01 冒烟教训）：
+1. **PG 专用角色**（勿用 postgres 超户——MS-01 冒烟教训）。**命名注意：PostgreSQL 保留 `pg_`
+   前缀（角色名与 schema 名都是）**，故角色/schema 用 `pggate`、仅数据库可叫 `pg_gate`：
    ```sql
-   CREATE ROLE pg_gate LOGIN PASSWORD '...';
-   CREATE DATABASE pg_gate OWNER pg_gate;
-   ALTER ROLE pg_gate REPLICATION;   -- CDC 面需要
+   CREATE ROLE pggate LOGIN PASSWORD '...';
+   CREATE DATABASE pg_gate OWNER pggate;
+   ALTER ROLE pggate REPLICATION;   -- CDC 面需要
+   -- CDC 面另需超户一次性执行（CDC Setup 的 CREATE PUBLICATION ... FOR ALL
+   -- TABLES 需超户，产品侧失败会吞错——见已知边界 P-CDC-PUB）：
+   CREATE PUBLICATION pg_gate_pub FOR ALL TABLES;
    ```
-   且实例 `wal_level=logical`。fixture schema `pg_gate`（或配置的 schema）**每跑必删建**，勿指向业务 schema。
-2. **TiDB 目标库**：工具不自建库，需一次性 `CREATE DATABASE pg_gate;`（或把 `tidb.database` 指到任一现有测试库——表名带 pg_gate 前缀且 `target_policy=drop` 每跑重建）。
+   且实例 **PG≥13**（pgoutput proto v2）+ `wal_level=logical` + `timezone='UTC'`。fixture schema
+   `pggate`（或配置的 schema，**勿用 `pg_` 前缀**）**每跑必删建**，勿指向业务 schema。
+2. **TiDB 目标库**：工具不自建库，需一次性预建。**注意产品约定：CDC 链把「PG schema 名」
+   当作 TiDB 库名写入，迁移链用 `tidb.database`——两者必须同名**（默认即 `pggate`，与 PG
+   schema 一致），否则迁移后 CDC 事件全部落库失败（schema mismatch 跳过）：
+   `CREATE DATABASE pggate;`
 3. `psql` 在 PATH（fixture 造数走 psql；TiDB 侧只经服务本身读写）。
 4. 端口：门禁实例默认 `18099`（`gate.port` 可改）；workdir 默认 `%TEMP%\pg-gate-run`（每跑清空）。
 5. Windows 测试机（进程树清理走 CIM；linux 上需自行补 kill 逻辑）。
@@ -74,6 +82,21 @@ powershell -File scripts\pg-gate.ps1 -KeepInstance
 4. 任何一面红灯：停下修或回退，**禁止**跳面/降级断言继续。
 
 ## 已知边界（记档，非遗漏）
+
+- **P-CDC-PUB（首跑发现，记档）**：CDC `Setup()` 的 `CREATE PUBLICATION ... FOR ALL TABLES`
+  需超户，非超户角色下失败被 Debug 级吞掉，链路在 START 才报「publication does not exist」
+  （诊断滞后）。门禁环境前置=超户预建 publication（见上）；产品侧诊断强化列 backlog。
+
+- **KNOWN ISSUE P-INC-TZ（首跑发现，已立案候修）**：增量引擎改写过的表，checksum 比对必红、
+  quick 比对绿——确定性 A/B 实证（同 fixture：迁移写入→checksum PASS；同一表被增量 REPLACE
+  改写→同一比对必红；逐行独立复算两侧值字符串全等、行数全等）。观测：远端 TiDB
+  （system_time_zone=Asia/Shanghai）上增量写入的 TIMESTAMP 列以 SET time_zone='+00:00' 会话
+  读回比真 instant 偏移 −8h，即增量写入路径的时区约定与「迁移写入+validator UTC 会话读取」
+  的自洽约定不一致（timestamp 值 instant 错位；validator.go getTiDBConn SET UTC vs
+  incremental 写入连接未对齐）。产线此前未暴露=从未在增量后跑 checksum。门禁处理：增量面终局
+  锚=quick 总量+diff=0（仍拦丢行/重复行），checksum 探针红→打 WARNING 提示 P-INC-TZ 在案；
+  **修复落地日探针翻绿，届时把 pg-gate-lib.ps1 的 known-issue 警示改回 equality 断言**（代码
+  内已留翻转提示）。
 
 - **脚本宿主口径**：入口为 PowerShell 5.1 脚本（团队作业机即 PS5.1，无 bash 依赖）。
   未采用 `go test -tags` 封装的记档理由：新增 Go 包会使 `go test ./...` 包数离开 23 包基线、

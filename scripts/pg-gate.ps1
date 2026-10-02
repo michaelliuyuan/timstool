@@ -62,7 +62,7 @@ try {
         New-PGFixture $cfg
         $refs = New-GateDataSources $cfg
         # wizard face IS the baseline migration; other faces run one themselves
-        $baselineTables = @('orders', 'orders_bulk', 'static_kv')
+        $baselineTables = @('pggate_orders', 'pggate_orders_bulk', 'pggate_static_kv')
         if ($faces -contains 'wizard') {
             Invoke-FaceWizard $cfg
         } else {
