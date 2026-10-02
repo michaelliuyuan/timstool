@@ -71,11 +71,13 @@ type versioner interface {
 // without a real connection attempt.
 func (s *Server) testSource(ctx context.Context, srcType string, fields map[string]any) map[string]interface{} {
 	// MS-01: legacy "" default unified into source.NormalizeKind (single
-	// truth for the "type missing = postgres" rule).
-	srcType, err := source.NormalizeKind(srcType)
+	// truth for the "type missing = postgres" rule). c-fix ⚠️2: the error
+	// payload echoes the ORIGINAL kind, not the zeroed assignment target.
+	normalized, err := source.NormalizeKind(srcType)
 	if err != nil {
 		return map[string]interface{}{"source": srcType, "success": false, "message": err.Error()}
 	}
+	srcType = normalized
 	result := map[string]interface{}{"source": srcType}
 
 	meta, err := source.Describe(srcType)
@@ -191,14 +193,9 @@ func (s *Server) handleSourceTables(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	// MS-01: legacy "" default unified into source.NormalizeKind.
-	srcType, err := source.NormalizeKind(req.Source)
-	if err != nil {
-		s.writeError(w, http.StatusNotFound, err.Error())
-		return
-	}
 	// F-02: a source_ref overrides {source, fields} with the stored profile
 	// (server-side password resolution).
+	srcType := req.Source
 	if req.SourceRef != "" {
 		e, err := s.resolveDataSourceRef(req.SourceRef)
 		if err != nil {
@@ -211,6 +208,14 @@ func (s *Server) handleSourceTables(w http.ResponseWriter, r *http.Request) {
 		}
 		srcType = e.Type
 		req.Fields = e.Fields
+	}
+	// MS-01 c-fix ⚠️1: normalize AFTER the ref override — {source:<unknown>,
+	// source_ref:<valid>} succeeds exactly as it did pre-MS-01 (the ref's
+	// type wins), and unknown kinds still 404 on the no-ref path.
+	srcType, err := source.NormalizeKind(srcType)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, err.Error())
+		return
 	}
 	meta, err := source.Describe(srcType)
 	if err != nil {
