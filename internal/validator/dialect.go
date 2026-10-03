@@ -63,10 +63,12 @@ type CompareDialect interface {
 
 	// BuildSelect renders the ordered+paged row-fetch shape
 	// (checksum.go :213-218 PG / :298-303 target; sample reads
-	// validator.go :508-516 / :889-893). orderBy columns are quoted by the
-	// dialect; wmFragment == "" means no WHERE clause; args (the single
-	// watermark value when filtered) are supplied by the main flow.
-	BuildSelect(schema, table, wmFragment string, orderBy []string, limit, offset int64) string
+	// validator.go :508-516 / :889-893). orderBy is the comma-joined column
+	// list (as at the call sites), quoted by the dialect via
+	// quoteOrderByCols (checksum.go); wmFragment == "" means no WHERE
+	// clause; args (the single watermark value when filtered) are supplied
+	// by the main flow.
+	BuildSelect(schema, table, wmFragment, orderBy string, limit, offset int64) string
 
 	// BuildSelectAll renders the full-table fetch shape with no ORDER BY /
 	// paging (nopk.go :170-173 / :626-631 bucket reads).
@@ -119,8 +121,8 @@ type TargetDialect interface {
 	WmPredicateFragment(wm *config.WatermarkFilter) string
 
 	// BuildSelect renders the ordered+paged shape for the target side
-	// (checksum.go :298-303; sample reads validator.go :889-893).
-	BuildSelect(schema, table, wmFragment string, orderBy []string, limit, offset int64) string
+	// (checksum.go :298-303; sample reads validator.go:889-893).
+	BuildSelect(schema, table, wmFragment, orderBy string, limit, offset int64) string
 
 	// BuildSelectAll renders the full-table fetch (nopk.go :626-631).
 	BuildSelectAll(schema, table, wmFragment string) string
