@@ -241,15 +241,15 @@ function Assert-SourceMatrix {
         if ($pg.capabilities.$cap -ne $true) { throw "postgres capability '$cap' not true (MS-01 A1 regression)" }
     }
     $my = $byKind['mysql']
-    if ($my.capabilities.compare -ne $false -or $my.capabilities.watermark -ne $false) {
-        throw "mysql compare/watermark capability not false (MS-01 A1 regression)"
+    if ($my.capabilities.compare -ne $true -or $my.capabilities.watermark -ne $false) {
+        throw "mysql compare not true (MS-08 A1 mirror) / watermark not false (MS-01 regression)"
     }
     $td = $byKind['tidb']
     if ($td.implemented -ne $false) { throw "tidb implemented not false (MS-01 A1 regression)" }
     foreach ($cap in @('schema', 'data', 'cdc', 'compare', 'watermark', 'assess', 'ddl_export')) {
         if ($td.capabilities.$cap -ne $false) { throw "tidb capability '$cap' not false (MS-01 A1 regression)" }
     }
-    Write-Host "  [matrix] postgres 7-true / mysql scoped / tidb all-false+not-implemented (A1 live)"
+    Write-Host "  [matrix] postgres 7-true / mysql compare (MS-08) / tidb all-false+not-implemented (A1 live)"
 }
 
 function New-GateDataSources {
