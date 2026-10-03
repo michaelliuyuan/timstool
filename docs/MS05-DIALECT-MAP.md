@@ -23,7 +23,7 @@
 
 ## 双轨一致性（红队补点-B / leader 定稿）
 
-- 内联双轨：wmSystemSchemas map ↔ wmCatalogSQL :161 内联 `NOT IN ('pg_catalog','information_schema','pg_toast')`。
+- 内联双轨：wmSystemSchemas map ↔ wmCatalogSQL :159 内联 `NOT IN ('pg_catalog','information_schema','pg_toast')`。
 - 锚 TestWMSuggestDialectDualTrack 双向钉死：正向=map 键渲染引号列表 Contains；反向=解析 NOT IN 字面集与键集相等（count+membership，防半漂移）。
 
 ## D4 吸收记录
