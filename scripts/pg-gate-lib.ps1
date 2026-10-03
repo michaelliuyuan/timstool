@@ -557,8 +557,8 @@ function Invoke-FaceIncremental {
     # 3) idempotent re-run: no new data. Row-count-zero does NOT hold under
     # ">=" (same-watermark re-read); idempotency anchors = watermark unchanged
     # + quick compare pass (ROW-COUNT parity, estimation level - quick mode
-    # does not compare values; value-level guarantee lives only in the
-    # checksum probe, which P-INC-TZ currently keeps red).
+    # does not compare values; value-level guarantee lives in the checksum
+    # probe, green since the P-INC-TZ fix, MS-03 segment 2).
     $before = (Get-IncJob $job.id).states.pggate_orders.last_watermark
     $null = Invoke-GateApi -Method Post -Path "/incremental/jobs/$($job.id)/run"
     $h3 = Wait-IncRunSettled -JobId $job.id
@@ -611,13 +611,10 @@ function Invoke-FaceIncremental {
     if ($h4.status -eq 'failed') { throw "incremental post-restart run failed: $($h4.error)" }
 
     # 5) zero-loss / zero-dup proof: row totals + PK-level compare over both
-    # tables. KNOWN ISSUE (first live run, deterministic): incremental-written
-    # TIMESTAMP columns drift -8h vs the migration+validator convention, so
-    # CHECKSUM parity after an incremental rewrite is red until the product
-    # fix lands (ticket P-INC-TZ in docs/PG-GATE.md). The completeness anchor
-    # (totals = full expectation, quick-mode compare pass) still catches lost
-    # or duplicated ROWS; the timestamp value drift is asserted EXPLICITLY so
-    # the gate turns green the day the fix ships (assert flips to equality).
+    # tables. FIXED (MS-03 segment 2, P-INC-TZ): the incremental write session
+    # is now pinned to UTC (incTargetDSN time_zone='+00:00'), matching the
+    # migration+validator convention - CHECKSUM parity after an incremental
+    # rewrite is now a hard equality assertion (value-level).
     $cmp = Invoke-GateApi -Method Post -Path '/compare/tasks' -Body @{
         name = "pg-gate inc parity $(Get-Date -Format HHmmss)"
         source = @{
@@ -648,16 +645,16 @@ function Invoke-FaceIncremental {
     }
     # exact-count anchor (MS-03 first-commit): PG side via COUNT(*) directly;
     # TiDB side via the checksum probe below whose count phase is exact
-    # (per-table source_rows/target_rows are exact even when the hash leg is
-    # red under P-INC-TZ - the probe covers pggate_orders; orders_bulk carries
-    # the PG-side exact anchor plus the quick parity above).
+    # (per-table source_rows/target_rows are exact; the hash leg covers
+    # pggate_orders; orders_bulk carries the PG-side exact anchor plus the
+    # quick parity above).
     foreach ($tbl in @('pggate_orders', 'pggate_orders_bulk')) {
         $exact = (Invoke-Psql $Cfg "SELECT count(*) FROM $($Cfg.pg.schema).$tbl;" | Select-Object -First 1).Trim()
         if ([long]$exact -ne $expectFinal[$tbl]) { throw "exact PG count ${tbl}: $exact, expected $($expectFinal[$tbl])" }
     }
-    # KNOWN-ISSUE probe (P-INC-TZ): checksum compare on the same data is red
-    # today (incremental TIMESTAMP drift); when the fix ships this flips to
-    # pass and the known-issue assert below must be inverted back to equality.
+    # checksum VALUE-LEVEL probe (P-INC-TZ FIXED, MS-03 segment 2): parity on
+    # the incremental-rewritten table is now asserted EQUAL - a red here is a
+    # regression of the UTC write-session pin (incTargetDSN).
     $ck = Invoke-GateApi -Method Post -Path '/compare/tasks' -Body @{
         name = "pg-gate inc checksum-probe $(Get-Date -Format HHmmss)"
         source = @{
@@ -674,8 +671,7 @@ function Invoke-FaceIncremental {
     $ckDone = Wait-CompareDone -CompareId $ck.id
     $ckRep = Invoke-GateApi -Method Get -Path "/compare/tasks/$($ck.id)/report"
     # exact-count anchor, TiDB side: the checksum count phase reads exact
-    # per-table rows (unlike quick's estimates) - assert them regardless of
-    # the hash leg's P-INC-TZ status.
+    # per-table rows (unlike quick's estimates).
     foreach ($tbl in $ckRep.tables) {
         $short = ($tbl.table_name -split '\.')[-1]
         if (-not $expectFinal.ContainsKey($short)) { continue }
@@ -683,11 +679,10 @@ function Invoke-FaceIncremental {
             throw "checksum-probe exact counts ${short}: src=$($tbl.source_rows) tgt=$($tbl.target_rows), expected $($expectFinal[$short])"
         }
     }
-    if ($ckRep.overall_status -eq 'pass') {
-        Write-Warning "  [incremental] P-INC-TZ appears FIXED (checksum parity now green) - invert the known-issue assert in pg-gate-lib.ps1 and update docs"
-    } else {
-        Write-Warning "  [incremental] known issue P-INC-TZ still present: checksum parity red on incremental-written TIMESTAMP columns (see docs/PG-GATE.md) - not a gate failure"
+    if ($ckRep.overall_status -ne 'pass') {
+        throw "P-INC-TZ REGRESSION: post-incremental checksum parity overall=$($ckRep.overall_status) (UTC write-session pin lost? see incTargetDSN)"
     }
+    Write-Host "  [incremental] checksum value-level parity PASS (P-INC-TZ fixed, UTC write session)"
     Write-Host "  [incremental] backfill 2050(+drain) + delta >=5 + idempotent (row-count est.) + restart-resume (totals 55/2300, diff=0, quick pass + exact counts PG/TiDB)"
 }
 

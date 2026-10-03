@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/michaelliuyuan/timstool/internal/common/config"
 )
 
 // F-04 anchors: watermark SQL construction, state-advance semantics, the
@@ -51,6 +53,25 @@ func TestIncInsertSQLStrategies(t *testing.T) {
 	plain := incBuildInsertSQL("db", "users", []string{"id"}, 1, "error")
 	if !strings.HasPrefix(plain, "INSERT INTO `db`.`users` (`id`) VALUES (?)") {
 		t.Fatalf("error-strategy SQL = %s", plain)
+	}
+}
+
+// P-INC-TZ anchor (MS-03 segment 2): the incremental write DSN must pin every
+// pooled connection's session to UTC (aligns with the validator read session
+// getTiDBConn -> SessionInit SET time_zone='+00:00'); TargetConfig.DSN()
+// itself must stay untouched so its other consumers are unaffected.
+func TestIncTargetDSNUTCTimezone(t *testing.T) {
+	tc := config.TargetConfig{Host: "h", Port: 4000, User: "root", Password: "p", Database: "db"}
+	got := incTargetDSN(tc)
+	if !strings.Contains(got, "time_zone=%27%2B00%3A00%27") {
+		t.Fatalf("incremental write DSN missing UTC session pin: %s", got)
+	}
+	if !strings.Contains(got, "charset=utf8mb4") {
+		t.Fatalf("incremental write DSN lost the charset param: %s", got)
+	}
+	plain := tc.DSN()
+	if strings.Contains(plain, "time_zone") {
+		t.Fatalf("TargetConfig.DSN() must not gain the session pin: %s", plain)
 	}
 }
 

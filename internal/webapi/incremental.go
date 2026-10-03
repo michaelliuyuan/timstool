@@ -226,6 +226,23 @@ func incBuildInsertSQL(db, table string, colNames []string, nRows int, strategy 
 		strings.Repeat(oneRow+", ", nRows-1)+oneRow)
 }
 
+// incTargetDSN renders the incremental write DSN with every pooled
+// connection's session pinned to UTC (P-INC-TZ fix, MS-03 segment 2):
+// go-sql-driver applies unknown DSN params as `SET <var>=<value>` on each
+// new connection, so `time_zone='+00:00'` aligns the write session with the
+// validator's read session (getTiDBConn -> TargetDialect.SessionInit SET
+// time_zone='+00:00') and with the migration write path. Before this pin
+// the write session inherited TiDB's system_time_zone (e.g. Asia/Shanghai):
+// TIMESTAMP wall strings / time.Time binds (driver loc default UTC) were
+// reinterpreted at the session offset, storing instants shifted by the
+// offset and making post-incremental checksum compares read back −8h.
+// TargetConfig.DSN() itself is intentionally untouched: its consumers
+// (test-connection, CDC, validator pools) keep their own session setups.
+func incTargetDSN(tc config.TargetConfig) string {
+	return config.BuildMySQLDSN(tc.Host, tc.Port, tc.User, tc.Password, tc.Database,
+		map[string]string{"charset": "utf8mb4", "time_zone": "'+00:00'"}, nil)
+}
+
 // incAdvanceWatermark implements the state rule: rows==0 keeps the current
 // watermark (no speculative advance); otherwise the stream's MAX (= last row
 // of the ORDER BY scan) becomes the new watermark.
@@ -937,7 +954,7 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 		return rec
 	}
 	defer pgDB.Close()
-	myDB, err := openMySQLTestConn(tc.DSN())
+	myDB, err := openMySQLTestConn(incTargetDSN(tc)) // P-INC-TZ: UTC-pinned write session
 	if err != nil {
 		lg.add(incLogLevelError, "", incLogPhaseFail, "连接目标端失败: "+err.Error(), "", 0, "", 0)
 		for _, t := range job.Tables {

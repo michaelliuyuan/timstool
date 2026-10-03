@@ -41,7 +41,7 @@ powershell -File scripts\pg-gate.ps1 -KeepInstance
 | `wizard` | 建迁移任务（quick 路径，无 Lightning）→ completed → **四阶段结果（precheck/schema/data/validate）全 Success** | 向导全链（行数值级锚由 compare 面同 fixture 承担） |
 | `compare` | checksum 比对 diff=0 + 水位过滤比对（`created_at <= max`）diff=0 | 比对面 + #t3 水位过滤 |
 | `watermark` | suggest-watermark：`total_tables>=3`、top 候选 `created_at` **coverage≈2/3**（static_kv 无时间列记入 `unmatched_tables` 负锚）+ DEFAULT-now 理由；tidb 源 400 守卫仍在位 | 水位建议面 + 冻结守卫负锚 |
-| `incremental` | 空水位全量补齐 2050（泄流重读 ≤+100 容差） → 同秒增量 5 → **幂等二跑：不要求 0 行**（">=" 语义下同水位重读；锚=水位不动+quick 比对 pass——**行数估算级**） → **中断恢复**（运行中硬杀服务重启再跑）→ 终局 **quick（行数估算级）总量=期望（55/2300）且 diff=0 + COUNT(*) 精确锚（PG 直查/TiDB 经 checksum 探针 count 相位）+ checksum 值级探针**（P-INC-TZ 期红→WARNING） | 增量面 + 红队补强专项；**值级保证仅 checksum 探针** |
+| `incremental` | 空水位全量补齐 2050（泄流重读 ≤+100 容差） → 同秒增量 5 → **幂等二跑：不要求 0 行**（">=" 语义下同水位重读；锚=水位不动+quick 比对 pass——**行数估算级**） → **中断恢复**（运行中硬杀服务重启再跑）→ 终局 **quick（行数估算级）总量=期望（55/2300）且 diff=0 + COUNT(*) 精确锚（PG 直查/TiDB 经 checksum 探针 count 相位）+ checksum 值级探针**（P-INC-TZ 已修复=MS-03 段二，翻回等值断言） | 增量面 + 红队补强专项；**值级保证=checksum 探针** |
 | `cdc` | 数据源导入 config → start → running → 源端 INSERT 一行 → TiDB 侧可查（quick 比对 pass）→ checkpoint LSN 不回退 → stop `ok:true` | CDC 面（配置→起链→活数据→停链） |
 
 ## 环境前置（一次性）
@@ -89,16 +89,12 @@ powershell -File scripts\pg-gate.ps1 -KeepInstance
   需超户，非超户角色下失败被 Debug 级吞掉，链路在 START 才报「publication does not exist」
   （诊断滞后）。门禁环境前置=超户预建 publication（见上）；产品侧诊断强化列 backlog。
 
-- **KNOWN ISSUE P-INC-TZ（首跑发现，已立案候修）**：增量引擎改写过的表，checksum 比对必红、
-  quick 比对绿——确定性 A/B 实证（同 fixture：迁移写入→checksum PASS；同一表被增量 REPLACE
-  改写→同一比对必红；逐行独立复算两侧值字符串全等、行数全等）。观测：远端 TiDB
-  （system_time_zone=Asia/Shanghai）上增量写入的 TIMESTAMP 列以 SET time_zone='+00:00' 会话
-  读回比真 instant 偏移 −8h，即增量写入路径的时区约定与「迁移写入+validator UTC 会话读取」
-  的自洽约定不一致（timestamp 值 instant 错位；validator.go getTiDBConn SET UTC vs
-  incremental 写入连接未对齐）。产线此前未暴露=从未在增量后跑 checksum。门禁处理：增量面终局
-  锚=quick 总量+diff=0（仍拦丢行/重复行），checksum 探针红→打 WARNING 提示 P-INC-TZ 在案；
-  **修复落地日探针翻绿，届时把 pg-gate-lib.ps1 的 known-issue 警示改回 equality 断言**（代码
-  内已留翻转提示）。
+- **P-INC-TZ（首跑发现，已修复=MS-03 段二）**：根因=增量写入连接（webapi/incremental.go
+  openMySQLTestConn）未对齐时区——TiDB 会话继承 system_time_zone（Asia/Shanghai），而迁移写入与
+  validator 读取均为 UTC 会话；TIMESTAMP 值按会话偏移重释，增量改写后 checksum 读回 −8h。
+  修复=增量写 DSN 内建 `time_zone='+00:00'`（incTargetDSN，go-sql-driver 逐连接 SET，池安全）；
+  锚测 TestIncTargetDSNUTCTimezone；门禁增量面 checksum 探针已**翻回等值断言**（红=P-INC-TZ
+  回归）。TargetConfig.DSN() 不动（test-connection/CDC/validator 各自会话口径不受影响）。
 
 - **脚本宿主口径**：入口为 PowerShell 5.1 脚本（团队作业机即 PS5.1，无 bash 依赖）。
   未采用 `go test -tags` 封装的记档理由：新增 Go 包会使 `go test ./...` 包数离开 23 包基线、
