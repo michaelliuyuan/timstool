@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -416,5 +417,21 @@ func TestWebConfigValidation(t *testing.T) {
 	cfg.Web.Port = 99999
 	if err := cfg.Validate(); err == nil {
 		t.Error("invalid web port should fail validation")
+	}
+}
+
+// TestSourceDSNByType_MySQLSessionTimeZonePinned pins MS-08d: the mysql DSN
+// must carry time_zone='+00:00' (URL-encoded %27%2B00%3A00%27 by FormatDSN,
+// same shape as incremental.go incTargetDSN) so the session clock is UTC and
+// DATETIME scans land as UTC time.Time; the PG shape stays param-free.
+func TestSourceDSNByType_MySQLSessionTimeZonePinned(t *testing.T) {
+	sc := SourceConfig{Type: "mysql", Host: "h", Port: 3306, User: "u", Password: "p", Database: "d"}
+	got := sc.DSNByType()
+	if !strings.Contains(got, "time_zone=%27%2B00%3A00%27") {
+		t.Fatalf("mysql DSNByType missing pinned UTC session time_zone: %s", got)
+	}
+	pg := SourceConfig{Type: "postgres", Host: "h", Port: 5432, User: "u", Password: "p", Database: "d"}
+	if plain := pg.DSNByType(); strings.Contains(plain, "time_zone") {
+		t.Fatalf("PG DSN must not carry a mysql time_zone param: %s", plain)
 	}
 }

@@ -183,7 +183,11 @@ func (s SourceConfig) DSN() string {
 // default to the PG shape here.
 func (s SourceConfig) DSNByType() string {
 	if s.SourceType() == "mysql" {
-		return BuildMySQLDSN(s.Host, s.Port, s.User, s.Password, s.Database, map[string]string{"charset": "utf8mb4"}, nil)
+		// time_zone='+00:00' pins the SESSION clock to UTC (same shape as
+		// incremental.go incTargetDSN): DATETIME scans then land as UTC
+		// time.Time, aligning the MySQL source with the PG source and the
+		// TiDB write sessions instead of the server's system_time_zone.
+		return BuildMySQLDSN(s.Host, s.Port, s.User, s.Password, s.Database, map[string]string{"charset": "utf8mb4", "time_zone": "'+00:00'"}, nil)
 	}
 	return s.DSN()
 }
