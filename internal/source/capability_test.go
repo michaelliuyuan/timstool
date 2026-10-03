@@ -139,7 +139,7 @@ var typeBranchFixture = map[string]int{
 	"internal/webapi/incremental.go": 2,
 	// legacy PG-direct endpoints + tidb-as-source guard + target guard +
 	// cdc_chain guard (M4) + assess guard (MS-06).
-	"internal/webapi/server.go": 6,
+	"internal/webapi/server.go": 4,
 	// tidb-as-source guards (kept until the tidb flip point).
 	"internal/webapi/source_handler.go": 2,
 }

@@ -30,6 +30,7 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/common/version"
 	"github.com/michaelliuyuan/timstool/internal/lightning"
 	"github.com/michaelliuyuan/timstool/internal/orchestrator"
+	"github.com/michaelliuyuan/timstool/internal/source"
 	"github.com/michaelliuyuan/timstool/internal/store"
 	"go.uber.org/zap"
 )
@@ -1261,7 +1262,10 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 	// starts so the migration window's WAL is retained. Any failure aborts the
 	// start — better not to run than to silently lose the window.
 	if cfg.Migration.CDCChain {
-		if cfg.Source.SourceType() != "postgres" {
+		if !srcCapable(cfg.Source.SourceType(), source.CapCDC) {
+			// MS-06 absorbs this guard (ruling seq 347): SourceType()
+			// normalizes "" to postgres, so the legacy empty-means-postgres
+			// ALLOW behavior is kept (C1 two-shape table, MS06-DIALECT-MAP).
 			s.writeError(w, http.StatusBadRequest, "cdc_chain 仅支持 PostgreSQL 源端")
 			return
 		}
@@ -2330,7 +2334,9 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 			return
 		}
-		if e.Type != "postgres" {
+		if !srcCapable(e.Type, source.CapAssess) {
+			// MS-06 absorbs this guard (ruling seq 347): raw stored type in,
+			// empty/unknown keep the same 400 text via the capability read.
 			s.writeError(w, http.StatusBadRequest, "source_ref: 兼容评估仅支持 PostgreSQL 数据源")
 			return
 		}

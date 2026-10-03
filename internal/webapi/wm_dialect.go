@@ -39,21 +39,31 @@ var incWatermarkTypes = map[string]bool{
 	"bigint":                      true,
 }
 
-// incSourceWatermarkCapable is the D4 guard's capability read (MS-04
-// absorption, ruling seq 271): kind "" is rejected EXPLICITLY before the
-// capability lookup (NormalizeKind("") would default it to postgres - the
-// legacy guard rejected empty, so semantics must not flip), and an unknown
-// kind resolves to false so the caller keeps its 400 same-text path (never
-// escalates to 500).
-func incSourceWatermarkCapable(kind string) bool {
+// srcCapable is the generalized D4 capability read (MS-06, ruling seq 347):
+// kind "" is rejected EXPLICITLY before the capability lookup (the caller
+// hands in the RAW stored type; legacy raw-compare guards rejected empty,
+// so semantics must not flip), and an unknown kind resolves to false so the
+// caller keeps its 400 same-text path (never escalates to 500). Callers
+// that normalize first (e.g. cfg.Source.SourceType(), which defaults "" to
+// "postgres") pass the NORMALIZED value and therefore keep their legacy
+// empty-means-postgres ALLOW behavior - see the TestSrcCapable two-shape
+// anchor and MS06-DIALECT-MAP C1 table.
+func srcCapable(kind string, cap source.Capability) bool {
 	if kind == "" {
 		return false
 	}
-	ok, err := source.Capable(kind, source.CapWatermark)
+	ok, err := source.Capable(kind, cap)
 	if err != nil {
 		return false
 	}
 	return ok
+}
+
+// incSourceWatermarkCapable is the D4 guard's capability read (MS-04
+// absorption, ruling seq 271); since MS-06 it is a thin delegate to the
+// generalized srcCapable (same-package anchors keep compiling unchanged).
+func incSourceWatermarkCapable(kind string) bool {
+	return srcCapable(kind, source.CapWatermark)
 }
 
 // WatermarkDialect is the source-side dialect consumed by the incremental

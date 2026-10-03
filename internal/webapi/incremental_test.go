@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/source"
 )
 
 // F-04 anchors: watermark SQL construction, state-advance semantics, the
@@ -339,6 +340,48 @@ func TestIncSourceWatermarkCapable(t *testing.T) {
 	}
 	if !incSourceWatermarkCapable("postgres") {
 		t.Fatal(`incSourceWatermarkCapable("postgres") = false`)
+	}
+}
+
+// MS-06 generalized capability-read anchors (ruling seq 347): the TWO call
+// shapes differ on the EMPTY kind - C1 two-shape table:
+//   - :2333 assess shape feeds the RAW stored type: empty -> srcCapable
+//     rejects -> 400 (legacy guard parity, same as the watermark shape);
+//   - :1264 cdc_chain shape feeds cfg.Source.SourceType(), which NORMALIZES
+//     "" to postgres: empty -> CapCDC(postgres) = true -> ALLOWED (legacy
+//     empty-means-postgres allow behavior preserved).
+//
+// Ten states pinned: each capability (CapAssess/CapCDC) across
+// empty/unknown/mysql/tidb/postgres in BOTH shapes.
+func TestSrcCapable(t *testing.T) {
+	// Shape 1 (raw value in, e.g. e.Type): empty is rejected.
+	if srcCapable("", source.CapAssess) {
+		t.Fatal(`srcCapable("", CapAssess) = true; raw-shape empty must be rejected (C1)`)
+	}
+	if srcCapable("oracle", source.CapAssess) {
+		t.Fatal(`srcCapable("oracle", CapAssess) = true; unknown kind must resolve false`)
+	}
+	for _, notCapable := range []string{"mysql", "tidb"} {
+		if srcCapable(notCapable, source.CapAssess) {
+			t.Fatalf("srcCapable(%q, CapAssess) = true; assess is PG-only in v1", notCapable)
+		}
+	}
+	if !srcCapable("postgres", source.CapAssess) {
+		t.Fatal(`srcCapable("postgres", CapAssess) = false`)
+	}
+	if srcCapable("oracle", source.CapCDC) || srcCapable("mysql", source.CapCDC) || srcCapable("tidb", source.CapCDC) {
+		t.Fatal("srcCapable(<non-pg>, CapCDC) = true; CDC is PG-only in v1")
+	}
+	if !srcCapable("postgres", source.CapCDC) {
+		t.Fatal(`srcCapable("postgres", CapCDC) = false`)
+	}
+	// Shape 2 (normalized value in, e.g. cfg.Source.SourceType()): empty
+	// has ALREADY defaulted to postgres, so the cdc_chain path ALLOWS it.
+	if cfg := (config.SourceConfig{}); cfg.SourceType() != "postgres" {
+		t.Fatal(`SourceConfig{}.SourceType() != "postgres"; the cdc_chain shape depends on the built-in default`)
+	}
+	if !srcCapable((config.SourceConfig{}).SourceType(), source.CapCDC) {
+		t.Fatal("srcCapable(SourceType(), CapCDC) = false for an empty config; legacy empty-means-postgres allow behavior flipped (C1)")
 	}
 }
 
