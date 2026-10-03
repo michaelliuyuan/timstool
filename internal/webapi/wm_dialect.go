@@ -17,6 +17,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/michaelliuyuan/timstool/internal/source"
@@ -56,8 +57,10 @@ func incSourceWatermarkCapable(kind string) bool {
 }
 
 // WatermarkDialect is the source-side dialect consumed by the incremental
-// engine: identifier quoting, the three scan-rendering shapes, watermark
-// type eligibility, and the column catalog probe. v1 has exactly one
+// engine and the watermark suggest flow: identifier quoting, the three
+// scan-rendering shapes, watermark type eligibility, the column catalog
+// probe, and the suggest catalog (system schemas / catalog query /
+// default-now detection - MS-05, ruling seq 310). v1 has exactly one
 // implementation (pgWatermarkDialect) - the D4 capability guard
 // (Capable(kind, CapWatermark)) guarantees only watermark-capable kinds
 // reach the engine; MS-09 swaps the package-level incSourceDialect seam.
@@ -76,7 +79,7 @@ type WatermarkDialect interface {
 
 	// BuildNextWatermarkSQL renders the post-drain MIN probe (relocated
 	// verbatim from incBuildNextWatermarkSQL, incremental.go :174-179).
-	BuildNextWatermarkSQL(schema, table, wmCol string) string
+	BuildNextWatermarkSQL(schema, table string, wmCol string) string
 
 	// WatermarkEligible reports whether an information_schema.data_type
 	// value may serve as a watermark column (delegates to the
@@ -88,15 +91,79 @@ type WatermarkDialect interface {
 	// :671-702; the batch KEY query queryIncTableKeys/:716-751 stays in the
 	// main flow - MS-09 seam).
 	QueryColumns(ctx context.Context, db *sql.DB, schema, table string) ([]incColumnView, error)
+
+	// SystemSchemas lists the schemas never scanned for watermark
+	// candidates (MS-05: the single source of the suggest-flow system
+	// schema filter; relocated verbatim from wmSystemSchemas,
+	// watermark_suggest.go :44-47).
+	SystemSchemas() map[string]bool
+
+	// QuerySuggestCatalog fetches all columns of all user tables for the
+	// watermark suggest flow in one query (relocated verbatim from
+	// queryWMCatalog, watermark_suggest.go :79-98, with the DefaultNow
+	// judgment routed through DefaultNowMatch - ruling seq 310: single
+	// source, no twin regex).
+	QuerySuggestCatalog(ctx context.Context, db *sql.DB, schema string) ([]wmCatalogColumn, error)
+
+	// DefaultNowMatch reports whether a column default expression is an
+	// automatically-maintained timestamp default (relocated verbatim from
+	// the wmDefaultNowRe match at watermark_suggest.go :94).
+	DefaultNowMatch(def string) bool
 }
 
 // pgWatermarkDialect is the PostgreSQL implementation of WatermarkDialect.
 type pgWatermarkDialect struct{}
 
+// wmSystemSchemas are never scanned for watermark candidates. Relocated
+// verbatim from watermark_suggest.go (MS-05); the package-level NAME is
+// kept so the same-package anchors keep compiling unchanged.
+// CONSUMPTION WHITELIST (ruling seq 310): the only legal readers are
+// pgWatermarkDialect methods (SystemSchemas / QuerySuggestCatalog) and the
+// white-box dual-track anchor - the main flow and handlers must NOT read
+// this map directly; wmCatalogSQL's inline NOT IN is pinned equal to these
+// keys by the dual-track anchor (drift in either direction is red).
+var wmSystemSchemas = map[string]bool{
+	"pg_catalog": true, "information_schema": true, "pg_toast": true,
+}
+
+// wmDefaultNowRe detects automatically-maintained timestamp defaults.
+// The (^|[^']) guard rejects string LITERALS like 'now()'::text (a quoted
+// default is a constant, not auto-maintenance); RE2 has no lookbehind, so
+// the preceding-character class stands in.
+// Relocated verbatim from watermark_suggest.go (MS-05).
+// CONSUMPTION WHITELIST: the only legal reader is DefaultNowMatch (and the
+// white-box anchors) - NO twin regex may exist (ruling seq 310).
+var wmDefaultNowRe = regexp.MustCompile(`(?i)(^|[^'])(now\(\)|current_timestamp|localtimestamp|transaction_timestamp\(\))`)
+
+// wmCatalogSQL is the suggest catalog query. Relocated verbatim from
+// watermark_suggest.go (MS-05) - byte-identical SQL, structural guards
+// (partition exclusion, valid-index-only, system-schema NOT IN) stay
+// pinned by the same-package anchors.
+// DUAL-TRACK NOTE: the inline NOT IN below and the wmSystemSchemas map are
+// the same source of truth in two renderings; the dual-track anchor pins
+// them equal in BOTH directions (map keys must appear quoted in the SQL,
+// and the SQL literal set must equal the map key set).
+const wmCatalogSQL = `
+		SELECT c.table_name, c.column_name, c.data_type,
+		       COALESCE(c.column_default, ''),
+		       EXISTS (SELECT 1 FROM pg_index i
+		                JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ord) ON true
+		                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+		               WHERE i.indrelid = t.oid AND i.indisvalid AND a.attname = c.column_name)
+		FROM information_schema.columns c
+		JOIN pg_class t ON t.relname = c.table_name
+		JOIN pg_namespace n ON n.oid = t.relnamespace AND n.nspname = c.table_schema
+		WHERE c.table_schema = $1
+		  AND t.relkind IN ('r', 'p')
+		  AND NOT t.relispartition
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+		ORDER BY c.table_name, c.ordinal_position`
+
 // incSourceDialect is the package-level single dial point (ruling seq 269):
 // every consumer (scan renderers, MIN initial-watermark probe, log-preview
-// renderers, suggest eligibility, column catalog) goes through this
-// instance; MS-09 swaps the selection by source kind at this one seam.
+// renderers, suggest eligibility, column catalog, suggest catalog) goes
+// through this instance; MS-09 swaps the selection by source kind at this
+// one seam.
 var incSourceDialect WatermarkDialect = pgWatermarkDialect{}
 
 // QuoteIdent relocates incQuotePG (incremental.go :141-142) verbatim.
@@ -174,4 +241,39 @@ func (pgWatermarkDialect) QueryColumns(ctx context.Context, db *sql.DB, schema, 
 		cols = append(cols, c)
 	}
 	return cols, rows.Err()
+}
+
+// SystemSchemas relocates the wmSystemSchemas catalog read (MS-05).
+func (pgWatermarkDialect) SystemSchemas() map[string]bool {
+	return wmSystemSchemas
+}
+
+// QuerySuggestCatalog relocates queryWMCatalog (watermark_suggest.go
+// :79-98) verbatim, with the DefaultNow judgment routed through
+// DefaultNowMatch (single source, ruling seq 310).
+func (d pgWatermarkDialect) QuerySuggestCatalog(ctx context.Context, db *sql.DB, schema string) ([]wmCatalogColumn, error) {
+	rows, err := db.QueryContext(ctx, wmCatalogSQL, schema)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []wmCatalogColumn
+	for rows.Next() {
+		var c wmCatalogColumn
+		var def string
+		var idxed bool
+		if err := rows.Scan(&c.Table, &c.Column, &c.DataType, &def, &idxed); err != nil {
+			return nil, err
+		}
+		c.Indexed = idxed
+		c.DefaultNow = d.DefaultNowMatch(def)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// DefaultNowMatch relocates the wmDefaultNowRe match (watermark_suggest.go
+// :94) - the ONLY consumption point of wmDefaultNowRe outside anchors.
+func (pgWatermarkDialect) DefaultNowMatch(def string) bool {
+	return wmDefaultNowRe.MatchString(def)
 }

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -41,60 +40,16 @@ type wmSuggestCandidate struct {
 	Warnings        []string       `json:"warnings"`
 }
 
-// wmSystemSchemas are never scanned for watermark candidates.
-var wmSystemSchemas = map[string]bool{
-	"pg_catalog": true, "information_schema": true, "pg_toast": true,
-}
-
-// wmDefaultNowRe detects automatically-maintained timestamp defaults.
-// The (^|[^']) guard rejects string LITERALS like 'now()'::text (a quoted
-// default is a constant, not auto-maintenance); RE2 has no lookbehind, so
-// the preceding-character class stands in.
-var wmDefaultNowRe = regexp.MustCompile(`(?i)(^|[^'])(now\(\)|current_timestamp|localtimestamp|transaction_timestamp\(\))`)
+// wmSystemSchemas / wmDefaultNowRe / wmCatalogSQL relocated verbatim to
+// wm_dialect.go (MS-05) - package-level names kept there; consumption goes
+// through the WatermarkDialect methods (SystemSchemas / QuerySuggestCatalog
+// / DefaultNowMatch).
 
 // queryWMCatalog fetches all columns of all user tables in one query.
-// relispartition=false excludes partition CHILDREN (relkind 'r' rows that
-// are partitions of a 'p' parent) so the catalog counts logical tables,
-// not one entry per partition; indisvalid skips failed/leftover invalid
-// indexes from the index flag.
-// wmCatalogSQL is a named const so tests can pin its structural guards
-// (partition exclusion, valid-index-only) — the SQL's real semantics are
-// covered by isolation testing against a live PG.
-const wmCatalogSQL = `
-		SELECT c.table_name, c.column_name, c.data_type,
-		       COALESCE(c.column_default, ''),
-		       EXISTS (SELECT 1 FROM pg_index i
-		                JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ord) ON true
-		                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-		               WHERE i.indrelid = t.oid AND i.indisvalid AND a.attname = c.column_name)
-		FROM information_schema.columns c
-		JOIN pg_class t ON t.relname = c.table_name
-		JOIN pg_namespace n ON n.oid = t.relnamespace AND n.nspname = c.table_schema
-		WHERE c.table_schema = $1
-		  AND t.relkind IN ('r', 'p')
-		  AND NOT t.relispartition
-		  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-		ORDER BY c.table_name, c.ordinal_position`
-
+// MS-05 transitional thin delegate to the dialect method; the handler
+// routes to incSourceDialect.QuerySuggestCatalog directly in commit 2.
 func queryWMCatalog(ctx context.Context, db *sql.DB, schema string) ([]wmCatalogColumn, error) {
-	rows, err := db.QueryContext(ctx, wmCatalogSQL, schema)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []wmCatalogColumn
-	for rows.Next() {
-		var c wmCatalogColumn
-		var def string
-		var idxed bool
-		if err := rows.Scan(&c.Table, &c.Column, &c.DataType, &def, &idxed); err != nil {
-			return nil, err
-		}
-		c.Indexed = idxed
-		c.DefaultNow = wmDefaultNowRe.MatchString(def)
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	return incSourceDialect.QuerySuggestCatalog(ctx, db, schema)
 }
 
 // wmNameNorm folds camelCase / snake_case / kebab-case into one comparable

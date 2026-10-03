@@ -326,3 +326,47 @@ func TestWMCatalogSQLGuards(t *testing.T) {
 		}
 	}
 }
+
+// TestWMSuggestDialectDualTrack pins the system-schema dual-track equality
+// in BOTH directions (MS-05, ruling seq 310): every wmSystemSchemas key
+// must appear quoted in wmCatalogSQL's inline NOT IN, and the NOT IN
+// literal set must equal the map key set exactly (no half-drift in either
+// direction). The map is read through the dialect method (SystemSchemas),
+// never directly.
+func TestWMSuggestDialectDualTrack(t *testing.T) {
+	sys := incSourceDialect.SystemSchemas()
+	// Forward: every map key appears as a quoted literal in the SQL.
+	for k := range sys {
+		quoted := "'" + k + "'"
+		if !strings.Contains(wmCatalogSQL, quoted) {
+			t.Errorf("wmCatalogSQL missing quoted system schema %q (dual-track drift)", k)
+		}
+	}
+	// Reverse: the NOT IN literal set equals the map key set exactly.
+	line := ""
+	for _, l := range strings.Split(wmCatalogSQL, "\n") {
+		if strings.Contains(l, "NOT IN (") {
+			line = strings.TrimSpace(l)
+		}
+	}
+	if line == "" {
+		t.Fatal("wmCatalogSQL has no NOT IN system-schema line")
+	}
+	inner := line[strings.Index(line, "(")+1 : strings.LastIndex(line, ")")]
+	got := map[string]bool{}
+	for _, lit := range strings.Split(inner, ",") {
+		lit = strings.TrimSpace(lit)
+		lit = strings.Trim(lit, "'")
+		if lit != "" {
+			got[lit] = true
+		}
+	}
+	if len(got) != len(sys) {
+		t.Errorf("NOT IN literal count %d != SystemSchemas count %d (half-drift)", len(got), len(sys))
+	}
+	for k := range got {
+		if !sys[k] {
+			t.Errorf("NOT IN literal %q not in SystemSchemas (dual-track drift)", k)
+		}
+	}
+}
