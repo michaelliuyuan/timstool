@@ -18,7 +18,42 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+
+	"github.com/michaelliuyuan/timstool/internal/source"
 )
+
+// incWatermarkTypes lists the information_schema.data_type values eligible as
+// watermark columns (comparable, monotonic-ish types). Relocated verbatim
+// from incremental.go (MS-04 commit 2/3); the package-level NAME is kept so
+// the same-package white-box anchors (incremental_test.go, watermark_suggest
+// drift anchor) keep compiling unchanged.
+// CONSUMPTION WHITELIST (ruling seq 269): the only legal readers are
+// pgWatermarkDialect methods (WatermarkEligible / QueryColumns) and those
+// white-box anchors - the main flow must NOT read this map directly.
+var incWatermarkTypes = map[string]bool{
+	"timestamp with time zone":    true,
+	"timestamp without time zone": true,
+	"date":                        true,
+	"integer":                     true,
+	"bigint":                      true,
+}
+
+// incSourceWatermarkCapable is the D4 guard's capability read (MS-04
+// absorption, ruling seq 271): kind "" is rejected EXPLICITLY before the
+// capability lookup (NormalizeKind("") would default it to postgres - the
+// legacy guard rejected empty, so semantics must not flip), and an unknown
+// kind resolves to false so the caller keeps its 400 same-text path (never
+// escalates to 500).
+func incSourceWatermarkCapable(kind string) bool {
+	if kind == "" {
+		return false
+	}
+	ok, err := source.Capable(kind, source.CapWatermark)
+	if err != nil {
+		return false
+	}
+	return ok
+}
 
 // WatermarkDialect is the source-side dialect consumed by the incremental
 // engine: identifier quoting, the three scan-rendering shapes, watermark
