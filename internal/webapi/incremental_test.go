@@ -19,18 +19,18 @@ import (
 // identifier allow-list).
 
 func TestIncSelectSQL(t *testing.T) {
-	got := incBuildSelectSQL("public", "users", []string{"id", "update_time", "name"}, "update_time", false)
+	got := incSourceDialect.BuildSelectSQL("public", "users", []string{"id", "update_time", "name"}, "update_time", false)
 	want := `SELECT "id", "update_time", "name" FROM "public"."users" WHERE "update_time" >= $1 ORDER BY "update_time" LIMIT $2`
 	if got != want {
 		t.Fatalf("non-strict select =\n%s\nwant\n%s", got, want)
 	}
 	// Strict mode (opt-in, may lose same-second late rows) must use ">".
-	got = incBuildSelectSQL("public", "users", []string{"id"}, "wm", true)
+	got = incSourceDialect.BuildSelectSQL("public", "users", []string{"id"}, "wm", true)
 	if !strings.Contains(got, `"wm" > $1`) {
 		t.Fatalf("strict select missing > : %s", got)
 	}
 	// Identifiers containing quotes must be escaped, never inlined raw.
-	got = incBuildSelectSQL(`s"x`, `t"y`, []string{`c"z`}, `w"m`, false)
+	got = incSourceDialect.BuildSelectSQL(`s"x`, `t"y`, []string{`c"z`}, `w"m`, false)
 	if strings.Contains(got, `"s"x"`) || !strings.Contains(got, `"s""x"`) {
 		t.Fatalf("quote escaping failed: %s", got)
 	}
@@ -321,8 +321,53 @@ func TestIncrementalColumnsBatchValidation(t *testing.T) {
 
 // --- F-04 v2: same-value saturation (Blocker A) anchors ---
 
+// MS-04 D4 absorption anchors (ruling seq 271): the capability read must
+// keep the legacy guard's semantics - empty kind REJECTED explicitly
+// (NormalizeKind("") would default to postgres = semantic flip risk) and
+// unknown kinds resolve false (400 same-text path, never 500).
+func TestIncSourceWatermarkCapable(t *testing.T) {
+	if incSourceWatermarkCapable("") {
+		t.Fatal(`incSourceWatermarkCapable("") = true; empty kind must be rejected (legacy guard parity)`)
+	}
+	if incSourceWatermarkCapable("oracle") {
+		t.Fatal(`incSourceWatermarkCapable("oracle") = true; unknown kind must resolve false`)
+	}
+	for _, notCapable := range []string{"mysql", "tidb"} {
+		if incSourceWatermarkCapable(notCapable) {
+			t.Fatalf("incSourceWatermarkCapable(%q) = true; watermark is PG-only in v1", notCapable)
+		}
+	}
+	if !incSourceWatermarkCapable("postgres") {
+		t.Fatal(`incSourceWatermarkCapable("postgres") = false`)
+	}
+}
+
+// MS-04 logs-renderer quote-fragment anchor (ruling seq 269): the log
+// previews' identifier fragments must be BYTE-identical to the dialect's -
+// the renderers are same-source different call sites (overall SQL differs:
+// inline wm/limit for display vs $1/$2 parameters).
+func TestIncLogsRenderersQuoteFragments(t *testing.T) {
+	cols := []string{"id", `c"z`}
+	strict := false
+	sel := incRenderSelectSQL(`s"x`, `t"y`, cols, `w"m`, strict, "'2026-01-01'", 500)
+	drn := incRenderDrainSQL(`s"x`, `t"y`, cols, `w"m`, "'2026-01-01'")
+	jmp := incRenderNextWatermarkSQL(`s"x`, `t"y`, `w"m`, "'2026-01-01'")
+	d := incSourceDialect
+	qualifier := d.QuoteIdent(`s"x`) + "." + d.QuoteIdent(`t"y`)
+	for _, rendered := range []string{sel, drn, jmp} {
+		if !strings.Contains(rendered, qualifier) || !strings.Contains(rendered, d.QuoteIdent(`w"m`)) {
+			t.Fatalf("log renderer fragment missing (qualifier/wm) from rendered SQL:\n%s", rendered)
+		}
+	}
+	for _, rendered := range []string{sel, drn} { // column list only in select/drain
+		if !strings.Contains(rendered, d.QuoteIdent(`c"z`)) {
+			t.Fatalf("log renderer column fragment missing from rendered SQL:\n%s", rendered)
+		}
+	}
+}
+
 func TestIncDrainAndJumpSQL(t *testing.T) {
-	got := incBuildDrainSQL("public", "users", []string{"id", "update_time"}, "update_time")
+	got := incSourceDialect.BuildDrainSQL("public", "users", []string{"id", "update_time"}, "update_time")
 	want := `SELECT "id", "update_time" FROM "public"."users" WHERE "update_time" = $1`
 	if got != want {
 		t.Fatalf("drain SQL =\n%s\nwant\n%s", got, want)
@@ -330,7 +375,7 @@ func TestIncDrainAndJumpSQL(t *testing.T) {
 	if strings.Contains(got, "LIMIT") {
 		t.Fatalf("drain scan must be unbounded (streamed): %s", got)
 	}
-	jump := incBuildNextWatermarkSQL("public", "users", "update_time")
+	jump := incSourceDialect.BuildNextWatermarkSQL("public", "users", "update_time")
 	wantJump := `SELECT MIN("update_time") FROM "public"."users" WHERE "update_time" > $1`
 	if jump != wantJump {
 		t.Fatalf("jump SQL =\n%s\nwant\n%s", jump, wantJump)

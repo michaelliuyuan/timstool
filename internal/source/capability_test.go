@@ -133,8 +133,10 @@ var typeBranchFixture = map[string]int{
 	"internal/webapi/datasource.go": 1,
 	// DDL export source guard (MS-07).
 	"internal/webapi/ddl_export_handler.go": 1,
-	// incremental source guards (MS-04) + target-tidb guards.
-	"internal/webapi/incremental.go": 6,
+	// incremental source guards absorbed into the WatermarkDialect capability
+	// read (MS-04, incSourceWatermarkCapable: empty kind rejected explicitly
+	// inside the helper); target-tidb guards remain.
+	"internal/webapi/incremental.go": 2,
 	// legacy PG-direct endpoints + tidb-as-source guard + target guard +
 	// cdc_chain guard (M4) + assess guard (MS-06).
 	"internal/webapi/server.go": 6,

@@ -142,7 +142,7 @@ func wmNameClass(name string) (float64, string) {
 // to the single incWatermarkTypes source (same package) so the two sets
 // can never drift; this switch only assigns the relative weight.
 func wmTypeWeight(dataType string) (float64, string) {
-	if !incWatermarkTypes[dataType] {
+	if !incSourceDialect.WatermarkEligible(dataType) {
 		return 0, ""
 	}
 	switch dataType {

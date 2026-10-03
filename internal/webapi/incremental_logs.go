@@ -300,6 +300,12 @@ func incQuoteSQLLiteral(v string) string {
 }
 
 // incRenderSelectSQL renders the keyset scan with wm and limit inlined.
+// MS-04 note: these log-preview renderers are SAME-SOURCE different call
+// sites of the dialect renderers (identifier fragments via
+// incSourceDialect.QuoteIdent; overall SQL differs from the parameterized
+// main-flow shapes by design - inline wm/limit for display). Do NOT copy
+// them again; the quote fragments are byte-anchored to the dialect in
+// incremental_test.go (TestIncLogsRenderersQuoteFragments).
 func incRenderSelectSQL(schema, table string, cols []string, wmCol string, strict bool, wm string, limit int) string {
 	op := ">="
 	if strict {
@@ -307,29 +313,29 @@ func incRenderSelectSQL(schema, table string, cols []string, wmCol string, stric
 	}
 	quoted := make([]string, len(cols))
 	for i, c := range cols {
-		quoted[i] = incQuotePG(c)
+		quoted[i] = incSourceDialect.QuoteIdent(c)
 	}
 	return fmt.Sprintf("SELECT %s FROM %s.%s WHERE %s %s %s ORDER BY %s LIMIT %d",
-		strings.Join(quoted, ", "), incQuotePG(schema), incQuotePG(table),
-		incQuotePG(wmCol), op, incQuoteSQLLiteral(wm), incQuotePG(wmCol), limit)
+		strings.Join(quoted, ", "), incSourceDialect.QuoteIdent(schema), incSourceDialect.QuoteIdent(table),
+		incSourceDialect.QuoteIdent(wmCol), op, incQuoteSQLLiteral(wm), incSourceDialect.QuoteIdent(wmCol), limit)
 }
 
 // incRenderDrainSQL renders the same-value drain scan with wm inlined.
 func incRenderDrainSQL(schema, table string, cols []string, wmCol, wm string) string {
 	quoted := make([]string, len(cols))
 	for i, c := range cols {
-		quoted[i] = incQuotePG(c)
+		quoted[i] = incSourceDialect.QuoteIdent(c)
 	}
 	return fmt.Sprintf("SELECT %s FROM %s.%s WHERE %s = %s",
-		strings.Join(quoted, ", "), incQuotePG(schema), incQuotePG(table),
-		incQuotePG(wmCol), incQuoteSQLLiteral(wm))
+		strings.Join(quoted, ", "), incSourceDialect.QuoteIdent(schema), incSourceDialect.QuoteIdent(table),
+		incSourceDialect.QuoteIdent(wmCol), incQuoteSQLLiteral(wm))
 }
 
 // incRenderNextWatermarkSQL renders the post-drain jump probe with wm inlined.
 func incRenderNextWatermarkSQL(schema, table, wmCol, wm string) string {
 	return fmt.Sprintf("SELECT MIN(%s) FROM %s.%s WHERE %s > %s",
-		incQuotePG(wmCol), incQuotePG(schema), incQuotePG(table),
-		incQuotePG(wmCol), incQuoteSQLLiteral(wm))
+		incSourceDialect.QuoteIdent(wmCol), incSourceDialect.QuoteIdent(schema), incSourceDialect.QuoteIdent(table),
+		incSourceDialect.QuoteIdent(wmCol), incQuoteSQLLiteral(wm))
 }
 
 // incLogScanBatchFull / incLogScanBatchSummary are the D3 frequency controls:

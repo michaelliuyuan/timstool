@@ -126,57 +126,15 @@ var incRunCtxHook func(context.Context)
 // pattern rejects — belt and braces against SQL injection).
 var incIdentifierRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// incWatermarkTypes lists the information_schema.data_type values eligible as
-// watermark columns (comparable, monotonic-ish types).
-var incWatermarkTypes = map[string]bool{
-	"timestamp with time zone":    true,
-	"timestamp without time zone": true,
-	"date":                        true,
-	"integer":                     true,
-	"bigint":                      true,
-}
-
 func incIdentifierOK(s string) bool { return incIdentifierRe.MatchString(s) }
-
-// incQuotePG quotes a PostgreSQL identifier.
-func incQuotePG(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
 
 // incQuoteMySQL quotes a MySQL/TiDB identifier.
 func incQuoteMySQL(s string) string { return "`" + strings.ReplaceAll(s, "`", "``") + "`" }
 
-// incBuildSelectSQL renders the keyset-paged source scan. The watermark value
-// is always the $1 parameter (never inlined); batch size is $2.
-func incBuildSelectSQL(schema, table string, cols []string, wmCol string, strict bool) string {
-	op := ">="
-	if strict {
-		op = ">"
-	}
-	quoted := make([]string, len(cols))
-	for i, c := range cols {
-		quoted[i] = incQuotePG(c)
-	}
-	return fmt.Sprintf("SELECT %s FROM %s.%s WHERE %s %s $1 ORDER BY %s LIMIT $2",
-		strings.Join(quoted, ", "), incQuotePG(schema), incQuotePG(table), incQuotePG(wmCol), op, incQuotePG(wmCol))
-}
-
-// incBuildDrainSQL renders the same-value drain scan used when a full batch
-// sits entirely on one watermark value: no LIMIT (streamed), equality only.
-// The watermark value stays the $1 parameter.
-func incBuildDrainSQL(schema, table string, cols []string, wmCol string) string {
-	quoted := make([]string, len(cols))
-	for i, c := range cols {
-		quoted[i] = incQuotePG(c)
-	}
-	return fmt.Sprintf("SELECT %s FROM %s.%s WHERE %s = $1",
-		strings.Join(quoted, ", "), incQuotePG(schema), incQuotePG(table), incQuotePG(wmCol))
-}
-
-// incBuildNextWatermarkSQL renders the post-drain jump probe: the smallest
-// watermark strictly above the drained value ("" / NULL ⇒ table complete).
-func incBuildNextWatermarkSQL(schema, table, wmCol string) string {
-	return fmt.Sprintf("SELECT MIN(%s) FROM %s.%s WHERE %s > $1",
-		incQuotePG(wmCol), incQuotePG(schema), incQuotePG(table), incQuotePG(wmCol))
-}
+// Source-side PG quoting/rendering/column-catalog/eligibility moved to
+// WatermarkDialect (wm_dialect.go, MS-04 commit 2/3); all consumers dial the
+// package-level incSourceDialect seam. incQuoteMySQL stays here: target-side
+// write path, MS-09 seam (ruling seq 269).
 
 // incCursorStep decides the keyset cursor after one fetched batch.
 // saturated=true means the batch was full AND its max watermark equals the
@@ -487,7 +445,7 @@ func (s *Server) handleCreateIncrementalJob(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return
 	}
-	if src.Type != "postgres" {
+	if !incSourceWatermarkCapable(src.Type) {
 		// MS-04 absorbs this guard into the WatermarkDialect capability read
 		// (ruling seq 82: baseline-frozen, only-decrease).
 		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
@@ -560,7 +518,7 @@ func (s *Server) handleUpdateIncrementalJob(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return
 	}
-	if src.Type != "postgres" {
+	if !incSourceWatermarkCapable(src.Type) {
 		// MS-04 absorbs this guard into the WatermarkDialect capability read
 		// (ruling seq 82: baseline-frozen, only-decrease).
 		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
@@ -668,38 +626,8 @@ type incColumnView struct {
 	Indexed    bool   `json:"indexed"`
 }
 
-// queryIncColumns runs the watermark-eligibility column query for one table
-// (shared by the single-table and batch endpoints).
-func queryIncColumns(ctx context.Context, db *sql.DB, schema, table string) ([]incColumnView, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT c.column_name, c.data_type,
-		       (SELECT COUNT(*) FROM pg_index i
-		         JOIN pg_class tc ON tc.oid = i.indrelid
-		         JOIN pg_namespace ns ON ns.oid = tc.relnamespace
-		         JOIN pg_attribute a ON a.attrelid = tc.oid AND a.attname = c.column_name
-		         JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ord) ON true
-		        WHERE ns.nspname = c.table_schema AND tc.relname = c.table_name
-		          AND k.attnum = a.attnum AND k.ord = 1) AS indexed_first
-		FROM information_schema.columns c
-		WHERE c.table_schema = $1 AND c.table_name = $2
-		ORDER BY c.ordinal_position`, schema, table)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	cols := []incColumnView{}
-	for rows.Next() {
-		var c incColumnView
-		var idxed int
-		if err := rows.Scan(&c.Name, &c.DataType, &idxed); err != nil {
-			return nil, err
-		}
-		c.Comparable = incWatermarkTypes[c.DataType]
-		c.Indexed = idxed > 0
-		cols = append(cols, c)
-	}
-	return cols, rows.Err()
-}
+// queryIncColumns moved to WatermarkDialect (pgWatermarkDialect.QueryColumns,
+// wm_dialect.go, MS-04 commit 2/3); callers dial incSourceDialect.QueryColumns.
 
 // incKeyInfo discloses whether a source table has a dedup-capable key
 // (FEAT-INC-KEY-WARN): REPLACE/IGNORE conflict strategies rely on a unique
@@ -768,7 +696,7 @@ func (s *Server) handleIncrementalColumns(w http.ResponseWriter, r *http.Request
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return
 	}
-	if e.Type != "postgres" {
+	if !incSourceWatermarkCapable(e.Type) {
 		// MS-04 absorbs this guard (ruling seq 82).
 		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
 		return
@@ -784,7 +712,7 @@ func (s *Server) handleIncrementalColumns(w http.ResponseWriter, r *http.Request
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	cols, err := queryIncColumns(ctx, db, sc.Schema, table)
+	cols, err := incSourceDialect.QueryColumns(ctx, db, sc.Schema, table)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "list columns failed: "+err.Error())
 		return
@@ -849,7 +777,7 @@ func (s *Server) handleIncrementalColumnsBatch(w http.ResponseWriter, r *http.Re
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return
 	}
-	if e.Type != "postgres" {
+	if !incSourceWatermarkCapable(e.Type) {
 		// MS-04 absorbs this guard (ruling seq 82).
 		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
 		return
@@ -880,7 +808,7 @@ func (s *Server) handleIncrementalColumnsBatch(w http.ResponseWriter, r *http.Re
 	}
 	out := make([]tableResult, 0, len(req.Tables))
 	for _, t := range req.Tables {
-		cols, err := queryIncColumns(ctx, db, sc.Schema, t)
+		cols, err := incSourceDialect.QueryColumns(ctx, db, sc.Schema, t)
 		if err != nil {
 			out = append(out, tableResult{Table: t, Error: err.Error()})
 			continue
@@ -1127,7 +1055,7 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 		lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, "", time.Since(tableStart).Milliseconds())
 		return res
 	}
-	if !incWatermarkTypes[wmType] {
+	if !incSourceDialect.WatermarkEligible(wmType) {
 		res.Error = fmt.Sprintf("水位列 %q 类型 %q 不在白名单（timestamp/timestamptz/date/int/bigint）", t.WatermarkColumn, wmType)
 		st.Failed = res.Error
 		lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, "", time.Since(tableStart).Milliseconds())
@@ -1141,7 +1069,7 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 	if wm == "" {
 		var minWM sql.NullString
 		if err := pgDB.QueryRowContext(ctx,
-			fmt.Sprintf("SELECT MIN(%s) FROM %s.%s", incQuotePG(t.WatermarkColumn), incQuotePG(sc.Schema), incQuotePG(t.Table)),
+			fmt.Sprintf("SELECT MIN(%s) FROM %s.%s", incSourceDialect.QuoteIdent(t.WatermarkColumn), incSourceDialect.QuoteIdent(sc.Schema), incSourceDialect.QuoteIdent(t.Table)),
 		).Scan(&minWM); err != nil {
 			res.Error = "计算初始水位失败: " + err.Error()
 			st.Failed = res.Error
@@ -1178,7 +1106,7 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 		entryWM := wm
 		batchNo++
 		scanStart := time.Now()
-		selSQL := incBuildSelectSQL(sc.Schema, t.Table, cols, t.WatermarkColumn, job.StrictMode && !geScan)
+		selSQL := incSourceDialect.BuildSelectSQL(sc.Schema, t.Table, cols, t.WatermarkColumn, job.StrictMode && !geScan)
 		srows, err := pgDB.QueryContext(ctx, selSQL, wm, job.BatchSize)
 		if err != nil {
 			res.Error = "查询源端失败: " + err.Error()
@@ -1310,7 +1238,7 @@ func wmIndex(cols []string, wmCol string) int {
 // MIN(watermark) > wm: no such value ⇒ the whole table is synced (done).
 // Memory stays bounded regardless of how many rows share the value.
 func (s *Server) incDrainWatermark(ctx context.Context, pgDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, cols []string, wm string, lg *incLogCollector) (rows int64, nextWM string, done bool, err error) {
-	srows, qErr := pgDB.QueryContext(ctx, incBuildDrainSQL(sc.Schema, t.Table, cols, t.WatermarkColumn), wm)
+	srows, qErr := pgDB.QueryContext(ctx, incSourceDialect.BuildDrainSQL(sc.Schema, t.Table, cols, t.WatermarkColumn), wm)
 	if qErr != nil {
 		return 0, "", false, qErr
 	}
@@ -1362,7 +1290,7 @@ func (s *Server) incDrainWatermark(ctx context.Context, pgDB, myDB *sql.DB, sc c
 
 	var next sql.NullString
 	if qErr = pgDB.QueryRowContext(ctx,
-		incBuildNextWatermarkSQL(sc.Schema, t.Table, t.WatermarkColumn), wm,
+		incSourceDialect.BuildNextWatermarkSQL(sc.Schema, t.Table, t.WatermarkColumn), wm,
 	).Scan(&next); qErr != nil {
 		return rows, "", false, qErr
 	}
