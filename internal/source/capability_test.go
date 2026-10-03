@@ -138,8 +138,11 @@ var typeBranchFixture = map[string]int{
 	// compare source guards absorbed into the capability read (MS-08: raw
 	// shape-1 :393 + normalized shape-2 :423); target-tidb guard remains.
 	"internal/webapi/compare.go": 1,
-	// connection-test target-style routing for tidb profiles.
-	"internal/webapi/datasource.go": 1,
+	// connection-test target-style routing for tidb profiles + MS-08c
+	// type-aware schema default (public fallback is PG-only, mysql keeps
+	// empty so the validator defaults to the connection database —
+	// legitimate routing, not gating).
+	"internal/webapi/datasource.go": 2,
 	// incremental source guards absorbed into the WatermarkDialect capability
 	// read (MS-04, incSourceWatermarkCapable: empty kind rejected explicitly
 	// inside the helper); target-tidb guards remain.
