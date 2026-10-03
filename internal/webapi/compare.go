@@ -569,7 +569,10 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 		})
 	}
 
-	v := validator.NewValidator(config.Config{})
+	// MS-08: the source TYPE must travel with the config so NewValidator
+	// assembles the right source dialect/driver (ruling seq 410 option 1) -
+	// the empty-config default would pin every source to postgresDialect.
+	v := validator.NewValidator(config.Config{Source: task.Source})
 	v.OnTableDone(func(done, total int, tr reporter.TableReport) {
 		taskMu.Lock()
 		defer taskMu.Unlock()
@@ -587,7 +590,9 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 
 	_, validateOpts, compareCfg := buildCompareRunParams(task,
 		filepath.Join(s.compareDir(task.ID), "report.json"))
-	report, err := v.RunWithDSNs(ctx, task.Source.DSN(), task.Target.DSN(),
+	// MS-08: DSNByType dispatches on the source type (PG keeps the legacy
+	// postgresql:// DSN byte-identically; MySQL assembles the driver DSN).
+	report, err := v.RunWithDSNs(ctx, task.Source.DSNByType(), task.Target.DSN(),
 		task.Source.Schema, compareCfg, task.Parallel, validateOpts)
 	// B1: check ctx FIRST regardless of err — Run swallows per-table ctx
 	// cancellations into failed table reports and returns (rpt, nil), so a

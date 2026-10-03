@@ -121,8 +121,12 @@ func TestCapableSingleTruth(t *testing.T) {
 // Only-decrease: MS-03..MS-07 each swap their guards for capability reads and
 // prune their fixture lines; MS-12 asserts the map is empty.
 var typeBranchFixture = map[string]int{
-	// config-level legacy default (unification deferred; data-shaping only).
-	"internal/common/config/config.go": 1,
+	// config-level legacy default + MS-08 DSNByType driver-DSN dispatch
+	// (routing, not feature gating - the capability guard stays in webapi).
+	"internal/common/config/config.go": 2,
+	// MS-08 source-dialect/driver assembly dispatch (NewValidator/
+	// srcDriverName/sourceSchema - legitimate routing, not gating).
+	"internal/validator/validator.go": 1,
 	// #t79 dual-path routing (legitimate routing, not feature gating).
 	"internal/orchestrator/orchestrator.go": 3,
 	// CDC source guard + target-tidb guard (M4 binlog work).

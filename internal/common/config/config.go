@@ -175,6 +175,19 @@ func (s SourceConfig) DSN() string {
 	return BuildPGDSN(s.Host, s.Port, s.User, s.Password, s.Database, s.SSLMode, nil)
 }
 
+// DSNByType returns the source DSN dispatched on the NORMALIZED source type
+// (MS-08): postgres keeps the legacy PG DSN (byte-identical to DSN()); mysql
+// assembles the go-sql-driver DSN (schema == database on MySQL - the driver
+// connects to Database; SSLMode is a PG-only concept and is ignored). Unknown
+// types are unreachable behind the webapi capability guard (srcCapable) and
+// default to the PG shape here.
+func (s SourceConfig) DSNByType() string {
+	if s.SourceType() == "mysql" {
+		return BuildMySQLDSN(s.Host, s.Port, s.User, s.Password, s.Database, map[string]string{"charset": "utf8mb4"}, nil)
+	}
+	return s.DSN()
+}
+
 type TargetConfig struct {
 	Host       string `yaml:"host" json:"host"`
 	Port       int    `yaml:"port" json:"port"`

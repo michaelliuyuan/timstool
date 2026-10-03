@@ -156,6 +156,35 @@ func (postgresDialect) AdjustDSN(dsn string) string {
 	return dsn + sep + "options=" + url.QueryEscape("-c TimeZone=UTC")
 }
 
+// ListTables relocates validator.go getTables' information_schema probe
+// (MS-08: the $1 placeholder is pgx-owned). Behavior is byte-identical to
+// the pre-relocation query.
+func (postgresDialect) ListTables(ctx context.Context, q dialectQueryer, schema string) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT table_name
+		FROM information_schema.tables
+		WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+		ORDER BY table_name
+	`, schema)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tables []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		tables = append(tables, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list tables: %w", err)
+	}
+	return tables, nil
+}
+
 // parseIndexColumns extracts column names from a CREATE UNIQUE INDEX
 // statement (relocated verbatim from nopk.go :102-128; anchor test
 // TestParseIndexColumns keeps targeting it).

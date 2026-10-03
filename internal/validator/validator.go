@@ -47,8 +47,30 @@ type Validator struct {
 	tgtDialect TargetDialect
 }
 
+// NewValidator assembles the validator with dialects dispatched on the
+// NORMALIZED source type (MS-08): mysql gets the MySQL source dialect +
+// go-sql-driver DSN/driver; everything else (including the empty default,
+// which SourceType() normalizes to postgres) keeps the legacy PG assembly
+// byte-identically. Unknown types are unreachable behind the webapi
+// capability guard (srcCapable) and fall to the PG shape here.
 func NewValidator(cfg config.Config) *Validator {
-	return &Validator{cfg: cfg, srcDialect: postgresDialect{}, tgtDialect: tidbDialect{}}
+	v := &Validator{cfg: cfg, tgtDialect: tidbDialect{}}
+	if cfg.Source.SourceType() == "mysql" {
+		v.srcDialect = mysqlDialect{}
+	} else {
+		v.srcDialect = postgresDialect{}
+	}
+	return v
+}
+
+// srcDriverName returns the database/sql driver for the source side,
+// dispatched on the assembled dialect (pgx for PG, mysql for MySQL/TiDB
+// wire).
+func (v *Validator) srcDriverName() string {
+	if _, ok := v.srcDialect.(mysqlDialect); ok {
+		return "mysql"
+	}
+	return "pgx"
 }
 
 // sourceDSN returns the PostgreSQL DSN to connect to (override first).
@@ -68,9 +90,17 @@ func (v *Validator) targetDSN() string {
 }
 
 // sourceSchema returns the source schema name (override first, may be "").
+// MS-08: a MySQL source has no PG-style schema (schema == database), so an
+// empty schema defaults to the connection database instead of "public".
 func (v *Validator) sourceSchema() string {
 	if v.schemaOverride != "" {
 		return v.schemaOverride
+	}
+	if v.cfg.Source.Schema != "" {
+		return v.cfg.Source.Schema
+	}
+	if _, ok := v.srcDialect.(mysqlDialect); ok {
+		return v.cfg.Source.Database
 	}
 	return v.cfg.Source.Schema
 }
@@ -205,7 +235,7 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 		pgDSN = v.srcDialect.AdjustDSN(pgDSN)
 	}
 
-	pgDB, err := sql.Open("pgx", pgDSN)
+	pgDB, err := sql.Open(v.srcDriverName(), pgDSN)
 	if err != nil {
 		return nil, cerrors.Wrap(cerrors.ErrSourceConnect, "connect to PostgreSQL", err)
 	}
@@ -1145,35 +1175,7 @@ func (v *Validator) getTables(ctx context.Context, pgDB *sql.DB, include []strin
 		return include, nil
 	}
 
-	schema := v.sourceSchema()
-	if schema == "" {
-		schema = "public"
-	}
-
-	query := `
-		SELECT table_name
-		FROM information_schema.tables
-		WHERE table_schema = $1 AND table_type = 'BASE TABLE'
-		ORDER BY table_name
-	`
-	rows, err := pgDB.QueryContext(ctx, query, schema)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var tables []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		tables = append(tables, name)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list tables: %w", err)
-	}
-	return tables, nil
+	return v.srcDialect.ListTables(ctx, pgDB, schemaOrDefault(v.sourceSchema()))
 }
 
 // MS-03: quotePG/quoteMySQL relocated verbatim into the dialect implementations QuoteIdent methods.
@@ -1196,6 +1198,13 @@ func normalizeValue(val interface{}) string {
 		return normalizeString(strconv.FormatFloat(float64(v), 'f', -1, 32))
 	case int64:
 		return normalizeString(strconv.FormatInt(v, 10))
+	case uint64:
+		// MS-08 MySQL source seam (dialect.go:22): UNSIGNED BIGINT may scan
+		// as uint64 on the MySQL driver (text protocol yields []byte, the
+		// binary/interpolated paths can yield uint64). PG never returns
+		// uint64, so this case is unreachable-and-inert for PG sources -
+		// extending the single shared implementation, not a per-dialect fork.
+		return normalizeString(strconv.FormatUint(v, 10))
 	case int:
 		return normalizeString(strconv.Itoa(v))
 	case []byte:

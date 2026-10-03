@@ -84,6 +84,12 @@ type CompareDialect interface {
 	// segment-2 must relocate this behavior BYTE-identically (ruling
 	// seq 203-2: no drive-by fixes).
 	AdjustDSN(dsn string) string
+
+	// ListTables returns the compare-eligible BASE TABLE names of the source
+	// schema, sorted. MS-08: the placeholder syntax is driver-owned ($1 on
+	// pgx, ? on go-sql-driver) so the information_schema probe moved behind
+	// the dialect; the include-list short-circuit stays in the main flow.
+	ListTables(ctx context.Context, q dialectQueryer, schema string) ([]string, error)
 }
 
 // TargetDialect abstracts the TARGET-side specifics. MS-03 ships exactly one
