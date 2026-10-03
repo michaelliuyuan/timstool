@@ -11,6 +11,7 @@ import (
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/ddlexport"
+	"github.com/michaelliuyuan/timstool/internal/source"
 	"go.uber.org/zap"
 )
 
@@ -81,8 +82,10 @@ func (s *Server) applySourceRef(w http.ResponseWriter, req *ddlExportRequest) bo
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return false
 	}
-	if e.Type != "postgres" {
-		// MS-07 absorbs this guard (ruling seq 82).
+	if !srcCapable(e.Type, source.CapDDLExport) {
+		// MS-07 absorbs this guard (ruling seq 82): e.Type is the RAW stored
+		// value (C1 shape 1 - empty is rejected), identical to the legacy
+		// `!= "postgres"` behavior for empty/unknown/mysql/tidb.
 		s.writeError(w, http.StatusBadRequest, "source_ref: DDL 导出仅支持 PostgreSQL 数据源")
 		return false
 	}

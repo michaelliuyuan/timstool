@@ -383,6 +383,22 @@ func TestSrcCapable(t *testing.T) {
 	if !srcCapable((config.SourceConfig{}).SourceType(), source.CapCDC) {
 		t.Fatal("srcCapable(SourceType(), CapCDC) = false for an empty config; legacy empty-means-postgres allow behavior flipped (C1)")
 	}
+	// MS-07: the DDL export guard reads the RAW stored type (C1 shape 1 -
+	// empty is rejected), identical to the legacy `!= "postgres"` behavior.
+	if srcCapable("", source.CapDDLExport) {
+		t.Fatal(`srcCapable("", CapDDLExport) = true; raw-shape empty must be rejected (C1)`)
+	}
+	if srcCapable("oracle", source.CapDDLExport) {
+		t.Fatal(`srcCapable("oracle", CapDDLExport) = true; unknown kind must resolve false`)
+	}
+	for _, notCapable := range []string{"mysql", "tidb"} {
+		if srcCapable(notCapable, source.CapDDLExport) {
+			t.Fatalf("srcCapable(%q, CapDDLExport) = true; ddl_export is PG-only in v1", notCapable)
+		}
+	}
+	if !srcCapable("postgres", source.CapDDLExport) {
+		t.Fatal(`srcCapable("postgres", CapDDLExport) = false`)
+	}
 }
 
 // MS-04 logs-renderer quote-fragment anchor (ruling seq 269): the log
