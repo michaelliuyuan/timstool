@@ -32,7 +32,7 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 		return tr
 	}
 	// Get a dedicated TiDB connection with UTC timezone for row count.
-	tidbConn, connErr := getTiDBConn(ctx, tidbDB)
+	tidbConn, connErr := v.getTiDBConn(ctx, tidbDB)
 	if connErr != nil {
 		release()
 		tr.Status = reporter.StatusFail
@@ -64,7 +64,7 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	}
 
 	// Detect key columns for chunking
-	keyInfo, _ := v.detectTableKey(ctx, pgDB, schema, table)
+	keyInfo, _ := v.srcDialect.DetectTableKey(ctx, pgDB, schema, table)
 	var orderByCols string
 	if keyInfo != nil && keyInfo.HasPK {
 		orderByCols = strings.Join(keyInfo.PKColumns, ", ")
@@ -211,11 +211,11 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 	var err error
 	if wm := v.wmFilter(); wm != nil {
 		query := fmt.Sprintf("SELECT * FROM %s.%s WHERE %s ORDER BY %s LIMIT %d OFFSET %d",
-			quotePG(schema), quotePG(table), wmWherePG(wm), quoteOrderByCols(orderBy, quotePG), ch.limit, ch.offset)
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm), quoteOrderByCols(orderBy, v.srcDialect.QuoteIdent), ch.limit, ch.offset)
 		rows, err = pgDB.QueryContext(ctx, query, wm.Value)
 	} else {
 		query := fmt.Sprintf("SELECT * FROM %s.%s ORDER BY %s LIMIT %d OFFSET %d",
-			quotePG(schema), quotePG(table), quoteOrderByCols(orderBy, quotePG), ch.limit, ch.offset)
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), quoteOrderByCols(orderBy, v.srcDialect.QuoteIdent), ch.limit, ch.offset)
 		rows, err = pgDB.QueryContext(ctx, query)
 	}
 	if err != nil {
@@ -287,7 +287,7 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 // It gets its own dedicated connection with UTC timezone for parallel goroutines.
 func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, table, orderBy string, ch chunkRange) (string, error) {
 	// Get dedicated connection with UTC timezone for this goroutine.
-	conn, err := getTiDBConn(ctx, tidbDB)
+	conn, err := v.getTiDBConn(ctx, tidbDB)
 	if err != nil {
 		return "", fmt.Errorf("get TiDB conn for chunk: %w", err)
 	}
@@ -296,11 +296,11 @@ func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, ta
 	var rows *sql.Rows
 	if wm := v.wmFilter(); wm != nil {
 		query := fmt.Sprintf("SELECT * FROM %s WHERE %s ORDER BY %s LIMIT %d OFFSET %d",
-			quoteMySQL(table), wmWhereMySQL(wm), quoteOrderByCols(orderBy, quoteMySQL), ch.limit, ch.offset)
+			v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm), quoteOrderByCols(orderBy, v.tgtDialect.QuoteIdent), ch.limit, ch.offset)
 		rows, err = conn.QueryContext(ctx, query, wm.Value)
 	} else {
 		query := fmt.Sprintf("SELECT * FROM %s ORDER BY %s LIMIT %d OFFSET %d",
-			quoteMySQL(table), quoteOrderByCols(orderBy, quoteMySQL), ch.limit, ch.offset)
+			v.tgtDialect.QuoteIdent(table), quoteOrderByCols(orderBy, v.tgtDialect.QuoteIdent), ch.limit, ch.offset)
 		rows, err = conn.QueryContext(ctx, query)
 	}
 	if err != nil {

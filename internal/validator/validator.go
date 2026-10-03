@@ -39,10 +39,16 @@ type Validator struct {
 	// far, total tables, latest table report). Called from worker goroutines;
 	// implementations must be safe for concurrent use.
 	onTableDone func(done, total int, tr reporter.TableReport)
+
+	// MS-03 dialect injection: source-side and target-side specifics live
+	// behind CompareDialect/TargetDialect (pure relocation; see
+	// docs/MS03-DIALECT-MAP.md). Defaults preserve the pre-MS-03 behavior.
+	srcDialect CompareDialect
+	tgtDialect TargetDialect
 }
 
 func NewValidator(cfg config.Config) *Validator {
-	return &Validator{cfg: cfg}
+	return &Validator{cfg: cfg, srcDialect: postgresDialect{}, tgtDialect: tidbDialect{}}
 }
 
 // sourceDSN returns the PostgreSQL DSN to connect to (override first).
@@ -161,21 +167,21 @@ func (v *Validator) RunWithDSNs(ctx context.Context, pgDSN, tidbDSN, schema stri
 }
 
 // getTiDBConn gets a dedicated connection from the TiDB connection pool and
-// sets the session timezone to UTC. This ensures TIMESTAMP values are returned
-// in UTC, matching PostgreSQL's timestamptz output.
-func getTiDBConn(ctx context.Context, tidbDB *sql.DB) (*sql.Conn, error) {
+// initializes the session (timezone to UTC) via the target dialect - this
+// ensures TIMESTAMP values are returned in UTC, matching PostgreSQL's
+// timestamptz output. P-INC-TZ touchpoint: session setup relocated
+// byte-identically (ruling seq 204-2); the fix lands in segment 2 only.
+func (v *Validator) getTiDBConn(ctx context.Context, tidbDB *sql.DB) (*sql.Conn, error) {
 	conn, err := tidbDB.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get TiDB connection: %w", err)
 	}
-	_, err = conn.ExecContext(ctx, "SET time_zone = '+00:00'")
-	if err != nil {
+	if err := v.tgtDialect.SessionInit(ctx, conn); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("set TiDB timezone: %w", err)
+		return nil, err
 	}
 	return conn, nil
 }
-
 func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporter.Report, error) {
 	logger := zap.L()
 	logger.Info("starting data validation", zap.String("level", opts.Level), zap.String("mode", opts.Mode))
@@ -196,7 +202,7 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 	pgDSN := v.sourceDSN()
 	wm := v.wmFilter()
 	if wm != nil {
-		pgDSN = appendPGDSNUTC(pgDSN)
+		pgDSN = v.srcDialect.AdjustDSN(pgDSN)
 	}
 
 	pgDB, err := sql.Open("pgx", pgDSN)
@@ -256,7 +262,7 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 							Error: fmt.Sprintf("cancelled before start: %v", aerr)}
 						break
 					}
-					werr := checkWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), tableName, wm)
+					werr := v.srcDialect.ValidateWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), tableName, wm)
 					release()
 					if werr != nil {
 						tr = reporter.TableReport{
@@ -346,7 +352,7 @@ func (v *Validator) runTableUnit(ctx context.Context, pgDB, tidbDB *sql.DB, sem 
 		return reporter.TableReport{TableName: table, Status: reporter.StatusFail,
 			Error: fmt.Sprintf("cancelled before start: %v", aerr)}
 	}
-	tidbConn, connErr := getTiDBConn(ctx, tidbDB)
+	tidbConn, connErr := v.getTiDBConn(ctx, tidbDB)
 	if connErr != nil {
 		release()
 		return reporter.TableReport{TableName: table, Status: reporter.StatusFail,
@@ -373,7 +379,7 @@ func (v *Validator) runTableUnit(ctx context.Context, pgDB, tidbDB *sql.DB, sem 
 func (v *Validator) validateTableUnit(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string,
 	wm *config.WatermarkFilter, fn func(*sql.Conn) reporter.TableReport) reporter.TableReport {
 	if wm != nil {
-		if werr := checkWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), table, wm); werr != nil {
+		if werr := v.srcDialect.ValidateWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), table, wm); werr != nil {
 			return reporter.TableReport{
 				TableName: table,
 				Status:    reporter.StatusFail,
@@ -398,10 +404,10 @@ func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn
 	if wm != nil {
 		err = pgDB.QueryRowContext(ctx,
 			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s WHERE %s",
-				quotePG(schema), quotePG(table), wmWherePG(wm)), wm.Value).Scan(&sourceCount)
+				v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wm.Value).Scan(&sourceCount)
 	} else {
 		err = pgDB.QueryRowContext(ctx,
-			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", quotePG(schema), quotePG(table))).Scan(&sourceCount)
+			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table))).Scan(&sourceCount)
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
@@ -413,10 +419,10 @@ func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn
 	if wm != nil {
 		err = tidbConn.QueryRowContext(ctx,
 			fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s",
-				quoteMySQL(table), wmWhereMySQL(wm)), wm.Value).Scan(&targetCount)
+				v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wm.Value).Scan(&targetCount)
 	} else {
 		err = tidbConn.QueryRowContext(ctx,
-			fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteMySQL(table))).Scan(&targetCount)
+			fmt.Sprintf("SELECT COUNT(*) FROM %s", v.tgtDialect.QuoteIdent(table))).Scan(&targetCount)
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
@@ -455,7 +461,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 	}
 
 	// Detect table structure: does it have a primary key or unique index?
-	keyInfo, err := v.detectTableKey(ctx, pgDB, schema, table)
+	keyInfo, err := v.srcDialect.DetectTableKey(ctx, pgDB, schema, table)
 	if err != nil {
 		logger := zap.L()
 		logger.Warn("failed to detect table key, assuming no PK", zap.String("table", table), zap.Error(err))
@@ -509,11 +515,11 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 	var pgRows *sql.Rows
 	if wm != nil {
 		pgQuery := fmt.Sprintf("SELECT * FROM %s.%s WHERE %s ORDER BY 1 LIMIT %d OFFSET %d",
-			quotePG(schema), quotePG(table), wmWherePG(wm), sampleSize, offset)
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm), sampleSize, offset)
 		pgRows, err = pgDB.QueryContext(ctx, pgQuery, wm.Value)
 	} else {
 		pgQuery := fmt.Sprintf("SELECT * FROM %s.%s ORDER BY 1 LIMIT %d OFFSET %d",
-			quotePG(schema), quotePG(table), sampleSize, offset)
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), sampleSize, offset)
 		pgRows, err = pgDB.QueryContext(ctx, pgQuery)
 	}
 	if err != nil {
@@ -633,7 +639,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		if isCompositePK {
 			var colNames []string
 			for _, idx := range keyColIndices {
-				colNames = append(colNames, quoteMySQL(pgCols[idx].Name()))
+				colNames = append(colNames, v.tgtDialect.QuoteIdent(pgCols[idx].Name()))
 			}
 			seen := make(map[string]bool)
 			var tupleParts []string
@@ -655,9 +661,9 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 				return tr
 			}
 			tidbQuery = fmt.Sprintf("SELECT * FROM %s WHERE (%s) IN (%s)",
-				quoteMySQL(table), strings.Join(colNames, ","), strings.Join(tupleParts, ","))
+				v.tgtDialect.QuoteIdent(table), strings.Join(colNames, ","), strings.Join(tupleParts, ","))
 			if wm != nil {
-				tidbQuery += fmt.Sprintf(" AND %s", wmWhereMySQL(wm))
+				tidbQuery += fmt.Sprintf(" AND %s", v.tgtDialect.WmPredicateFragment(wm))
 				tidbArgs = []interface{}{wm.Value}
 			}
 		} else {
@@ -678,9 +684,9 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 				return tr
 			}
 			tidbQuery = fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s)",
-				quoteMySQL(table), quoteMySQL(keyColName), strings.Join(whereParts, ","))
+				v.tgtDialect.QuoteIdent(table), v.tgtDialect.QuoteIdent(keyColName), strings.Join(whereParts, ","))
 			if wm != nil {
-				tidbQuery += fmt.Sprintf(" AND %s", wmWhereMySQL(wm))
+				tidbQuery += fmt.Sprintf(" AND %s", v.tgtDialect.WmPredicateFragment(wm))
 				tidbArgs = []interface{}{wm.Value}
 			}
 		}
@@ -886,11 +892,11 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		var tidbRows *sql.Rows
 		if wm != nil {
 			tidbQuery := fmt.Sprintf("SELECT * FROM %s WHERE %s LIMIT %d OFFSET %d",
-				quoteMySQL(table), wmWhereMySQL(wm), sampleSize, offset)
+				v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm), sampleSize, offset)
 			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery, wm.Value)
 		} else {
 			tidbQuery := fmt.Sprintf("SELECT * FROM %s LIMIT %d OFFSET %d",
-				quoteMySQL(table), sampleSize, offset)
+				v.tgtDialect.QuoteIdent(table), sampleSize, offset)
 			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery)
 		}
 		if err != nil {
@@ -966,10 +972,10 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 	var err error
 	if wm := v.wmFilter(); wm != nil {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
-			quotePG(schema), quotePG(table), wmWherePG(wm)), wm.Value)
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wm.Value)
 	} else {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
-			quotePG(schema), quotePG(table)))
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table)))
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
@@ -1028,10 +1034,10 @@ func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB,
 	var err error
 	if wm := v.wmFilter(); wm != nil {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
-			quotePG(schema), quotePG(table), wmWherePG(wm)), wm.Value)
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wm.Value)
 	} else {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
-			quotePG(schema), quotePG(table)))
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table)))
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
@@ -1084,10 +1090,10 @@ func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, ti
 	var err error
 	if wm := v.wmFilter(); wm != nil {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
-			quotePG(schema), quotePG(table), wmWherePG(wm)), wm.Value)
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wm.Value)
 	} else {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
-			quotePG(schema), quotePG(table)))
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table)))
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
@@ -1170,13 +1176,7 @@ func (v *Validator) getTables(ctx context.Context, pgDB *sql.DB, include []strin
 	return tables, nil
 }
 
-func quotePG(name string) string {
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
-}
-
-func quoteMySQL(name string) string {
-	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
-}
+// MS-03: quotePG/quoteMySQL relocated verbatim into the dialect implementations QuoteIdent methods.
 
 func normalizeValue(val interface{}) string {
 	if val == nil {

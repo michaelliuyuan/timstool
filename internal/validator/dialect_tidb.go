@@ -123,3 +123,12 @@ func (tidbDialect) MatchHashColumns(sourceColNames []string, targetCols []*sql.C
 	}
 	return tidbHashCols
 }
+
+// escapeSQLLike escapes special characters in a SQL LIKE pattern (relocated
+// verbatim from quick.go :90-96).
+func escapeSQLLike(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "%", "\\%")
+	s = strings.ReplaceAll(s, "_", "\\_")
+	return s
+}

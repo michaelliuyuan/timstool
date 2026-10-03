@@ -6,19 +6,19 @@ import (
 )
 
 func TestQuotePG(t *testing.T) {
-	if quotePG("table") != `"table"` {
+	if (postgresDialect{}).QuoteIdent("table") != `"table"` {
 		t.Error("should double-quote PG identifier")
 	}
-	if quotePG(`ta"ble`) != `"ta""ble"` {
+	if (postgresDialect{}).QuoteIdent(`ta"ble`) != `"ta""ble"` {
 		t.Error("should escape double quotes")
 	}
 }
 
 func TestQuoteMySQL(t *testing.T) {
-	if quoteMySQL("table") != "`table`" {
+	if (tidbDialect{}).QuoteIdent("table") != "`table`" {
 		t.Error("should backtick-quote MySQL identifier")
 	}
-	if quoteMySQL("ta`ble") != "`ta``ble`" {
+	if (tidbDialect{}).QuoteIdent("ta`ble") != "`ta``ble`" {
 		t.Error("should escape backticks")
 	}
 }

@@ -20,23 +20,23 @@ func wmTestFilter(op string) *config.WatermarkFilter {
 
 // A1: PG predicate shape — quoted column, parameterized $1, both operators.
 func TestWmWherePG(t *testing.T) {
-	if got := wmWherePG(wmTestFilter("")); got != `"updated_at" <= $1` {
+	if got := (postgresDialect{}).WmPredicateFragment(wmTestFilter("")); got != `"updated_at" <= $1` {
 		t.Fatalf("default op predicate wrong: %s", got)
 	}
-	if got := wmWherePG(wmTestFilter("<")); got != `"updated_at" < $1` {
+	if got := (postgresDialect{}).WmPredicateFragment(wmTestFilter("<")); got != `"updated_at" < $1` {
 		t.Fatalf("strict op predicate wrong: %s", got)
 	}
-	if strings.Contains(wmWherePG(wmTestFilter("")), "2026-") {
+	if strings.Contains((postgresDialect{}).WmPredicateFragment(wmTestFilter("")), "2026-") {
 		t.Fatalf("value must NEVER be concatenated into the predicate")
 	}
 }
 
 // A2: MySQL predicate shape — backtick column, driver "?" placeholder.
 func TestWmWhereMySQL(t *testing.T) {
-	if got := wmWhereMySQL(wmTestFilter("<")); got != "`updated_at` < ?" {
+	if got := (tidbDialect{}).WmPredicateFragment(wmTestFilter("<")); got != "`updated_at` < ?" {
 		t.Fatalf("mysql predicate wrong: %s", got)
 	}
-	if strings.Contains(wmWhereMySQL(wmTestFilter("")), "2026-") {
+	if strings.Contains((tidbDialect{}).WmPredicateFragment(wmTestFilter("")), "2026-") {
 		t.Fatalf("value must NEVER be concatenated into the predicate")
 	}
 }
@@ -75,11 +75,11 @@ func TestWmIdentAllowList(t *testing.T) {
 // A5: PG DSN gains exactly one pool-level UTC option; existing query
 // strings get "&" instead of a second "?".
 func TestAppendPGDSNUTC(t *testing.T) {
-	got := appendPGDSNUTC("postgresql://u:p@h:5432/db?sslmode=disable")
+	got := (postgresDialect{}).AdjustDSN("postgresql://u:p@h:5432/db?sslmode=disable")
 	if !strings.Contains(got, "&options=") {
 		t.Fatalf("existing query must append with &: %s", got)
 	}
-	got2 := appendPGDSNUTC("postgresql://u:p@h:5432/db")
+	got2 := (postgresDialect{}).AdjustDSN("postgresql://u:p@h:5432/db")
 	if !strings.Contains(got2, "?options=") {
 		t.Fatalf("bare DSN must open a query: %s", got2)
 	}

@@ -167,3 +167,33 @@ func (postgresDialect) AdjustDSN(dsn string) string {
 	}
 	return dsn + sep + "options=" + url.QueryEscape("-c TimeZone=UTC")
 }
+
+// parseIndexColumns extracts column names from a CREATE UNIQUE INDEX
+// statement (relocated verbatim from nopk.go :102-128; anchor test
+// TestParseIndexColumns keeps targeting it).
+func parseIndexColumns(indexDef string) []string {
+	// Find the last parenthesized group: ... ON table (col1, col2, ...)
+	idx := strings.LastIndex(indexDef, "(")
+	if idx < 0 {
+		return nil
+	}
+	inner := indexDef[idx+1:]
+	end := strings.Index(inner, ")")
+	if end < 0 {
+		return nil
+	}
+	inner = inner[:end]
+
+	parts := strings.Split(inner, ",")
+	var cols []string
+	for _, p := range parts {
+		col := strings.TrimSpace(p)
+		// Remove optional ASC/DESC/NULLS options
+		col = strings.Split(col, " ")[0]
+		col = strings.Trim(col, "\"")
+		if col != "" {
+			cols = append(cols, col)
+		}
+	}
+	return cols
+}

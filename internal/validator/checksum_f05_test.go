@@ -15,15 +15,15 @@ import (
 // dialects — quoting the whole "col1, col2" string breaks every composite-key
 // chunk query.
 func TestQuoteOrderByColsComposite(t *testing.T) {
-	pg := quoteOrderByCols("col1, col2", quotePG)
+	pg := quoteOrderByCols("col1, col2", (postgresDialect{}).QuoteIdent)
 	if pg != `"col1", "col2"` {
 		t.Errorf("PG composite ORDER BY = %s", pg)
 	}
-	my := quoteOrderByCols("col1, col2", quoteMySQL)
+	my := quoteOrderByCols("col1, col2", (tidbDialect{}).QuoteIdent)
 	if my != "`col1`, `col2`" {
 		t.Errorf("MySQL composite ORDER BY = %s", my)
 	}
-	if got := quoteOrderByCols(" id ", quoteMySQL); got != "`id`" {
+	if got := quoteOrderByCols(" id ", (tidbDialect{}).QuoteIdent); got != "`id`" {
 		t.Errorf("single column should be quoted and trimmed, got %s", got)
 	}
 }

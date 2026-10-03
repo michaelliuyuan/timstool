@@ -1,12 +1,7 @@
 package validator
 
 import (
-	"context"
-	"database/sql"
-	"fmt"
-	"net/url"
 	"regexp"
-	"strings"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 )
@@ -51,37 +46,11 @@ func wmOp(wm *config.WatermarkFilter) string {
 	return "<="
 }
 
-// wmWherePG builds the parameterized PG predicate. The watermark value is
-// the ONLY parameter of every query it joins, so the placeholder is always $1.
-func wmWherePG(wm *config.WatermarkFilter) string {
-	return fmt.Sprintf("%s %s $1", quotePG(wm.Column), wmOp(wm))
-}
-
-// wmWhereMySQL builds the parameterized TiDB predicate (driver "?" style).
-func wmWhereMySQL(wm *config.WatermarkFilter) string {
-	return fmt.Sprintf("%s %s ?", quoteMySQL(wm.Column), wmOp(wm))
-}
-
-// checkWatermarkColumn verifies per table that the watermark column exists
-// and its type is comparable — a table that fails this check fails alone
-// with an explicit error (per-table failure semantics, same as incremental).
-func checkWatermarkColumn(ctx context.Context, pgDB *sql.DB, schema, table string, wm *config.WatermarkFilter) error {
-	var dataType string
-	err := pgDB.QueryRowContext(ctx, `
-		SELECT data_type FROM information_schema.columns
-		WHERE table_schema = $1 AND table_name = $2 AND column_name = $3`,
-		schema, table, wm.Column).Scan(&dataType)
-	if err == sql.ErrNoRows {
-		return fmt.Errorf("水位列 %s 不存在于表 %s（水位过滤仅支持列存在的表参与比对）", wm.Column, table)
-	}
-	if err != nil {
-		return fmt.Errorf("校验水位列: %w", err)
-	}
-	if !wmAllowedColumnTypes[dataType] {
-		return fmt.Errorf("水位列 %s 类型 %s 不在可比白名单（timestamptz/timestamp/date/int/bigint）", wm.Column, dataType)
-	}
-	return nil
-}
+// MS-03: the predicate builders (wmWherePG/wmWhereMySQL), the column-check
+// probe (checkWatermarkColumn) and appendPGDSNUTC were relocated verbatim
+// into the dialect implementations (dialect_postgres.go / dialect_tidb.go);
+// the guards above (allow-lists, activation, op semantics) stay here in the
+// main flow by ruling (docs/MS03-DIALECT-MAP.md).
 
 // schemaOrDefault returns the effective source schema ("public" when unset).
 func schemaOrDefault(s string) string {
@@ -89,15 +58,4 @@ func schemaOrDefault(s string) string {
 		return "public"
 	}
 	return s
-}
-
-// appendPGDSNUTC appends a pool-level `options=-c TimeZone=UTC` to a PG DSN
-// so timestamptz watermark literals are interpreted as UTC on every pooled
-// connection (no per-conn SET race), symmetric with the TiDB UTC session.
-func appendPGDSNUTC(dsn string) string {
-	sep := "?"
-	if strings.Contains(dsn, "?") {
-		sep = "&"
-	}
-	return dsn + sep + "options=" + url.QueryEscape("-c TimeZone=UTC")
 }
