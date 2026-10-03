@@ -68,23 +68,10 @@ func (d tidbDialect) WmPredicateFragment(wm *config.WatermarkFilter) string {
 	return fmt.Sprintf("%s %s ?", d.QuoteIdent(wm.Column), wmOp(wm))
 }
 
-// BuildSelect relocates the ordered+paged fetch shapes (checksum.go :298-303).
-func (d tidbDialect) BuildSelect(schema, table, wmFragment, orderBy string, limit, offset int64) string {
-	if wmFragment != "" {
-		return fmt.Sprintf("SELECT * FROM %s WHERE %s ORDER BY %s LIMIT %d OFFSET %d",
-			d.QuoteIdent(table), wmFragment, quoteOrderByCols(orderBy, d.QuoteIdent), limit, offset)
-	}
-	return fmt.Sprintf("SELECT * FROM %s ORDER BY %s LIMIT %d OFFSET %d",
-		d.QuoteIdent(table), quoteOrderByCols(orderBy, d.QuoteIdent), limit, offset)
-}
-
-// BuildSelectAll relocates the full-table fetch shapes (nopk.go :626-631).
-func (d tidbDialect) BuildSelectAll(schema, table, wmFragment string) string {
-	if wmFragment != "" {
-		return fmt.Sprintf("SELECT * FROM %s WHERE %s", d.QuoteIdent(table), wmFragment)
-	}
-	return fmt.Sprintf("SELECT * FROM %s", d.QuoteIdent(table))
-}
+// Row-fetch shapes are NOT dialect methods (leader seq 214 dead-surface
+// pruning): call sites compose the SELECT templates in the main flow via
+// fmt.Sprintf + QuoteIdent/WmPredicateFragment (checksum.go :298-303,
+// validator.go :889-893, nopk.go :170-173/:507-510/:626-631).
 
 // SessionInit relocates getTiDBConn's per-connection session setup
 // (validator.go getTiDBConn: "SET time_zone = '+00:00'") - P-INC-TZ

@@ -55,23 +55,11 @@ func (d postgresDialect) WmPredicateFragment(wm *config.WatermarkFilter) string 
 	return fmt.Sprintf("%s %s $1", d.QuoteIdent(wm.Column), wmOp(wm))
 }
 
-// BuildSelect relocates the ordered+paged fetch shapes (checksum.go :213-218).
-func (d postgresDialect) BuildSelect(schema, table, wmFragment, orderBy string, limit, offset int64) string {
-	if wmFragment != "" {
-		return fmt.Sprintf("SELECT * FROM %s WHERE %s ORDER BY %s LIMIT %d OFFSET %d",
-			d.Qualify(schema, table), wmFragment, quoteOrderByCols(orderBy, d.QuoteIdent), limit, offset)
-	}
-	return fmt.Sprintf("SELECT * FROM %s ORDER BY %s LIMIT %d OFFSET %d",
-		d.Qualify(schema, table), quoteOrderByCols(orderBy, d.QuoteIdent), limit, offset)
-}
-
-// BuildSelectAll relocates the full-table fetch shapes (nopk.go :170-173).
-func (d postgresDialect) BuildSelectAll(schema, table, wmFragment string) string {
-	if wmFragment != "" {
-		return fmt.Sprintf("SELECT * FROM %s WHERE %s", d.Qualify(schema, table), wmFragment)
-	}
-	return fmt.Sprintf("SELECT * FROM %s", d.Qualify(schema, table))
-}
+// Row-fetch shapes are NOT dialect methods (leader seq 214 dead-surface
+// pruning): call sites compose the SELECT templates in the main flow via
+// fmt.Sprintf + QuoteIdent/WmPredicateFragment (checksum.go :213-218,
+// validator.go :508-516/:889-893/:967-970/:1029-1032/:1085-1088, nopk.go
+// :170-173/:507-510/:626-631).
 
 // ValidateWatermarkColumn relocates checkWatermarkColumn's information_schema
 // probe (wmfilter.go :68-84); the type-whitelist judgment (wmAllowedColumnTypes)

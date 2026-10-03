@@ -61,19 +61,12 @@ type CompareDialect interface {
 	// allow-list/type whitelist remain in the main flow.
 	WmPredicateFragment(wm *config.WatermarkFilter) string
 
-	// BuildSelect renders the ordered+paged row-fetch shape
-	// (checksum.go :213-218 PG / :298-303 target; sample reads
-	// validator.go :508-516 / :889-893). orderBy is the comma-joined column
-	// list (as at the call sites), quoted by the dialect via
-	// quoteOrderByCols (checksum.go); wmFragment == "" means no WHERE
-	// clause; args (the single watermark value when filtered) are supplied
-	// by the main flow.
-	BuildSelect(schema, table, wmFragment, orderBy string, limit, offset int64) string
-
-	// BuildSelectAll renders the full-table fetch shape with no ORDER BY /
-	// paging (source side: validator.go :967-970 / :1029-1032 / :1085-1088
-	// no-PK full reads; target side: nopk.go :170-173 / :507-510 / :626-631).
-	BuildSelectAll(schema, table, wmFragment string) string
+	// Row-fetch statement shapes are NOT dialect methods: every call site
+	// composes "SELECT * FROM %s [WHERE %s] [ORDER BY ...] [LIMIT/OFFSET]"
+	// in the main flow via fmt.Sprintf + QuoteIdent/WmPredicateFragment
+	// (byte-identical to the pre-relocation templates; ORDER BY 1 literals
+	// stay literal). MS-08 adds builder methods here only if a new source
+	// genuinely diverges (leader seq 214: dead surface pruned).
 
 	// ValidateWatermarkColumn checks column existence + comparability.
 	// PG: information_schema probe (wmfilter.go checkWatermarkColumn
@@ -122,12 +115,8 @@ type TargetDialect interface {
 	// placeholder. TiDB: `col` <= ? (wmfilter.go wmWhereMySQL :61-63).
 	WmPredicateFragment(wm *config.WatermarkFilter) string
 
-	// BuildSelect renders the ordered+paged shape for the target side
-	// (checksum.go :298-303; sample reads validator.go:889-893).
-	BuildSelect(schema, table, wmFragment, orderBy string, limit, offset int64) string
-
-	// BuildSelectAll renders the full-table fetch (nopk.go :626-631).
-	BuildSelectAll(schema, table, wmFragment string) string
+	// Row-fetch shapes are NOT dialect methods (see CompareDialect note):
+	// main-flow composition + QuoteIdent/WmPredicateFragment.
 
 	// SessionInit applies target-side per-connection session defaults.
 	// TiDB: SET time_zone UTC on every pooled/pinned connection

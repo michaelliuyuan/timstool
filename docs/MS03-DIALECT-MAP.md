@@ -12,8 +12,7 @@
 | EstimateRows | quick.go:26-30（pg_stat_user_tables.n_live_tup） | err=估算不可用；fallback 决策留主流程 |
 | CountExact | quick.go:35-36 / validator.go:404 | COUNT(*) |
 | WmPredicateFragment | wmfilter.go:56-58 wmWherePG | `col <= $1`；wmOp/白名单留主流程 |
-| BuildSelect | checksum.go:213-218；采样 validator.go:508-516 | ORDER BY+LIMIT/OFFSET |
-| BuildSelectAll | validator.go:967-970/1029-1032/1085-1088（no-PK 三策略 PG 全表取数） | 全表取数；ORDER BY 拼装走主流程 quoteOrderByCols（新增胶水↔原 checksum.go:213/:217/:299/:303 内联拼装位，签名未变） |
+| ~~BuildSelect/BuildSelectAll~~ | 取数组合=**主流程 fmt.Sprintf+方言 QuoteIdent/WmPredicateFragment**（checksum.go:213-218/298-303、validator.go:508-516/889-893/967-970/1029-1032/1085-1088、nopk.go:170-173/507-510/626-631） | leader seq 214 裁定：零调用方死面裁撤，MS-08 真分叉再加回 |
 | ValidateWatermarkColumn | wmfilter.go:68-84 checkWatermarkColumn 整函数 | information_schema 探测；**白名单 map（wmfilter.go:26）留主流程，其应用随函数搬运**（leader seq 209-③口径） |
 | DetectTableKey | nopk.go:37-100（含 parseIndexColumns :102-128） | PK/唯一索引元数据 |
 | AdjustDSN | wmfilter.go:97-103 appendPGDSNUTC | **P-INC-TZ 触点，段一逐字保留** |
@@ -27,8 +26,7 @@
 | EstimateRows | quick.go:44-73（SHOW TABLE STATUS LIKE+escapeSQLLike+Sscanf；escapeSQLLike :90-96） | 解析失败=0+nil（保 :67-72 语义） |
 | CountExact | quick.go:58-59 / validator.go:419 | COUNT(*) |
 | WmPredicateFragment | wmfilter.go:61-63 wmWhereMySQL | `col` <= ? |
-| BuildSelect | checksum.go:298-303；采样 validator.go:889-893 | |
-| BuildSelectAll | nopk.go:170-173/507-510/626-631 | 全表取数 |
+| ~~BuildSelect/BuildSelectAll~~ | 同源侧：主流程组合 | seq 214 裁撤 |
 | SessionInit | validator.go getTiDBConn 的 SET time_zone（UTC） | **P-INC-TZ 触点，段一逐字保留（含 −8h 潜伏态）** |
 | MatchHashColumns | nopk.go:646-662 | 小写列名匹配+approximate-float/json 跳过 |
 
