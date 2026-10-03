@@ -40,3 +40,4 @@
 - normalizeValue+PG 数组→JSON 解析（validator.go:1299 附近）——MS-03 单实现共用，MS-08 位预留
 - 报告结构/Summary/Suggestion 文案
 - quick fallback 决策（估算 err→COUNT 精确，同一触发条件/同一调用序，行为恒等迁出）
+- **hashGroup 统一跳过集匹配=主流程残留**（validateHashGroup 内联的 TiDB 侧统一 skip 匹配与共享 skip 机绑定，MatchHashColumns 签名不达；MS-08 接异构目标时在该位扩接口——红队 seq 217 🟡 记档）
