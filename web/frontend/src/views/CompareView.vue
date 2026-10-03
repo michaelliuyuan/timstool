@@ -772,7 +772,7 @@ onUnmounted(() => {
           <el-alert
             v-if="!sourceCompareCapable"
             type="warning" :closable="false" style="margin-top: 8px; width: 100%;"
-            :title="`当前源类型（${effectiveSourceType}）暂不支持数据比对，等待多源化任务（MS-08）接入后开放`"
+            :title="`当前源类型（${effectiveSourceType}）暂不支持数据比对（支持 postgres 与 mysql）`"
           />
         </el-form-item>
         <el-form-item v-if="form.mode === 'sample' || (form.mode === 'watermark' && wmConfig.base_mode === 'sample')" label="采样率">

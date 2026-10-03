@@ -147,6 +147,44 @@ func TestCompareTask_Validation(t *testing.T) {
 	}
 }
 
+// MS-08 absorption anchor: the inline source guard reads the capability via
+// the NORMALIZED type (C1 shape 2 - empty defaults to postgres and passes);
+// mysql passes since MS-08, unsupported kinds still 400.
+func TestCompareTask_SourceTypeGuardCapability(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	// Unsupported kinds are rejected with the updated bilingual message.
+	for _, bad := range []string{`"tidb"`, `"oracle"`, `"cockroachdb"`} {
+		body := `{"source":{"host":"s","type":` + bad + `},"target":{"host":"t"}}`
+		w, req := doReq("POST", "/api/v1/compare/tasks", body)
+		s.handleCreateCompare(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("type %s: status = %d body=%s", bad, w.Code, w.Body.String())
+		}
+		if msg := w.Body.String(); !strings.Contains(msg, "postgres") || !strings.Contains(msg, "mysql") {
+			t.Fatalf("type %s: 400 body must name postgres/mysql: %s", bad, msg)
+		}
+	}
+
+	// mysql + empty (normalized postgres) both PASS the gate; the created
+	// tasks fail later at connection time (no live DB in unit tests), which
+	// the create handler reports asynchronously - the 400 gate itself is
+	// what this anchor pins. A fresh server per case avoids the single-
+	// running-task mutex (409) from the previous case's async run.
+	for _, ok := range []string{`"mysql"`, `""`} {
+		s2, _ := newTestServer(t)
+		body := `{"source":{"host":"s","type":` + ok + `,"port":3306},"target":{"host":"t"}}`
+		w, req := doReq("POST", "/api/v1/compare/tasks", body)
+		s2.handleCreateCompare(w, req)
+		if w.Code != http.StatusBadRequest && w.Code != http.StatusCreated && w.Code != http.StatusOK {
+			t.Fatalf("type %s: unexpected gate status %d body=%s", ok, w.Code, w.Body.String())
+		}
+		if w.Code == http.StatusBadRequest && strings.Contains(w.Body.String(), "source.type") {
+			t.Fatalf("type %s: wrongly 400'd at the source gate: %s", ok, w.Body.String())
+		}
+	}
+}
+
 func TestCompareTask_PersistRedactsPasswords(t *testing.T) {
 	s, _ := newTestServer(t)
 

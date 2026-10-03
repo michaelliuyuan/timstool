@@ -44,15 +44,19 @@ func TestCapabilityMatrixSnapshot(t *testing.T) {
 	if !myc.Schema || !myc.Data {
 		t.Errorf("mysql schema/data = %v/%v, want true/true", myc.Schema, myc.Data)
 	}
+	// MS-08: compare flipped ON for mysql (MySQL-wire compare validator).
+	if !myc.Compare {
+		t.Error("mysql capability \"compare\" = false; want true since MS-08")
+	}
 	for _, off := range []struct {
 		name string
 		bit  bool
 	}{
-		{"cdc", myc.CDC}, {"compare", myc.Compare}, {"watermark", myc.Watermark},
+		{"cdc", myc.CDC}, {"watermark", myc.Watermark},
 		{"assess", myc.Assess}, {"ddl_export", myc.DDLExport},
 	} {
 		if off.bit {
-			t.Errorf("mysql capability %q = true, want false until MS-08..MS-11 land", off.name)
+			t.Errorf("mysql capability %q = true, want false until MS-09..MS-11 land", off.name)
 		}
 	}
 
@@ -98,8 +102,8 @@ func TestCapableSingleTruth(t *testing.T) {
 		t.Errorf(`Capable("", compare) = %v, %v; want true (legacy default = postgres)`, ok, err)
 	}
 	ok, err = source.Capable("mysql", source.CapCompare)
-	if err != nil || ok {
-		t.Errorf(`Capable("mysql", compare) = %v, %v; want false until MS-08`, ok, err)
+	if err != nil || !ok {
+		t.Errorf(`Capable("mysql", compare) = %v, %v; want true since MS-08`, ok, err)
 	}
 	if ok, err := source.Capable("tidb", source.CapData); err != nil || ok {
 		t.Errorf(`Capable("tidb", data) = %v, %v; want false/nil (target-only)`, ok, err)
@@ -131,8 +135,9 @@ var typeBranchFixture = map[string]int{
 	"internal/orchestrator/orchestrator.go": 3,
 	// CDC source guard + target-tidb guard (M4 binlog work).
 	"internal/webapi/cdc_config.go": 2,
-	// compare source guards (MS-03) + target-tidb guard.
-	"internal/webapi/compare.go": 3,
+	// compare source guards absorbed into the capability read (MS-08: raw
+	// shape-1 :393 + normalized shape-2 :423); target-tidb guard remains.
+	"internal/webapi/compare.go": 1,
 	// connection-test target-style routing for tidb profiles.
 	"internal/webapi/datasource.go": 1,
 	// incremental source guards absorbed into the WatermarkDialect capability

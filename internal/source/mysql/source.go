@@ -37,10 +37,11 @@ var mysqlMeta = source.SourceMeta{
 	DisplayName: "MySQL",
 	Implemented: true,
 	DefaultPort: 3306,
-	// MS-01: compare/watermark/assess/ddl_export arrive with MS-08..MS-11;
-	// the bits stay false until then so the UI greys them out and the API
+	// MS-01: watermark/assess/ddl_export arrive with MS-09..MS-11; compare
+	// flipped on by MS-08 (the compare validator speaks the MySQL wire).
+	// The bits stay false until then so the UI greys them out and the API
 	// 400-guards reject them (single truth, no scattered type branches).
-	Capabilities: source.Capabilities{Schema: true, Data: true, CDC: false},
+	Capabilities: source.Capabilities{Schema: true, Data: true, CDC: false, Compare: true},
 	Fields: []source.FieldSpec{
 		{Key: "host", Label: "主机地址", Type: "text", Required: true, Default: "localhost", Placeholder: "localhost", Group: "common"},
 		{Key: "port", Label: "端口", Type: "number", Required: true, Default: 3306, Group: "common"},

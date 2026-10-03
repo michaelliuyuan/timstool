@@ -326,15 +326,24 @@ func TestDatasources_CompareSourceTypeGate(t *testing.T) {
 
 	w, req = doReq("POST", "/api/v1/compare", fmt.Sprintf(`{"source_ref": %q, "target": {"host": "t", "port": 4000}}`, myID))
 	s.handleCreateCompare(w, req)
-	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "postgres") {
-		t.Fatalf("compare mysql ref: %d %s", w.Code, w.Body.String())
+	// MS-08: the mysql compare gate is OPEN - the task is created (it fails
+	// asynchronously at connection time in unit tests); only unsupported
+	// kinds (tidb/oracle) keep the 400.
+	if w.Code == http.StatusBadRequest {
+		t.Fatalf("compare mysql ref wrongly 400'd (MS-08 opened the gate): %d %s", w.Code, w.Body.String())
 	}
 
-	// Inline mysql source type is equally rejected.
-	w, req = doReq("POST", "/api/v1/compare", `{"source": {"host": "s", "type": "mysql"}, "target": {"host": "t", "port": 4000}}`)
+	// Unsupported kinds are still rejected at the source gate.
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "td2", "type": "tidb",
+		"fields": {"host": "10.0.0.5", "port": 4000, "user": "root", "password": "pw", "database": "d"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tdID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/compare", fmt.Sprintf(`{"source_ref": %q, "target": {"host": "t", "port": 4000}}`, tdID))
 	s.handleCreateCompare(w, req)
-	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "postgres") {
-		t.Fatalf("compare inline mysql: %d %s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "postgres") || !strings.Contains(w.Body.String(), "mysql") {
+		t.Fatalf("compare tidb ref: %d %s", w.Code, w.Body.String())
 	}
 }
 

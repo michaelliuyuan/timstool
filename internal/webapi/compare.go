@@ -18,6 +18,7 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/common"
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/common/reporter"
+	"github.com/michaelliuyuan/timstool/internal/source"
 	"github.com/michaelliuyuan/timstool/internal/validator"
 	"go.uber.org/zap"
 )
@@ -390,13 +391,13 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 			return
 		}
-		if e.Type != "postgres" {
-			// The compare validator speaks the PG wire protocol only
-			// (SourceConfig.DSN is always postgresql://), so non-PG sources
-			// are rejected at the gate instead of failing at runtime (P2-3).
-			// MS-03 absorbs this guard into the CompareDialect capability
-			// read (ruling seq 82: baseline-frozen, only-decrease).
-			s.writeError(w, http.StatusBadRequest, "source_ref: 比对源端数据源类型必须是 postgres")
+		if !srcCapable(e.Type, source.CapCompare) {
+			// MS-08 absorbs this guard into the capability read (ruling seq
+			// 410): e.Type is the RAW stored value (C1 shape 1 - empty is
+			// rejected), postgres/mysql pass (mysql since MS-08), unknown
+			// kinds resolve false. The PG-wire-only comment is obsolete -
+			// the validator now speaks the MySQL wire via mysqlDialect.
+			s.writeError(w, http.StatusBadRequest, "source_ref: 比对源端数据源类型必须是 postgres 或 mysql")
 			return
 		}
 		req.Source = dataSourceToSourceConfig(e)
@@ -417,11 +418,12 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "source and target host are required")
 		return
 	}
-	// P2-3 (inline path): non-PG source types are equally unsupported by the
-	// PG-wire-only validator — reject at the gate (MS-03 absorbs into the
-	// capability read).
-	if req.Source.Type != "" && req.Source.Type != "postgres" {
-		s.writeError(w, http.StatusBadRequest, "source.type: 比对源端类型必须是 postgres")
+	// P2-3 (inline path), MS-08 absorption: the NORMALIZED type feeds the
+	// capability read (C1 shape 2 - empty defaults to postgres and passes,
+	// byte-identical to the legacy `Type != "" && Type != "postgres"` guard
+	// where empty was allowed through).
+	if !srcCapable(req.Source.SourceType(), source.CapCompare) {
+		s.writeError(w, http.StatusBadRequest, "source.type: 比对源端类型必须是 postgres 或 mysql")
 		return
 	}
 	wm, werr := normalizeWatermarkFilter(req.Watermark)
