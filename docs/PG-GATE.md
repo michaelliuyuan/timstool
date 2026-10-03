@@ -40,22 +40,24 @@ powershell -File scripts\pg-gate.ps1 -KeepInstance
 | `static` | `go vet` 净 + `gofmt -l` 净 + `go test ./...` 0 FAIL + MS-01 四锚（A1 矩阵/A2 归一化/Capable/A3 冻结 fixture=26）+ **linux-amd64 件哈希对账**（`expected_artifact_sha256`） | 23 包基线与"生产代码零改动"机械证明 |
 | `wizard` | 建迁移任务（quick 路径，无 Lightning）→ completed → **四阶段结果（precheck/schema/data/validate）全 Success** | 向导全链（行数值级锚由 compare 面同 fixture 承担） |
 | `compare` | checksum 比对 diff=0 + 水位过滤比对（`created_at <= max`）diff=0 | 比对面 + #t3 水位过滤 |
-| `watermark` | suggest-watermark：`total_tables>=3`、top 候选 `created_at` coverage=1.0 + DEFAULT-now 理由；tidb 源 400 守卫仍在位 | 水位建议面 + 冻结守卫负锚 |
-| `incremental` | 空水位全量补齐 2050（泄流重读 ≤+100 容差，正确性由值级锚承担） → 同秒增量 5 → **幂等二跑 0 行+水位不动+值级 quick 比对 pass**（行数+值双锚） → **中断恢复**（运行中硬杀服务重启再跑）→ 终局 checksum 逐表 **总量=期望（55/2300）且 diff=0**（双条件，重复/漏行都拦） | 增量面 + 红队补强专项 |
+| `watermark` | suggest-watermark：`total_tables>=3`、top 候选 `created_at` **coverage≈2/3**（static_kv 无时间列记入 `unmatched_tables` 负锚）+ DEFAULT-now 理由；tidb 源 400 守卫仍在位 | 水位建议面 + 冻结守卫负锚 |
+| `incremental` | 空水位全量补齐 2050（泄流重读 ≤+100 容差） → 同秒增量 5 → **幂等二跑：不要求 0 行**（">=" 语义下同水位重读；锚=水位不动+quick 比对 pass——**行数估算级**） → **中断恢复**（运行中硬杀服务重启再跑）→ 终局 **quick（行数估算级）总量=期望（55/2300）且 diff=0 + COUNT(*) 精确锚（PG 直查/TiDB 经 checksum 探针 count 相位）+ checksum 值级探针**（P-INC-TZ 期红→WARNING） | 增量面 + 红队补强专项；**值级保证仅 checksum 探针** |
 | `cdc` | 数据源导入 config → start → running → 源端 INSERT 一行 → TiDB 侧可查（quick 比对 pass）→ checkpoint LSN 不回退 → stop `ok:true` | CDC 面（配置→起链→活数据→停链） |
 
 ## 环境前置（一次性）
 
 1. **PG 专用角色**（勿用 postgres 超户——MS-01 冒烟教训）。**命名注意：PostgreSQL 保留 `pg_`
    前缀（角色名与 schema 名都是）**，故角色/schema 用 `pggate`、仅数据库可叫 `pg_gate`：
-   ```sql
-   CREATE ROLE pggate LOGIN PASSWORD '...';
-   CREATE DATABASE pg_gate OWNER pggate;
-   ALTER ROLE pggate REPLICATION;   -- CDC 面需要
-   -- CDC 面另需超户一次性执行（CDC Setup 的 CREATE PUBLICATION ... FOR ALL
-   -- TABLES 需超户，产品侧失败会吞错——见已知边界 P-CDC-PUB）：
-   CREATE PUBLICATION pg_gate_pub FOR ALL TABLES;
-   ```
+    ```sql
+    CREATE ROLE pggate LOGIN PASSWORD '...';
+    CREATE DATABASE pg_gate OWNER pggate;   -- 坑①：须单独执行，勿与其他语句混跑
+    ALTER ROLE pggate REPLICATION;   -- CDC 面需要
+    -- CDC 面另需超户一次性执行（CDC Setup 的 CREATE PUBLICATION ... FOR ALL
+    -- TABLES 需超户，产品侧失败会吞错——见已知边界 P-CDC-PUB）：
+    CREATE PUBLICATION pg_gate_pub FOR ALL TABLES;
+    ```
+    **坑①**：`CREATE DATABASE` 不能与其他语句同一条 psql 多语句调用混跑（会静默跳过），须单独执行。
+    **坑②**：**TiDB 库名（`pggate`）≠ PG 库名（`pg_gate`）**，仅一杠之差极易混淆——对照下条逐字核对。
    且实例 **PG≥13**（pgoutput proto v2）+ `wal_level=logical` + `timezone='UTC'`。fixture schema
    `pggate`（或配置的 schema，**勿用 `pg_` 前缀**）**每跑必删建**，勿指向业务 schema。
 2. **TiDB 目标库**：工具不自建库，需一次性预建。**注意产品约定：CDC 链把「PG schema 名」

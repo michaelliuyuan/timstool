@@ -502,7 +502,7 @@ function Invoke-FaceWatermark {
     try { $null = Invoke-GateApi -Method Post -Path '/incremental/suggest-watermark' -Body @{ source_ref = $Refs.Tgt } }
     catch { $rejected = $true }
     if (-not $rejected) { throw "suggest-watermark accepted a tidb source_ref (guard regression)" }
-    Write-Host "  [watermark] top candidate=created_at coverage=1.0 default-now reason; tidb source 400-guard intact"
+    Write-Host "  [watermark] top candidate=$($top.column) coverage=$($top.coverage) default-now reason; tidb source 400-guard intact"
 }
 
 # ---------------------------------------------------------------------------
@@ -518,7 +518,9 @@ function Invoke-FaceIncremental {
     # interrupted batch (documented F-04 behavior) which would break the
     # resume anchor; under ">=" same-watermark rows are re-read (REPLACE
     # idempotent), so intermediate row METRICS carry re-read slack and the
-    # correctness anchors are value-level (quick/checksum compares).
+    # correctness anchors are row-count-parity (quick, estimation level) plus
+    # the checksum VALUE probe (quick mode does NOT compare values - it reads
+    # n_live_tup / SHOW TABLE STATUS estimates; see internal/validator/quick.go).
     $job = Invoke-GateApi -Method Post -Path '/incremental/jobs' -Body @{
         name = 'pg-gate inc'; source_ref = $Refs.Src; target_ref = $Refs.Tgt
         batch_size = 100; strict_mode = $false; conflict_strategy = 'replace'
@@ -554,16 +556,18 @@ function Invoke-FaceIncremental {
 
     # 3) idempotent re-run: no new data. Row-count-zero does NOT hold under
     # ">=" (same-watermark re-read); idempotency anchors = watermark unchanged
-    # + VALUE-level quick compare pass (duplicate/missed pairs that cancel in
-    # counts cannot pass a value compare).
+    # + quick compare pass (ROW-COUNT parity, estimation level - quick mode
+    # does not compare values; value-level guarantee lives only in the
+    # checksum probe, which P-INC-TZ currently keeps red).
     $before = (Get-IncJob $job.id).states.pggate_orders.last_watermark
     $null = Invoke-GateApi -Method Post -Path "/incremental/jobs/$($job.id)/run"
     $h3 = Wait-IncRunSettled -JobId $job.id
     if ($h3.status -eq 'failed') { throw "incremental idempotent run failed: $($h3.error)" }
     $after = (Get-IncJob $job.id).states.pggate_orders.last_watermark
     if ("$before".Trim() -ne "$after".Trim()) { throw "watermark drifted on no-op run: '$before' -> '$after'" }
-    # value-level anchor at the idempotent point (ruling seq 117-2: row count
-    # alone cannot catch duplicate+missed canceling out)
+    # row-count-parity anchor at the idempotent point (ruling seq 117-2: the
+    # count check still rules out one-sided duplicate/missed growth; note
+    # quick mode is estimation level, exact counts are pinned in step 5)
     $idem = Invoke-GateApi -Method Post -Path '/compare/tasks' -Body @{
         name   = "pg-gate inc idem $(Get-Date -Format HHmmss)"
         source = @{
@@ -580,7 +584,7 @@ function Invoke-FaceIncremental {
     $idemDone = Wait-CompareDone -CompareId $idem.id
     if ($idemDone.status -ne 'completed') { throw "idempotency quick compare failed: $($idemDone.error)" }
     $idemRep = Invoke-GateApi -Method Get -Path "/compare/tasks/$($idem.id)/report"
-    if ($idemRep.overall_status -ne 'pass') { throw "idempotency value-level anchor: quick compare overall=$($idemRep.overall_status)" }
+    if ($idemRep.overall_status -ne 'pass') { throw "idempotency row-count anchor: quick compare overall=$($idemRep.overall_status)" }
 
     # 4) interrupt/resume: new rows + hard service kill mid-run, restart, re-run
     Invoke-Psql $Cfg "INSERT INTO $($Cfg.pg.schema).pggate_orders_bulk(code) SELECT 'RESUME' || g FROM generate_series(1,300) g;"
@@ -633,12 +637,23 @@ function Invoke-FaceIncremental {
     if ($rep.overall_status -ne 'pass') { throw "post-incremental parity overall=$($rep.overall_status): resume lost or duplicated rows" }
     # resume double-condition (ruling seq 117-2): total = full expectation AND
     # zero diff (no duplicate keys, no missed rows) - per table, explicit.
+    # NOTE: quick-mode source_rows are ESTIMATES (n_live_tup / SHOW TABLE
+    # STATUS); the exact-count anchors below pin the same state precisely.
     $expectFinal = @{ pggate_orders = 55; pggate_orders_bulk = 2300 }
     foreach ($tbl in $rep.tables) {
         $short = ($tbl.table_name -split '\.')[-1]
         if (-not $expectFinal.ContainsKey($short)) { continue }
         if ([long]$tbl.diff_rows -ne 0) { throw "resume parity: $short diff_rows=$($tbl.diff_rows) (duplicate or missed rows)" }
         if ([long]$tbl.source_rows -ne $expectFinal[$short]) { throw "resume parity: $short total=$($tbl.source_rows), expected $($expectFinal[$short])" }
+    }
+    # exact-count anchor (MS-03 first-commit): PG side via COUNT(*) directly;
+    # TiDB side via the checksum probe below whose count phase is exact
+    # (per-table source_rows/target_rows are exact even when the hash leg is
+    # red under P-INC-TZ - the probe covers pggate_orders; orders_bulk carries
+    # the PG-side exact anchor plus the quick parity above).
+    foreach ($tbl in @('pggate_orders', 'pggate_orders_bulk')) {
+        $exact = (Invoke-Psql $Cfg "SELECT count(*) FROM $($Cfg.pg.schema).$tbl;" | Select-Object -First 1).Trim()
+        if ([long]$exact -ne $expectFinal[$tbl]) { throw "exact PG count ${tbl}: $exact, expected $($expectFinal[$tbl])" }
     }
     # KNOWN-ISSUE probe (P-INC-TZ): checksum compare on the same data is red
     # today (incremental TIMESTAMP drift); when the fix ships this flips to
@@ -658,12 +673,22 @@ function Invoke-FaceIncremental {
     }
     $ckDone = Wait-CompareDone -CompareId $ck.id
     $ckRep = Invoke-GateApi -Method Get -Path "/compare/tasks/$($ck.id)/report"
+    # exact-count anchor, TiDB side: the checksum count phase reads exact
+    # per-table rows (unlike quick's estimates) - assert them regardless of
+    # the hash leg's P-INC-TZ status.
+    foreach ($tbl in $ckRep.tables) {
+        $short = ($tbl.table_name -split '\.')[-1]
+        if (-not $expectFinal.ContainsKey($short)) { continue }
+        if ([long]$tbl.source_rows -ne $expectFinal[$short] -or [long]$tbl.target_rows -ne $expectFinal[$short]) {
+            throw "checksum-probe exact counts ${short}: src=$($tbl.source_rows) tgt=$($tbl.target_rows), expected $($expectFinal[$short])"
+        }
+    }
     if ($ckRep.overall_status -eq 'pass') {
         Write-Warning "  [incremental] P-INC-TZ appears FIXED (checksum parity now green) - invert the known-issue assert in pg-gate-lib.ps1 and update docs"
     } else {
         Write-Warning "  [incremental] known issue P-INC-TZ still present: checksum parity red on incremental-written TIMESTAMP columns (see docs/PG-GATE.md) - not a gate failure"
     }
-    Write-Host "  [incremental] backfill 2050(+drain) + delta >=5 + idempotent (value-level) + restart-resume (totals 55/2300, diff=0, quick pass)"
+    Write-Host "  [incremental] backfill 2050(+drain) + delta >=5 + idempotent (row-count est.) + restart-resume (totals 55/2300, diff=0, quick pass + exact counts PG/TiDB)"
 }
 
 # ---------------------------------------------------------------------------
