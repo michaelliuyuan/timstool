@@ -634,3 +634,23 @@ func TestDatasources_CDCImportFromDataSource(t *testing.T) {
 		t.Fatalf("config.yaml missing imported credentials: %s", string(raw))
 	}
 }
+
+// TestDataSourceToSourceConfig_SchemaFallbackByType pins the MS-08c schema
+// default: only postgres refs fall back to "public"; a mysql ref with no
+// schema field must convert to an empty schema so the validator's mysql
+// branch defaults to the connection database instead of searching a
+// nonexistent "public" schema.
+func TestDataSourceToSourceConfig_SchemaFallbackByType(t *testing.T) {
+	pg := &dataSourceEntry{Type: "postgres", Fields: map[string]any{
+		"host": "pg-host", "database": "pgdb",
+	}}
+	if sc := dataSourceToSourceConfig(pg); sc.Schema != "public" {
+		t.Fatalf("postgres ref schema fallback = %q, want public", sc.Schema)
+	}
+	my := &dataSourceEntry{Type: "mysql", Fields: map[string]any{
+		"host": "my-host", "database": "mydb",
+	}}
+	if sc := dataSourceToSourceConfig(my); sc.Schema != "" {
+		t.Fatalf("mysql ref schema = %q, want empty (validator defaults to database)", sc.Schema)
+	}
+}

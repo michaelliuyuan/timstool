@@ -517,7 +517,10 @@ func dataSourceToSourceConfig(e *dataSourceEntry) (sc config.SourceConfig) {
 		}
 	}
 	schema := stringField(e.Fields, "schema")
-	if schema == "" {
+	if schema == "" && e.Type == "postgres" {
+		// Only PG gets the "public" fallback: mysql has no PG-style schema
+		// layer, and an empty schema lets the validator's mysql branch
+		// default to the connection database (MS-08 sourceSchema).
 		schema = "public"
 	}
 	sslmode := stringField(e.Fields, "sslmode")
