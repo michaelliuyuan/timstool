@@ -46,5 +46,5 @@
 
 ## 锚测账
 
-- TestInc 21 锚+keywarn 锚：渲染锚改靶 incSourceDialect（断言值零变化）；白名单/漂移锚同包保名零改动。
+- TestInc 锚（基线 22 个 TestInc 函数+2 新锚=24；旧「21」为既往口径计数，非本单引入）+keywarn 锚：渲染锚改靶 incSourceDialect（断言值零变化）；白名单/漂移锚同包保名零改动。
 - 新增：TestIncSourceWatermarkCapable / TestIncLogsRenderersQuoteFragments。
