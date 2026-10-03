@@ -95,6 +95,9 @@ powershell -File scripts\pg-gate.ps1 -KeepInstance
   修复=增量写 DSN 内建 `time_zone='+00:00'`（incTargetDSN，go-sql-driver 逐连接 SET，池安全）；
   锚测 TestIncTargetDSNUTCTimezone；门禁增量面 checksum 探针已**翻回等值断言**（红=P-INC-TZ
   回归）。TargetConfig.DSN() 不动（test-connection/CDC/validator 各自会话口径不受影响）。
+  源侧读会话（openPGTestConn）无显式时区——水位/时间戳壁钟串按 PG 服务器 tz 渲染，合规前置
+  timezone='UTC' 下全链自洽；显式化+存量水位串迁移列**远期池券**（触发=非合规 tz 环境部署，
+  MS-04 段零盘点记档）。
 
 - **脚本宿主口径**：入口为 PowerShell 5.1 脚本（团队作业机即 PS5.1，无 bash 依赖）。
   未采用 `go test -tags` 封装的记档理由：新增 Go 包会使 `go test ./...` 包数离开 23 包基线、
