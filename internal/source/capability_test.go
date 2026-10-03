@@ -142,8 +142,6 @@ var typeBranchFixture = map[string]int{
 	"internal/webapi/server.go": 6,
 	// tidb-as-source guards (kept until the tidb flip point).
 	"internal/webapi/source_handler.go": 2,
-	// watermark suggest guard (MS-05).
-	"internal/webapi/watermark_suggest.go": 1,
 }
 
 // Ruling pattern (seq 82): catches .Type/srcType/SourceType() compares plus

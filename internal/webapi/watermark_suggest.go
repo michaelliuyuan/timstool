@@ -2,7 +2,6 @@ package webapi
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"sort"
@@ -44,13 +43,6 @@ type wmSuggestCandidate struct {
 // wm_dialect.go (MS-05) - package-level names kept there; consumption goes
 // through the WatermarkDialect methods (SystemSchemas / QuerySuggestCatalog
 // / DefaultNowMatch).
-
-// queryWMCatalog fetches all columns of all user tables in one query.
-// MS-05 transitional thin delegate to the dialect method; the handler
-// routes to incSourceDialect.QuerySuggestCatalog directly in commit 2.
-func queryWMCatalog(ctx context.Context, db *sql.DB, schema string) ([]wmCatalogColumn, error) {
-	return incSourceDialect.QuerySuggestCatalog(ctx, db, schema)
-}
 
 // wmNameNorm folds camelCase / snake_case / kebab-case into one comparable
 // form: lowercase with separators stripped ("updatedAt" == "updated_at").
@@ -275,13 +267,14 @@ func (s *Server) handleSuggestWatermark(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return
 	}
-	if e.Type != "postgres" {
-		// MS-05 absorbs this guard (ruling seq 82).
+	if !incSourceWatermarkCapable(e.Type) {
+		// MS-05 absorbs this guard (ruling seq 82); empty/unknown kinds keep
+		// the same 400 text via the capability read.
 		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
 		return
 	}
 	sc := dataSourceToSourceConfig(e)
-	if wmSystemSchemas[sc.Schema] {
+	if incSourceDialect.SystemSchemas()[sc.Schema] {
 		s.writeError(w, http.StatusBadRequest, "系统 schema 不参与水位建议")
 		return
 	}
@@ -295,7 +288,7 @@ func (s *Server) handleSuggestWatermark(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
-	cols, err := queryWMCatalog(ctx, db, sc.Schema)
+	cols, err := incSourceDialect.QuerySuggestCatalog(ctx, db, sc.Schema)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "catalog query failed: "+err.Error())
 		return
