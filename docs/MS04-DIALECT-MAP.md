@@ -21,7 +21,7 @@
 | incremental.go:1181 selSQL | BuildSelectSQL |
 | incremental.go:1313 drain | BuildDrainSQL |
 | incremental.go:1365 jump | BuildNextWatermarkSQL |
-| incremental.go:1144 MIN 初始水位探针（incQuotePG×4） | QuoteIdent×4 |
+| incremental.go:1144 MIN 初始水位探针（incQuotePG×3：WatermarkColumn/sc.Schema/t.Table） | QuoteIdent×3 |
 | incremental.go:787/:883 queryIncColumns×2（单表+批端点） | QueryColumns |
 | incremental.go:1130 incWatermarkTypes 直读 | WatermarkEligible |
 | incremental_logs.go:310-332 三渲染器（incQuotePG） | QuoteIdent（同源不同调用点禁再复制注记；恒等口径=引号片段，整体 SQL 与主流程非同串——logs 内联 wm/limit 供展示，锚 TestIncLogsRenderersQuoteFragments） |
