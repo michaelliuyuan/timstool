@@ -149,7 +149,14 @@ async function loadTables() {
   try {
     let data: { tables: { name: string; row_estimate: number }[] }
     if (sourceRef.value) {
-      ;({ data } = await apiClient.getRefTables(sourceRef.value))
+      // P2-4: mysql refs route through the multi-source adapter endpoint —
+      // /config/list-tables is PG-wire only and would 400; effectiveSourceType
+      // falls back to 'postgres' on a dead ref, keeping the legacy PG path.
+      if (effectiveSourceType.value === 'mysql') {
+        ;({ data } = await apiClient.getRefTablesMulti(sourceRef.value))
+      } else {
+        ;({ data } = await apiClient.getRefTables(sourceRef.value))
+      }
     } else if (sourceType.value === 'postgres') {
       ;({ data } = await apiClient.listTables({
         type: 'source',
