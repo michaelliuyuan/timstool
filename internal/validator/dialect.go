@@ -71,12 +71,14 @@ type CompareDialect interface {
 	BuildSelect(schema, table, wmFragment, orderBy string, limit, offset int64) string
 
 	// BuildSelectAll renders the full-table fetch shape with no ORDER BY /
-	// paging (nopk.go :170-173 / :626-631 bucket reads).
+	// paging (source side: validator.go :967-970 / :1029-1032 / :1085-1088
+	// no-PK full reads; target side: nopk.go :170-173 / :507-510 / :626-631).
 	BuildSelectAll(schema, table, wmFragment string) string
 
 	// ValidateWatermarkColumn checks column existence + comparability.
 	// PG: information_schema probe (wmfilter.go checkWatermarkColumn
-	// :68-84); the type whitelist judgment itself stays in the main flow.
+	// :68-84) - the whitelist MAP (wmAllowedColumnTypes) stays in the main
+	// flow; its application moved with the function (leader seq 209-3).
 	ValidateWatermarkColumn(ctx context.Context, q dialectQueryer, schema, table string, wm *config.WatermarkFilter) error
 
 	// DetectTableKey reads PK / unique-index metadata for the no-PK path.
