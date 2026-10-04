@@ -33,7 +33,7 @@ func (v *Validator) validateQuick(ctx context.Context, pgDB *sql.DB, tidbConn *s
 		pgCount, err = v.srcDialect.CountExact(ctx, pgDB, schema, table)
 		if err != nil {
 			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("quick: PG count: %v", err)
+			tr.Error = fmt.Sprintf("quick: %s count: %v", v.srcLabel(), err)
 			return tr
 		}
 	}

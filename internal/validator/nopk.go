@@ -249,10 +249,10 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 		if pgCnt != tidbCnt {
 			if tidbCnt == 0 {
 				mismatchDetails = append(mismatchDetails,
-					fmt.Sprintf("PG has %d row(s) with hash %s not found in TiDB", pgCnt, truncate(h, 16)))
+					fmt.Sprintf("%s has %d row(s) with hash %s not found in TiDB", v.srcLabel(), pgCnt, truncate(h, 16)))
 			} else {
 				mismatchDetails = append(mismatchDetails,
-					fmt.Sprintf("hash %s: PG count=%d TiDB count=%d", truncate(h, 16), pgCnt, tidbCnt))
+					fmt.Sprintf("hash %s: %s count=%d TiDB count=%d", truncate(h, 16), v.srcLabel(), pgCnt, tidbCnt))
 			}
 		}
 	}
@@ -262,7 +262,7 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 		pgCnt := pgHashCounts[h]
 		if pgCnt == 0 {
 			mismatchDetails = append(mismatchDetails,
-				fmt.Sprintf("TiDB has %d row(s) with hash %s not found in PG", tidbCnt, truncate(h, 16)))
+				fmt.Sprintf("TiDB has %d row(s) with hash %s not found in %s", tidbCnt, truncate(h, 16), v.srcLabel()))
 		}
 	}
 
@@ -277,8 +277,8 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 		tr.Status = reporter.StatusPass
 	}
 
-	tr.Suggestion = fmt.Sprintf("hash group validation: %d PG hashes vs %d TiDB rows, %d mismatches",
-		len(pgHashCounts), tidbRowCount, len(mismatchDetails))
+	tr.Suggestion = fmt.Sprintf("hash group validation: %d %s hashes vs %d TiDB rows, %d mismatches",
+		len(pgHashCounts), v.srcLabel(), tidbRowCount, len(mismatchDetails))
 
 	return tr
 }
@@ -459,8 +459,8 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 		tr.Status = reporter.StatusPass
 	}
 
-	tr.Suggestion = fmt.Sprintf("aggregate hash validation: pg_hash=%s tidb_hash=%s, %d PG rows vs %d TiDB rows",
-		truncate(pgAggregate, 16), truncate(tidbAggregate, 16), len(pgHashes), len(tidbHashes))
+	tr.Suggestion = fmt.Sprintf("aggregate hash validation: src_hash=%s tidb_hash=%s, %d %s rows vs %d TiDB rows",
+		truncate(pgAggregate, 16), truncate(tidbAggregate, 16), len(pgHashes), v.srcLabel(), len(tidbHashes))
 
 	return tr
 }
@@ -607,8 +607,8 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 		tr.Status = reporter.StatusPass
 	}
 
-	tr.Suggestion = fmt.Sprintf("bucket validation: %d buckets, %d mismatched, %d PG rows",
-		bucketCount, mismatchedBuckets, len(pgData))
+	tr.Suggestion = fmt.Sprintf("bucket validation: %d buckets, %d mismatched, %d %s rows",
+		bucketCount, mismatchedBuckets, len(pgData), v.srcLabel())
 
 	return tr
 }

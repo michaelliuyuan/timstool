@@ -141,7 +141,7 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 			pgHash, err := v.computeChunkHashPG(ctx, pgDB, schema, table, orderByCols, ch)
 			if err != nil {
 				mu.Lock()
-				mismatchDetails = append(mismatchDetails, fmt.Sprintf("chunk %d: PG error: %v", idx, err))
+				mismatchDetails = append(mismatchDetails, fmt.Sprintf("chunk %d: %s error: %v", idx, v.srcLabel(), err))
 				mu.Unlock()
 				return
 			}

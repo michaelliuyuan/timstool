@@ -63,6 +63,17 @@ func NewValidator(cfg config.Config) *Validator {
 	return v
 }
 
+// srcLabel returns the user-facing source label for mismatch report
+// formatting, dispatched on the assembled source dialect ("PG" for the
+// legacy postgres assembly, "MySQL" for the mysql one) so reports stop
+// hard-coding PG when comparing a MySQL source.
+func (v *Validator) srcLabel() string {
+	if _, ok := v.srcDialect.(mysqlDialect); ok {
+		return "MySQL"
+	}
+	return "PG"
+}
+
 // srcDriverName returns the database/sql driver for the source side,
 // dispatched on the assembled dialect (pgx for PG, mysql for MySQL/TiDB
 // wire).
@@ -592,7 +603,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 	for pgRows.Next() {
 		if err := pgRows.Scan(pgPtrs...); err != nil {
 			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("scan PG row: %v", err)
+			tr.Error = fmt.Sprintf("scan %s row: %v", v.srcLabel(), err)
 			return tr
 		}
 		row := make([]string, len(pgCols))
@@ -894,10 +905,10 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 				diag := ""
 				if mismatchCount <= 3 {
 					if pgIdx, ok := pgKeyToIdx[key]; ok {
-						diag = diagnoseRowDiff(pgData[pgIdx], tidbRow, pgHashCols, tidbHashCols, trimColNames, pgCols, tidbCols)
+						diag = diagnoseRowDiff(v.srcLabel(), pgData[pgIdx], tidbRow, pgHashCols, tidbHashCols, trimColNames, pgCols, tidbCols)
 					}
 				}
-				mismatchDetails = append(mismatchDetails, fmt.Sprintf("hash=%s not found in PG (key=%s)%s", truncate(h, 16), truncate(key, 40), diag))
+				mismatchDetails = append(mismatchDetails, fmt.Sprintf("hash=%s not found in %s (key=%s)%s", truncate(h, 16), v.srcLabel(), truncate(key, 40), diag))
 				continue
 			}
 			// Remove first matching entry
@@ -912,7 +923,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		for _, entries := range pgHashMap {
 			for _, e := range entries {
 				mismatchCount++
-				mismatchDetails = append(mismatchDetails, fmt.Sprintf("hash=%s in PG but not found in TiDB (key=%s)", truncate(e.hash, 16), truncate(e.key, 40)))
+				mismatchDetails = append(mismatchDetails, fmt.Sprintf("hash=%s in %s but not found in TiDB (key=%s)", truncate(e.hash, 16), v.srcLabel(), truncate(e.key, 40)))
 			}
 		}
 
@@ -1041,7 +1052,7 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 	for pgRows.Next() {
 		if err := pgRows.Scan(pgPtrs...); err != nil {
 			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("scan PG row: %v", err)
+			tr.Error = fmt.Sprintf("scan %s row: %v", v.srcLabel(), err)
 			return tr
 		}
 		row := make([]string, len(pgCols))
@@ -1101,7 +1112,7 @@ func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB,
 	for pgRows.Next() {
 		if err := pgRows.Scan(pgPtrs...); err != nil {
 			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("aggregate hash: scan PG row: %v", err)
+			tr.Error = fmt.Sprintf("aggregate hash: scan %s row: %v", v.srcLabel(), err)
 			return tr
 		}
 		row := make([]string, len(pgCols))
@@ -1157,7 +1168,7 @@ func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, ti
 	for pgRows.Next() {
 		if err := pgRows.Scan(pgPtrs...); err != nil {
 			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("bucket compare: scan PG row: %v", err)
+			tr.Error = fmt.Sprintf("bucket compare: scan %s row: %v", v.srcLabel(), err)
 			return tr
 		}
 		row := make([]string, len(pgCols))
@@ -1415,9 +1426,12 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-// diagnoseRowDiff compares a PG row and TiDB row column-by-column and returns
-// a diagnostic string listing the first few column differences with precise diff location.
+// diagnoseRowDiff compares a source row and TiDB row column-by-column and
+// returns a diagnostic string listing the first few column differences with
+// precise diff location. srcLabel is the user-facing source label ("PG" or
+// "MySQL") so the type tags match the actual source kind.
 func diagnoseRowDiff(
+	srcLabel string,
 	pgRow []string, tidbRow []string,
 	pgHashCols []colMapping, tidbHashCols []tidbColMapping,
 	trimColNames map[string]bool,
@@ -1476,8 +1490,8 @@ func diagnoseRowDiff(
 				tidbHex = tidbHex[:80] + "..."
 			}
 
-			diffs = append(diffs, fmt.Sprintf("%s PG(%s)[len=%d] TiDB(%s)[len=%d] diff@byte%d pg_hex_after=%s tidb_hex_after=%s",
-				pgHC.name, pgType, len(pgVal), tidbType, len(tidbVal), diffPos,
+			diffs = append(diffs, fmt.Sprintf("%s %s(%s)[len=%d] TiDB(%s)[len=%d] diff@byte%d src_hex_after=%s tidb_hex_after=%s",
+				pgHC.name, srcLabel, pgType, len(pgVal), tidbType, len(tidbVal), diffPos,
 				pgHex, tidbHex))
 		}
 	}
