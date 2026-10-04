@@ -84,12 +84,15 @@ func (v *Validator) srcDriverName() string {
 	return "pgx"
 }
 
-// sourceDSN returns the PostgreSQL DSN to connect to (override first).
+// sourceDSN returns the source DSN to connect to (override first). F-13
+// hardening: the fallback dispatches on the source type (DSNByType) so a
+// future non-PG reuse of Run() gets the driver-shaped, UTC-pinned DSN; for
+// postgres it is byte-identical to the legacy DSN().
 func (v *Validator) sourceDSN() string {
 	if v.pgDSNOverride != "" {
 		return v.pgDSNOverride
 	}
-	return v.cfg.Source.DSN()
+	return v.cfg.Source.DSNByType()
 }
 
 // targetDSN returns the TiDB DSN to connect to (override first).

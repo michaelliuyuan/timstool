@@ -131,8 +131,10 @@ var typeBranchFixture = map[string]int{
 	// MS-08 source-dialect/driver assembly dispatch (NewValidator/
 	// srcDriverName/sourceSchema - legitimate routing, not gating).
 	"internal/validator/validator.go": 1,
-	// #t79 dual-path routing (legitimate routing, not feature gating).
-	"internal/orchestrator/orchestrator.go": 3,
+	// #t79 dual-path routing (legitimate routing, not feature gating) +
+	// F-13 validate-read-session UTC pin dispatch (mysql-only pinned pools;
+	// same #t79 class — routing, not gating).
+	"internal/orchestrator/orchestrator.go": 4,
 	// CDC source guard + target-tidb guard (M4 binlog work).
 	"internal/webapi/cdc_config.go": 2,
 	// compare source guards absorbed into the capability read (MS-08: raw

@@ -135,6 +135,18 @@ func TestMySQLDialectShapes(t *testing.T) {
 	if got := sc.DSNByType(); got != sc.DSN() {
 		t.Fatalf("empty-type DSNByType must equal the legacy DSN(); got %q want %q", got, sc.DSN())
 	}
+
+	// F-13 hardening anchor: validator.Run's fallback source DSN dispatches
+	// on type (mysql → UTC-pinned driver DSN) and is byte-identical to the
+	// legacy PG shape for postgres sources.
+	vMy := NewValidator(config.Config{Source: config.SourceConfig{Type: "mysql", Host: "h", Port: 3306, User: "u", Password: "p", Database: "d"}})
+	if got := vMy.sourceDSN(); got == vMy.cfg.Source.DSN() {
+		t.Fatalf("mysql sourceDSN fallback must be the driver-shaped DSNByType, got the PG shape %q", got)
+	}
+	vPG := NewValidator(config.Config{Source: config.SourceConfig{Type: "postgres", Host: "h", Port: 5432, User: "u", Password: "p", Database: "d", SSLMode: "disable"}})
+	if got := vPG.sourceDSN(); got != vPG.cfg.Source.DSN() {
+		t.Fatalf("postgres sourceDSN fallback must stay byte-identical: %q vs %q", got, vPG.cfg.Source.DSN())
+	}
 }
 
 // MS-08 no-DB smoke: the MySQL ListTables probe uses the `?` placeholder and

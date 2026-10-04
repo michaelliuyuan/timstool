@@ -206,6 +206,15 @@ func (t TargetConfig) DSN() string {
 	return BuildMySQLDSN(t.Host, t.Port, t.User, t.Password, t.Database, map[string]string{"charset": "utf8mb4"}, nil)
 }
 
+// DSNPinnedUTC is the validate-read-session variant (F-13): the session
+// clock is pinned to UTC so a TIMESTAMP renders as the same instant on both
+// sides of the comparison. The data-path DSN() above stays untouched — its
+// wall-clock coupling with the source write session is load-bearing.
+func (t TargetConfig) DSNPinnedUTC() string {
+	return BuildMySQLDSN(t.Host, t.Port, t.User, t.Password, t.Database,
+		map[string]string{"charset": "utf8mb4", "time_zone": "'+00:00'"}, nil)
+}
+
 type MigrationConfig struct {
 	Parallel            int      `yaml:"parallel"`
 	BatchSize           int      `yaml:"batch_size"`

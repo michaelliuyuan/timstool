@@ -357,7 +357,29 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	validateSuccess := true
 	type dbConn interface{ DB() *sql.DB }
 	if dc, ok := src.(dbConn); ok {
-		vr, verr := target.ValidateMigration(ctx, dc.DB(), tidb, cir, sampleSize)
+		// F-13: validate READ sessions on both sides pin UTC
+		// (time_zone='+00:00', DSN-level so pooled semantics stay correct).
+		// The data-path pools (dc.DB() / tidb) are deliberately untouched —
+		// their wall-clock coupling with the write path is load-bearing;
+		// pinning only one side would shift writes −8h and fabricate real
+		// diffs (leader ruling seq640/641). MySQL source only; other kinds
+		// keep the legacy pools unchanged.
+		srcValDB, tgtValDB := dc.DB(), tidb
+		if srcType == "mysql" {
+			if db2, err := sql.Open("mysql", o.cfg.Source.DSNByType()); err == nil {
+				defer db2.Close()
+				srcValDB = db2
+			} else {
+				log.Warn("source-cir: pinned validate source pool failed, falling back to data pool", zap.Error(err))
+			}
+			if db2, err := sql.Open("mysql", o.cfg.Target.DSNPinnedUTC()); err == nil {
+				defer db2.Close()
+				tgtValDB = db2
+			} else {
+				log.Warn("source-cir: pinned validate target pool failed, falling back to data pool", zap.Error(err))
+			}
+		}
+		vr, verr := target.ValidateMigration(ctx, srcValDB, tgtValDB, cir, sampleSize)
 		if verr != nil {
 			log.Warn("source-cir: validation error", zap.Error(verr))
 			validateSuccess = false
