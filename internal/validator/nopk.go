@@ -454,7 +454,7 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 
 	if pgAggregate != tidbAggregate {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("aggregate hash mismatch: pg=%s tidb=%s", truncate(pgAggregate, 16), truncate(tidbAggregate, 16))
+		tr.Error = fmt.Sprintf("aggregate hash mismatch: src=%s tidb=%s", truncate(pgAggregate, 16), truncate(tidbAggregate, 16))
 	} else {
 		tr.Status = reporter.StatusPass
 	}
@@ -569,7 +569,7 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 			mismatchedBuckets++
 			if len(mismatchDetails) < 5 {
 				mismatchDetails = append(mismatchDetails,
-					fmt.Sprintf("bucket %d: PG=%d rows TiDB=%d rows", i, pgCount, tidbCount))
+					fmt.Sprintf("bucket %d: %s=%d rows TiDB=%d rows", i, v.srcLabel(), pgCount, tidbCount))
 			}
 			continue
 		}

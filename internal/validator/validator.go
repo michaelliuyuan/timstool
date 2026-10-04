@@ -573,7 +573,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 	pgCols, _ := pgRows.ColumnTypes()
 	if pgCols == nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = "failed to get PG column types"
+		tr.Error = "failed to get source column types"
 		return tr
 	}
 
@@ -975,7 +975,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 					if pgVal != tidbVal {
 						mismatchCount++
 						colName := tidbCols[colIdx].Name()
-						mismatchDetails = append(mismatchDetails, fmt.Sprintf("row %d col %q: PG=%q TiDB=%q", rowIdx+int(offset)+1, colName, truncate(pgVal, 80), truncate(tidbVal, 80)))
+						mismatchDetails = append(mismatchDetails, fmt.Sprintf("row %d col %q: %s=%q TiDB=%q", rowIdx+int(offset)+1, colName, v.srcLabel(), truncate(pgVal, 80), truncate(tidbVal, 80)))
 						break
 					}
 				}
@@ -1028,7 +1028,7 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 	pgCols, _ := pgRows.ColumnTypes()
 	if pgCols == nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = "failed to get PG column types"
+		tr.Error = "failed to get source column types"
 		return tr
 	}
 
@@ -1082,7 +1082,7 @@ func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB,
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("aggregate hash: query PG: %v", err)
+		tr.Error = fmt.Sprintf("aggregate hash: query %s: %v", v.srcLabel(), err)
 		return tr
 	}
 	defer pgRows.Close()
@@ -1090,7 +1090,7 @@ func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB,
 	pgCols, _ := pgRows.ColumnTypes()
 	if pgCols == nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = "aggregate hash: failed to get PG column types"
+		tr.Error = "aggregate hash: failed to get source column types"
 		return tr
 	}
 
@@ -1138,7 +1138,7 @@ func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, ti
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("bucket compare: query PG: %v", err)
+		tr.Error = fmt.Sprintf("bucket compare: query %s: %v", v.srcLabel(), err)
 		return tr
 	}
 	defer pgRows.Close()
@@ -1146,7 +1146,7 @@ func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, ti
 	pgCols, _ := pgRows.ColumnTypes()
 	if pgCols == nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = "bucket compare: failed to get PG column types"
+		tr.Error = "bucket compare: failed to get source column types"
 		return tr
 	}
 
