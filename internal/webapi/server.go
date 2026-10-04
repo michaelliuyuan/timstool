@@ -513,8 +513,7 @@ func (s *Server) testPGConnection(ctx context.Context, req *TestConnectionReques
 	}
 
 	start := time.Now()
-	dsn := cfg.DSN()
-	pgConn, err := openPGTestConn(dsn)
+	pgConn, err := openSourceTestConn(cfg)
 	elapsed := time.Since(start)
 
 	result := map[string]interface{}{
@@ -729,6 +728,7 @@ func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 
 	// F-02: a source_ref resolves the request's inline fields server-side so
 	// the table-selection step works without credentials in the browser.
+	var refType string
 	if req.SourceRef != "" {
 		e, err := s.resolveDataSourceRef(req.SourceRef)
 		if err != nil {
@@ -743,9 +743,13 @@ func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 		req.Host, req.Port = sc.Host, sc.Port
 		req.User, req.Password, req.Database, req.Schema, req.SSLMode =
 			sc.User, sc.Password, sc.Database, sc.Schema, sc.SSLMode
+		// MS-09 deep-defense: thread the resolved entry's type so the
+		// connection layer dispatch is real, not silently PG.
+		refType = sc.Type
 	}
 
 	cfg := config.SourceConfig{
+		Type:     refType,
 		Host:     req.Host,
 		Port:     req.Port,
 		User:     req.User,
@@ -761,7 +765,7 @@ func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 		cfg.SSLMode = "disable"
 	}
 
-	pgConn, err := openPGTestConn(cfg.DSN())
+	pgConn, err := openSourceTestConn(cfg)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "connect failed: "+err.Error())
 		return

@@ -702,7 +702,7 @@ func (s *Server) handleIncrementalColumns(w http.ResponseWriter, r *http.Request
 		return
 	}
 	sc := dataSourceToSourceConfig(e)
-	db, err := openPGTestConn(sc.DSN())
+	db, err := openSourceTestConn(sc)
 	if err != nil {
 		s.writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -783,7 +783,7 @@ func (s *Server) handleIncrementalColumnsBatch(w http.ResponseWriter, r *http.Re
 		return
 	}
 	sc := dataSourceToSourceConfig(e)
-	db, err := openPGTestConn(sc.DSN())
+	db, err := openSourceTestConn(sc)
 	if err != nil {
 		s.writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -873,7 +873,7 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 	sc := dataSourceToSourceConfig(src)
 	tc := dataSourceToTargetConfig(tgt)
 
-	pgDB, err := openPGTestConn(sc.DSN())
+	srcDB, err := openSourceTestConn(sc)
 	if err != nil {
 		lg.add(incLogLevelError, "", incLogPhaseFail, "连接源端失败: "+err.Error(), "", 0, "", 0)
 		for _, t := range job.Tables {
@@ -881,7 +881,7 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 		}
 		return rec
 	}
-	defer pgDB.Close()
+	defer srcDB.Close()
 	myDB, err := openMySQLTestConn(incTargetDSN(tc)) // P-INC-TZ: UTC-pinned write session
 	if err != nil {
 		lg.add(incLogLevelError, "", incLogPhaseFail, "连接目标端失败: "+err.Error(), "", 0, "", 0)
@@ -923,7 +923,7 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 	workers := normalizeIncParallelism(job.Parallelism)
 	rec.Tables = incRunTableTasks(tasks, workers,
 		func(task incRunTableTask) incTableResult {
-			res := s.syncOneTable(ctx, pgDB, myDB, sc, tc, job, task.t, task.st, lg)
+			res := s.syncOneTable(ctx, srcDB, myDB, sc, tc, job, task.t, task.st, lg)
 			res.Table = task.t.Table
 			return res
 		},
@@ -1007,7 +1007,7 @@ func incRunTableTasks(tasks []incRunTableTask, workers int, runOne func(t incRun
 // syncOneTable syncs one table. st is the pre-resolved per-table state
 // pointer (resolved by the scheduler — job.States is not consulted here so
 // concurrent workers never race on the map).
-func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, st *incTableState, lg *incLogCollector) incTableResult {
+func (s *Server) syncOneTable(ctx context.Context, srcDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, st *incTableState, lg *incLogCollector) incTableResult {
 	tableStart := time.Now()
 	res := incTableResult{Table: t.Table, FromWM: st.LastWatermark}
 
@@ -1017,7 +1017,7 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 	}
 	// Discover columns + validate the watermark type (D4 whitelist) at run
 	// time against the live source — creation only validates identifiers.
-	rows, err := pgDB.QueryContext(ctx, `
+	rows, err := srcDB.QueryContext(ctx, `
 		SELECT column_name, data_type FROM information_schema.columns
 		WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`, sc.Schema, t.Table)
 	if err != nil {
@@ -1068,7 +1068,7 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 	minDerived := false
 	if wm == "" {
 		var minWM sql.NullString
-		if err := pgDB.QueryRowContext(ctx,
+		if err := srcDB.QueryRowContext(ctx,
 			fmt.Sprintf("SELECT MIN(%s) FROM %s.%s", incSourceDialect.QuoteIdent(t.WatermarkColumn), incSourceDialect.QuoteIdent(sc.Schema), incSourceDialect.QuoteIdent(t.Table)),
 		).Scan(&minWM); err != nil {
 			res.Error = "计算初始水位失败: " + err.Error()
@@ -1107,7 +1107,7 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 		batchNo++
 		scanStart := time.Now()
 		selSQL := incSourceDialect.BuildSelectSQL(sc.Schema, t.Table, cols, t.WatermarkColumn, job.StrictMode && !geScan)
-		srows, err := pgDB.QueryContext(ctx, selSQL, wm, job.BatchSize)
+		srows, err := srcDB.QueryContext(ctx, selSQL, wm, job.BatchSize)
 		if err != nil {
 			res.Error = "查询源端失败: " + err.Error()
 			st.Failed = res.Error
@@ -1185,7 +1185,7 @@ func (s *Server) syncOneTable(ctx context.Context, pgDB, myDB *sql.DB, sc config
 			lg.add(incLogLevelSQL, t.Table, incLogPhaseDrain,
 				fmt.Sprintf("整批同值饱和，进入泄流（水位 %s）", lastWM),
 				incRenderDrainSQL(sc.Schema, t.Table, cols, t.WatermarkColumn, lastWM), 0, lastWM, 0)
-			n, jump, tableDone, derr := s.incDrainWatermark(ctx, pgDB, myDB, sc, tc, job, t, cols, lastWM, lg)
+			n, jump, tableDone, derr := s.incDrainWatermark(ctx, srcDB, myDB, sc, tc, job, t, cols, lastWM, lg)
 			if derr != nil {
 				res.Error = "泄流同值批次失败: " + derr.Error()
 				st.Failed = res.Error
@@ -1237,8 +1237,8 @@ func wmIndex(cols []string, wmCol string) int {
 // (semantics identical to the main path). Afterwards the cursor jumps to
 // MIN(watermark) > wm: no such value ⇒ the whole table is synced (done).
 // Memory stays bounded regardless of how many rows share the value.
-func (s *Server) incDrainWatermark(ctx context.Context, pgDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, cols []string, wm string, lg *incLogCollector) (rows int64, nextWM string, done bool, err error) {
-	srows, qErr := pgDB.QueryContext(ctx, incSourceDialect.BuildDrainSQL(sc.Schema, t.Table, cols, t.WatermarkColumn), wm)
+func (s *Server) incDrainWatermark(ctx context.Context, srcDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, cols []string, wm string, lg *incLogCollector) (rows int64, nextWM string, done bool, err error) {
+	srows, qErr := srcDB.QueryContext(ctx, incSourceDialect.BuildDrainSQL(sc.Schema, t.Table, cols, t.WatermarkColumn), wm)
 	if qErr != nil {
 		return 0, "", false, qErr
 	}
@@ -1289,7 +1289,7 @@ func (s *Server) incDrainWatermark(ctx context.Context, pgDB, myDB *sql.DB, sc c
 	}
 
 	var next sql.NullString
-	if qErr = pgDB.QueryRowContext(ctx,
+	if qErr = srcDB.QueryRowContext(ctx,
 		incSourceDialect.BuildNextWatermarkSQL(sc.Schema, t.Table, t.WatermarkColumn), wm,
 	).Scan(&next); qErr != nil {
 		return rows, "", false, qErr

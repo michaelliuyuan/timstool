@@ -152,6 +152,10 @@ var typeBranchFixture = map[string]int{
 	"internal/webapi/server.go": 4,
 	// tidb-as-source guards (kept until the tidb flip point).
 	"internal/webapi/source_handler.go": 2,
+	// MS-09 sourceConnSpec driver/DSN dispatch (mysql -> DSNByType with the
+	// MS-08d UTC pin, everything else pgx byte-identical — routing, not
+	// gating; the capability guards stay at the handlers).
+	"internal/webapi/dbconn.go": 1,
 }
 
 // Ruling pattern (seq 82): catches .Type/srcType/SourceType() compares plus

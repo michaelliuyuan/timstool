@@ -63,7 +63,7 @@ func (s *Server) openDDLSource(w http.ResponseWriter, req *ddlExportRequest) (*s
 		s.writeError(w, http.StatusBadRequest, "host and database are required")
 		return nil, false
 	}
-	db, err := openPGTestConn(req.source().DSN())
+	db, err := openSourceTestConn(req.source())
 	if err != nil {
 		s.writeError(w, http.StatusBadGateway, err.Error())
 		return nil, false

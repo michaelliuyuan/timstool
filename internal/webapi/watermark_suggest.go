@@ -278,7 +278,7 @@ func (s *Server) handleSuggestWatermark(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusBadRequest, "系统 schema 不参与水位建议")
 		return
 	}
-	db, err := openPGTestConn(sc.DSN())
+	db, err := openSourceTestConn(sc)
 	if err != nil {
 		s.writeError(w, http.StatusBadGateway, err.Error())
 		return
