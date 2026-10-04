@@ -148,8 +148,10 @@ var typeBranchFixture = map[string]int{
 	// inside the helper); target-tidb guards remain.
 	"internal/webapi/incremental.go": 2,
 	// legacy PG-direct endpoints + tidb-as-source guard + target guard +
-	// cdc_chain guard (M4) + assess guard (MS-06).
-	"internal/webapi/server.go": 4,
+	// cdc_chain guard (M4) + assess guard (MS-06). MS-09 lifted the
+	// /config/test-connection postgres-only source_ref gate (pure
+	// connectivity endpoint, gate removal per ruling — not a type branch).
+	"internal/webapi/server.go": 3,
 	// tidb-as-source guards (kept until the tidb flip point).
 	"internal/webapi/source_handler.go": 2,
 	// MS-09 sourceConnSpec driver/DSN dispatch (mysql -> DSNByType with the

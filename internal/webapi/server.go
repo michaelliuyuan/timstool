@@ -462,6 +462,7 @@ func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
 
 	// P2-5: honor the documented source_ref — resolve the stored profile
 	// server-side so the password never travels to the browser.
+	var refType string
 	if req.SourceRef != "" {
 		e, err := s.resolveDataSourceRef(req.SourceRef)
 		if err != nil {
@@ -476,16 +477,16 @@ func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
 		req.Database = sc.Database
 		req.Schema = sc.Schema
 		req.SSLMode = sc.SSLMode
-		if e.Type != "postgres" {
-			s.writeError(w, http.StatusBadRequest, "source_ref: 此端点仅支持 postgres 数据源（mysql 请用 /test-connection）")
-			return
-		}
+		// MS-09: this endpoint is pure connectivity — a source_ref of any
+		// capable kind is dispatched on its type (inline bodies carry no
+		// type and keep the legacy PG-only semantics).
+		refType = sc.Type
 	}
 
 	var result map[string]interface{}
 	switch req.Type {
 	case "source":
-		result = s.testPGConnection(r.Context(), &req)
+		result = s.testPGConnection(r.Context(), &req, refType)
 	case "target":
 		result = s.testTiDBConnection(r.Context(), &req)
 	default:
@@ -495,8 +496,13 @@ func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, result)
 }
 
-func (s *Server) testPGConnection(ctx context.Context, req *TestConnectionRequest) map[string]interface{} {
+// testPGConnection tests a SOURCE connection. refType threads the resolved
+// datasource ref's type (MS-09): inline bodies pass "" and keep the legacy
+// PG-only endpoint semantics; a ref dispatches on its real type via
+// openSourceTestConn.
+func (s *Server) testPGConnection(ctx context.Context, req *TestConnectionRequest, refType string) map[string]interface{} {
 	cfg := config.SourceConfig{
+		Type:     refType,
 		Host:     req.Host,
 		Port:     req.Port,
 		User:     req.User,

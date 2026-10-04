@@ -367,8 +367,13 @@ func TestDatasources_TestConnectionSourceRef(t *testing.T) {
 		t.Fatalf("dangling config test ref: %d %s", w.Code, w.Body.String())
 	}
 
-	// A mysql ref on the PG-only /config/test-connection is rejected with a
-	// pointer to the multi-source endpoint.
+	// MS-09: a mysql ref on /config/test-connection is now dispatched on its
+	// type instead of 400'ing — the endpoint is pure connectivity. Against
+	// the unreachable fixture host the response is 200/ok=false, and the
+	// error must be a mysql-driver dial (entry port 3306), never the pgx
+	// "failed to connect to `user=… database=…`" signature: that proves the
+	// dispatch is real (guard-lift without type threading would silently
+	// dial pgx).
 	w, req = doReq("POST", "/api/v1/datasources", `{
 		"name": "my3", "type": "mysql",
 		"fields": {"host": "10.0.0.5", "port": 3306, "user": "root", "password": "pw", "database": "d"}
@@ -377,8 +382,18 @@ func TestDatasources_TestConnectionSourceRef(t *testing.T) {
 	myID := dsBody(t, w)["id"].(string)
 	w, req = doReq("POST", "/api/v1/config/test-connection", fmt.Sprintf(`{"type": "source", "source_ref": %q}`, myID))
 	s.handleTestConnection(w, req)
-	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "postgres") {
-		t.Fatalf("mysql ref on PG test endpoint: %d %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("mysql ref on config test endpoint: %d %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if strings.Contains(body, `"ok":true`) {
+		t.Fatalf("unreachable mysql fixture reported ok=true: %s", body)
+	}
+	if strings.Contains(body, "failed to connect to `") {
+		t.Fatalf("mysql ref dispatched to pgx (type threading lost): %s", body)
+	}
+	if !strings.Contains(body, "10.0.0.5:3306") {
+		t.Fatalf("mysql ref did not dial the entry host:port: %s", body)
 	}
 }
 
