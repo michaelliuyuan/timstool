@@ -76,6 +76,15 @@ func TestMySQLTypeMapper(t *testing.T) {
 		{"datetime", 0, 0, "DATETIME"},
 		{"datetime(6)", 6, 0, "DATETIME(6)"},
 		{"timestamp", 0, 0, "TIMESTAMP"},
+		// fsp shapes (F-fsp fix): temporal fsp flows from DATETIME_PRECISION
+		{"timestamp(6)", 6, 0, "TIMESTAMP(6)"},
+		{"timestamp(3)", 3, 0, "TIMESTAMP(3)"},
+		{"datetime(6)", 6, 0, "DATETIME(6)"},
+		{"time(3)", 3, 0, "TIME(3)"},
+		{"time", 0, 0, "TIME"},
+		// production trap shape: temporal column with NUMERIC_PRECISION=NULL
+		// arrives as prec=0 regardless of the "(6)" in COLUMN_TYPE text
+		{"timestamp(6)", 0, 0, "TIMESTAMP"},
 		{"date", 0, 0, "DATE"},
 		{"year", 0, 0, "YEAR"},
 
@@ -100,6 +109,22 @@ func TestMySQLTypeMapper(t *testing.T) {
 					tc.srcType, tc.prec, tc.scale, got.Name, tc.wantTiDB)
 			}
 		})
+	}
+}
+
+// TestIsTemporalDataType anchors the DATETIME_PRECISION consumer set: exactly
+// timestamp/datetime/time carry fsp there (date/year do NOT — their
+// DATETIME_PRECISION is NULL and NUMERIC_PRECISION must not leak in as fsp).
+func TestIsTemporalDataType(t *testing.T) {
+	for _, dt := range []string{"timestamp", "datetime", "time", "TIMESTAMP", "DATETIME", "TIME"} {
+		if !isTemporalDataType(dt) {
+			t.Errorf("isTemporalDataType(%q) = false, want true", dt)
+		}
+	}
+	for _, dt := range []string{"date", "year", "int", "varchar", "decimal", ""} {
+		if isTemporalDataType(dt) {
+			t.Errorf("isTemporalDataType(%q) = true, want false", dt)
+		}
 	}
 }
 

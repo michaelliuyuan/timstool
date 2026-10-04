@@ -95,7 +95,8 @@ func (r *schemaReader) readTables(ctx context.Context, db *sql.DB, database stri
 func (r *schemaReader) readColumns(ctx context.Context, db *sql.DB, database, table string) ([]source.Column, []string, error) {
 	query := `
 		SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT,
-		       EXTRA, COLUMN_COMMENT, NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_KEY
+		       EXTRA, COLUMN_COMMENT, NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_KEY,
+		       DATETIME_PRECISION
 		FROM information_schema.COLUMNS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 		ORDER BY ORDINAL_POSITION`
@@ -115,9 +116,10 @@ func (r *schemaReader) readColumns(ctx context.Context, db *sql.DB, database, ta
 			colDefault, extra, comment             sql.NullString
 			colKey                                 sql.NullString
 			numPrec, numScale                      sql.NullInt64
+			dtPrec                                 sql.NullInt64
 		)
 		if err := rows.Scan(&colName, &dataType, &colType, &isNullable,
-			&colDefault, &extra, &comment, &numPrec, &numScale, &colKey); err != nil {
+			&colDefault, &extra, &comment, &numPrec, &numScale, &colKey, &dtPrec); err != nil {
 			return nil, nil, err
 		}
 
@@ -135,6 +137,16 @@ func (r *schemaReader) readColumns(ctx context.Context, db *sql.DB, database, ta
 		sc := 0
 		if numScale.Valid {
 			sc = int(numScale.Int64)
+		}
+
+		// Temporal types: fsp comes from DATETIME_PRECISION (MySQL 8 returns
+		// NULL in NUMERIC_PRECISION for temporal columns — never use it as fsp).
+		// Whitelist 0-6; anything outside (NULL/garbage) degrades to 0 = bare type.
+		if isTemporalDataType(dataType) {
+			prec = 0
+			if dtPrec.Valid && dtPrec.Int64 >= 0 && dtPrec.Int64 <= 6 {
+				prec = int(dtPrec.Int64)
+			}
 		}
 
 		mapped := tm.MapType(colType, prec, sc)
@@ -214,6 +226,16 @@ func (r *schemaReader) readIndexes(ctx context.Context, db *sql.DB, database, ta
 
 // schemaReader is the MySQL SchemaReader implementation.
 type schemaReader struct{ src *Source }
+
+// isTemporalDataType reports whether dataType is a temporal type whose
+// optional precision (fsp) lives in information_schema DATETIME_PRECISION.
+func isTemporalDataType(dataType string) bool {
+	switch dataType {
+	case "timestamp", "datetime", "time", "TIMESTAMP", "DATETIME", "TIME":
+		return true
+	}
+	return false
+}
 
 func stringsContains(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {

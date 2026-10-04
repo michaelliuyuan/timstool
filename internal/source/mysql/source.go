@@ -267,6 +267,9 @@ func mapMySQLType(srcType string, precision, scale int) string {
 	case "DATE":
 		return "DATE"
 	case "TIME":
+		if precision > 0 {
+			return fmt.Sprintf("TIME(%d)", precision)
+		}
 		return "TIME"
 	case "DATETIME":
 		if precision > 0 {
