@@ -236,6 +236,24 @@ func TestDatasources_TaskRefSnapshot(t *testing.T) {
 	}
 }
 
+// TestTaskCreate_SampleRatioGate anchors the F-12 migration-side gate: the
+// create path used to pass opts.sample_ratio straight into cfg.Compare with
+// no range check (only PUT compare-options had the [0,1] gate).
+func TestTaskCreate_SampleRatioGate(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	for _, body := range []string{
+		`{"source":{"host":"s"},"target":{"host":"t"},"opts":{"sample_ratio":100}}`,
+		`{"source":{"host":"s"},"target":{"host":"t"},"opts":{"sample_ratio":-0.5}}`,
+	} {
+		w, req := doReq("POST", "/api/v1/tasks", body)
+		s.handleCreateTask(w, req)
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "sample_ratio") {
+			t.Fatalf("sample_ratio gate: %d %s", w.Code, w.Body.String())
+		}
+	}
+}
+
 func TestDatasources_DDLAndAssessRefTypeGate(t *testing.T) {
 	s, _ := newTestServer(t)
 

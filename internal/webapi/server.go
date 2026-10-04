@@ -1205,6 +1205,13 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("batch_size 必须在 1-%d 之间（当前 %d）", config.MaxBatchSize, cfg.Migration.BatchSize))
 		return
 	}
+	// F-12: shape defense — the migration compare knobs (cfg.Compare) fed the
+	// PG-pipeline validate (runValidate) with the same unclamped ratio; gate
+	// here too, aligned with the compare create path and PUT options.
+	if req.Opts.SampleRatio < 0 || req.Opts.SampleRatio > 1 {
+		s.writeError(w, http.StatusBadRequest, "sample_ratio must be within [0,1]")
+		return
+	}
 	if cfg.Migration.TempDir == "" {
 		cfg.Migration.TempDir = "/tmp/timstool"
 	}

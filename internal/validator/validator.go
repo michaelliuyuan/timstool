@@ -483,6 +483,17 @@ func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn
 	return tr
 }
 
+// sampleOffset picks a random OFFSET for the sampling window. F-12 defense:
+// when sampleSize >= rows (ratio > 1 against a table smaller than the window,
+// or a 1-row table) the naive span rows-sampleSize+1 goes <= 0 and
+// rand.Int63n panics on the negative argument — take the whole table from
+// offset 0 instead.
+func sampleOffset(rows int64, sampleSize int) int64 {
+	if rows <= 0 || int64(sampleSize) >= rows {
+		return 0
+	}
+	return rand.Int63n(rows - int64(sampleSize) + 1)
+}
 func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, tidbDB *sql.DB, table string, ratio float64) reporter.TableReport {
 	tr := v.validateRowCount(ctx, pgDB, tidbConn, table)
 	// Same fallthrough guard as checksum.go: a COUNT error (DiffRows==0,
@@ -550,7 +561,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		sampleSize = 1000
 	}
 
-	offset := rand.Int63n(tr.SourceRows - int64(sampleSize) + 1)
+	offset := sampleOffset(tr.SourceRows, sampleSize)
 
 	wm := v.wmFilter()
 	var pgRows *sql.Rows

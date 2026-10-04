@@ -457,6 +457,13 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "concurrency must be >= 0")
 		return
 	}
+	// F-12: the create path had no [0,1] gate (only PUT options did), so a
+	// sample_ratio=100 body reached rand.Int63n with a negative span and
+	// panicked the whole web process. Same message/semantics as PUT :236.
+	if req.SampleRatio < 0 || req.SampleRatio > 1 {
+		s.writeError(w, http.StatusBadRequest, "sample_ratio must be within [0,1]")
+		return
+	}
 	conc := validator.ResolveConcurrency(req.Concurrency, req.Parallel, req.ChecksumParallel)
 
 	// B2: single-running invariant — check + persist + claim must be one
@@ -516,6 +523,14 @@ func buildCompareRunParams(task *CompareTask, reportFile string) (float64, commo
 	sampleRatio := task.SampleRatio
 	if sampleRatio <= 0 {
 		sampleRatio = 0.01
+	}
+	// F-12 read-side clamp: tasks persisted before the create gate (or other
+	// hand-built CompareTask values) must never feed the sampler an
+	// out-of-range ratio — clamp to 1 and say so.
+	if sampleRatio > 1 {
+		zap.L().Warn("sample_ratio above 1 clamped to 1 (stale persisted task?)",
+			zap.Float64("sample_ratio", sampleRatio))
+		sampleRatio = 1
 	}
 	mode := task.Mode
 	// #t3 belt-and-braces: a watermark task's mode is the filter's base

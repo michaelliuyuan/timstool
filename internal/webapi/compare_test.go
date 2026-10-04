@@ -137,6 +137,10 @@ func TestCompareTask_Validation(t *testing.T) {
 		{"missing target host", `{"source":{"host":"s"}}`, http.StatusBadRequest},
 		{"bad mode", `{"source":{"host":"s"},"target":{"host":"t"},"mode":"full"}`, http.StatusBadRequest},
 		{"bad body", `{`, http.StatusBadRequest},
+		// F-12: the create path must gate sample_ratio exactly like PUT
+		// options — 100 used to sail through and panic the sampler.
+		{"ratio 100", `{"source":{"host":"s"},"target":{"host":"t"},"sample_ratio":100}`, http.StatusBadRequest},
+		{"ratio negative", `{"source":{"host":"s"},"target":{"host":"t"},"sample_ratio":-0.5}`, http.StatusBadRequest},
 	}
 	for _, c := range cases {
 		w, req := doReq("POST", "/api/v1/compare/tasks", c.body)
@@ -144,6 +148,16 @@ func TestCompareTask_Validation(t *testing.T) {
 		if w.Code != c.code {
 			t.Fatalf("%s: status = %d body=%s", c.name, w.Code, w.Body.String())
 		}
+	}
+
+	// F-12 boundary: ratio=1 is legal and must clear the gate (the task then
+	// fails asynchronously at connect time — only the 400 gate is pinned).
+	w, req := doReq("POST", "/api/v1/compare/tasks",
+		`{"source":{"host":"s","type":"postgres","port":5432},"target":{"host":"t"},"sample_ratio":1}`)
+	s2, _ := newTestServer(t)
+	s2.handleCreateCompare(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("ratio 1: status = %d body=%s", w.Code, w.Body.String())
 	}
 }
 
@@ -331,6 +345,13 @@ func TestCompareTask_BuildRunParamsSampleRatio(t *testing.T) {
 	_, opts, _ = buildCompareRunParams(task, "/tmp/r.json")
 	if opts.SampleRatio != 0.25 {
 		t.Fatalf("explicit ratio not propagated: %+v", opts)
+	}
+	// F-12 read-side clamp: a stale persisted task with ratio > 1 must be
+	// clamped to 1, never reach the sampler out of range.
+	task.SampleRatio = 100
+	ratio, opts, cfg = buildCompareRunParams(task, "/tmp/r.json")
+	if ratio != 1 || opts.SampleRatio != 1 || cfg.SampleRatio != 1 {
+		t.Fatalf("ratio 100 not clamped: ratio=%v opts=%+v cfg=%+v", ratio, opts, cfg)
 	}
 	if opts.Mode != "sample" || len(opts.Tables) != 1 || opts.ReportFile != "/tmp/r.json" {
 		t.Fatalf("unexpected opts: %+v", opts)
