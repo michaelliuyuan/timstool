@@ -44,6 +44,10 @@ type Options struct {
 	IncludeTiDB bool
 	// MaxObjects caps total exported objects across schemas (0 = default 20000).
 	MaxObjects int
+	// SourceType dispatches the exporter dialect: "" (legacy default) and
+	// "postgres" keep the byte-identical PG catalog walk; "mysql" routes to
+	// the SHOW CREATE based walk in exporter_mysql.go (MS-10c).
+	SourceType string
 }
 
 const defaultMaxObjects = 20000
@@ -94,12 +98,15 @@ func (e *Exporter) serverVersionNum(ctx context.Context) int {
 	return v
 }
 
-// NewExporter creates an exporter bound to an open PG connection.
+// NewExporter creates an exporter bound to an open connection. The
+// "public" schema default is PG-only: MySQL has no PG-style schema layer
+// (a "schema" is a database there), so a MySQL run keeps exactly the
+// caller-supplied list.
 func NewExporter(db *sql.DB, opts Options) *Exporter {
 	if opts.MaxObjects <= 0 {
 		opts.MaxObjects = defaultMaxObjects
 	}
-	if len(opts.Schemas) == 0 {
+	if len(opts.Schemas) == 0 && opts.SourceType != "mysql" {
 		opts.Schemas = []string{"public"}
 	}
 	return &Exporter{db: db, opts: opts, manifest: Manifest{GeneratedAt: time.Now(), Counts: ObjectCounts{}}}
@@ -107,6 +114,16 @@ func NewExporter(db *sql.DB, opts Options) *Exporter {
 
 // ListSchemas returns all non-system schemas of the connected database.
 func ListSchemas(ctx context.Context, db *sql.DB) ([]string, error) {
+	return ListSchemasFor(ctx, db, "")
+}
+
+// ListSchemasFor dispatches on the normalized source type: PG keeps the
+// information_schema.schemata walk; MySQL lists non-system databases via
+// SHOW DATABASES (MS-10c).
+func ListSchemasFor(ctx context.Context, db *sql.DB, sourceType string) ([]string, error) {
+	if sourceType == "mysql" {
+		return listMySQLDatabases(ctx, db)
+	}
 	rows, err := db.QueryContext(ctx, `
 SELECT schema_name FROM information_schema.schemata
 WHERE schema_name NOT IN ('pg_catalog','information_schema')
@@ -197,6 +214,9 @@ func (e *Exporter) renderRows(ctx context.Context, label string, query string, a
 
 // schemaFiles renders every selected file for one schema.
 func (e *Exporter) schemaFiles(ctx context.Context, schemaName string) (map[string]string, error) {
+	if e.opts.SourceType == "mysql" {
+		return e.mysqlSchemaFiles(ctx, schemaName)
+	}
 	files := map[string]string{}
 	t := e.opts.Types
 

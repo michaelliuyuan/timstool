@@ -412,10 +412,13 @@ func TestSrcCapable(t *testing.T) {
 	if srcCapable("oracle", source.CapDDLExport) {
 		t.Fatal(`srcCapable("oracle", CapDDLExport) = true; unknown kind must resolve false`)
 	}
-	for _, notCapable := range []string{"mysql", "tidb"} {
-		if srcCapable(notCapable, source.CapDDLExport) {
-			t.Fatalf("srcCapable(%q, CapDDLExport) = true; ddl_export is PG-only in v1", notCapable)
-		}
+	// MS-10c: ddl_export flipped ON for mysql (SHOW CREATE exporter
+	// dialect); tidb stays target-only (the last PG-only flow is CDC).
+	if !srcCapable("mysql", source.CapDDLExport) {
+		t.Fatal(`srcCapable("mysql", CapDDLExport) = false; want true since MS-10c`)
+	}
+	if srcCapable("tidb", source.CapDDLExport) {
+		t.Fatal(`srcCapable("tidb", CapDDLExport) = true; tidb stays target-only`)
 	}
 	if !srcCapable("postgres", source.CapDDLExport) {
 		t.Fatal(`srcCapable("postgres", CapDDLExport) = false`)

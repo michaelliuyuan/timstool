@@ -27,7 +27,11 @@ type ddlExportRequest struct {
 	Schemas   []string        `json:"schemas"`
 	Types     *ddlExportTypes `json:"types"`
 	TiDB      bool            `json:"tidb"`
-	SourceRef string          `json:"source_ref"` // datasource id (F-02): postgres only
+	SourceRef string          `json:"source_ref"` // datasource id (F-02)
+	// srcType is the internal normalized source type (MS-10c): filled from
+	// the resolved datasource ref; the inline/manual form leaves it empty,
+	// which config.SourceConfig.SourceType() normalizes to postgres.
+	srcType string
 }
 
 type ddlExportTypes struct {
@@ -44,20 +48,24 @@ type ddlExportTypes struct {
 func (req *ddlExportRequest) source() config.SourceConfig {
 	port := req.Port
 	if port == 0 {
-		port = 5432
+		// MS-10c: registry-driven type-aware port fallback (same source as
+		// dataSourceToSourceConfig — no hand-rolled type branch).
+		port = dsDefaultPort(req.srcType)
 	}
 	sslmode := req.SSLMode
 	if sslmode == "" {
 		sslmode = "disable"
 	}
 	return config.SourceConfig{
+		Type: req.srcType,
 		Host: req.Host, Port: port, User: req.User,
 		Password: req.Password, Database: req.Database, SSLMode: sslmode,
 	}
 }
 
-// openDDLSource validates the request, opens a PG connection and pings it
-// (reuses the test-connection semantics).
+// openDDLSource validates the request, opens a source connection and pings
+// it (reuses the test-connection semantics; MS-10c: dispatched on the
+// normalized source type via openSourceTestConn).
 func (s *Server) openDDLSource(w http.ResponseWriter, req *ddlExportRequest) (*sql.DB, bool) {
 	if req.Host == "" || req.Database == "" {
 		s.writeError(w, http.StatusBadRequest, "host and database are required")
@@ -85,13 +93,15 @@ func (s *Server) applySourceRef(w http.ResponseWriter, req *ddlExportRequest) bo
 	if !srcCapable(e.Type, source.CapDDLExport) {
 		// MS-07 absorbs this guard (ruling seq 82): e.Type is the RAW stored
 		// value (C1 shape 1 - empty is rejected), identical to the legacy
-		// `!= "postgres"` behavior for empty/unknown/mysql/tidb.
-		s.writeError(w, http.StatusBadRequest, "source_ref: DDL 导出仅支持 PostgreSQL 数据源")
+		// behavior for empty/unknown. MS-10c flipped mysql on; tidb stays
+		// target-only (the last PG-only source flow is CDC).
+		s.writeError(w, http.StatusBadRequest, "source_ref: 该数据源类型不支持 DDL 导出")
 		return false
 	}
 	sc := dataSourceToSourceConfig(e)
 	req.Host, req.Port = sc.Host, sc.Port
 	req.User, req.Password, req.Database, req.SSLMode = sc.User, sc.Password, sc.Database, sc.SSLMode
+	req.srcType = e.Type
 	return true
 }
 
@@ -115,7 +125,7 @@ func (s *Server) handleDDLSchemas(w http.ResponseWriter, r *http.Request) {
 	// long-running group; an inner cap would only ever shorten it.
 	ctx := r.Context()
 
-	schemas, err := ddlexport.ListSchemas(ctx, db)
+	schemas, err := ddlexport.ListSchemasFor(ctx, db, req.srcType)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "list schemas failed: "+err.Error())
 		return
@@ -158,6 +168,7 @@ func (s *Server) handleDDLExport(w http.ResponseWriter, r *http.Request) {
 		Schemas:     req.Schemas,
 		Types:       ts,
 		IncludeTiDB: req.TiDB,
+		SourceType:  req.srcType,
 	})
 
 	// Buffer the whole archive first: the catalog walk happens inside

@@ -2,8 +2,9 @@ package source_test
 
 // MS-01 anchors (ruling seq 82 final):
 //   A1 — capability-bit snapshots per registered kind: postgres all-true,
-//        mysql schema/data only, tidb ALL-false (target-only status quo),
-//        stubs all-false. Pins the matrix the UI greying reads.
+//        mysql all-true except CDC (the last PG-only flow), tidb ALL-false
+//        (target-only status quo), stubs all-false. Pins the matrix the
+//        UI greying reads.
 //   A2 — NormalizeKind single-default semantics: ""→postgres, unknown
 //        non-empty→error (never silently downgraded), known (incl. tidb)
 //        passes through.
@@ -58,16 +59,14 @@ func TestCapabilityMatrixSnapshot(t *testing.T) {
 	if !myc.Assess {
 		t.Error("mysql capability \"assess\" = false; want true since MS-10b")
 	}
-	for _, off := range []struct {
-		name string
-		bit  bool
-	}{
-		{"cdc", myc.CDC},
-		{"ddl_export", myc.DDLExport},
-	} {
-		if off.bit {
-			t.Errorf("mysql capability %q = true, want false until MS-10c/CDC-epic land", off.name)
-		}
+	// MS-10c: ddl_export flipped ON for mysql (SHOW CREATE exporter
+	// dialect + srcType dispatch in the ddl-export handlers).
+	if !myc.DDLExport {
+		t.Error("mysql capability \"ddl_export\" = false; want true since MS-10c")
+	}
+	// CDC is the last PG-only source flow (CDC epic): it must stay false.
+	if myc.CDC {
+		t.Error("mysql capability \"cdc\" = true; want false until the CDC epic lands")
 	}
 
 	// Ruling seq 82 ①: tidb is a registered kind with EVERY bit false —

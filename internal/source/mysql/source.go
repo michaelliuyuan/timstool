@@ -37,13 +37,14 @@ var mysqlMeta = source.SourceMeta{
 	DisplayName: "MySQL",
 	Implemented: true,
 	DefaultPort: 3306,
-	// MS-01: assess arrives with MS-10b (assess scanner dialect); ddl_export
-	// with MS-10c; compare flipped on by MS-08 (the compare validator speaks
-	// the MySQL wire); watermark (suggest + incremental) flipped on by
-	// MS-10a (mysqlWatermarkDialect). The remaining bits stay false so the
-	// UI greys them out and the API 400-guards reject them (single truth,
-	// no scattered type branches).
-	Capabilities: source.Capabilities{Schema: true, Data: true, CDC: false, Compare: true, Watermark: true, Assess: true},
+	// MS-01: assess flipped on by MS-10b (assess scanner dialect);
+	// ddl_export flipped on by MS-10c (SHOW CREATE exporter dialect);
+	// compare flipped on by MS-08 (the compare validator speaks the MySQL
+	// wire); watermark (suggest + incremental) flipped on by MS-10a
+	// (mysqlWatermarkDialect). The remaining bit (CDC) stays false so the
+	// UI greys it out and the API 400-guards reject it (single truth,
+	// no scattered type branches) — CDC is the last PG-only source flow.
+	Capabilities: source.Capabilities{Schema: true, Data: true, CDC: false, Compare: true, Watermark: true, Assess: true, DDLExport: true},
 	Fields: []source.FieldSpec{
 		{Key: "host", Label: "主机地址", Type: "text", Required: true, Default: "localhost", Placeholder: "localhost", Group: "common"},
 		{Key: "port", Label: "端口", Type: "number", Required: true, Default: 3306, Group: "common"},

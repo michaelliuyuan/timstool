@@ -242,20 +242,19 @@ function Assert-SourceMatrix {
     }
     $my = $byKind['mysql']
     # MS-10a: watermark flipped ON for mysql (mysqlWatermarkDialect); MS-10b:
-    # assess flipped ON (information_schema scanner dialect); the remaining
-    # bits (cdc/ddl_export) must stay false until their batches land.
-    if ($my.capabilities.compare -ne $true -or $my.capabilities.watermark -ne $true -or $my.capabilities.assess -ne $true) {
-        throw "mysql compare/watermark/assess not true (MS-08/MS-10a/MS-10b A1 mirror)"
+    # assess flipped ON (information_schema scanner dialect); MS-10c:
+    # ddl_export flipped ON (SHOW CREATE exporter dialect). The remaining
+    # bit (cdc) must stay false until the CDC epic lands.
+    if ($my.capabilities.compare -ne $true -or $my.capabilities.watermark -ne $true -or $my.capabilities.assess -ne $true -or $my.capabilities.ddl_export -ne $true) {
+        throw "mysql compare/watermark/assess/ddl_export not true (MS-08/MS-10a/MS-10b/MS-10c A1 mirror)"
     }
-    foreach ($cap in @('cdc', 'ddl_export')) {
-        if ($my.capabilities.$cap -ne $false) { throw "mysql capability '$cap' not false (pre MS-10c/CDC regression)" }
-    }
+    if ($my.capabilities.cdc -ne $false) { throw "mysql capability 'cdc' not false (pre CDC-epic regression)" }
     $td = $byKind['tidb']
     if ($td.implemented -ne $false) { throw "tidb implemented not false (MS-01 A1 regression)" }
     foreach ($cap in @('schema', 'data', 'cdc', 'compare', 'watermark', 'assess', 'ddl_export')) {
         if ($td.capabilities.$cap -ne $false) { throw "tidb capability '$cap' not false (MS-01 A1 regression)" }
     }
-    Write-Host "  [matrix] postgres 7-true / mysql compare (MS-08) + watermark (MS-10a) + assess (MS-10b) / tidb all-false+not-implemented (A1 live)"
+    Write-Host "  [matrix] postgres 7-true / mysql compare (MS-08) + watermark (MS-10a) + assess (MS-10b) + ddl_export (MS-10c) / tidb all-false+not-implemented (A1 live)"
 }
 
 function New-GateDataSources {

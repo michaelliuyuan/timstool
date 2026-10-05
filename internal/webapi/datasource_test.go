@@ -257,7 +257,11 @@ func TestTaskCreate_SampleRatioGate(t *testing.T) {
 func TestDatasources_DDLAndAssessRefTypeGate(t *testing.T) {
 	s, _ := newTestServer(t)
 
-	// A mysql datasource cannot drive DDL export / assess (PG-only flows).
+	// MS-10c: DDL export no longer 400-rejects a mysql ref (SHOW CREATE
+	// exporter dialect flipped); the unreachable-host shape surfaces as a
+	// connect error (5xx) instead of the capability 400 — the assess
+	// mirror (MS-10b). The capability gate itself is anchored on tidb,
+	// which stays target-only.
 	w, req := doReq("POST", "/api/v1/datasources", `{
 		"name": "my", "type": "mysql",
 		"fields": {"host": "10.0.0.3", "port": 3306, "user": "root", "password": "pw", "database": "d"}
@@ -267,20 +271,23 @@ func TestDatasources_DDLAndAssessRefTypeGate(t *testing.T) {
 
 	w, req = doReq("POST", "/api/v1/ddl-export/schemas", fmt.Sprintf(`{"source_ref": %q}`, myID))
 	s.handleDDLSchemas(w, req)
-	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "PostgreSQL") {
-		t.Fatalf("ddl mysql ref: %d %s", w.Code, w.Body.String())
+	if w.Code == http.StatusBadRequest {
+		t.Fatalf("ddl mysql ref must not 400 on capability (MS-10c), got: %d %s", w.Code, w.Body.String())
 	}
 
-	// MS-10b: assess no longer 400-rejects a mysql ref (scanner dialect
-	// flipped); the unreachable-host shape surfaces as a connect error (5xx)
-	// instead of the capability 400. The capability gate itself is anchored
-	// on tidb, which stays target-only.
 	w, req = doReq("POST", "/api/v1/datasources", `{
 		"name": "td", "type": "tidb",
 		"fields": {"host": "10.0.0.4", "port": 4000, "user": "root", "password": "pw", "database": "d"}
 	}`)
 	s.handleCreateDataSource(w, req)
 	tdID := dsBody(t, w)["id"].(string)
+
+	w, req = doReq("POST", "/api/v1/ddl-export/schemas", fmt.Sprintf(`{"source_ref": %q}`, tdID))
+	s.handleDDLSchemas(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "不支持 DDL 导出") {
+		t.Fatalf("ddl tidb ref: %d %s", w.Code, w.Body.String())
+	}
+
 	w, req = doReq("POST", "/api/v1/assess", fmt.Sprintf(`{"source_ref": %q}`, tdID))
 	s.handleAssess(w, req)
 	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "不支持兼容评估") {
@@ -291,6 +298,41 @@ func TestDatasources_DDLAndAssessRefTypeGate(t *testing.T) {
 	s.handleAssess(w, req)
 	if w.Code == http.StatusBadRequest {
 		t.Fatalf("assess mysql ref must not 400 on capability (MS-10b), got: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// TestDDLExportSrcTypeDispatch anchors the MS-10c srcType plumbing on the
+// request struct: the ref path carries the datasource type into
+// config.SourceConfig (driver dispatch + DSNByType UTC pin) and the port
+// fallback is type-aware; the inline/manual form stays postgres.
+func TestDDLExportSrcTypeDispatch(t *testing.T) {
+	// Inline form: no type — postgres pair, 5432 fallback.
+	req := ddlExportRequest{Host: "h", Database: "d"}
+	sc := req.source()
+	if sc.Type != "" || sc.SourceType() != "postgres" {
+		t.Fatalf("inline srcType = %q, want empty (postgres default)", sc.Type)
+	}
+	if _, dsn := sourceConnSpec(sc); dsn == "" || sc.Port != 5432 {
+		t.Fatalf("inline form must keep the PG pair/5432: port=%d", sc.Port)
+	}
+
+	// Ref-resolved mysql: mysql driver pair, 3306 fallback, and the DSN
+	// carries the MS-08d UTC session pin (the DDL walk inherits it —
+	// SHOW CREATE output and the walk share one pinned session).
+	req = ddlExportRequest{Host: "h", Database: "d", srcType: "mysql"}
+	sc = req.source()
+	driver, dsn := sourceConnSpec(sc)
+	if driver != "mysql" || sc.Port != 3306 {
+		t.Fatalf("mysql form: driver=%s port=%d, want mysql/3306", driver, sc.Port)
+	}
+	if !strings.Contains(dsn, "time_zone=") {
+		t.Fatalf("mysql DDL DSN missing the UTC session pin: %s", dsn)
+	}
+
+	// Explicit port wins over the fallback for both kinds.
+	req = ddlExportRequest{Host: "h", Database: "d", Port: 3307, srcType: "mysql"}
+	if got := req.source().Port; got != 3307 {
+		t.Fatalf("explicit port overridden: %d", got)
 	}
 }
 
