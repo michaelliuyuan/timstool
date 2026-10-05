@@ -21,7 +21,7 @@
     "endpoint": "",
     "workdir": "",
     "psql_path": "psql",
-    "expected_artifact_sha256": "4484BA526118A9850C684D6DA691AA15F60295661FF5BBA8C7F737C394CAE0E7",
+    "expected_artifact_sha256": "0838C494030DF2E2CDB7635CA82B5DA9ACE87ED8584FC1A1EEAA6DAE06448343",
     "build_env": {}
   }
 }
