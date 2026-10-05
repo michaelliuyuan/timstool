@@ -165,8 +165,7 @@ func TestMySQLCursorValue(t *testing.T) {
 // Adversarial R2 P0: a UI-shaped MySQL datasource carries schema="" - the
 // watermark flows must resolve it to the connection database (validator
 // sourceSchema parity), never query an empty schema.
-func TestIncSchemaMySQLFallback(t *testing.T) {
-	// UI shape: mysql ref, schema empty -> database.
+func TestIncSchemaMySQLFallback(t *testing.T) { // UI shape: mysql ref, schema empty -> database.
 	sc := config.SourceConfig{Type: "mysql", Host: "h", Port: 3306, Database: "appdb"}
 	if got := incSchema(sc); got != "appdb" {
 		t.Fatalf("incSchema(mysql empty) = %q, want appdb (database fallback)", got)
@@ -181,5 +180,24 @@ func TestIncSchemaMySQLFallback(t *testing.T) {
 	pg := config.SourceConfig{Type: "postgres", Database: "pgdb"}
 	if got := incSchema(pg); got != "" {
 		t.Fatalf("incSchema(pg empty) = %q, want empty (public fallback lives upstream)", got)
+	}
+}
+
+// c-fix P2-1 (seq683): every STATISTICS probe must filter IS_VISIBLE='YES'
+// (invisible indexes must not mark the column indexed / disclose a key).
+// SQL-shape pin over the shared fragment and the two const'd probe shapes;
+// the keys probe embeds the fragment dynamically (IN list), pinned via the
+// fragment itself. Live invisible-index behavior rides the test-eng
+// black-box list (production 8.0.26); IS_VISIBLE is 8.0+, the 5.7 floor
+// ruling lives in the tail-batch pool.
+func TestMySQLStatisticsVisibilityFilter(t *testing.T) {
+	if !strings.Contains(mysqlQueryColumnsSQL, mysqlIdxVisibleFrag) {
+		t.Fatal("mysqlQueryColumnsSQL lost the IS_VISIBLE filter")
+	}
+	if !strings.Contains(mysqlSuggestCatalogSQL, mysqlIdxVisibleFrag) {
+		t.Fatal("mysqlSuggestCatalogSQL lost the IS_VISIBLE filter")
+	}
+	if mysqlIdxVisibleFrag != `AND s.IS_VISIBLE = 'YES'` {
+		t.Fatalf("mysqlIdxVisibleFrag drifted: %q", mysqlIdxVisibleFrag)
 	}
 }

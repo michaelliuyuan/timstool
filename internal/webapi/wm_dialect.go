@@ -440,18 +440,41 @@ func (mysqlWatermarkDialect) WatermarkEligible(dataType string) bool {
 	return mysqlWatermarkTypes[dataType]
 }
 
+// mysqlIdxVisibleFrag is the shared index-visibility filter for every
+// information_schema.STATISTICS probe (c-fix P2-1: an invisible index must
+// not mark the watermark column indexed - PG side already filters
+// indisvalid). Kept as one const so the three query shapes cannot drift.
+// NOTE: IS_VISIBLE is MySQL 8.0+ (production 8.0.26 in evidence); the 5.7
+// floor ruling lives in the tail-batch pool.
+const mysqlIdxVisibleFrag = `AND s.IS_VISIBLE = 'YES'`
+
+// The three STATISTICS probe shapes, as package consts so the
+// visibility-filter anchor (wm_dialect_mysql_test.go) can pin them.
+const mysqlQueryColumnsSQL = `
+		SELECT c.COLUMN_NAME, c.DATA_TYPE,
+		       EXISTS (SELECT 1 FROM information_schema.STATISTICS s
+		                WHERE s.TABLE_SCHEMA = c.TABLE_SCHEMA AND s.TABLE_NAME = c.TABLE_NAME
+		                  AND s.COLUMN_NAME = c.COLUMN_NAME AND s.SEQ_IN_INDEX = 1 ` + mysqlIdxVisibleFrag + `) AS indexed_first
+		FROM information_schema.COLUMNS c
+		WHERE c.TABLE_SCHEMA = ? AND c.TABLE_NAME = ?
+		ORDER BY c.ORDINAL_POSITION`
+
+const mysqlSuggestCatalogSQL = `
+		SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, COALESCE(c.COLUMN_DEFAULT, ''),
+		       EXISTS (SELECT 1 FROM information_schema.STATISTICS s
+		                WHERE s.TABLE_SCHEMA = c.TABLE_SCHEMA AND s.TABLE_NAME = c.TABLE_NAME
+		                  AND s.COLUMN_NAME = c.COLUMN_NAME AND s.SEQ_IN_INDEX = 1 ` + mysqlIdxVisibleFrag + `) AS indexed_first
+		FROM information_schema.COLUMNS c
+		JOIN information_schema.TABLES t
+		  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME AND t.TABLE_TYPE = 'BASE TABLE'
+		WHERE c.TABLE_SCHEMA = ?
+		ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION`
+
 // QueryColumns mirrors pgWatermarkDialect.QueryColumns over MySQL's
 // information_schema: the indexed_first flag comes from STATISTICS
 // (SEQ_IN_INDEX=1 = the column leads some index).
 func (mysqlWatermarkDialect) QueryColumns(ctx context.Context, db *sql.DB, schema, table string) ([]incColumnView, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT c.COLUMN_NAME, c.DATA_TYPE,
-		       EXISTS (SELECT 1 FROM information_schema.STATISTICS s
-		                WHERE s.TABLE_SCHEMA = c.TABLE_SCHEMA AND s.TABLE_NAME = c.TABLE_NAME
-		                  AND s.COLUMN_NAME = c.COLUMN_NAME AND s.SEQ_IN_INDEX = 1) AS indexed_first
-		FROM information_schema.COLUMNS c
-		WHERE c.TABLE_SCHEMA = ? AND c.TABLE_NAME = ?
-		ORDER BY c.ORDINAL_POSITION`, schema, table)
+	rows, err := db.QueryContext(ctx, mysqlQueryColumnsSQL, schema, table)
 	if err != nil {
 		return nil, err
 	}
@@ -479,16 +502,7 @@ func (mysqlWatermarkDialect) SystemSchemas() map[string]bool {
 // MySQL's information_schema (BASE TABLE only - no views); the DefaultNow
 // judgment reuses the same regex source (CURRENT_TIMESTAMP matches).
 func (d mysqlWatermarkDialect) QuerySuggestCatalog(ctx context.Context, db *sql.DB, schema string) ([]wmCatalogColumn, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, COALESCE(c.COLUMN_DEFAULT, ''),
-		       EXISTS (SELECT 1 FROM information_schema.STATISTICS s
-		                WHERE s.TABLE_SCHEMA = c.TABLE_SCHEMA AND s.TABLE_NAME = c.TABLE_NAME
-		                  AND s.COLUMN_NAME = c.COLUMN_NAME AND s.SEQ_IN_INDEX = 1) AS indexed_first
-		FROM information_schema.COLUMNS c
-		JOIN information_schema.TABLES t
-		  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME AND t.TABLE_TYPE = 'BASE TABLE'
-		WHERE c.TABLE_SCHEMA = ?
-		ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION`, schema)
+	rows, err := db.QueryContext(ctx, mysqlSuggestCatalogSQL, schema)
 	if err != nil {
 		return nil, err
 	}
@@ -561,7 +575,7 @@ func (mysqlWatermarkDialect) QueryTableKeys(ctx context.Context, db *sql.DB, sch
 		       MAX(s.INDEX_NAME = 'PRIMARY') AS has_pk,
 		       MAX(s.NON_UNIQUE = 0 AND s.INDEX_NAME <> 'PRIMARY') AS has_unique
 		FROM information_schema.STATISTICS s
-		WHERE s.TABLE_SCHEMA = ? AND s.TABLE_NAME IN (`+strings.Join(ph, ", ")+`)
+		WHERE s.TABLE_SCHEMA = ? AND s.TABLE_NAME IN (`+strings.Join(ph, ", ")+`) `+mysqlIdxVisibleFrag+`
 		GROUP BY s.TABLE_NAME`, args...)
 	if err != nil {
 		return nil, err
