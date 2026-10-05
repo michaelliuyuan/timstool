@@ -1,17 +1,23 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import apiClient from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import DataSourcePicker from '../components/DataSourcePicker.vue'
 import { useDataSources } from '../composables/useDataSources'
 
-// F-02: connection comes from a saved postgres datasource (server-side
-// credentials) or the legacy inline form. The localStorage memory is retired —
-// passwords must not persist in the browser.
+// F-02: connection comes from a saved datasource (postgres / mysql since
+// MS-10c, server-side credentials) or the legacy inline form (PG-only).
+// The localStorage memory is retired — passwords must not persist.
 
 const sourceRef = ref('')
-const { load: loadDataSources } = useDataSources()
+const { load: loadDataSources, get: getDataSource } = useDataSources()
+// MS-10c: the picker accepts postgres + mysql; the manual inline form
+// stays PG-only (a MySQL source must come in as a datasource reference —
+// the AssessView precedent).
+const effectiveSourceType = computed(() =>
+  sourceRef.value ? (getDataSource(sourceRef.value)?.type || 'postgres') : 'postgres')
+
 // P1-1: one-shot migration — the retired localStorage key historically stored
 // the inline sourceForm including a plaintext password; drop it so the value
 // can never be read back.
@@ -139,7 +145,7 @@ async function exportDDL() {
 
 <template>
   <div class="tims-page">
-    <PageHeader title="DDL 导出" subtitle="一键导出源端 PostgreSQL 各类对象的 DDL（按 schema 分文件夹打包）" />
+    <PageHeader title="DDL 导出" subtitle="一键导出源端各类对象的 DDL（按 schema 分文件夹打包）" />
 
     <el-card shadow="never" style="margin-bottom: 20px;">
       <template #header>
@@ -147,10 +153,17 @@ async function exportDDL() {
       </template>
       <el-form :model="sourceForm" label-width="120px" size="default">
         <el-form-item label="数据源">
-          <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
+          <DataSourcePicker v-model="sourceRef" :types="['postgres', 'mysql']" />
         </el-form-item>
+        <!-- v1: the legacy inline form stays PG-only (MS-10c scope) — a
+             MySQL source must come in as a datasource reference above. -->
         <template v-if="!sourceRef">
-          <el-divider content-position="left">源数据库（PostgreSQL）</el-divider>
+          <el-divider content-position="left">源数据库（{{ effectiveSourceType === 'postgres' ? 'PostgreSQL' : effectiveSourceType }}）</el-divider>
+          <el-form-item>
+            <div style="font-size: var(--tims-font-sm); color: var(--el-text-color-secondary); line-height: 1.6;">
+              手工连接仅支持 PostgreSQL；MySQL 源请使用上方数据源引用。
+            </div>
+          </el-form-item>
           <el-row :gutter="24">
             <el-col :span="12">
               <el-form-item label="主机">

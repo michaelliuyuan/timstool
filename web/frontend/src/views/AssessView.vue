@@ -46,7 +46,12 @@ const ddlDialogTitle = ref('')
 const ddlDialogContent = ref('')
 
 const sourceRef = ref('')
-const { load: loadDataSources } = useDataSources()
+const { load: loadDataSources, get: getDataSource } = useDataSources()
+// 刘源 seq768 调整：副标题不列举类型（picker 自承载类型集）；报告面的
+// 源库标签随所选源动态（V3.18.4 比对报告 srcLabel 先例同款）。
+const effectiveSourceType = computed(() =>
+  sourceRef.value ? (getDataSource(sourceRef.value)?.type || 'postgres') : 'postgres')
+const srcLabelShort = computed(() => (effectiveSourceType.value === 'mysql' ? 'MySQL' : 'PG'))
 // P1-1: one-shot migration — the retired localStorage key historically stored
 // the inline sourceForm including a plaintext password; drop it so the value
 // can never be read back.
@@ -199,7 +204,7 @@ function showDDL(finding: Finding) {
   ddlDialogTitle.value = finding.object_name + ' — DDL'
   const parts: string[] = []
   if (finding.ddl) {
-    parts.push('-- PG DDL')
+    parts.push(`-- ${srcLabelShort.value} DDL`)
     parts.push(finding.ddl)
   }
   if (finding.tidb_ddl) {
@@ -219,7 +224,7 @@ function copyDDL() {
 
 <template>
   <div class="tims-page">
-    <PageHeader title="兼容评估" subtitle="扫描 MySQL / PostgreSQL → TiDB 迁移兼容性风险" />
+    <PageHeader title="兼容评估" subtitle="扫描源数据库 → TiDB 迁移兼容性风险" />
     <!-- Connection Form -->
     <el-card shadow="never" style="margin-bottom: 20px;">
       <template #header>
@@ -372,7 +377,7 @@ function copyDDL() {
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="pg_detail" label="PG" width="140" show-overflow-tooltip />
+          <el-table-column prop="pg_detail" :label="srcLabelShort" width="140" show-overflow-tooltip />
           <el-table-column prop="tidb_detail" label="TiDB" width="120" show-overflow-tooltip />
           <el-table-column prop="suggestion" label="建议" min-width="250" show-overflow-tooltip />
           <el-table-column label="DDL" width="80" align="center">
