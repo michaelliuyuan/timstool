@@ -447,8 +447,9 @@ func (s *Server) handleCreateIncrementalJob(w http.ResponseWriter, r *http.Reque
 	}
 	if !incSourceWatermarkCapable(src.Type) {
 		// MS-04 absorbs this guard into the WatermarkDialect capability read
-		// (ruling seq 82: baseline-frozen, only-decrease).
-		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
+		// (ruling seq 82: baseline-frozen, only-decrease). MS-10a: the
+		// message is capability-shaped, not kind-shaped.
+		s.writeError(w, http.StatusBadRequest, "源数据源不支持增量同步（当前支持 PostgreSQL/MySQL）")
 		return
 	}
 	tgt, err := s.resolveDataSourceRef(job.TargetRef)
@@ -519,9 +520,10 @@ func (s *Server) handleUpdateIncrementalJob(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if !incSourceWatermarkCapable(src.Type) {
-		// MS-04 absorbs this guard into the WatermarkDialect capability read
-		// (ruling seq 82: baseline-frozen, only-decrease).
-		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
+		// D4 double-gate on update too (F-02 dual-path gate parity): a PUT must
+		// not be able to swap refs past the create-side type checks. MS-10a:
+		// capability-shaped message, same as create.
+		s.writeError(w, http.StatusBadRequest, "源数据源不支持增量同步（当前支持 PostgreSQL/MySQL）")
 		return
 	}
 	tgt, err := s.resolveDataSourceRef(job.TargetRef)
@@ -653,29 +655,11 @@ const incTableKeysSQL = `
 		  AND i.indisvalid AND tc.relispartition = false
 		GROUP BY tc.relname`
 
-// queryIncTableKeys returns the key disclosure per table. Tables absent
-// from the map have no qualifying key (missing table, plain heap, only
-// partial/expression/invalid indexes).
+// queryIncTableKeys is the PG-wire legacy entry, kept as a thin delegate to
+// pgWatermarkDialect.QueryTableKeys (MS-10a: the main flow dials the
+// dialect by source kind; the white-box anchors keep compiling unchanged).
 func queryIncTableKeys(ctx context.Context, db *sql.DB, schema string, tables []string) (map[string]incKeyInfo, error) {
-	if len(tables) == 0 {
-		return map[string]incKeyInfo{}, nil
-	}
-	// pgx stdlib encodes []string natively as a text[] argument for ANY($2).
-	rows, err := db.QueryContext(ctx, incTableKeysSQL, schema, tables)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string]incKeyInfo{}
-	for rows.Next() {
-		var name string
-		var ki incKeyInfo
-		if err := rows.Scan(&name, &ki.HasPK, &ki.HasUnique); err != nil {
-			return nil, err
-		}
-		out[name] = ki
-	}
-	return out, rows.Err()
+	return pgWatermarkDialect{}.QueryTableKeys(ctx, db, schema, tables)
 }
 
 // handleIncrementalColumns lists a table's columns with watermark eligibility
@@ -697,11 +681,13 @@ func (s *Server) handleIncrementalColumns(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if !incSourceWatermarkCapable(e.Type) {
-		// MS-04 absorbs this guard (ruling seq 82).
-		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
+		// MS-04 absorbs this guard (ruling seq 82). MS-10a: capability-shaped
+		// message (MySQL watermark landed).
+		s.writeError(w, http.StatusBadRequest, "源数据源不支持增量同步（当前支持 PostgreSQL/MySQL）")
 		return
 	}
 	sc := dataSourceToSourceConfig(e)
+	d := incDialectFor(e.Type)
 	db, err := openSourceTestConn(sc)
 	if err != nil {
 		s.writeError(w, http.StatusBadGateway, err.Error())
@@ -712,7 +698,7 @@ func (s *Server) handleIncrementalColumns(w http.ResponseWriter, r *http.Request
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
-	cols, err := incSourceDialect.QueryColumns(ctx, db, sc.Schema, table)
+	cols, err := d.QueryColumns(ctx, db, sc.Schema, table)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "list columns failed: "+err.Error())
 		return
@@ -721,7 +707,7 @@ func (s *Server) handleIncrementalColumns(w http.ResponseWriter, r *http.Request
 		s.writeError(w, http.StatusNotFound, "table not found in source schema")
 		return
 	}
-	keys, err := queryIncTableKeys(ctx, db, sc.Schema, []string{table})
+	keys, err := d.QueryTableKeys(ctx, db, sc.Schema, []string{table})
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "query table keys failed: "+err.Error())
 		return
@@ -778,11 +764,13 @@ func (s *Server) handleIncrementalColumnsBatch(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if !incSourceWatermarkCapable(e.Type) {
-		// MS-04 absorbs this guard (ruling seq 82).
-		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
+		// MS-04 absorbs this guard (ruling seq 82). MS-10a: capability-shaped
+		// message (MySQL watermark landed).
+		s.writeError(w, http.StatusBadRequest, "源数据源不支持增量同步（当前支持 PostgreSQL/MySQL）")
 		return
 	}
 	sc := dataSourceToSourceConfig(e)
+	d := incDialectFor(e.Type)
 	db, err := openSourceTestConn(sc)
 	if err != nil {
 		s.writeError(w, http.StatusBadGateway, err.Error())
@@ -801,14 +789,14 @@ func (s *Server) handleIncrementalColumnsBatch(w http.ResponseWriter, r *http.Re
 	}
 	// One catalog round trip covers the whole batch (FEAT-INC-KEY-WARN):
 	// missing tables simply stay absent from the map ⇒ no key.
-	keys, err := queryIncTableKeys(ctx, db, sc.Schema, req.Tables)
+	keys, err := d.QueryTableKeys(ctx, db, sc.Schema, req.Tables)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "query table keys failed: "+err.Error())
 		return
 	}
 	out := make([]tableResult, 0, len(req.Tables))
 	for _, t := range req.Tables {
-		cols, err := incSourceDialect.QueryColumns(ctx, db, sc.Schema, t)
+		cols, err := d.QueryColumns(ctx, db, sc.Schema, t)
 		if err != nil {
 			out = append(out, tableResult{Table: t, Error: err.Error()})
 			continue
@@ -872,6 +860,19 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 	}
 	sc := dataSourceToSourceConfig(src)
 	tc := dataSourceToTargetConfig(tgt)
+	// MS-10a run-entry re-check (F-13 family discipline): the capability
+	// read at create/update time can go stale (e.g. a source row edited to
+	// an unsupported kind after the job was created) - the engine must
+	// re-verify before dialing the dialect, failing per-table instead of
+	// speaking the wrong wire protocol.
+	if !incSourceWatermarkCapable(src.Type) {
+		lg.add(incLogLevelError, "", incLogPhaseFail, "源数据源不支持增量同步（当前支持 PostgreSQL/MySQL）", "", 0, "", 0)
+		for _, t := range job.Tables {
+			rec.Tables = append(rec.Tables, incTableResult{Table: t.Table, Error: "源数据源不支持增量同步（当前支持 PostgreSQL/MySQL）"})
+		}
+		return rec
+	}
+	d := incDialectFor(src.Type)
 
 	srcDB, err := openSourceTestConn(sc)
 	if err != nil {
@@ -923,7 +924,7 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 	workers := normalizeIncParallelism(job.Parallelism)
 	rec.Tables = incRunTableTasks(tasks, workers,
 		func(task incRunTableTask) incTableResult {
-			res := s.syncOneTable(ctx, srcDB, myDB, sc, tc, job, task.t, task.st, lg)
+			res := s.syncOneTable(ctx, srcDB, myDB, sc, tc, job, task.t, task.st, d, lg)
 			res.Table = task.t.Table
 			return res
 		},
@@ -1006,8 +1007,9 @@ func incRunTableTasks(tasks []incRunTableTask, workers int, runOne func(t incRun
 
 // syncOneTable syncs one table. st is the pre-resolved per-table state
 // pointer (resolved by the scheduler — job.States is not consulted here so
-// concurrent workers never race on the map).
-func (s *Server) syncOneTable(ctx context.Context, srcDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, st *incTableState, lg *incLogCollector) incTableResult {
+// concurrent workers never race on the map). d is the source dialect
+// resolved once per run (MS-10a).
+func (s *Server) syncOneTable(ctx context.Context, srcDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, st *incTableState, d WatermarkDialect, lg *incLogCollector) incTableResult {
 	tableStart := time.Now()
 	res := incTableResult{Table: t.Table, FromWM: st.LastWatermark}
 
@@ -1017,32 +1019,13 @@ func (s *Server) syncOneTable(ctx context.Context, srcDB, myDB *sql.DB, sc confi
 	}
 	// Discover columns + validate the watermark type (D4 whitelist) at run
 	// time against the live source — creation only validates identifiers.
-	rows, err := srcDB.QueryContext(ctx, `
-		SELECT column_name, data_type FROM information_schema.columns
-		WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`, sc.Schema, t.Table)
+	cols, wmType, err := d.QueryColumnNames(ctx, srcDB, sc.Schema, t.Table, t.WatermarkColumn)
 	if err != nil {
 		res.Error = "读取源表列信息失败: " + err.Error()
 		st.Failed = res.Error
 		lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, "", time.Since(tableStart).Milliseconds())
 		return res
 	}
-	var cols []string
-	var wmType string
-	for rows.Next() {
-		var name, dataType string
-		if err := rows.Scan(&name, &dataType); err != nil {
-			rows.Close()
-			res.Error = "读取源表列信息失败: " + err.Error()
-			st.Failed = res.Error
-			lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, "", time.Since(tableStart).Milliseconds())
-			return res
-		}
-		if name == t.WatermarkColumn {
-			wmType = dataType
-		}
-		cols = append(cols, name)
-	}
-	rows.Close()
 	if len(cols) == 0 {
 		res.Error = fmt.Sprintf("源 schema %q 中不存在表 %q", sc.Schema, t.Table)
 		st.Failed = res.Error
@@ -1055,7 +1038,7 @@ func (s *Server) syncOneTable(ctx context.Context, srcDB, myDB *sql.DB, sc confi
 		lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, "", time.Since(tableStart).Milliseconds())
 		return res
 	}
-	if !incSourceDialect.WatermarkEligible(wmType) {
+	if !d.WatermarkEligible(wmType) {
 		res.Error = fmt.Sprintf("水位列 %q 类型 %q 不在白名单（timestamp/timestamptz/date/int/bigint）", t.WatermarkColumn, wmType)
 		st.Failed = res.Error
 		lg.add(incLogLevelError, t.Table, incLogPhaseFail, res.Error, "", 0, "", time.Since(tableStart).Milliseconds())
@@ -1069,7 +1052,7 @@ func (s *Server) syncOneTable(ctx context.Context, srcDB, myDB *sql.DB, sc confi
 	if wm == "" {
 		var minWM sql.NullString
 		if err := srcDB.QueryRowContext(ctx,
-			fmt.Sprintf("SELECT MIN(%s) FROM %s.%s", incSourceDialect.QuoteIdent(t.WatermarkColumn), incSourceDialect.QuoteIdent(sc.Schema), incSourceDialect.QuoteIdent(t.Table)),
+			fmt.Sprintf("SELECT MIN(%s) FROM %s.%s", d.QuoteIdent(t.WatermarkColumn), d.QuoteIdent(sc.Schema), d.QuoteIdent(t.Table)),
 		).Scan(&minWM); err != nil {
 			res.Error = "计算初始水位失败: " + err.Error()
 			st.Failed = res.Error
@@ -1106,7 +1089,7 @@ func (s *Server) syncOneTable(ctx context.Context, srcDB, myDB *sql.DB, sc confi
 		entryWM := wm
 		batchNo++
 		scanStart := time.Now()
-		selSQL := incSourceDialect.BuildSelectSQL(sc.Schema, t.Table, cols, t.WatermarkColumn, job.StrictMode && !geScan)
+		selSQL := d.BuildSelectSQL(sc.Schema, t.Table, cols, t.WatermarkColumn, job.StrictMode && !geScan)
 		srows, err := srcDB.QueryContext(ctx, selSQL, wm, job.BatchSize)
 		if err != nil {
 			res.Error = "查询源端失败: " + err.Error()
@@ -1146,7 +1129,7 @@ func (s *Server) syncOneTable(ctx context.Context, srcDB, myDB *sql.DB, sc confi
 		if incLogShouldFullScan(batchNo) {
 			lg.add(incLogLevelSQL, t.Table, incLogPhaseScan,
 				fmt.Sprintf("第 %d 批扫描（%d 行）", batchNo, len(batch)),
-				incRenderSelectSQL(sc.Schema, t.Table, cols, t.WatermarkColumn, job.StrictMode && !geScan, entryWM, job.BatchSize),
+				incRenderSelectSQL(d, sc.Schema, t.Table, cols, t.WatermarkColumn, job.StrictMode && !geScan, entryWM, job.BatchSize),
 				int64(len(batch)), entryWM, time.Since(scanStart).Milliseconds())
 		} else if incLogShouldSummaryScan(batchNo) {
 			lg.add(incLogLevelInfo, t.Table, incLogPhaseScan,
@@ -1184,8 +1167,8 @@ func (s *Server) syncOneTable(ctx context.Context, srcDB, myDB *sql.DB, sc confi
 			// (streamed, chunked writes), then jump to the next value.
 			lg.add(incLogLevelSQL, t.Table, incLogPhaseDrain,
 				fmt.Sprintf("整批同值饱和，进入泄流（水位 %s）", lastWM),
-				incRenderDrainSQL(sc.Schema, t.Table, cols, t.WatermarkColumn, lastWM), 0, lastWM, 0)
-			n, jump, tableDone, derr := s.incDrainWatermark(ctx, srcDB, myDB, sc, tc, job, t, cols, lastWM, lg)
+				incRenderDrainSQL(d, sc.Schema, t.Table, cols, t.WatermarkColumn, lastWM), 0, lastWM, 0)
+			n, jump, tableDone, derr := s.incDrainWatermark(ctx, srcDB, myDB, sc, tc, job, t, cols, lastWM, d, lg)
 			if derr != nil {
 				res.Error = "泄流同值批次失败: " + derr.Error()
 				st.Failed = res.Error
@@ -1195,7 +1178,7 @@ func (s *Server) syncOneTable(ctx context.Context, srcDB, myDB *sql.DB, sc confi
 			total += n
 			lg.add(incLogLevelSQL, t.Table, incLogPhaseJump,
 				fmt.Sprintf("泄流完成（%d 行），跳转下一水位", n),
-				incRenderNextWatermarkSQL(sc.Schema, t.Table, t.WatermarkColumn, lastWM), n, jump, 0)
+				incRenderNextWatermarkSQL(d, sc.Schema, t.Table, t.WatermarkColumn, lastWM), n, jump, 0)
 			if tableDone {
 				break
 			}
@@ -1237,8 +1220,8 @@ func wmIndex(cols []string, wmCol string) int {
 // (semantics identical to the main path). Afterwards the cursor jumps to
 // MIN(watermark) > wm: no such value ⇒ the whole table is synced (done).
 // Memory stays bounded regardless of how many rows share the value.
-func (s *Server) incDrainWatermark(ctx context.Context, srcDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, cols []string, wm string, lg *incLogCollector) (rows int64, nextWM string, done bool, err error) {
-	srows, qErr := srcDB.QueryContext(ctx, incSourceDialect.BuildDrainSQL(sc.Schema, t.Table, cols, t.WatermarkColumn), wm)
+func (s *Server) incDrainWatermark(ctx context.Context, srcDB, myDB *sql.DB, sc config.SourceConfig, tc config.TargetConfig, job *incJob, t incTableConfig, cols []string, wm string, d WatermarkDialect, lg *incLogCollector) (rows int64, nextWM string, done bool, err error) {
+	srows, qErr := srcDB.QueryContext(ctx, d.BuildDrainSQL(sc.Schema, t.Table, cols, t.WatermarkColumn), wm)
 	if qErr != nil {
 		return 0, "", false, qErr
 	}
@@ -1290,7 +1273,7 @@ func (s *Server) incDrainWatermark(ctx context.Context, srcDB, myDB *sql.DB, sc 
 
 	var next sql.NullString
 	if qErr = srcDB.QueryRowContext(ctx,
-		incSourceDialect.BuildNextWatermarkSQL(sc.Schema, t.Table, t.WatermarkColumn), wm,
+		d.BuildNextWatermarkSQL(sc.Schema, t.Table, t.WatermarkColumn), wm,
 	).Scan(&next); qErr != nil {
 		return rows, "", false, qErr
 	}

@@ -86,10 +86,13 @@ func wmNameClass(name string) (float64, string) {
 }
 
 // wmTypeWeight grades comparable watermark types. Membership is anchored
-// to the single incWatermarkTypes source (same package) so the two sets
-// can never drift; this switch only assigns the relative weight.
+// to the single incWatermarkTypes + mysqlWatermarkTypes sources (same
+// package) so the sets can never drift; this switch only assigns the
+// relative weight. MS-10a: MySQL renders lower-case unprefixed names
+// ("int", "datetime") - the dual-catalog read keeps one scorer for both
+// dialects.
 func wmTypeWeight(dataType string) (float64, string) {
-	if !incSourceDialect.WatermarkEligible(dataType) {
+	if !incWatermarkTypes[dataType] && !mysqlWatermarkTypes[dataType] {
 		return 0, ""
 	}
 	switch dataType {
@@ -97,11 +100,17 @@ func wmTypeWeight(dataType string) (float64, string) {
 		return 1.0, "timestamptz"
 	case "timestamp without time zone":
 		return 0.9, "timestamp"
+	case "timestamp":
+		return 0.9, "timestamp"
+	case "datetime":
+		return 0.9, "datetime"
 	case "date":
 		return 0.7, "date"
 	case "bigint":
 		return 0.5, "bigint"
 	case "integer":
+		return 0.4, "integer"
+	case "int":
 		return 0.4, "integer"
 	default:
 		return 0, ""
@@ -269,12 +278,14 @@ func (s *Server) handleSuggestWatermark(w http.ResponseWriter, r *http.Request) 
 	}
 	if !incSourceWatermarkCapable(e.Type) {
 		// MS-05 absorbs this guard (ruling seq 82); empty/unknown kinds keep
-		// the same 400 text via the capability read.
-		s.writeError(w, http.StatusBadRequest, "增量同步 v1 仅支持 PostgreSQL 源数据源")
+		// the same 400 text via the capability read. MS-10a: capability-shaped
+		// message (MySQL watermark landed).
+		s.writeError(w, http.StatusBadRequest, "源数据源不支持水位建议（当前支持 PostgreSQL/MySQL）")
 		return
 	}
 	sc := dataSourceToSourceConfig(e)
-	if incSourceDialect.SystemSchemas()[sc.Schema] {
+	d := incDialectFor(e.Type)
+	if d.SystemSchemas()[sc.Schema] {
 		s.writeError(w, http.StatusBadRequest, "系统 schema 不参与水位建议")
 		return
 	}
@@ -288,7 +299,7 @@ func (s *Server) handleSuggestWatermark(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
-	cols, err := incSourceDialect.QuerySuggestCatalog(ctx, db, sc.Schema)
+	cols, err := d.QuerySuggestCatalog(ctx, db, sc.Schema)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "catalog query failed: "+err.Error())
 		return

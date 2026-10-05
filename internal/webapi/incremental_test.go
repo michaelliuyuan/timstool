@@ -137,9 +137,16 @@ func TestIncrementalJobAPIValidation(t *testing.T) {
 	}`)
 	s.handleCreateDataSource(w, req)
 	tgtID := dsBody(t, w)["id"].(string)
-	// And a tidb "source" to prove the D4 rejection.
+	// And a tidb "source" to prove the D4 rejection (target-only kind), plus
+	// a mysql source which MS-10a lifted INTO the watermark capability set.
 	w, req = doReq("POST", "/api/v1/datasources", `{
-		"name": "inc-bad", "type": "mysql",
+		"name": "inc-bad", "type": "tidb",
+		"fields": {"host": "10.0.0.8", "port": 4000, "user": "root", "password": "pw", "database": "db9"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tidbID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "inc-my", "type": "mysql",
 		"fields": {"host": "10.0.0.2", "port": 3306, "user": "u", "password": "pw", "database": "db3"}
 	}`)
 	s.handleCreateDataSource(w, req)
@@ -151,11 +158,19 @@ func TestIncrementalJobAPIValidation(t *testing.T) {
 			`", "tables": [{"table": "` + table + `", "watermark_column": "` + wmCol + `", "initial_watermark": ""}]}`
 	}
 
-	// D4: non-postgres source rejected with 400.
-	w, req = doReq("POST", "/api/v1/incremental/jobs", validBody(mysqlID, "replace", "users", "update_time"))
+	// D4: watermark-incapable source rejected with 400 (capability-shaped).
+	w, req = doReq("POST", "/api/v1/incremental/jobs", validBody(tidbID, "replace", "users", "update_time"))
 	s.handleCreateIncrementalJob(w, req)
-	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "PostgreSQL") {
-		t.Fatalf("mysql source must be rejected 400: %d %s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "不支持增量同步") {
+		t.Fatalf("tidb source must be rejected 400: %d %s", w.Code, w.Body.String())
+	}
+	// MS-10a: mysql source is watermark-capable — the create must be
+	// accepted (no live connect happens at create time).
+	w, req = doReq("POST", "/api/v1/incremental/jobs", `{"name": "jmy", "source_ref": "`+mysqlID+`", "target_ref": "`+tgtID+
+		`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time", "initial_watermark": ""}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("mysql source create must be 201 since MS-10a: %d %s", w.Code, w.Body.String())
 	}
 
 	// Bad conflict strategy / bad identifiers / bad batch size 鈫?400.
@@ -210,11 +225,11 @@ func TestIncrementalJobAPIValidation(t *testing.T) {
 	incMu.Unlock()
 
 	// D4 gate on UPDATE too (v2): PUT must not swap refs past the type checks.
-	w, req = doReq("PUT", "/api/v1/incremental/jobs/"+id, validBody(mysqlID, "replace", "users", "update_time"))
+	w, req = doReq("PUT", "/api/v1/incremental/jobs/"+id, validBody(tidbID, "replace", "users", "update_time"))
 	req = withChiParam(req, "id", id)
 	s.handleUpdateIncrementalJob(w, req)
-	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "PostgreSQL") {
-		t.Fatalf("PUT with mysql source must be rejected 400: %d %s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "不支持增量同步") {
+		t.Fatalf("PUT with tidb source must be rejected 400: %d %s", w.Code, w.Body.String())
 	}
 	w, req = doReq("PUT", "/api/v1/incremental/jobs/"+id, `{"name": "j1", "source_ref": "`+srcID+
 		`", "target_ref": "`+mysqlID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time"}]}`)
@@ -274,11 +289,11 @@ func TestIncrementalColumnsBatchValidation(t *testing.T) {
 	s.handleCreateDataSource(w, req)
 	srcID := dsBody(t, w)["id"].(string)
 	w, req = doReq("POST", "/api/v1/datasources", `{
-		"name": "cb-bad", "type": "mysql",
-		"fields": {"host": "10.0.0.2", "port": 3306, "user": "u", "password": "pw", "database": "db3"}
+		"name": "cb-bad", "type": "tidb",
+		"fields": {"host": "10.0.0.8", "port": 4000, "user": "root", "password": "pw", "database": "db9"}
 	}`)
 	s.handleCreateDataSource(w, req)
-	mysqlID := dsBody(t, w)["id"].(string)
+	tidbID := dsBody(t, w)["id"].(string)
 
 	post := func(body string) *httptest.ResponseRecorder {
 		w, req := doReq("POST", "/api/v1/incremental/columns-batch", body)
@@ -293,9 +308,10 @@ func TestIncrementalColumnsBatchValidation(t *testing.T) {
 	if w := post(`{"source_ref": "` + srcID + `", "tables": []}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("empty tables must be 400: %d %s", w.Code, w.Body.String())
 	}
-	// Non-postgres source → 400 with the D4 message.
-	if w := post(`{"source_ref": "` + mysqlID + `", "tables": ["users"]}`); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "PostgreSQL") {
-		t.Fatalf("mysql source must be rejected 400: %d %s", w.Code, w.Body.String())
+	// Watermark-incapable source → 400 with the capability-shaped D4 message
+	// (MS-10a: mysql is capable now; tidb is the target-only negative kind).
+	if w := post(`{"source_ref": "` + tidbID + `", "tables": ["users"]}`); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "不支持增量同步") {
+		t.Fatalf("tidb source must be rejected 400: %d %s", w.Code, w.Body.String())
 	}
 	// Injection-shaped / duplicate table names → 400 before any connect.
 	if w := post(`{"source_ref": "` + srcID + `", "tables": ["users; DROP TABLE x"]}`); w.Code != http.StatusBadRequest {
@@ -333,10 +349,12 @@ func TestIncSourceWatermarkCapable(t *testing.T) {
 	if incSourceWatermarkCapable("oracle") {
 		t.Fatal(`incSourceWatermarkCapable("oracle") = true; unknown kind must resolve false`)
 	}
-	for _, notCapable := range []string{"mysql", "tidb"} {
-		if incSourceWatermarkCapable(notCapable) {
-			t.Fatalf("incSourceWatermarkCapable(%q) = true; watermark is PG-only in v1", notCapable)
-		}
+	if incSourceWatermarkCapable("tidb") {
+		t.Fatal(`incSourceWatermarkCapable("tidb") = true; target-only kind must stay watermark-incapable`)
+	}
+	// MS-10a: mysql flipped into the watermark capability set.
+	if !incSourceWatermarkCapable("mysql") {
+		t.Fatal(`incSourceWatermarkCapable("mysql") = false; watermark landed for MySQL in MS-10a`)
 	}
 	if !incSourceWatermarkCapable("postgres") {
 		t.Fatal(`incSourceWatermarkCapable("postgres") = false`)
@@ -408,9 +426,9 @@ func TestSrcCapable(t *testing.T) {
 func TestIncLogsRenderersQuoteFragments(t *testing.T) {
 	cols := []string{"id", `c"z`}
 	strict := false
-	sel := incRenderSelectSQL(`s"x`, `t"y`, cols, `w"m`, strict, "'2026-01-01'", 500)
-	drn := incRenderDrainSQL(`s"x`, `t"y`, cols, `w"m`, "'2026-01-01'")
-	jmp := incRenderNextWatermarkSQL(`s"x`, `t"y`, `w"m`, "'2026-01-01'")
+	sel := incRenderSelectSQL(incSourceDialect, `s"x`, `t"y`, cols, `w"m`, strict, "'2026-01-01'", 500)
+	drn := incRenderDrainSQL(incSourceDialect, `s"x`, `t"y`, cols, `w"m`, "'2026-01-01'")
+	jmp := incRenderNextWatermarkSQL(incSourceDialect, `s"x`, `t"y`, `w"m`, "'2026-01-01'")
 	d := incSourceDialect
 	qualifier := d.QuoteIdent(`s"x`) + "." + d.QuoteIdent(`t"y`)
 	for _, rendered := range []string{sel, drn, jmp} {

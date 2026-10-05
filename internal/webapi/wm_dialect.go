@@ -119,6 +119,18 @@ type WatermarkDialect interface {
 	// automatically-maintained timestamp default (relocated verbatim from
 	// the wmDefaultNowRe match at watermark_suggest.go :94).
 	DefaultNowMatch(def string) bool
+
+	// QueryColumnNames runs the run-time column discovery for one table
+	// (MS-10a: relocated from the inline $1/$2 query at incremental.go
+	// syncOneTable): ordered column names plus the watermark column's
+	// data_type ("" when absent).
+	QueryColumnNames(ctx context.Context, db *sql.DB, schema, table, wmCol string) (cols []string, wmType string, err error)
+
+	// QueryTableKeys returns the dedup-key disclosure per table for the
+	// batch key warning (MS-10a: relocated from queryIncTableKeys,
+	// incremental.go - pg_index/ANY($2) is PG-wire-only). Tables absent
+	// from the map have no qualifying key.
+	QueryTableKeys(ctx context.Context, db *sql.DB, schema string, tables []string) (map[string]incKeyInfo, error)
 }
 
 // pgWatermarkDialect is the PostgreSQL implementation of WatermarkDialect.
@@ -286,4 +298,279 @@ func (d pgWatermarkDialect) QuerySuggestCatalog(ctx context.Context, db *sql.DB,
 // :94) - the ONLY consumption point of wmDefaultNowRe outside anchors.
 func (pgWatermarkDialect) DefaultNowMatch(def string) bool {
 	return wmDefaultNowRe.MatchString(def)
+}
+
+// QueryColumnNames relocates the syncOneTable column discovery (formerly an
+// inline $1/$2 information_schema query) - PG wire shape, verbatim semantics
+// (the watermark column's type is flagged in the scan loop).
+func (pgWatermarkDialect) QueryColumnNames(ctx context.Context, db *sql.DB, schema, table, wmCol string) ([]string, string, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT column_name, data_type FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`, schema, table)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+	var cols []string
+	var wmType string
+	for rows.Next() {
+		var name, dataType string
+		if err := rows.Scan(&name, &dataType); err != nil {
+			return nil, "", err
+		}
+		if name == wmCol {
+			wmType = dataType
+		}
+		cols = append(cols, name)
+	}
+	return cols, wmType, rows.Err()
+}
+
+// QueryTableKeys relocates queryIncTableKeys (incremental.go :659-679)
+// verbatim - pg_index + ANY($2) text[] is PG-wire-only, which is why the
+// key disclosure had to join the dialect seam for MS-10a.
+func (pgWatermarkDialect) QueryTableKeys(ctx context.Context, db *sql.DB, schema string, tables []string) (map[string]incKeyInfo, error) {
+	if len(tables) == 0 {
+		return map[string]incKeyInfo{}, nil
+	}
+	// pgx stdlib encodes []string natively as a text[] argument for ANY($2).
+	rows, err := db.QueryContext(ctx, incTableKeysSQL, schema, tables)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]incKeyInfo{}
+	for rows.Next() {
+		var name string
+		var ki incKeyInfo
+		if err := rows.Scan(&name, &ki.HasPK, &ki.HasUnique); err != nil {
+			return nil, err
+		}
+		out[name] = ki
+	}
+	return out, rows.Err()
+}
+
+// --- MySQL dialect (MS-10a) ---
+
+// mysqlWatermarkTypes lists the information_schema.DATA_TYPE values eligible
+// as MySQL watermark columns. MySQL renders types lower-case and unprefixed
+// ("int", not "integer"); datetime is the MySQL counterpart of the PG
+// timestamp weight. SINGLE SOURCE: mysqlWatermarkDialect.WatermarkEligible
+// and the suggest scorer's dual-catalog read both go through this map - no
+// twin set may appear (same ruling shape as incWatermarkTypes seq 269).
+var mysqlWatermarkTypes = map[string]bool{
+	"timestamp": true,
+	"datetime": true,
+	"date":     true,
+	"int":      true,
+	"bigint":   true,
+}
+
+// mysqlSystemSchemas are the MySQL schemas never scanned for watermark
+// candidates. Same consumption-whitelist shape as wmSystemSchemas: only
+// mysqlWatermarkDialect.SystemSchemas / QuerySuggestCatalog and anchors.
+var mysqlSystemSchemas = map[string]bool{
+	"mysql": true, "sys": true, "performance_schema": true, "information_schema": true,
+}
+
+// mysqlWatermarkDialect is the MySQL implementation of WatermarkDialect
+// (MS-10a): backtick quoting, ? placeholders, information_schema catalog
+// probes (STATISTICS for index metadata - MySQL has no pg_index). The
+// source read session arrives UTC-pinned via DSNByType (MS-08d
+// time_zone='+00:00'), so timestamp/datetime scans render as UTC instants
+// and the cursor string round-trips without offset drift (F-13 family
+// discipline).
+type mysqlWatermarkDialect struct{}
+
+// QuoteIdent quotes a MySQL identifier (backticks, doubled on escape).
+func (mysqlWatermarkDialect) QuoteIdent(s string) string {
+	return "`" + strings.ReplaceAll(s, "`", "``") + "`"
+}
+
+// BuildSelectSQL renders the keyset batch scan with ? placeholders and
+// LIMIT ? (MySQL prepared statements accept a parameterized LIMIT).
+func (d mysqlWatermarkDialect) BuildSelectSQL(schema, table string, cols []string, wmCol string, strict bool) string {
+	op := ">="
+	if strict {
+		op = ">"
+	}
+	quoted := make([]string, len(cols))
+	for i, c := range cols {
+		quoted[i] = d.QuoteIdent(c)
+	}
+	return fmt.Sprintf("SELECT %s FROM %s.%s WHERE %s %s ? ORDER BY %s LIMIT ?",
+		strings.Join(quoted, ", "), d.QuoteIdent(schema), d.QuoteIdent(table), d.QuoteIdent(wmCol), op, d.QuoteIdent(wmCol))
+}
+
+// BuildDrainSQL renders the same-value drain scan with ? placeholder.
+func (d mysqlWatermarkDialect) BuildDrainSQL(schema, table string, cols []string, wmCol string) string {
+	quoted := make([]string, len(cols))
+	for i, c := range cols {
+		quoted[i] = d.QuoteIdent(c)
+	}
+	return fmt.Sprintf("SELECT %s FROM %s.%s WHERE %s = ?",
+		strings.Join(quoted, ", "), d.QuoteIdent(schema), d.QuoteIdent(table), d.QuoteIdent(wmCol))
+}
+
+// BuildNextWatermarkSQL renders the post-drain MIN probe.
+func (d mysqlWatermarkDialect) BuildNextWatermarkSQL(schema, table, wmCol string) string {
+	return fmt.Sprintf("SELECT MIN(%s) FROM %s.%s WHERE %s > ?",
+		d.QuoteIdent(wmCol), d.QuoteIdent(schema), d.QuoteIdent(table), d.QuoteIdent(wmCol))
+}
+
+// WatermarkEligible delegates to the mysqlWatermarkTypes catalog.
+func (mysqlWatermarkDialect) WatermarkEligible(dataType string) bool {
+	return mysqlWatermarkTypes[dataType]
+}
+
+// QueryColumns mirrors pgWatermarkDialect.QueryColumns over MySQL's
+// information_schema: the indexed_first flag comes from STATISTICS
+// (SEQ_IN_INDEX=1 = the column leads some index).
+func (mysqlWatermarkDialect) QueryColumns(ctx context.Context, db *sql.DB, schema, table string) ([]incColumnView, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT c.COLUMN_NAME, c.DATA_TYPE,
+		       EXISTS (SELECT 1 FROM information_schema.STATISTICS s
+		                WHERE s.TABLE_SCHEMA = c.TABLE_SCHEMA AND s.TABLE_NAME = c.TABLE_NAME
+		                  AND s.COLUMN_NAME = c.COLUMN_NAME AND s.SEQ_IN_INDEX = 1) AS indexed_first
+		FROM information_schema.COLUMNS c
+		WHERE c.TABLE_SCHEMA = ? AND c.TABLE_NAME = ?
+		ORDER BY c.ORDINAL_POSITION`, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols := []incColumnView{}
+	for rows.Next() {
+		var c incColumnView
+		var idxed int
+		if err := rows.Scan(&c.Name, &c.DataType, &idxed); err != nil {
+			return nil, err
+		}
+		c.Comparable = mysqlWatermarkTypes[c.DataType]
+		c.Indexed = idxed > 0
+		cols = append(cols, c)
+	}
+	return cols, rows.Err()
+}
+
+// SystemSchemas returns the MySQL system schema set.
+func (mysqlWatermarkDialect) SystemSchemas() map[string]bool {
+	return mysqlSystemSchemas
+}
+
+// QuerySuggestCatalog mirrors pgWatermarkDialect.QuerySuggestCatalog over
+// MySQL's information_schema (BASE TABLE only - no views); the DefaultNow
+// judgment reuses the same regex source (CURRENT_TIMESTAMP matches).
+func (d mysqlWatermarkDialect) QuerySuggestCatalog(ctx context.Context, db *sql.DB, schema string) ([]wmCatalogColumn, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, COALESCE(c.COLUMN_DEFAULT, ''),
+		       EXISTS (SELECT 1 FROM information_schema.STATISTICS s
+		                WHERE s.TABLE_SCHEMA = c.TABLE_SCHEMA AND s.TABLE_NAME = c.TABLE_NAME
+		                  AND s.COLUMN_NAME = c.COLUMN_NAME AND s.SEQ_IN_INDEX = 1) AS indexed_first
+		FROM information_schema.COLUMNS c
+		JOIN information_schema.TABLES t
+		  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME AND t.TABLE_TYPE = 'BASE TABLE'
+		WHERE c.TABLE_SCHEMA = ?
+		ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION`, schema)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []wmCatalogColumn
+	for rows.Next() {
+		var c wmCatalogColumn
+		var def string
+		var idxed bool
+		if err := rows.Scan(&c.Table, &c.Column, &c.DataType, &def, &idxed); err != nil {
+			return nil, err
+		}
+		c.Indexed = idxed
+		c.DefaultNow = d.DefaultNowMatch(def)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// DefaultNowMatch reuses wmDefaultNowRe (MySQL's CURRENT_TIMESTAMP matches
+// the same pattern; no twin regex - ruling seq 310).
+func (mysqlWatermarkDialect) DefaultNowMatch(def string) bool {
+	return wmDefaultNowRe.MatchString(def)
+}
+
+// QueryColumnNames mirrors pgWatermarkDialect.QueryColumnNames on the MySQL
+// wire (? placeholders); the watermark column's type is flagged in the scan
+// loop exactly like the PG side.
+func (mysqlWatermarkDialect) QueryColumnNames(ctx context.Context, db *sql.DB, schema, table, wmCol string) ([]string, string, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`, schema, table)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+	var cols []string
+	var wmType string
+	for rows.Next() {
+		var name, dataType string
+		if err := rows.Scan(&name, &dataType); err != nil {
+			return nil, "", err
+		}
+		if name == wmCol {
+			wmType = dataType
+		}
+		cols = append(cols, name)
+	}
+	return cols, wmType, rows.Err()
+}
+
+// QueryTableKeys mirrors pgWatermarkDialect.QueryTableKeys over MySQL's
+// STATISTICS: has_pk = PRIMARY leads the table, has_unique = any valid
+// non-primary unique index. go-sql-driver has no array parameter, so the
+// table list becomes a parameterized IN (?, ...) - table names are already
+// behind the incIdentifierOK allow-list at every caller.
+func (mysqlWatermarkDialect) QueryTableKeys(ctx context.Context, db *sql.DB, schema string, tables []string) (map[string]incKeyInfo, error) {
+	if len(tables) == 0 {
+		return map[string]incKeyInfo{}, nil
+	}
+	ph := make([]string, len(tables))
+	args := make([]any, 0, len(tables)+1)
+	args = append(args, schema)
+	for i, t := range tables {
+		ph[i] = "?"
+		args = append(args, t)
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT s.TABLE_NAME,
+		       MAX(s.INDEX_NAME = 'PRIMARY') AS has_pk,
+		       MAX(s.NON_UNIQUE = 0 AND s.INDEX_NAME <> 'PRIMARY') AS has_unique
+		FROM information_schema.STATISTICS s
+		WHERE s.TABLE_SCHEMA = ? AND s.TABLE_NAME IN (`+strings.Join(ph, ", ")+`)
+		GROUP BY s.TABLE_NAME`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]incKeyInfo{}
+	for rows.Next() {
+		var name string
+		var ki incKeyInfo
+		if err := rows.Scan(&name, &ki.HasPK, &ki.HasUnique); err != nil {
+			return nil, err
+		}
+		out[name] = ki
+	}
+	return out, rows.Err()
+}
+
+// incDialectFor is the kind-based seam swap announced on incSourceDialect
+// (MS-09 note; landed with MS-10a): every consumer that knows the source
+// kind resolves its dialect here. The package-level incSourceDialect stays
+// the PG default so the same-package white-box anchors keep pinning the PG
+// shapes byte-identically.
+func incDialectFor(kind string) WatermarkDialect {
+	if kind == "mysql" {
+		return mysqlWatermarkDialect{}
+	}
+	return pgWatermarkDialect{}
 }

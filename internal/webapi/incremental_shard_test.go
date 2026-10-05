@@ -223,7 +223,7 @@ func TestIncShardDrainFlushSharded(t *testing.T) {
 
 	rows, _, _, err := s.incDrainWatermark(context.Background(), pgDB, myDB,
 		config.SourceConfig{}, config.TargetConfig{}, job,
-		incTableConfig{Table: "wide", WatermarkColumn: cols[0]}, cols, "w1", nil)
+		incTableConfig{Table: "wide", WatermarkColumn: cols[0]}, cols, "w1", pgWatermarkDialect{}, nil)
 	if err != nil || rows != 1000 {
 		t.Fatalf("drain rows=%d err=%v (want 1000, nil)", rows, err)
 	}

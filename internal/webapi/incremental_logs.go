@@ -306,36 +306,36 @@ func incQuoteSQLLiteral(v string) string {
 // main-flow shapes by design - inline wm/limit for display). Do NOT copy
 // them again; the quote fragments are byte-anchored to the dialect in
 // incremental_test.go (TestIncLogsRenderersQuoteFragments).
-func incRenderSelectSQL(schema, table string, cols []string, wmCol string, strict bool, wm string, limit int) string {
+func incRenderSelectSQL(d WatermarkDialect, schema, table string, cols []string, wmCol string, strict bool, wm string, limit int) string {
 	op := ">="
 	if strict {
 		op = ">"
 	}
 	quoted := make([]string, len(cols))
 	for i, c := range cols {
-		quoted[i] = incSourceDialect.QuoteIdent(c)
+		quoted[i] = d.QuoteIdent(c)
 	}
 	return fmt.Sprintf("SELECT %s FROM %s.%s WHERE %s %s %s ORDER BY %s LIMIT %d",
-		strings.Join(quoted, ", "), incSourceDialect.QuoteIdent(schema), incSourceDialect.QuoteIdent(table),
-		incSourceDialect.QuoteIdent(wmCol), op, incQuoteSQLLiteral(wm), incSourceDialect.QuoteIdent(wmCol), limit)
+		strings.Join(quoted, ", "), d.QuoteIdent(schema), d.QuoteIdent(table),
+		d.QuoteIdent(wmCol), op, incQuoteSQLLiteral(wm), d.QuoteIdent(wmCol), limit)
 }
 
 // incRenderDrainSQL renders the same-value drain scan with wm inlined.
-func incRenderDrainSQL(schema, table string, cols []string, wmCol, wm string) string {
+func incRenderDrainSQL(d WatermarkDialect, schema, table string, cols []string, wmCol, wm string) string {
 	quoted := make([]string, len(cols))
 	for i, c := range cols {
-		quoted[i] = incSourceDialect.QuoteIdent(c)
+		quoted[i] = d.QuoteIdent(c)
 	}
 	return fmt.Sprintf("SELECT %s FROM %s.%s WHERE %s = %s",
-		strings.Join(quoted, ", "), incSourceDialect.QuoteIdent(schema), incSourceDialect.QuoteIdent(table),
-		incSourceDialect.QuoteIdent(wmCol), incQuoteSQLLiteral(wm))
+		strings.Join(quoted, ", "), d.QuoteIdent(schema), d.QuoteIdent(table),
+		d.QuoteIdent(wmCol), incQuoteSQLLiteral(wm))
 }
 
 // incRenderNextWatermarkSQL renders the post-drain jump probe with wm inlined.
-func incRenderNextWatermarkSQL(schema, table, wmCol, wm string) string {
+func incRenderNextWatermarkSQL(d WatermarkDialect, schema, table, wmCol, wm string) string {
 	return fmt.Sprintf("SELECT MIN(%s) FROM %s.%s WHERE %s > %s",
-		incSourceDialect.QuoteIdent(wmCol), incSourceDialect.QuoteIdent(schema), incSourceDialect.QuoteIdent(table),
-		incSourceDialect.QuoteIdent(wmCol), incQuoteSQLLiteral(wm))
+		d.QuoteIdent(wmCol), d.QuoteIdent(schema), d.QuoteIdent(table),
+		d.QuoteIdent(wmCol), incQuoteSQLLiteral(wm))
 }
 
 // incLogScanBatchFull / incLogScanBatchSummary are the D3 frequency controls:

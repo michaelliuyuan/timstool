@@ -48,15 +48,20 @@ func TestCapabilityMatrixSnapshot(t *testing.T) {
 	if !myc.Compare {
 		t.Error("mysql capability \"compare\" = false; want true since MS-08")
 	}
+	// MS-10a: watermark (suggest + incremental) flipped ON for mysql
+	// (mysqlWatermarkDialect + MySQL-wire incremental engine).
+	if !myc.Watermark {
+		t.Error("mysql capability \"watermark\" = false; want true since MS-10a")
+	}
 	for _, off := range []struct {
 		name string
 		bit  bool
 	}{
-		{"cdc", myc.CDC}, {"watermark", myc.Watermark},
+		{"cdc", myc.CDC},
 		{"assess", myc.Assess}, {"ddl_export", myc.DDLExport},
 	} {
 		if off.bit {
-			t.Errorf("mysql capability %q = true, want false until MS-09..MS-11 land", off.name)
+			t.Errorf("mysql capability %q = true, want false until MS-10b/MS-10c/CDC-epic land", off.name)
 		}
 	}
 

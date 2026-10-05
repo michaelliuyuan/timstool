@@ -243,17 +243,18 @@ func TestSuggestWatermarkEndpointValidation(t *testing.T) {
 		t.Errorf("unknown ref = %d %s, want 400", w.Code, w.Body.String())
 	}
 
-	// non-PG source
+	// Watermark-incapable source (MS-10a: mysql is capable now; tidb is the
+	// target-only negative kind).
 	w, req = doReq("POST", "/api/v1/datasources", `{
-		"name": "wm-mysql", "type": "mysql",
-		"fields": {"host": "10.0.0.2", "port": 3306, "user": "u", "password": "p", "database": "db"}
+		"name": "wm-tidb", "type": "tidb",
+		"fields": {"host": "10.0.0.8", "port": 4000, "user": "root", "password": "p", "database": "db"}
 	}`)
 	s.handleCreateDataSource(w, req)
 	id := dsBody(t, w)["id"].(string)
 	w, req = doReq("POST", "/api/v1/incremental/suggest-watermark", fmt.Sprintf(`{"source_ref":%q}`, id))
 	s.handleSuggestWatermark(w, req)
 	if w.Code != http.StatusBadRequest {
-		t.Errorf("mysql source = %d %s, want 400 (PG-only)", w.Code, w.Body.String())
+		t.Errorf("tidb source = %d %s, want 400 (watermark-incapable)", w.Code, w.Body.String())
 	}
 }
 

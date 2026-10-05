@@ -95,22 +95,22 @@ func TestIncLogFrequencyBoundaries(t *testing.T) {
 }
 
 func TestIncLogRenderSelectSQL(t *testing.T) {
-	got := incRenderSelectSQL("public", "users", []string{"id", "update_time"}, "update_time", false, "2026-09-29 00:00:00", 1000)
+	got := incRenderSelectSQL(incSourceDialect, "public", "users", []string{"id", "update_time"}, "update_time", false, "2026-09-29 00:00:00", 1000)
 	want := `SELECT "id", "update_time" FROM "public"."users" WHERE "update_time" >= '2026-09-29 00:00:00' ORDER BY "update_time" LIMIT 1000`
 	if got != want {
 		t.Fatalf("render mismatch:\n got: %s\nwant: %s", got, want)
 	}
-	got = incRenderSelectSQL("s", "t", []string{"w"}, "w", true, "x'y", 5)
+	got = incRenderSelectSQL(incSourceDialect, "s", "t", []string{"w"}, "w", true, "x'y", 5)
 	want = `SELECT "w" FROM "s"."t" WHERE "w" > 'x''y' ORDER BY "w" LIMIT 5`
 	if got != want {
 		t.Fatalf("strict + quote-escape mismatch:\n got: %s\nwant: %s", got, want)
 	}
-	got = incRenderDrainSQL("s", "t", []string{"a", "w"}, "w", "w1")
+	got = incRenderDrainSQL(incSourceDialect, "s", "t", []string{"a", "w"}, "w", "w1")
 	want = `SELECT "a", "w" FROM "s"."t" WHERE "w" = 'w1'`
 	if got != want {
 		t.Fatalf("drain render mismatch:\n got: %s\nwant: %s", got, want)
 	}
-	got = incRenderNextWatermarkSQL("s", "t", "w", "w1")
+	got = incRenderNextWatermarkSQL(incSourceDialect, "s", "t", "w", "w1")
 	want = `SELECT MIN("w") FROM "s"."t" WHERE "w" > 'w1'`
 	if got != want {
 		t.Fatalf("jump render mismatch:\n got: %s\nwant: %s", got, want)
