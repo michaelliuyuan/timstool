@@ -687,6 +687,7 @@ func (s *Server) handleIncrementalColumns(w http.ResponseWriter, r *http.Request
 		return
 	}
 	sc := dataSourceToSourceConfig(e)
+	sc.Schema = incSchema(sc) // P0 (adversarial R2): mysql empty schema -> database
 	d := incDialectFor(e.Type)
 	db, err := openSourceTestConn(sc)
 	if err != nil {
@@ -770,6 +771,7 @@ func (s *Server) handleIncrementalColumnsBatch(w http.ResponseWriter, r *http.Re
 		return
 	}
 	sc := dataSourceToSourceConfig(e)
+	sc.Schema = incSchema(sc) // P0 (adversarial R2): mysql empty schema -> database
 	d := incDialectFor(e.Type)
 	db, err := openSourceTestConn(sc)
 	if err != nil {
@@ -812,6 +814,26 @@ func (s *Server) handleIncrementalColumnsBatch(w http.ResponseWriter, r *http.Re
 }
 
 // --- run engine ---
+
+// incSchema resolves the effective source schema for the watermark/
+// incremental flows (adversarial P0, MS-10a R2): a MySQL source has no
+// PG-style schema (schema == database) and the webapi datasource shape
+// keeps mysql refs at schema="" (datasource_test.go pins it) - the empty
+// schema must default to the connection database, exactly like the
+// validator's sourceSchema() (validator.go:109-120). PG keeps the
+// dataSourceToSourceConfig "public" fallback.
+func incSchema(sc config.SourceConfig) string {
+	if sc.Schema != "" {
+		return sc.Schema
+	}
+	// Dialect-shape routing (validator.go sourceSchema parity - NOT a kind
+	// gate, so this stays out of the A3 pattern): only the MySQL dialect
+	// defaults an empty schema to the connection database.
+	if _, ok := incDialectFor(sc.SourceType()).(mysqlWatermarkDialect); ok {
+		return sc.Database
+	}
+	return sc.Schema
+}
 
 func incValueToString(v any) string {
 	switch t := v.(type) {
@@ -859,6 +881,7 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 		return rec
 	}
 	sc := dataSourceToSourceConfig(src)
+	sc.Schema = incSchema(sc) // P0 (adversarial R2): mysql empty schema -> database
 	tc := dataSourceToTargetConfig(tgt)
 	// MS-10a run-entry re-check (F-13 family discipline): the capability
 	// read at create/update time can go stale (e.g. a source row edited to
@@ -867,7 +890,13 @@ func (s *Server) runIncrementalJob(ctx context.Context, job *incJob, subset map[
 	// speaking the wrong wire protocol.
 	if !incSourceWatermarkCapable(src.Type) {
 		lg.add(incLogLevelError, "", incLogPhaseFail, "源数据源不支持增量同步（当前支持 PostgreSQL/MySQL）", "", 0, "", 0)
+		// Adversarial P2: report the SUBSET actually scheduled, not the full
+		// job table list (a partial run's failure report must not name
+		// tables that were never attempted).
 		for _, t := range job.Tables {
+			if len(subset) > 0 && !subset[t.Table] {
+				continue
+			}
 			rec.Tables = append(rec.Tables, incTableResult{Table: t.Table, Error: "源数据源不支持增量同步（当前支持 PostgreSQL/MySQL）"})
 		}
 		return rec
@@ -1159,7 +1188,7 @@ func (s *Server) syncOneTable(ctx context.Context, srcDB, myDB *sql.DB, sc confi
 		lg.add(incLogLevelInfo, t.Table, incLogPhaseWrite,
 			fmt.Sprintf("写入 %d 行（%d 片）", written, nShards), insSQL, written, "", time.Since(scanStart).Milliseconds())
 		// ORDER BY watermark ⇒ the last row carries the batch MAX.
-		lastWM = incValueToString(batch[len(batch)-1][wmIndex(cols, t.WatermarkColumn)])
+		lastWM = d.CursorValue(batch[len(batch)-1][wmIndex(cols, t.WatermarkColumn)])
 		next, saturated, done := incCursorStep(entryWM, lastWM, len(batch), job.BatchSize)
 		if saturated {
 			// Same-value saturation: the keyset cannot advance inside this

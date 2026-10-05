@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/source"
 )
@@ -131,6 +132,15 @@ type WatermarkDialect interface {
 	// incremental.go - pg_index/ANY($2) is PG-wire-only). Tables absent
 	// from the map have no qualifying key.
 	QueryTableKeys(ctx context.Context, db *sql.DB, schema string, tables []string) (map[string]incKeyInfo, error)
+
+	// CursorValue renders a scanned watermark value into the cursor string
+	// form (adversarial P1, MS-10a R2). The scan binds the watermark as a
+	// STRING, so the rendered form must be comparable against the source's
+	// own MIN()/ORDER BY output: PG renders time.Time as RFC3339Nano (and
+	// natively accepts ISO 8601), MySQL needs its native
+	// "2006-01-02 15:04:05[.ffffff]" shape - an RFC3339 "T"/"Z" cursor
+	// relies on version-dependent implicit string->DATETIME casts.
+	CursorValue(v any) string
 }
 
 // pgWatermarkDialect is the PostgreSQL implementation of WatermarkDialect.
@@ -298,6 +308,12 @@ func (d pgWatermarkDialect) QuerySuggestCatalog(ctx context.Context, db *sql.DB,
 // :94) - the ONLY consumption point of wmDefaultNowRe outside anchors.
 func (pgWatermarkDialect) DefaultNowMatch(def string) bool {
 	return wmDefaultNowRe.MatchString(def)
+}
+
+// CursorValue delegates to incValueToString (RFC3339Nano for time.Time)
+// - the PG engine's historical cursor form, byte-identical.
+func (pgWatermarkDialect) CursorValue(v any) string {
+	return incValueToString(v)
 }
 
 // QueryColumnNames relocates the syncOneTable column discovery (formerly an
@@ -561,6 +577,19 @@ func (mysqlWatermarkDialect) QueryTableKeys(ctx context.Context, db *sql.DB, sch
 		out[name] = ki
 	}
 	return out, rows.Err()
+}
+
+// CursorValue renders a MySQL-native cursor (adversarial P1, MS-10a R2):
+// time.Time -> "2006-01-02 15:04:05[.ffffff]" (space separator, no zone
+// suffix - the UTC-pinned session already guarantees the instant), so the
+// string compares cleanly against MIN()/index scans and the saturation
+// equality check never sees a T/Z-vs-space mismatch. Non-time values keep
+// the shared incValueToString rendering.
+func (mysqlWatermarkDialect) CursorValue(v any) string {
+	if t, ok := v.(time.Time); ok {
+		return t.UTC().Format("2006-01-02 15:04:05.999999")
+	}
+	return incValueToString(v)
 }
 
 // incDialectFor is the kind-based seam swap announced on incSourceDialect

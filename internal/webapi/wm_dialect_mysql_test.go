@@ -3,6 +3,9 @@ package webapi
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/michaelliuyuan/timstool/internal/common/config"
 )
 
 // MS-10a MySQL dialect shape anchors: the rendering forms (backticks, ?
@@ -115,5 +118,68 @@ func TestWMTypeWeightMySQLNames(t *testing.T) {
 	}
 	if w, _ := wmTypeWeight("varchar"); w != 0 {
 		t.Errorf(`wmTypeWeight("varchar") = %v, want 0`, w)
+	}
+}
+
+// Adversarial R2 P1: the MySQL cursor must render in MySQL-native shape
+// (space separator, no T/Z) so string compares against MIN()/index scans
+// and the saturation equality check stay format-consistent.
+func TestMySQLCursorValue(t *testing.T) {
+	d := mysqlWatermarkDialect{}
+	// UTC instant with microseconds: space separator, trailing zeros
+	// trimmed, NO T and NO Z suffix.
+	ts := time.Date(2026, 10, 5, 2, 50, 6, 123456000, time.UTC)
+	if got := d.CursorValue(ts); got != "2026-10-05 02:50:06.123456" {
+		t.Fatalf("CursorValue(time) = %q, want native MySQL form", got)
+	}
+	// Whole seconds: no dangling dot.
+	ts = time.Date(2026, 10, 5, 2, 50, 6, 0, time.UTC)
+	if got := d.CursorValue(ts); got != "2026-10-05 02:50:06" {
+		t.Fatalf("CursorValue(whole-second time) = %q, want no dot fragment", got)
+	}
+	// A +08 wall-clock instant must render as its UTC reading (session pin).
+	ts = time.Date(2026, 10, 5, 10, 50, 6, 0, time.FixedZone("CST", 8*3600))
+	if got := d.CursorValue(ts); got != "2026-10-05 02:50:06" {
+		t.Fatalf("CursorValue(+08 time) = %q, want UTC reading", got)
+	}
+	// DATE columns carry no time fragment -> the zero-time shape.
+	ts = time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
+	if got := d.CursorValue(ts); got != "2026-10-05 00:00:00" {
+		t.Fatalf("CursorValue(date-shaped time) = %q, want 00:00:00 short form", got)
+	}
+	// Non-time values keep the shared rendering (int/bigint cursors).
+	if got := d.CursorValue(int64(42)); got != "42" {
+		t.Fatalf("CursorValue(int64) = %q, want 42", got)
+	}
+	if got := d.CursorValue(nil); got != "" {
+		t.Fatalf("CursorValue(nil) = %q, want empty", got)
+	}
+	// PG side: byte-identical to the historical incValueToString form.
+	pg := pgWatermarkDialect{}
+	ts = time.Date(2026, 10, 5, 2, 50, 6, 123456000, time.UTC)
+	if pg.CursorValue(ts) != incValueToString(ts) {
+		t.Fatal("pgWatermarkDialect.CursorValue must equal incValueToString byte-for-byte")
+	}
+}
+
+// Adversarial R2 P0: a UI-shaped MySQL datasource carries schema="" - the
+// watermark flows must resolve it to the connection database (validator
+// sourceSchema parity), never query an empty schema.
+func TestIncSchemaMySQLFallback(t *testing.T) {
+	// UI shape: mysql ref, schema empty -> database.
+	sc := config.SourceConfig{Type: "mysql", Host: "h", Port: 3306, Database: "appdb"}
+	if got := incSchema(sc); got != "appdb" {
+		t.Fatalf("incSchema(mysql empty) = %q, want appdb (database fallback)", got)
+	}
+	// Explicit schema wins (raw API can still pin one).
+	sc.Schema = "pinned"
+	if got := incSchema(sc); got != "pinned" {
+		t.Fatalf("incSchema(mysql explicit) = %q, want pinned", got)
+	}
+	// PG empty stays empty at this helper - dataSourceToSourceConfig has
+	// already applied its "public" fallback before incSchema is consulted.
+	pg := config.SourceConfig{Type: "postgres", Database: "pgdb"}
+	if got := incSchema(pg); got != "" {
+		t.Fatalf("incSchema(pg empty) = %q, want empty (public fallback lives upstream)", got)
 	}
 }

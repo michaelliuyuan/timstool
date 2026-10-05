@@ -284,6 +284,7 @@ func (s *Server) handleSuggestWatermark(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	sc := dataSourceToSourceConfig(e)
+	sc.Schema = incSchema(sc) // P0 (adversarial R2): mysql empty schema -> database
 	d := incDialectFor(e.Type)
 	if d.SystemSchemas()[sc.Schema] {
 		s.writeError(w, http.StatusBadRequest, "系统 schema 不参与水位建议")
