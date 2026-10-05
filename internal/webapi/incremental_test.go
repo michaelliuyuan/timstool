@@ -379,10 +379,13 @@ func TestSrcCapable(t *testing.T) {
 	if srcCapable("oracle", source.CapAssess) {
 		t.Fatal(`srcCapable("oracle", CapAssess) = true; unknown kind must resolve false`)
 	}
-	for _, notCapable := range []string{"mysql", "tidb"} {
-		if srcCapable(notCapable, source.CapAssess) {
-			t.Fatalf("srcCapable(%q, CapAssess) = true; assess is PG-only in v1", notCapable)
-		}
+	// MS-10b: assess flipped ON for mysql (information_schema scanner
+	// dialect); tidb stays target-only.
+	if srcCapable("tidb", source.CapAssess) {
+		t.Fatal(`srcCapable("tidb", CapAssess) = true; tidb is target-only`)
+	}
+	if !srcCapable("mysql", source.CapAssess) {
+		t.Fatal(`srcCapable("mysql", CapAssess) = false; want true since MS-10b`)
 	}
 	if !srcCapable("postgres", source.CapAssess) {
 		t.Fatal(`srcCapable("postgres", CapAssess) = false`)

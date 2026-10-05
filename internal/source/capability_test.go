@@ -53,15 +53,20 @@ func TestCapabilityMatrixSnapshot(t *testing.T) {
 	if !myc.Watermark {
 		t.Error("mysql capability \"watermark\" = false; want true since MS-10a")
 	}
+	// MS-10b: assess flipped ON for mysql (information_schema scanner
+	// dialect + openSourceTestConn dispatch in handleAssess).
+	if !myc.Assess {
+		t.Error("mysql capability \"assess\" = false; want true since MS-10b")
+	}
 	for _, off := range []struct {
 		name string
 		bit  bool
 	}{
 		{"cdc", myc.CDC},
-		{"assess", myc.Assess}, {"ddl_export", myc.DDLExport},
+		{"ddl_export", myc.DDLExport},
 	} {
 		if off.bit {
-			t.Errorf("mysql capability %q = true, want false until MS-10b/MS-10c/CDC-epic land", off.name)
+			t.Errorf("mysql capability %q = true, want false until MS-10c/CDC-epic land", off.name)
 		}
 	}
 

@@ -271,10 +271,26 @@ func TestDatasources_DDLAndAssessRefTypeGate(t *testing.T) {
 		t.Fatalf("ddl mysql ref: %d %s", w.Code, w.Body.String())
 	}
 
+	// MS-10b: assess no longer 400-rejects a mysql ref (scanner dialect
+	// flipped); the unreachable-host shape surfaces as a connect error (5xx)
+	// instead of the capability 400. The capability gate itself is anchored
+	// on tidb, which stays target-only.
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "td", "type": "tidb",
+		"fields": {"host": "10.0.0.4", "port": 4000, "user": "root", "password": "pw", "database": "d"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tdID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/assess", fmt.Sprintf(`{"source_ref": %q}`, tdID))
+	s.handleAssess(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "不支持兼容评估") {
+		t.Fatalf("assess tidb ref: %d %s", w.Code, w.Body.String())
+	}
+
 	w, req = doReq("POST", "/api/v1/assess", fmt.Sprintf(`{"source_ref": %q}`, myID))
 	s.handleAssess(w, req)
-	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "PostgreSQL") {
-		t.Fatalf("assess mysql ref: %d %s", w.Code, w.Body.String())
+	if w.Code == http.StatusBadRequest {
+		t.Fatalf("assess mysql ref must not 400 on capability (MS-10b), got: %d %s", w.Code, w.Body.String())
 	}
 }
 

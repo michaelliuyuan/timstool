@@ -2,7 +2,6 @@ package webapi
 
 import (
 	"context"
-	"database/sql"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -2345,6 +2344,9 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// MS-10b: the datasource kind rides on the ref resolution (inline form
+	// stays "" = PG legacy shape); it only routes the connection/scanner.
+	var srcType string
 	if req.SourceRef != "" {
 		e, err := s.resolveDataSourceRef(req.SourceRef)
 		if err != nil {
@@ -2354,9 +2356,10 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 		if !srcCapable(e.Type, source.CapAssess) {
 			// MS-06 absorbs this guard (ruling seq 347): raw stored type in,
 			// empty/unknown keep the same 400 text via the capability read.
-			s.writeError(w, http.StatusBadRequest, "source_ref: 兼容评估仅支持 PostgreSQL 数据源")
+			s.writeError(w, http.StatusBadRequest, "source_ref: 该数据源类型不支持兼容评估")
 			return
 		}
+		srcType = e.Type
 		sc := dataSourceToSourceConfig(e)
 		req.Host, req.Port = sc.Host, sc.Port
 		req.User, req.Password, req.Database, req.Schema = sc.User, sc.Password, sc.Database, sc.Schema
@@ -2366,29 +2369,55 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "host and database are required")
 		return
 	}
-	if req.Schema == "" {
-		req.Schema = "public"
+
+	// MS-10b: the assess connection routes through the MS-09 dispatch
+	// (openSourceTestConn) instead of the hardcoded pgx pair, so MySQL
+	// sources ride the go-sql-driver DSN with the MS-08d UTC session pin.
+	// srcType stays "" on the legacy inline form (normalize to PG).
+	connCfg := config.SourceConfig{
+		Type:     srcType,
+		Host:     req.Host,
+		Port:     req.Port,
+		User:     req.User,
+		Password: req.Password,
+		Database: req.Database,
+		Schema:   req.Schema,
 	}
-	if req.Port == 0 {
-		req.Port = 5432
+	driver, _ := sourceConnSpec(connCfg)
+	if connCfg.Port == 0 {
+		// Type-aware port fallback (was hardcoded 5432): a MySQL source
+		// without an explicit port must land on 3306, not the PG default.
+		if driver == "mysql" {
+			connCfg.Port = 3306
+		} else {
+			connCfg.Port = 5432
+		}
+	}
+	// Type-aware schema fallback (was hardcoded "public"): MySQL has no
+	// PG-style schema - the database IS the schema (MS-10a incSchema shape).
+	schema := connCfg.Schema
+	if schema == "" {
+		if driver == "mysql" {
+			schema = connCfg.Database
+		} else {
+			schema = "public"
+		}
 	}
 
-	dsn := config.BuildPGDSN(req.Host, req.Port, req.User, req.Password, req.Database, "disable", nil)
-
-	pgDB, err := sql.Open("pgx", dsn)
+	srcDB, err := openSourceTestConn(connCfg)
 	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "connect failed: "+err.Error())
+		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	defer pgDB.Close()
+	defer srcDB.Close()
 
 	// F-10: no handler-level timeout here — the deadline belongs to the
 	// chi 120s long-running group; an inner WithTimeout(r.Context(), …)
 	// would only ever shorten it.
 	ctx := r.Context()
 
-	// Scan and assess
-	scanner := assess.NewScanner(pgDB, req.Schema)
+	// Scan and assess (dialect dispatched on the routed driver).
+	scanner := assess.NewScannerFor(driver, srcDB, schema)
 	result, err := scanner.ScanAll(ctx)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "scan failed: "+err.Error())
