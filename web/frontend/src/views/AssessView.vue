@@ -219,7 +219,7 @@ function copyDDL() {
 
 <template>
   <div class="tims-page">
-    <PageHeader title="兼容评估" subtitle="扫描 PostgreSQL → TiDB 迁移兼容性风险" />
+    <PageHeader title="兼容评估" subtitle="扫描 MySQL / PostgreSQL → TiDB 迁移兼容性风险" />
     <!-- Connection Form -->
     <el-card shadow="never" style="margin-bottom: 20px;">
       <template #header>
@@ -227,10 +227,17 @@ function copyDDL() {
       </template>
       <el-form :model="sourceForm" label-width="120px" size="default">
         <el-form-item label="数据源">
-          <DataSourcePicker v-model="sourceRef" :types="['postgres']" />
+          <DataSourcePicker v-model="sourceRef" :types="['postgres', 'mysql']" />
         </el-form-item>
+        <!-- v1: the legacy inline form stays PG-only (MS-10-FE scope) — a
+             MySQL source must come in as a datasource reference above. -->
         <template v-if="!sourceRef">
           <el-divider content-position="left">源数据库（PostgreSQL）</el-divider>
+          <el-form-item>
+            <div style="font-size: var(--tims-font-sm); color: var(--el-text-color-secondary); line-height: 1.6;">
+              手工连接仅支持 PostgreSQL；MySQL 源请使用上方数据源引用。
+            </div>
+          </el-form-item>
           <el-row :gutter="24">
             <el-col :span="12">
               <el-form-item label="主机">

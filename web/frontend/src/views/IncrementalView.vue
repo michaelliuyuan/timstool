@@ -870,9 +870,9 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
         <el-form-item label="任务名称">
           <el-input v-model="form.name" placeholder="例如：订单表水位补齐" style="width: 360px;" />
         </el-form-item>
-        <el-divider content-position="left">源数据库（仅 PostgreSQL）</el-divider>
+        <el-divider content-position="left">源数据库</el-divider>
         <el-form-item label="源数据源">
-          <DataSourcePicker v-model="form.source_ref" :types="['postgres']" />
+          <DataSourcePicker v-model="form.source_ref" :types="['postgres', 'mysql']" />
         </el-form-item>
         <el-divider content-position="left">目标数据库（TiDB）</el-divider>
         <el-form-item label="目标数据源">
