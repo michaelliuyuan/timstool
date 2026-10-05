@@ -361,10 +361,10 @@ func (pgWatermarkDialect) QueryTableKeys(ctx context.Context, db *sql.DB, schema
 // twin set may appear (same ruling shape as incWatermarkTypes seq 269).
 var mysqlWatermarkTypes = map[string]bool{
 	"timestamp": true,
-	"datetime": true,
-	"date":     true,
-	"int":      true,
-	"bigint":   true,
+	"datetime":  true,
+	"date":      true,
+	"int":       true,
+	"bigint":    true,
 }
 
 // mysqlSystemSchemas are the MySQL schemas never scanned for watermark
