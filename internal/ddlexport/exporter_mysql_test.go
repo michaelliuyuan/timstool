@@ -10,13 +10,19 @@ import (
 // four system databases must never appear in the schema list (the
 // mysqlWatermarkDialect SystemSchemas parity, MS-10a).
 func TestMySQLDatabaseFilter(t *testing.T) {
-	for _, sys := range []string{"mysql", "information_schema", "performance_schema", "sys"} {
+	for _, sys := range []string{"mysql", "information_schema", "performance_schema", "sys", "metrics_schema"} {
 		if !mysqlSystemDatabases[sys] {
 			t.Errorf("system database %q missing from the filter set", sys)
 		}
 	}
 	if mysqlSystemDatabases["migration_test"] {
 		t.Error("user database must not be filtered")
+	}
+	// TiDB (and Windows MySQL) report the system databases upper-case.
+	for _, sys := range []string{"INFORMATION_SCHEMA", "PERFORMANCE_SCHEMA", "METRICS_SCHEMA", "Mysql"} {
+		if !mysqlSystemDatabases[strings.ToLower(sys)] {
+			t.Errorf("case-insensitive filter miss: %q", sys)
+		}
 	}
 }
 
@@ -69,10 +75,10 @@ func TestMySQLQueryAnchors(t *testing.T) {
 			}
 		}
 	}
-	// SHOW DATABASES output must pass the system-set filter (the loop body
-	// lives outside the query literal, so anchor it repo-wide).
-	if !strings.Contains(s, "mysqlSystemDatabases[s]") {
-		t.Error("SHOW DATABASES walk must filter via mysqlSystemDatabases")
+	// SHOW DATABASES output must pass the case-insensitive system-set
+	// filter (the loop body lives outside the query literal).
+	if !strings.Contains(s, "mysqlSystemDatabases[strings.ToLower(s)]") {
+		t.Error("SHOW DATABASES walk must filter via mysqlSystemDatabases (case-insensitive)")
 	}
 	// SHOW CREATE DDL column pins: table/view at index 1,
 	// function/procedure/trigger at index 2.

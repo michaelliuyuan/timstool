@@ -20,6 +20,8 @@ var mysqlSystemDatabases = map[string]bool{
 	"information_schema": true,
 	"performance_schema": true,
 	"sys":                true,
+	// TiDB (MySQL-compatible surface) reports its own system schemas.
+	"metrics_schema": true,
 }
 
 // qiB quotes a MySQL identifier with backticks (doubling embedded ones).
@@ -41,7 +43,9 @@ func listMySQLDatabases(ctx context.Context, db *sql.DB) ([]string, error) {
 		if err := rows.Scan(&s); err != nil {
 			return nil, err
 		}
-		if mysqlSystemDatabases[s] {
+		// Case-insensitive: TiDB (and Windows MySQL builds) report the
+		// system databases upper/mixed-case (INFORMATION_SCHEMA etc.).
+		if mysqlSystemDatabases[strings.ToLower(s)] {
 			continue
 		}
 		out = append(out, s)
