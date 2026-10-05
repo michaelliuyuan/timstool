@@ -9,14 +9,14 @@
 | 文件 | PG 走法 | MySQL 走法 | 边界 |
 |---|---|---|---|
 | tables.sql | pg_class + 列级重建 | `SHOW CREATE TABLE db.tbl`（DDL 列 idx 1） | **FK 已含在表 DDL 内**（MySQL 无独立 ADD CONSTRAINT 导出面）；无 PG 的「FK 后置追加」段 |
-| indexes.sql | pg_get_indexdef 逐索引 | **降级注记文件** | MySQL 索引无独立命名空间——全部在 SHOW CREATE TABLE 输出内（含函数式索引 8.0.13+） |
+| indexes.sql | pg_get_indexdef 逐索引 | **降级注记文件** | MySQL 索引无独立命名空间——全部在 SHOW CREATE TABLE 输出内（含函数式索引 8.0.13+，`KEY idx ((expr))` 表达式在表 DDL 内**天然保真**——与 seq746 P2 的 apply 面渲染缺口互补，apply 面缺口见 10c2/尾批池） |
 | views.sql | pg_get_viewdef | `SHOW CREATE VIEW`（DDL 列 idx 1） | 输出含 `CREATE ALGORITHM=... DEFINER=...` 前缀（见 DEFINER 注记） |
 | sequences.sql | pg_sequences 逐列 | **降级注记文件** | MySQL 无序列对象；AUTO_INCREMENT 语义在表 DDL 内 |
 | functions.sql | pg_get_functiondef | `SHOW CREATE FUNCTION`（DDL 列 idx 2） | DEFINER 注记同下 |
 | procedures.sql | pg_get_functiondef | `SHOW CREATE PROCEDURE`（DDL 列 idx 2） | 同上 |
 | triggers.sql | pg_get_triggerdef | `SHOW CREATE TRIGGER`（DDL 列 idx 2） | 同上 |
 | types.sql | enum/composite/domain 三查 | **降级注记文件** | MySQL 无用户自定义类型对象 |
-| tidb-tables.sql | schema 采集+DDLBuilder 转换 | **manifest skip**（PG catalog 专用路径，MySQL 源不支持） | 不使导出失败；skip 面在 zip manifest+服务端 Warn 可见 |
+| tidb-tables.sql | schema 采集+DDLBuilder 转换 | **manifest skip**（PG catalog 专用路径，MySQL 源不支持） | 不使导出失败；skip 面在 zip manifest+服务端 Warn 可见；**10c2 候选**：SHOW CREATE TABLE 结果经 mysql→TiDB 类型映射出 TiDB 转换版（候刘源点单；防「10c 完成」被误读为迁移主线 DDL 面闭环——导出面暂仅产原生形） |
 
 ## 关键语义注记
 
