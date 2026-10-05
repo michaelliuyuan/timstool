@@ -24,5 +24,5 @@
 3. **GROUP_CONCAT 截断（P3）**：group_concat_max_len 默认 1024，超宽复合索引 Definition 可截断（仅报告展示，非评分面）。
 4. **newMySQLScanner 空 schema 兜 "public"**：防御形（handler 已前置 database 兜底，webapi 不可达）；改进建议=该层不默认、交调用方（positive/adversarial 同见）。
 5. **大库/无分页（P2）**：九扫描器串行全量 I_S 扫，挂 chi 120s 组单 ctx；九条查询非单事务（并发 DDL 下跨维非原子快照）。v1 典型规模护栏：建议 ≤ 数万列级。
-6. **5.7 地板**：IS_VISIBLE 为 8.0+ 列（沿 MS-10a 尾批池同项）。
+6. **5.7 地板**：IS_VISIBLE 为 8.0+ 列（沿 MS-10a 尾批池同项）；**EXPRESSION 同限**（F-15 笔③：schema_reader readIndexes 的 `COALESCE(COLUMN_NAME, EXPRESSION)` 同为 8.0+ 地板，沿 IS_VISIBLE 同项——5.7 无函数式索引故 COLUMN_NAME 恒非 NULL，但查询引用 EXPRESSION 列本身在 5.7 报错；产品 MySQL 面宣称 8.0.x）。
 7. **SET SESSION 亲缘（P2，adversarial 增量票记档）**：`group_concat_max_len` 会话钉扎依赖 database/sql 池的隐式行为（handler 私有 srcDB+顺序单 goroutine→LIFO 单连接复用=实际有效）——**非 API 保证**，未来并行化/复用池即失效；改进=`db.SetMaxOpenConns(1)` 显式钉死或维持假设记档。
