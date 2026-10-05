@@ -35,6 +35,7 @@ func init() {
 var mysqlMeta = source.SourceMeta{
 	Name:        "mysql",
 	DisplayName: "MySQL",
+	ShortName:   "MySQL",
 	Implemented: true,
 	DefaultPort: 3306,
 	// MS-01: assess flipped on by MS-10b (assess scanner dialect);

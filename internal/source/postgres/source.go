@@ -34,6 +34,7 @@ func init() {
 var postgresMeta = source.SourceMeta{
 	Name:        "postgres",
 	DisplayName: "PostgreSQL",
+	ShortName:   "PG",
 	Implemented: true,
 	DefaultPort: 5432,
 	Capabilities: source.Capabilities{

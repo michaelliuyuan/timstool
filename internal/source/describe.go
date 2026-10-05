@@ -117,6 +117,7 @@ func Capable(kind string, c Capability) (bool, error) {
 type SourceMeta struct {
 	Name         string       `json:"name"`        // "postgres"
 	DisplayName  string       `json:"displayName"` // "PostgreSQL"
+	ShortName    string       `json:"shortName"`   // compact table-header label ("PG", "MySQL") — registry single truth, callers must not derive it by branching on the type string
 	Implemented  bool         `json:"implemented"` // stub=false
 	DefaultPort  int          `json:"defaultPort"` // 5432
 	Fields       []FieldSpec  `json:"fields"`

@@ -6,18 +6,48 @@ import (
 	"io"
 	"os"
 	"sort"
+
+	"github.com/michaelliuyuan/timstool/internal/source"
 )
 
 // ReportGenerator creates assessment reports in various formats.
 type ReportGenerator struct {
-	report *AssessmentReport
+	report  *AssessmentReport
+	srcMeta source.SourceMeta
 }
 
 // NewReportGenerator creates a report generator from assessment results.
-func NewReportGenerator(dims []DimensionResult) *ReportGenerator {
-	rg := &ReportGenerator{}
-	rg.report = buildReport(dims)
-	return rg
+// srcType drives the source-database labels rendered in the reports; it is
+// resolved through the source registry (A3 single truth: callers must not
+// branch on the raw type string). "" normalizes to the PG legacy wording so
+// inline/legacy call sites stay byte-identical; an unknown kind falls back to
+// PG rather than failing report rendering.
+func NewReportGenerator(dims []DimensionResult, srcType string) *ReportGenerator {
+	kind, err := source.NormalizeKind(srcType)
+	if err != nil {
+		kind = "postgres"
+	}
+	meta, err := source.Describe(kind)
+	if err != nil {
+		meta = source.SourceMeta{DisplayName: "PostgreSQL", ShortName: "PG"}
+	}
+	return &ReportGenerator{report: buildReport(dims), srcMeta: meta}
+}
+
+// SourceLabel returns the full source label used in report titles.
+func (rg *ReportGenerator) SourceLabel() string {
+	if rg.srcMeta.DisplayName != "" {
+		return rg.srcMeta.DisplayName
+	}
+	return "PostgreSQL"
+}
+
+// SourceLabelShort returns the short source label used in table headers.
+func (rg *ReportGenerator) SourceLabelShort() string {
+	if rg.srcMeta.ShortName != "" {
+		return rg.srcMeta.ShortName
+	}
+	return "PG"
 }
 
 func buildReport(dims []DimensionResult) *AssessmentReport {
@@ -56,7 +86,7 @@ func (rg *ReportGenerator) PrintTerminal(w io.Writer) {
 
 	fmt.Fprintf(w, "\n")
 	fmt.Fprintf(w, "╔══════════════════════════════════════════════════════════════╗\n")
-	fmt.Fprintf(w, "║         PostgreSQL → TiDB 兼容性评估报告                    ║\n")
+	fmt.Fprintf(w, "║         %s → TiDB 兼容性评估报告                    ║\n", rg.SourceLabel())
 	fmt.Fprintf(w, "╚══════════════════════════════════════════════════════════════╝\n")
 	fmt.Fprintf(w, "\n")
 

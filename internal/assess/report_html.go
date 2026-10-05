@@ -17,7 +17,7 @@ const htmlReportTemplate = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PG → TiDB 兼容性评估报告</title>
+<title>{{.SourceLabel}} → TiDB 兼容性评估报告</title>
 <style>
 {{.ReportCSS}}
 h1 { text-align: center; color: #0C1222; margin-bottom: 8px; font-size: 28px; }
@@ -83,7 +83,7 @@ h1 { text-align: center; color: #0C1222; margin-bottom: 8px; font-size: 28px; }
 </head>
 <body>
 <div class="container">
-  <h1>PostgreSQL → TiDB 兼容性评估报告</h1>
+  <h1>{{.SourceLabel}} → TiDB 兼容性评估报告</h1>
   <p class="subtitle">自动评估数据库迁移兼容性，识别潜在风险和迁移建议</p>
 
   <!-- Score Card -->
@@ -133,7 +133,7 @@ h1 { text-align: center; color: #0C1222; margin-bottom: 8px; font-size: 28px; }
   {{if .ProblemRows}}
   <h2 class="section-title">需要处理的项目（{{.ProblemCount}} 项）</h2>
   <table class="problem-table">
-    <thead><tr><th style="width:40px">#</th><th>类型</th><th>对象</th><th>级别</th><th>PG</th><th>TiDB</th><th>建议</th><th style="width:60px">DDL</th></tr></thead>
+    <thead><tr><th style="width:40px">#</th><th>类型</th><th>对象</th><th>级别</th><th>{{.SourceLabelShort}}</th><th>TiDB</th><th>建议</th><th style="width:60px">DDL</th></tr></thead>
     <tbody>
     {{range .ProblemRows}}
     <tr>
@@ -195,6 +195,8 @@ window.onclick = function(event) {
 // htmlTemplateData holds data for the HTML report template.
 type htmlTemplateData struct {
 	ReportCSS           template.CSS
+	SourceLabel         string
+	SourceLabelShort    string
 	ScoreDisplay        string
 	ScoreGradient       string
 	LevelCN             string
@@ -254,6 +256,8 @@ func (rg *ReportGenerator) buildHTMLData() htmlTemplateData {
 	r := rg.report
 	data := htmlTemplateData{
 		ReportCSS:           template.CSS(reporter.ReportCSS),
+		SourceLabel:         rg.SourceLabel(),
+		SourceLabelShort:    rg.SourceLabelShort(),
 		ScoreDisplay:        FormatScore(r.Score),
 		LevelCN:             levelNameCN(r.Level),
 		SummaryCompatible:   r.Summary[LevelCompatible],
