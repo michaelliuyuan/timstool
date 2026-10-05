@@ -178,7 +178,7 @@ func (r *schemaReader) readColumns(ctx context.Context, db *sql.DB, database, ta
 
 func (r *schemaReader) readIndexes(ctx context.Context, db *sql.DB, database, table string) ([]source.Index, error) {
 	query := `
-		SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE, SEQ_IN_INDEX
+		SELECT INDEX_NAME, COALESCE(COLUMN_NAME, EXPRESSION), NON_UNIQUE, SEQ_IN_INDEX
 		FROM information_schema.STATISTICS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 		ORDER BY INDEX_NAME, SEQ_IN_INDEX`
