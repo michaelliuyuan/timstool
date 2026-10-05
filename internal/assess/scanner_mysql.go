@@ -33,8 +33,10 @@ func NewScannerFor(kind string, db *sql.DB, schema string) SchemaScanner {
 //	tables     information_schema.TABLES            - equivalent
 //	columns    information_schema.COLUMNS + PK probe - equivalent
 //	indexes    information_schema.STATISTICS aggregate
-//	          (per-index row) - equivalent modulo IsPartial/IsExpression,
-//	          which MySQL catalogs do not expose (degraded: false)
+//	          (per-index row) - equivalent modulo IsPartial, which MySQL
+//	          catalogs do not expose (MySQL has no partial indexes at all);
+//	          IsExpression IS detected via the functional-key-part shape
+//	          (EXPRESSION non-NULL / COLUMN_NAME NULL, MySQL 8.0.13+)
 //	views      information_schema.VIEWS             - equivalent for the
 //	          definition; DDL is degraded (no pg_get_viewdef analog, a
 //	          per-view SHOW CREATE VIEW round-trip is not paid here)
@@ -44,8 +46,10 @@ func NewScannerFor(kind string, db *sql.DB, schema string) SchemaScanner {
 //	enums      n/a - MySQL has no schema-level enum types (column ENUM
 //	          types surface via the data_type dimension instead)
 //	extensions n/a - no extension concept (empty)
-//	sequences  n/a - no sequence objects (AUTO_INCREMENT is column-level
-//	          and already covered by the column/index scans)
+//	sequences  n/a - no sequence objects (AUTO_INCREMENT is column-level;
+//	          NOT collected today - the sequences dimension stays empty,
+//	          which is benign MySQL->TiDB (TiDB supports AUTO_INCREMENT)
+//	          but a real gap if this scanner is ever reused in reverse)
 //
 // The connection is expected to arrive with the MS-08d UTC session pin
 // (time_zone='+00:00' on the DSN); the catalog queries below read no
@@ -107,7 +111,7 @@ const mysqlIndexesSQL = `
 		s.INDEX_NAME = 'PRIMARY',
 		CONCAT(s.INDEX_NAME, ' (', GROUP_CONCAT(COALESCE(s.COLUMN_NAME, s.EXPRESSION) ORDER BY s.SEQ_IN_INDEX SEPARATOR ','), ')'),
 		0,
-		0
+		MAX(s.COLUMN_NAME IS NULL)
 	FROM information_schema.STATISTICS s
 	WHERE s.TABLE_SCHEMA = ?` + mysqlIdxVisibleFrag + `
 	GROUP BY s.TABLE_SCHEMA, s.TABLE_NAME, s.INDEX_NAME, s.INDEX_TYPE

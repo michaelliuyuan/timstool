@@ -45,7 +45,13 @@ func (mysqlStubConn) QueryContext(_ context.Context, q string, _ []driver.NamedV
 	case strings.Contains(q, "information_schema.STATISTICS"):
 		return &stubRows{
 			cols: []string{"t", "n", "ty", "u", "p", "def", "part", "expr"},
-			rows: [][]driver.Value{{"t1", "idx_a", "btree", true, false, "idx_a (a)", int64(0), int64(0)}},
+			rows: [][]driver.Value{
+				{"t1", "idx_a", "btree", true, false, "idx_a (a)", int64(0), int64(0)},
+				// MS-10b P1-2: a functional key part has COLUMN_NAME NULL
+				// (EXPRESSION non-NULL, 8.0.13+); the aggregate must flag
+				// IsExpression so the checker can raise it.
+				{"t1", "idx_fn", "btree", false, false, "idx_fn (LOWER(a))", int64(0), int64(1)},
+			},
 		}, nil
 	case strings.Contains(q, "information_schema.VIEWS"):
 		return &stubRows{
@@ -119,6 +125,7 @@ func TestMySQLScannerSQLShapes(t *testing.T) {
 		"INDEX_NAME = 'PRIMARY'",
 		"information_schema.STATISTICS",
 		"IS_VISIBLE = 'YES'",
+		"COLUMN_NAME IS NULL",
 		"GROUP_CONCAT",
 		"information_schema.VIEWS",
 		"information_schema.ROUTINES",
@@ -158,8 +165,14 @@ func TestMySQLScannerDegradedEmptySets(t *testing.T) {
 	if len(res.Columns) != 1 || !res.Columns[0].IsPrimary {
 		t.Errorf("columns = %+v (PK probe must mark id)", res.Columns)
 	}
-	if len(res.Indexes) != 1 || res.Indexes[0].IndexType != "btree" || res.Indexes[0].IsPartial || res.Indexes[0].IsExpression {
+	if len(res.Indexes) != 2 || res.Indexes[0].IndexType != "btree" || res.Indexes[0].IsPartial || res.Indexes[0].IsExpression {
 		t.Errorf("indexes = %+v", res.Indexes)
+	}
+	// P1-2 anchor: the functional-key-part row (COLUMN_NAME NULL -> the
+	// MAX(COLUMN_NAME IS NULL) aggregate reads 1) must carry IsExpression
+	// so the index checker raises the MySQL->TiDB incompatibility.
+	if !res.Indexes[1].IsExpression {
+		t.Errorf("functional index idx_fn must have IsExpression=true, got %+v", res.Indexes[1])
 	}
 	if len(res.Triggers) != 1 || res.Triggers[0].Timing != "AFTER" || res.Triggers[0].EventType != "INSERT" {
 		t.Errorf("triggers = %+v", res.Triggers)
