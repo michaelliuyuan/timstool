@@ -141,7 +141,18 @@ const mysqlTriggersSQL = `
 	ORDER BY EVENT_OBJECT_TABLE, TRIGGER_NAME
 `
 
+// mysqlGroupConcatPin lifts the server-side GROUP_CONCAT cap for this
+// session only: the default group_concat_max_len=1024 silently truncates
+// the Definition text of wide composite indexes (adversarial P3, hardened
+// per the leader c-fix ticket). 1 MiB covers any realistic index shape.
+const mysqlGroupConcatPin = `SET SESSION group_concat_max_len = 1048576`
+
 func (s *mysqlScanner) ScanAll(ctx context.Context) (*ScanResult, error) {
+	if rows, err := s.db.QueryContext(ctx, mysqlGroupConcatPin); err == nil {
+		rows.Close()
+	} else {
+		return nil, wrapScanErr("pin group_concat_max_len", err)
+	}
 	result := &ScanResult{}
 
 	tables, err := s.queryTables(ctx)

@@ -130,6 +130,9 @@ func TestMySQLScannerSQLShapes(t *testing.T) {
 		"information_schema.VIEWS",
 		"information_schema.ROUTINES",
 		"information_schema.TRIGGERS",
+		// c-fix item 3: the session GROUP_CONCAT cap pin must ride along
+		// so wide composite index definitions never truncate.
+		"group_concat_max_len = 1048576",
 	} {
 		if !strings.Contains(joined, frag) {
 			t.Errorf("mysql scanner SQL missing fragment %q", frag)
