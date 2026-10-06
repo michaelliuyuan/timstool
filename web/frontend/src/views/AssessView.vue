@@ -28,6 +28,10 @@ interface DimResult {
   total: number
   score: number
   findings: Finding[]
+  // MS-10b2 item 3: false = the source has no objects of this kind
+  // (MySQL: sequences/custom types/...) — the dimension is N/A, not a
+  // fake 100. Absent (legacy payloads) = applicable.
+  applicable?: boolean
 }
 
 interface AssessReport {
@@ -340,8 +344,12 @@ function copyDDL() {
           <el-table-column prop="total" label="对象数" width="100" align="center" />
           <el-table-column label="得分" width="220">
             <template #default="{ row }">
+              <!-- MS-10b2 item 3: N/A dimension renders a gray
+                   not-applicable note, never a fake-100 progress bar. -->
+              <span v-if="row.applicable === false" style="color: #9AA3AF;">N/A 不适用</span>
               <!-- #t2 ⚠️-1 填充色族同步 AA -->
               <el-progress
+                v-else
                 :percentage="Math.round(row.score)"
                 :color="row.score >= 90 ? '#0b7a7a' : row.score >= 70 ? '#9a5700' : row.score >= 40 ? '#7a4300' : '#c02f2f'"
                 :stroke-width="10"
@@ -350,9 +358,12 @@ function copyDDL() {
           </el-table-column>
           <el-table-column label="兼容性" width="120">
             <template #default="{ row }">
-              {{ levelEmoji[
-                row.score >= 90 ? 'compatible' : row.score >= 70 ? 'convertible' : row.score >= 40 ? 'manual_needed' : 'incompatible'
-              ] }}
+              <span v-if="row.applicable === false" style="color: #9AA3AF;">—</span>
+              <template v-else>
+                {{ levelEmoji[
+                  row.score >= 90 ? 'compatible' : row.score >= 70 ? 'convertible' : row.score >= 40 ? 'manual_needed' : 'incompatible'
+                ] }}
+              </template>
             </template>
           </el-table-column>
         </el-table>
