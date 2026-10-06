@@ -38,7 +38,7 @@
 | ① 视图方言 | checker.go viewDialectDetail | PG-only 方言词 **7 词子集**（裁定 :269）；MySQL 源视图定义只匹配该子集（WHERE/OR/JOIN 等 PG/MySQL 共有词不算方言），命中记 PG 方言风险；文案 seam=「PostgreSQL（口径：TiDB 目标兼容性）」 |
 | ② 类型分级 | checker.go checkDataTypesMySQL | **mysql.NewTypeMapper 共享真源**（source/mysql）：恒等族（int/bigint/varchar/…/MEDIUMINT/YEAR）=Convertible（YEAR 注记 1:1 保留语义差异，非恒等）；bool/real/text 族+blob 族=Convertible（良性转换）；geometry/未知=ManualNeeded；九维分级锚=checker_ms10b2_test.go |
 | ③ N/A 三态 | types.go Applicable *bool omitempty | 空集维（如 MySQL 源的 enums/extensions/sequences）→markApplicability 标 N/A+Score 0；聚合分子分母同剔 N/A 权重（全维 N/A 时分母=剩余权重和，全适用时=1.0 无痕）；PG 报告 JSON 键零出现=逐字节恒等 |
-| ④ 口径行 | report.go CaliberLine | PG 源：「PostgreSQL（口径：TiDB 目标兼容性）」；MySQL 源：「MySQL（口径：TiDB 目标兼容性）」；HTML/JSON 双面 |
+| ④ 口径行 | report.go CaliberLine | MySQL 源：「源端类型：MySQL（口径：TiDB 目标兼容性）」；**PG 源无口径行（返回 ""，legacy 布局恒等——测试锚 TestReportFacesCaliberAndNA 断言 PG HTML 不含「口径」）**；渲染面=terminal+HTML 双面，**JSON 面不承载口径行**（AssessmentReport 无 caliber 字段） |
 | ⑤ schema 兜底 | scanner_mysql.go | newMySQLScanner 空 schema **fail-loud**（errSchemaRequired）——「public」兜底移除（上文边界 4 关闭）；HTTP 级 400 锚=webapi assessSchemaRejected（TrimSpace 封尾空白绕过形） |
 | ⑥ 快照原子性 | scanner_mysql.go BeginTx | 九扫描器单 tx 快照（修边界 5 非原子项）；maxScanObjects=20000 护栏（件门超限拒） |
 | ⑦ AutoIncr 探针 | checker.go IsAutoIncr | EXTRA 列探针 `auto_increment` →结构维标注 |
@@ -52,3 +52,5 @@
 - **5.7 地板沿边界 6**：EXPRESSION/IS_VISIBLE 8.0+ 限不改（产品 MySQL 面宣称 8.0.x）。
 - **视图 DDL 降级空沿表 1**：不付 per-view SHOW CREATE VIEW 往返（笔①未改此面）。
 - **group_concat 截断沿边界 3**（笔⑨池钉扎后仍会话内有效，上限默认 1024 不变）。
+- **Score_() 死码（adversarial P3，双轨增量票记档）**：types.go Score_ 同步了 N/A 剔除但全仓零调用者——保留为聚合口径参考实现，**勿新增调用**（聚合真源=buildReport/Score 双面）；若后续接 FE 重算需求再启。
+- **dist 目录清理（adversarial P3）**：构建产物仅以 cmd/static 形式入库（dist 不入库），rebuild 依赖 vite 产物一致性——黑盒期 te 核 bundle 逐字节重建。
