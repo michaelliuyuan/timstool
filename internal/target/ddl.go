@@ -10,6 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/michaelliuyuan/timstool/internal/source"
@@ -88,7 +89,12 @@ func RenderCreateTable(t source.Table) string {
 		b.WriteString("INDEX ")
 		b.WriteString(QuoteIdent(idx.Name))
 		b.WriteString(" (")
-		writeIdentList(&b, idx.Columns)
+		for i, part := range idx.Columns {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			renderIndexPart(&b, part)
+		}
 		b.WriteString(")")
 	}
 	b.WriteString(")")
@@ -126,6 +132,24 @@ func writeIdentList(b *strings.Builder, names []string) {
 		}
 		b.WriteString(QuoteIdent(n))
 	}
+}
+
+// plainIdent matches a bare TiDB/MySQL identifier (unquoted form). Anything
+// else in an index key part is a functional key part (MySQL 8.0.13+
+// information_schema.STATISTICS EXPRESSION text, e.g. "(lower(`b`))").
+var plainIdent = regexp.MustCompile(`^[A-Za-z0-9_$\x{0080}-\x{FFFF}]+$`)
+
+// renderIndexPart renders one index key part. Plain identifiers are
+// backtick-quoted; functional parts are emitted VERBATIM — the
+// information_schema original is already valid DDL, so no re-wrapping in
+// backticks and no paren stripping (MS-10c2 replay-equivalence rule: the
+// rendered output must replay as the server's own expression text).
+func renderIndexPart(b *strings.Builder, part string) {
+	if plainIdent.MatchString(part) {
+		b.WriteString(QuoteIdent(part))
+		return
+	}
+	b.WriteString(part)
 }
 
 // QuoteIdent quotes a TiDB/MySQL identifier with backticks (doubled internally).

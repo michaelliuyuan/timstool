@@ -779,7 +779,13 @@ func ParsePGArray(s string) []string {
 	return out
 }
 
-func readmeFile(schema string) string {
+// readmeFile renders the per-schema README. The PG variant ("" legacy
+// default and "postgres") is byte-frozen; "mysql" routes to the SHOW
+// CREATE walk's README (MS-10c2).
+func readmeFile(schema, sourceType string) string {
+	if sourceType == "mysql" {
+		return readmeFileMySQL(schema)
+	}
 	var b strings.Builder
 	b.WriteString("# DDL Export\n\n")
 	b.WriteString("Recommended apply order per schema (native PG DDL):\n")
@@ -790,6 +796,28 @@ func readmeFile(schema string) string {
 	b.WriteString("- Sequences are exported before tables so serial DEFAULT nextval(...) references resolve.\n")
 	b.WriteString("- tidb-tables.sql (if present) is a TiDB-converted reference script, not native PG DDL.\n")
 	b.WriteString("- manifest.json lists exported object counts and any skipped objects (e.g. permission denied).\n\n")
+	b.WriteString("Schema: " + schema + "\n")
+	return b.String()
+}
+
+// readmeFileMySQL is the MySQL-source README (MS-10c2, per
+// docs/MS10C-DIALECT-MAP.md): apply order follows the SHOW CREATE walk;
+// no PG wording appears anywhere in this template.
+func readmeFileMySQL(schema string) string {
+	var b strings.Builder
+	b.WriteString("# DDL Export\n\n")
+	b.WriteString("Recommended apply order per schema (native MySQL DDL):\n")
+	b.WriteString("tables.sql -> views.sql -> functions.sql -> procedures.sql -> triggers.sql\n\n")
+	b.WriteString("Notes:\n")
+	b.WriteString("- tables.sql contains SHOW CREATE TABLE output verbatim: columns, all indexes, AUTO_INCREMENT, ENGINE and other table options.\n")
+	b.WriteString("- Secondary indexes live inside tables.sql (MySQL has no standalone index namespace); indexes.sql is a note file.\n")
+	b.WriteString("- sequences.sql and types.sql are note files: MySQL has no sequence or user-defined type objects (see MS10C-DIALECT-MAP.md).\n")
+	b.WriteString("- DEFINER clauses in views/functions/procedures/triggers are exported as-is; restoring may require the referenced accounts to exist.\n")
+	b.WriteString("- The export walks ordered listings, not a single consistent snapshot: concurrent DDL between object reads can interleave.\n")
+	b.WriteString("- Functional key parts (MySQL 8.0.13+) are preserved by SHOW CREATE TABLE and replay verbatim in tidb-tables.sql.\n")
+	b.WriteString("- TIMESTAMP/DATETIME literals reflect the exporting session's time zone; MySQL 5.7 is the minimum supported server.\n")
+	b.WriteString("- tidb-tables.sql (if present) is a TiDB-converted reference script rendered from information_schema via the MySQL type mapper, not native MySQL DDL.\n")
+	b.WriteString("- manifest.json lists exported object counts, any skipped objects, and per-type 1:1 passthrough ledger entries.\n\n")
 	b.WriteString("Schema: " + schema + "\n")
 	return b.String()
 }
@@ -829,7 +857,7 @@ func (e *Exporter) allFiles(ctx context.Context) ([]string, map[string]string, e
 		}
 		// Per-schema self-containment: README + manifest live inside the
 		// schema folder (zip and --out directory layouts stay identical).
-		files[s+"/README.txt"] = readmeFile(s)
+		files[s+"/README.txt"] = readmeFile(s, e.opts.SourceType)
 		files[s+"/manifest.json"] = marshalManifest(e.manifestFor(s))
 		names = append(names, s+"/README.txt", s+"/manifest.json")
 		if e.manifest.Total > e.opts.MaxObjects {

@@ -227,6 +227,13 @@ func (r *schemaReader) readIndexes(ctx context.Context, db *sql.DB, database, ta
 // schemaReader is the MySQL SchemaReader implementation.
 type schemaReader struct{ src *Source }
 
+// NewSchemaReaderForDB exposes a SchemaReader over an already-open *sql.DB
+// (the DDL exporter reuses its connection instead of opening a second one).
+// Only Database matters to the reader; credentials stay with the caller.
+func NewSchemaReaderForDB(db *sql.DB, database string) source.SchemaReader {
+	return &schemaReader{src: &Source{cfg: source.SourceConfig{Database: database}, db: db}}
+}
+
 // isTemporalDataType reports whether dataType is a temporal type whose
 // optional precision (fsp) lives in information_schema DATETIME_PRECISION.
 func isTemporalDataType(dataType string) bool {

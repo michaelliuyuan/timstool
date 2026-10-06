@@ -11,6 +11,10 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/michaelliuyuan/timstool/internal/source"
+	"github.com/michaelliuyuan/timstool/internal/source/mysql"
+	"github.com/michaelliuyuan/timstool/internal/target"
 )
 
 // mysqlSystemDatabases mirrors the mysqlWatermarkDialect SystemSchemas
@@ -143,8 +147,9 @@ func (e *Exporter) mysqlRenderObjects(ctx context.Context, schema, typ, listQuer
 //   - indexes.sql: MySQL indexes are part of SHOW CREATE TABLE output
 //     (no standalone index namespace) — a note file is written instead;
 //   - sequences/types: MySQL has no such object types — note files;
-//   - tidb-tables.sql: the TiDB conversion reads the PG catalog; a MySQL
-//     source records a skip instead of failing the export.
+//   - tidb-tables.sql: since MS-10c2 the TiDB conversion is rendered via
+//     the source adapter's CIR path (information_schema walk + type
+//     mapper + target renderer); the old PG-catalog skip is gone.
 func (e *Exporter) mysqlSchemaFiles(ctx context.Context, schemaName string) (map[string]string, error) {
 	files := map[string]string{}
 	t := e.opts.Types
@@ -207,9 +212,66 @@ ORDER BY TRIGGER_NAME`, "SHOW CREATE TRIGGER %s.%s", 2)
 	}
 
 	if e.opts.IncludeTiDB && t.Tables {
-		e.skip(schemaName, "tidb-tables.sql", schemaName,
-			"tidb-tables.sql requires the PG catalog path; not supported for a MySQL source (MS-10c)")
+		ddl, n := e.mysqlTiDBTables(ctx, schemaName)
+		files["tidb-tables.sql"] = ddl
+		e.countN(schemaName, "tidb-tables.sql", n)
 	}
 
 	return files, nil
+}
+
+// mysqlTiDBTables renders the TiDB-converted CREATE TABLE script for a
+// MySQL database (MS-10c2): the source adapter's SchemaReader walks
+// information_schema into CIR (columns already carry the mysqlTypeMapper's
+// TiDBType), and the target renderer emits one CREATE TABLE per table.
+// Functional key parts replay their information_schema EXPRESSION text
+// verbatim (no re-wrap, no paren strip). Column types that pass through
+// 1:1 (no conversion applied — ENUM/SET fidelity, the geometry family
+// fallback) are recorded per distinct type in the manifest skip ledger
+// instead of silently passing (coverage accounting, MS10C-DIALECT-MAP.md).
+func (e *Exporter) mysqlTiDBTables(ctx context.Context, schemaName string) (string, int) {
+	sch, err := mysql.NewSchemaReaderForDB(e.db, schemaName).ReadSchema(ctx, source.Filter{})
+	if err != nil {
+		e.skip(schemaName, "tidb-tables.sql", schemaName, err.Error())
+		return "", 0
+	}
+	seen := map[string]bool{}
+	var b strings.Builder
+	n := 0
+	for _, tbl := range sch.Tables {
+		b.WriteString(target.RenderCreateTable(tbl))
+		b.WriteString(";\n\n")
+		n++
+		for _, c := range tbl.Columns {
+			if passthroughType(c) && !seen[c.TiDBType] {
+				seen[c.TiDBType] = true
+				e.skip(schemaName, "tidb-tables.sql", "type:"+c.TiDBType,
+					"column type passes through 1:1 (no TiDB conversion applied) — coverage ledger: MS10C-DIALECT-MAP.md")
+			}
+		}
+	}
+	return b.String(), n
+}
+
+// passthroughType reports a column whose TiDB type is a 1:1 fallback, not
+// a conversion: either the type mapper's default branch returned the
+// source string verbatim (unmapped type), or it is the geometry family
+// (TiDB keeps the spelling but applies no conversion). Native 1:1 integer
+// families (BIGINT etc.) are mapped spellings, not fallbacks, and stay
+// off the ledger — case-sensitive compare separates "BIGINT" (mapped)
+// from a verbatim echo.
+func passthroughType(c source.Column) bool {
+	if c.TiDBType == c.SourceType {
+		return true
+	}
+	base := strings.ToUpper(strings.TrimSpace(c.TiDBType))
+	if idx := strings.IndexByte(base, '('); idx >= 0 {
+		base = base[:idx]
+	}
+	switch base {
+	case "GEOMETRY", "POINT", "LINESTRING", "POLYGON", "MULTIPOINT",
+		"MULTILINESTRING", "MULTIPOLYGON", "GEOMETRYCOLLECTION":
+		return true
+	}
+	return false
 }

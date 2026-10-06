@@ -102,9 +102,10 @@ func TestMySQLQueryAnchors(t *testing.T) {
 }
 
 // TestMySQLDegradeAnchors pins the degrade contract (MS10C-DIALECT-MAP):
-// indexes/sequences/types write note files (zip-visible, zero counts) and
-// the TiDB conversion records a manifest skip for a MySQL source instead
-// of failing the export.
+// indexes/sequences/types write note files (zip-visible, zero counts);
+// since MS-10c2 the TiDB conversion is PRODUCED for a MySQL source via the
+// source adapter's CIR path (the old "PG catalog only" skip is gone), and
+// 1:1 passthrough column types land in the manifest skip ledger per type.
 func TestMySQLDegradeAnchors(t *testing.T) {
 	src, err := os.ReadFile("exporter_mysql.go")
 	if err != nil {
@@ -115,11 +116,17 @@ func TestMySQLDegradeAnchors(t *testing.T) {
 		`files["indexes.sql"] = "-- MySQL: indexes have no standalone namespace`,
 		`files["sequences.sql"] = "-- MySQL: no sequence objects`,
 		`files["types.sql"] = "-- MySQL: no user-defined type objects`,
-		"tidb-tables.sql requires the PG catalog path",
+		"mysql.NewSchemaReaderForDB(e.db, schemaName)",
+		"target.RenderCreateTable(tbl)",
+		"no TiDB conversion applied) — coverage ledger: MS10C-DIALECT-MAP.md",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("degrade anchor missing: %q", want)
 		}
+	}
+	// The flipped contract must not regress to the MS-10c skip.
+	if strings.Contains(s, "tidb-tables.sql requires the PG catalog path") {
+		t.Error("MySQL TiDB conversion must not fall back to the PG-catalog skip (MS-10c2)")
 	}
 }
 
