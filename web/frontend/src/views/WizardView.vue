@@ -489,7 +489,7 @@ function prevStep() {
 
 <template>
   <div class="tims-page">
-    <PageHeader title="新建迁移" subtitle="配置源端 PostgreSQL 与目标端 TiDB，生成迁移任务" />
+    <PageHeader title="新建迁移" subtitle="配置源端数据库与目标端 TiDB，生成迁移任务" />
     <el-card>
       <template #header>
         <div style="display: flex; align-items: center; justify-content: space-between;">
