@@ -43,7 +43,35 @@ func (a *Assessor) Assess(result *ScanResult) []DimensionResult {
 	dims = append(dims, a.checkExtensions(result))
 	dims = append(dims, a.checkSequences(result))
 
+	markApplicability(dims, result)
+
 	return dims
+}
+
+// markApplicability applies the MS-10b2 item-3 N/A calibration: a
+// dimension whose source object set is empty (MySQL sources have no
+// sequences / schema-level custom types / extensions) is marked
+// not-applicable instead of silently scoring the "empty = fully
+// compatible" 100 that a MySQL report used to show. Populated dimensions
+// keep the legacy shape (Applicable nil) so PG payloads with objects in
+// every dimension stay byte-identical.
+func markApplicability(dims []DimensionResult, result *ScanResult) {
+	counts := map[string]int{
+		DimDataType:   len(result.Columns),
+		DimStructure:  len(result.Tables) + len(result.Columns),
+		DimIndex:      len(result.Indexes),
+		DimView:       len(result.Views),
+		DimFunction:   len(result.Functions),
+		DimTrigger:    len(result.Triggers),
+		DimCustomType: len(result.Enums),
+		DimExtension:  len(result.Extensions),
+		DimSequence:   len(result.Sequences),
+	}
+	for i := range dims {
+		if counts[dims[i].Dimension] == 0 {
+			dims[i].MarkNotApplicable()
+		}
+	}
 }
 
 // scorer helps build dimension results.

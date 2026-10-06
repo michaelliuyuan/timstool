@@ -85,6 +85,7 @@ h1 { text-align: center; color: #0C1222; margin-bottom: 8px; font-size: 28px; }
 <div class="container">
   <h1>{{.SourceLabel}} → TiDB 兼容性评估报告</h1>
   <p class="subtitle">自动评估数据库迁移兼容性，识别潜在风险和迁移建议</p>
+  {{if .CaliberLine}}<p class="subtitle">{{.CaliberLine}}</p>{{end}}
 
   <!-- Score Card -->
   <div class="score-card">
@@ -207,6 +208,7 @@ type htmlTemplateData struct {
 	DimensionRows       []htmlDimRow
 	ProblemRows         []htmlProblemRow
 	ProblemCount        int
+	CaliberLine         string
 }
 
 type htmlDimRow struct {
@@ -260,6 +262,7 @@ func (rg *ReportGenerator) buildHTMLData() htmlTemplateData {
 		SourceLabelShort:    rg.SourceLabelShort(),
 		ScoreDisplay:        FormatScore(r.Score),
 		LevelCN:             levelNameCN(r.Level),
+		CaliberLine:         rg.CaliberLine(),
 		SummaryCompatible:   r.Summary[LevelCompatible],
 		SummaryConvertible:  r.Summary[LevelConvertible],
 		SummaryManual:       r.Summary[LevelManualNeeded],
@@ -278,8 +281,22 @@ func (rg *ReportGenerator) buildHTMLData() htmlTemplateData {
 		data.ScoreGradient = "#E13C3C, #EA6A6A"
 	}
 
-	// Dimension rows
+	// Dimension rows. N/A dimensions (empty source object set, MS-10b2
+	// item 3) render a gray N/A row instead of a fake-100 bar; PG
+	// payloads with populated dimensions render byte-identically (no
+	// CaliberLine, no N/A rows).
 	for _, dim := range r.DimensionResults {
+		if !dim.IsApplicable() {
+			data.DimensionRows = append(data.DimensionRows, htmlDimRow{
+				Name:         dimNameCN(dim.Dimension),
+				Total:        dim.Total,
+				ScoreDisplay: "N/A",
+				ScorePct:     "0%",
+				BarColor:     "#9AA3AF",
+				LevelCN:      "N/A 不适用",
+			})
+			continue
+		}
 		level := OverallLevel(dim.Score)
 		row := htmlDimRow{
 			Name:         dimNameCN(dim.Dimension),

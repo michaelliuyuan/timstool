@@ -177,6 +177,27 @@ type DimensionResult struct {
 	Total     int       `json:"total"`
 	Score     float64   `json:"score"`
 	Findings  []Finding `json:"findings"`
+	// Applicable is the MS-10b2 item-3 N/A tri-state: nil means the
+	// dimension is applicable (legacy shape — the field is omitted from
+	// JSON so populated-dimension payloads stay byte-identical, the PG
+	// parity anchor); an explicit false marks a dimension whose source
+	// object set is empty (MySQL: sequences/custom types/extensions) —
+	// it must render N/A and stay out of the weighted aggregate.
+	Applicable *bool `json:"applicable,omitempty"`
+}
+
+// IsApplicable reports whether the dimension enters scoring/rendering;
+// nil (legacy) counts as applicable. Value receiver so map-indexed
+// DimensionResult values can be queried directly.
+func (d DimensionResult) IsApplicable() bool {
+	return d.Applicable == nil || *d.Applicable
+}
+
+// MarkNotApplicable flags the dimension N/A and zeroes its score.
+func (d *DimensionResult) MarkNotApplicable() {
+	v := false
+	d.Applicable = &v
+	d.Score = 0
 }
 
 // AssessmentReport is the top-level report.
@@ -188,17 +209,27 @@ type AssessmentReport struct {
 	Summary          map[string]int    `json:"summary"`
 }
 
-// Score calculates the overall score from dimension results.
+// Score calculates the overall score from dimension results. N/A
+// dimensions (MS-10b2 item 3) are excluded from both numerator and
+// denominator; with every dimension applicable the weights already sum
+// to 1.0 so the legacy value is unchanged (PG parity).
 func (r *AssessmentReport) Score_() float64 {
 	if len(r.DimensionResults) == 0 {
 		return 0
 	}
-	var total float64
+	var total, weightSum float64
 	for _, dr := range r.DimensionResults {
+		if !dr.IsApplicable() {
+			continue
+		}
 		weight := DimensionWeights[dr.Dimension]
 		total += weight * dr.Score
+		weightSum += weight
 	}
-	return total
+	if weightSum > 0 {
+		return total / weightSum
+	}
+	return 0
 }
 
 // OverallLevel returns the compatibility level based on score.

@@ -2409,8 +2409,9 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 	// performance_schema/sys/metrics_schema) is rejected 400 up front —
 	// the scanner would otherwise happily return a 200 empty/builtin-only
 	// set. The guard reads the shared exported source/mysql.SystemDatabases
-	// (single truth, same set the ddlexport SHOW DATABASES walk uses).
-	if driver == "mysql" && mysql.SystemDatabases[strings.ToLower(schema)] {
+	// (single truth, same set the ddlexport SHOW DATABASES walk uses);
+	// surrounding whitespace is trimmed so "mysql " cannot slip past.
+	if assessSchemaRejected(driver, schema) {
 		s.writeError(w, http.StatusBadRequest, "schema: 系统库不支持兼容评估（"+schema+"）")
 		return
 	}
@@ -2453,4 +2454,12 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 	// Default: return JSON
 	report := rg.Report()
 	s.writeJSON(w, http.StatusOK, report)
+}
+
+// assessSchemaRejected is the MS-10b2 item-8 assess guard: MySQL system
+// schemas (shared source/mysql.SystemDatabases truth, case-insensitive,
+// whitespace-tolerant) must never enter the scanner. Unit-anchored in
+// assess_guard_test.go; the HTTP-level 400 rides the black-box ticket.
+func assessSchemaRejected(driver, schema string) bool {
+	return driver == "mysql" && mysql.SystemDatabases[strings.ToLower(strings.TrimSpace(schema))]
 }
