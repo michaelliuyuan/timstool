@@ -89,7 +89,6 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
           </button>
         </template>
       </nav>
-      <div class="tims-sidenav-foot tims-mono">PG → TiDB</div>
     </aside>
 
     <div class="tims-main-col">
@@ -100,7 +99,7 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
             <i class="tims-heartbeat-dot"></i>
             <span class="tims-mono">{{ runningCount > 0 ? `${runningCount} 运行` : backendUp ? '空闲' : '离线' }}</span>
           </span>
-          <span class="tims-version tims-mono">V3.9</span>
+          <span class="tims-version tims-mono">V3.18</span>
         </div>
       </header>
       <main class="tims-workspace">
@@ -177,14 +176,6 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
   background: var(--tims-brand);
 }
 .tims-nav-label { font-size: 12px; letter-spacing: 0.2px; line-height: 1.3; text-align: center; }
-
-.tims-sidenav-foot {
-  margin-top: auto;
-  text-align: center;
-  font-size: var(--tims-font-xs);
-  color: var(--tims-text-inv-2);
-  opacity: 0.6;
-}
 
 /* --- Main column --- */
 .tims-main-col { flex: 1; display: flex; flex-direction: column; min-width: 0; }
