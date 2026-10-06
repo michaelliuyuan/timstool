@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import apiClient from '../api'
 import PageHeader from '../components/PageHeader.vue'
@@ -11,12 +11,11 @@ import { useDataSources } from '../composables/useDataSources'
 // The localStorage memory is retired — passwords must not persist.
 
 const sourceRef = ref('')
-const { load: loadDataSources, get: getDataSource } = useDataSources()
+const { load: loadDataSources } = useDataSources()
 // MS-10c: the picker accepts postgres + mysql; the manual inline form
 // stays PG-only (a MySQL source must come in as a datasource reference —
-// the AssessView precedent).
-const effectiveSourceType = computed(() =>
-  sourceRef.value ? (getDataSource(sourceRef.value)?.type || 'postgres') : 'postgres')
+// the AssessView precedent). Commit 9: the section divider is generic
+// (「源数据库」) — the type is carried by the picker, not the label.
 
 // P1-1: one-shot migration — the retired localStorage key historically stored
 // the inline sourceForm including a plaintext password; drop it so the value
@@ -158,7 +157,7 @@ async function exportDDL() {
         <!-- v1: the legacy inline form stays PG-only (MS-10c scope) — a
              MySQL source must come in as a datasource reference above. -->
         <template v-if="!sourceRef">
-          <el-divider content-position="left">源数据库（{{ effectiveSourceType === 'postgres' ? 'PostgreSQL' : effectiveSourceType }}）</el-divider>
+          <el-divider content-position="left">源数据库</el-divider>
           <el-form-item>
             <div style="font-size: var(--tims-font-sm); color: var(--el-text-color-secondary); line-height: 1.6;">
               手工连接仅支持 PostgreSQL；MySQL 源请使用上方数据源引用。
