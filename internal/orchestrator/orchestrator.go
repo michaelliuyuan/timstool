@@ -25,6 +25,44 @@ import (
 	"go.uber.org/zap"
 )
 
+// Source-CIR test seams (MS-10d pen 1): package vars so unit anchors can
+// drive runSourceCIR end-to-end with fakes — no real source adapter, TiDB
+// connection, Lightning or dumpling binary in tests.
+var (
+	cirOpenSource        = source.Open
+	cirOpenTargetDB      = func(cfg config.Config) (*sql.DB, error) { return sql.Open("mysql", cfg.Target.DSN()) }
+	cirDropTables        = target.DropTables
+	cirTruncateTables    = target.TruncateTables
+	cirApplyDDL          = target.ApplyDDL
+	cirLoadData          = target.LoadData
+	cirRunLightning      = target.RunLightningImport
+	cirValidateMigration = target.ValidateMigration
+	cirFindDumpling      = dumpling.FindBinary
+	cirPrecheck          = cirPrecheckProbe
+)
+
+// cirPrecheckProbe is the source-CIR precheck (MS-10d v1 minimal, leader
+// ruling seq906): the source connection is live (Connect already succeeded),
+// so stamp the server version when the adapter exposes its *sql.DB.
+// Structural checks (privileges, charset, version floor) stay out of v1 —
+// recorded as latent in docs/MS10D-WIZARD-MAP.md.
+func cirPrecheckProbe(ctx context.Context, src source.Source) error {
+	dc, ok := src.(interface{ DB() *sql.DB })
+	if !ok {
+		return nil
+	}
+	db := dc.DB()
+	if db == nil {
+		return nil
+	}
+	var version string
+	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
+		return fmt.Errorf("source-cir: precheck version probe: %w", err)
+	}
+	zap.L().Info("source-cir precheck: source reachable", zap.String("version", version))
+	return nil
+}
+
 type Orchestrator struct {
 	cfg        config.Config
 	schemaMig  common.SchemaMigrator
@@ -94,10 +132,10 @@ func (o *Orchestrator) Run(ctx context.Context, pipelineCfg PipelineConfig) ([]P
 	}
 	log.Info("migration routing", zap.String("source", srcType), zap.String("path", route))
 	if srcType != "postgres" {
-		// Source-CIR path has no precheck phase — record it skipped so
-		// the phase machine covers the same four phases.
-		_ = o.cpMgr.InitPhases(map[string]bool{"precheck": true})
-		return o.runSourceCIR(ctx)
+		// MS-10d: the skip switches honor the same PipelineConfig as the
+		// PG path; the phase seeds at Run entry (pipelineCfg values) are
+		// the truth — no overriding "precheck always skipped" here anymore.
+		return o.runSourceCIR(ctx, pipelineCfg)
 	}
 
 	var results []PipelineResult
@@ -160,12 +198,15 @@ func (o *Orchestrator) Run(ctx context.Context, pipelineCfg PipelineConfig) ([]P
 }
 
 // runSourceCIR executes the non-PG Source+CIR path (#t81). Steps:
+//  0. Precheck (MS-10d v1 minimal) — connectivity probe + version stamp.
 //  1. ApplyDDL — open the source adapter, read schema into CIR, CREATE TABLE on TiDB.
 //  2. LoadData — dumpling fast-path (or stream fallback) → Lightning import.
 //  3. Validate — row-count + value-level sample comparison (#t82, wired here).
 //
 // Source-agnostic: the target only sees CIR. PG is unaffected (COPY→Lightning path).
-func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, error) {
+// MS-10d: every phase honors pipelineCfg.Skip* exactly like the PG path — a
+// switch the user never set must never show "skipped" (silent-lie bug class).
+func (o *Orchestrator) runSourceCIR(ctx context.Context, pipelineCfg PipelineConfig) ([]PipelineResult, error) {
 	log := zap.L()
 	srcType := o.cfg.Source.SourceType()
 
@@ -179,7 +220,7 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 		Schema:   o.cfg.Source.Schema,
 		Options:  map[string]string{"sslmode": o.cfg.Source.SSLMode},
 	}
-	src, err := source.Open(srcType, srcCfg)
+	src, err := cirOpenSource(srcType, srcCfg)
 	if err != nil {
 		return nil, fmt.Errorf("source-cir: open %s: %w", srcType, err)
 	}
@@ -187,6 +228,24 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	if err := src.Connect(ctx); err != nil {
 		return nil, fmt.Errorf("source-cir: connect %s: %w", srcType, err)
 	}
+
+	// Phase: precheck (v1 minimal — probe only; runs after Connect so the
+	// probe's "source reachable" claim is backed by a live connection).
+	if pipelineCfg.SkipPrecheck {
+		log.Info("skipping precheck (user requested)")
+	} else {
+		if o.cpMgr != nil {
+			_ = o.cpMgr.SetPhase("precheck")
+			_ = o.cpMgr.StartPhase("precheck")
+		}
+		log.Info("Phase: 预检查 (source-cir)", zap.String("source", srcType))
+		if perr := cirPrecheck(ctx, src); perr != nil {
+			o.finishPhase("precheck", perr, false)
+			return nil, perr
+		}
+		o.finishPhase("precheck", nil, false)
+	}
+
 	cir, err := src.SchemaReader().ReadSchema(ctx, source.Filter{
 		Tables:        o.cfg.Migration.Tables,
 		ExcludeTables: o.cfg.Migration.ExcludeTables,
@@ -195,208 +254,220 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 		return nil, fmt.Errorf("source-cir: read schema: %w", err)
 	}
 
-	tidb, err := sql.Open("mysql", o.cfg.Target.DSN())
+	tidb, err := cirOpenTargetDB(o.cfg)
 	if err != nil {
 		return nil, fmt.Errorf("source-cir: open target: %w", err)
 	}
 	defer tidb.Close()
 
-	// Phase: schema (observability parity with the PG path — phase log + cpMgr).
-	if o.cpMgr != nil {
-		_ = o.cpMgr.SetPhase("schema")
-		_ = o.cpMgr.StartPhase("schema")
-		// Register the CIR tables up front (schema tables_total correct from
-		// the start), then mark them per ApplyDDL outcome.
-		names := make([]string, len(cir.Tables))
-		for i, t := range cir.Tables {
-			names[i] = t.Name
+	if pipelineCfg.SkipSchema {
+		log.Info("skipping schema migration (user requested)")
+	} else {
+		// Phase: schema (observability parity with the PG path — phase log + cpMgr).
+		if o.cpMgr != nil {
+			_ = o.cpMgr.SetPhase("schema")
+			_ = o.cpMgr.StartPhase("schema")
+			// Register the CIR tables up front (schema tables_total correct from
+			// the start), then mark them per ApplyDDL outcome.
+			names := make([]string, len(cir.Tables))
+			for i, t := range cir.Tables {
+				names[i] = t.Name
+			}
+			_ = o.cpMgr.RegisterSchemaTables(names)
 		}
-		_ = o.cpMgr.RegisterSchemaTables(names)
-	}
-	log.Info("Phase: Schema 迁移", zap.String("source", srcType))
+		log.Info("Phase: Schema 迁移", zap.String("source", srcType))
 
-	// Apply the target data policy (mirrors the PG path). Lightning local-backend
-	// requires EMPTY target tables, so drop/truncate empty them before import.
-	policy := o.cfg.Migration.TargetPolicy
-	if policy == "drop" {
-		if err := target.DropTables(ctx, tidb, cir); err != nil {
-			o.finishPhase("schema", err, false)
-			return nil, fmt.Errorf("source-cir: drop tables (policy=drop): %w", err)
+		// Apply the target data policy (mirrors the PG path). Lightning local-backend
+		// requires EMPTY target tables, so drop/truncate empty them before import.
+		policy := o.cfg.Migration.TargetPolicy
+		if policy == "drop" {
+			if err := cirDropTables(ctx, tidb, cir); err != nil {
+				o.finishPhase("schema", err, false)
+				return nil, fmt.Errorf("source-cir: drop tables (policy=drop): %w", err)
+			}
+			log.Info("source-cir: dropped target tables", zap.String("policy", policy))
 		}
-		log.Info("source-cir: dropped target tables", zap.String("policy", policy))
-	}
-	if err := target.ApplyDDL(ctx, tidb, cir); err != nil {
+		if err := cirApplyDDL(ctx, tidb, cir); err != nil {
+			if o.cpMgr != nil {
+				for _, t := range cir.Tables {
+					_ = o.cpMgr.MarkSchemaTableFailed(t.Name, err.Error())
+				}
+			}
+			o.finishPhase("schema", err, false)
+			return nil, fmt.Errorf("source-cir: apply ddl: %w", err)
+		}
 		if o.cpMgr != nil {
 			for _, t := range cir.Tables {
-				_ = o.cpMgr.MarkSchemaTableFailed(t.Name, err.Error())
+				_ = o.cpMgr.MarkSchemaTableCompleted(t.Name)
 			}
 		}
-		o.finishPhase("schema", err, false)
-		return nil, fmt.Errorf("source-cir: apply ddl: %w", err)
-	}
-	if o.cpMgr != nil {
-		for _, t := range cir.Tables {
-			_ = o.cpMgr.MarkSchemaTableCompleted(t.Name)
+		if policy == "truncate" {
+			if err := cirTruncateTables(ctx, tidb, cir); err != nil {
+				o.finishPhase("schema", err, false)
+				return nil, fmt.Errorf("source-cir: truncate tables (policy=truncate): %w", err)
+			}
+			log.Info("source-cir: truncated target tables", zap.String("policy", policy))
 		}
+		o.finishPhase("schema", nil, false)
+		log.Info("source-cir schema applied", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)))
 	}
-	if policy == "truncate" {
-		if err := target.TruncateTables(ctx, tidb, cir); err != nil {
-			o.finishPhase("schema", err, false)
-			return nil, fmt.Errorf("source-cir: truncate tables (policy=truncate): %w", err)
-		}
-		log.Info("source-cir: truncated target tables", zap.String("policy", policy))
-	}
-	o.finishPhase("schema", nil, false)
-	log.Info("source-cir schema applied", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)))
 
 	// Phase: data (#t81 Step 2 — CIR rows via DataReader -> TSV CSV -> lightning -> TiDB).
-	if o.cpMgr != nil {
-		_ = o.cpMgr.SetPhase("data")
-		_ = o.cpMgr.StartPhase("data")
-		_ = o.cpMgr.SetSubPhase("data", "data-export")
-	}
-	log.Info("Phase: 数据迁移", zap.String("source", srcType))
-	tempDir, err := os.MkdirTemp("", "timstool-cir-load-*")
-	if err != nil {
-		o.finishPhase("data", err, false)
-		return nil, fmt.Errorf("source-cir: create temp dir: %w", err)
-	}
-	defer os.RemoveAll(tempDir)
+	if pipelineCfg.SkipData {
+		log.Info("skipping data migration (user requested)")
+	} else {
+		if o.cpMgr != nil {
+			_ = o.cpMgr.SetPhase("data")
+			_ = o.cpMgr.StartPhase("data")
+			_ = o.cpMgr.SetSubPhase("data", "data-export")
+		}
+		log.Info("Phase: 数据迁移", zap.String("source", srcType))
+		tempDir, err := os.MkdirTemp("", "timstool-cir-load-*")
+		if err != nil {
+			o.finishPhase("data", err, false)
+			return nil, fmt.Errorf("source-cir: create temp dir: %w", err)
+		}
+		defer os.RemoveAll(tempDir)
 
-	// Export mode: dumpling (fast-path, concurrent+snapshot) if binary available;
-	// otherwise stream (per-row CIR DataReader → CSV). Design §3.
-	exportMode := "stream"
-	if srcType == "mysql" {
-		if bin := dumpling.FindBinary(""); bin != "" {
-			exportMode = "dumpling"
-			log.Info("source-cir: using dumpling export (fast-path)", zap.String("binary", bin))
-			// Dumpling exports CSV directly to tempDir; LoadData then imports via lightning.
-			tableNames := make([]string, len(cir.Tables))
-			for i, t := range cir.Tables {
-				tableNames[i] = o.cfg.Source.Database + "." + t.Name
+		// Export mode: dumpling (fast-path, concurrent+snapshot) if binary available;
+		// otherwise stream (per-row CIR DataReader → CSV). Design §3.
+		exportMode := "stream"
+		if srcType == "mysql" {
+			if bin := cirFindDumpling(""); bin != "" {
+				exportMode = "dumpling"
+				log.Info("source-cir: using dumpling export (fast-path)", zap.String("binary", bin))
+				// Dumpling exports CSV directly to tempDir; LoadData then imports via lightning.
+				tableNames := make([]string, len(cir.Tables))
+				for i, t := range cir.Tables {
+					tableNames[i] = o.cfg.Source.Database + "." + t.Name
+				}
+				if err := dumpling.Dump(ctx, dumpling.DumpFromConfig(o.cfg.Source, tempDir, bin, tableNames)); err != nil {
+					// Fall back to stream on dumpling failure.
+					log.Warn("source-cir: dumpling failed, falling back to stream", zap.Error(err))
+					exportMode = "stream"
+				}
+			} else {
+				log.Info("source-cir: dumpling binary not found, using stream export")
 			}
-			if err := dumpling.Dump(ctx, dumpling.DumpFromConfig(o.cfg.Source, tempDir, bin, tableNames)); err != nil {
-				// Fall back to stream on dumpling failure.
-				log.Warn("source-cir: dumpling failed, falling back to stream", zap.Error(err))
-				exportMode = "stream"
+		}
+
+		if exportMode == "stream" {
+			if err := cirLoadData(ctx, src, cir, o.cfg.Target, tempDir, func(name string, rows int64) {
+				// progress parity: each exported table feeds tables_done/rows to the UI.
+				if o.cpMgr != nil {
+					o.cpMgr.GetOrCreateTable(name, rows)
+					_ = o.cpMgr.MarkTableCompleted(name, rows)
+				}
+			}); err != nil {
+				o.finishPhase("data", err, false)
+				return nil, fmt.Errorf("source-cir: load data: %w", err)
 			}
 		} else {
-			log.Info("source-cir: dumpling binary not found, using stream export")
-		}
-	}
-
-	if exportMode == "stream" {
-		if err := target.LoadData(ctx, src, cir, o.cfg.Target, tempDir, func(name string, rows int64) {
-			// progress parity: each exported table feeds tables_done/rows to the UI.
-			if o.cpMgr != nil {
-				o.cpMgr.GetOrCreateTable(name, rows)
-				_ = o.cpMgr.MarkTableCompleted(name, rows)
+			// Dumpling produced CSVs directly; run lightning import (CSVs already in
+			// tempDir). Report real per-table row counts from the dumped CSVs so the
+			// progress layer/UI shows the true figure — the stream path gets counts
+			// from exportTableCSV's callback, but dumpling writes files directly and
+			// bypasses it, so without this the UI reports "0 rows migrated" even
+			// though Lightning loaded everything. See #t83.
+			bareTables := make([]string, len(cir.Tables))
+			for i, t := range cir.Tables {
+				bareTables[i] = t.Name
 			}
-		}); err != nil {
-			o.finishPhase("data", err, false)
-			return nil, fmt.Errorf("source-cir: load data: %w", err)
-		}
-	} else {
-		// Dumpling produced CSVs directly; run lightning import (CSVs already in
-		// tempDir). Report real per-table row counts from the dumped CSVs so the
-		// progress layer/UI shows the true figure — the stream path gets counts
-		// from exportTableCSV's callback, but dumpling writes files directly and
-		// bypasses it, so without this the UI reports "0 rows migrated" even
-		// though Lightning loaded everything. See #t83.
-		bareTables := make([]string, len(cir.Tables))
-		for i, t := range cir.Tables {
-			bareTables[i] = t.Name
-		}
-		rowCounts := dumpling.CountExportedRows(tempDir, o.cfg.Source.Database, bareTables)
-		for _, t := range cir.Tables {
-			rows := rowCounts[t.Name]
-			if o.cpMgr != nil {
-				o.cpMgr.GetOrCreateTable(t.Name, rows)
-				_ = o.cpMgr.MarkTableCompleted(t.Name, rows)
+			rowCounts := dumpling.CountExportedRows(tempDir, o.cfg.Source.Database, bareTables)
+			for _, t := range cir.Tables {
+				rows := rowCounts[t.Name]
+				if o.cpMgr != nil {
+					o.cpMgr.GetOrCreateTable(t.Name, rows)
+					_ = o.cpMgr.MarkTableCompleted(t.Name, rows)
+				}
+				log.Info("source-cir: dumpling exported table", zap.String("table", t.Name), zap.Int64("rows", rows))
 			}
-			log.Info("source-cir: dumpling exported table", zap.String("table", t.Name), zap.Int64("rows", rows))
+			if o.cpMgr != nil {
+				_ = o.cpMgr.SetSubPhase("data", "data-import")
+				// Align the coarse phase + import mode with the PG data
+				// migrator (data/migrator.go:199) so pollProgress and the
+				// phases API normalize the CIR path identically.
+				_ = o.cpMgr.SetPhase("data-import")
+				_ = o.cpMgr.SetImportMode(checkpoint.ImportModeLightning)
+			}
+			if err := cirRunLightning(ctx, tempDir, o.cfg.Target); err != nil {
+				o.finishPhase("data", err, false)
+				return nil, fmt.Errorf("source-cir: lightning import (dumpling): %w", err)
+			}
+			// CIR has no per-table import callback; one honest terminal
+			// write of N/N (same display the PG lightning path shows before
+			// its first table) — progress jumps to 100% monotonically.
+			if o.cpMgr != nil {
+				_ = o.cpMgr.SetImportedTables(len(cir.Tables))
+			}
 		}
-		if o.cpMgr != nil {
-			_ = o.cpMgr.SetSubPhase("data", "data-import")
-			// Align the coarse phase + import mode with the PG data
-			// migrator (data/migrator.go:199) so pollProgress and the
-			// phases API normalize the CIR path identically.
-			_ = o.cpMgr.SetPhase("data-import")
-			_ = o.cpMgr.SetImportMode(checkpoint.ImportModeLightning)
-		}
-		if err := target.RunLightningImport(ctx, tempDir, o.cfg.Target); err != nil {
-			o.finishPhase("data", err, false)
-			return nil, fmt.Errorf("source-cir: lightning import (dumpling): %w", err)
-		}
-		// CIR has no per-table import callback; one honest terminal
-		// write of N/N (same display the PG lightning path shows before
-		// its first table) — progress jumps to 100% monotonically.
-		if o.cpMgr != nil {
-			_ = o.cpMgr.SetImportedTables(len(cir.Tables))
-		}
+		o.finishPhase("data", nil, false)
+		log.Info("source-cir data loaded", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)), zap.String("export", exportMode))
 	}
-	o.finishPhase("data", nil, false)
-	log.Info("source-cir data loaded", zap.String("source", srcType), zap.Int("tables", len(cir.Tables)), zap.String("export", exportMode))
 
 	// Phase: validate (#t81 Step 3 + #t82 value-level). CompareMode "quick" →
 	// row-count only; otherwise value-level sample comparison (closes the
 	// "row-count green but values corrupt" hole — e.g. a bad CSV separator
 	// corrupts every value while row counts still match).
-	if o.cpMgr != nil {
-		_ = o.cpMgr.SetPhase("validate")
-		_ = o.cpMgr.StartPhase("validate")
-	}
-	log.Info("Phase: 数据验证", zap.String("source", srcType))
-	sampleSize := 0
-	if o.cfg.Compare.CompareMode != "quick" { // "" / "sample" / "checksum" → value-level
-		sampleSize = o.cfg.Compare.SampleRows
-		if sampleSize <= 0 {
-			sampleSize = 20
-		}
-	}
 	validateSuccess := true
-	type dbConn interface{ DB() *sql.DB }
-	if dc, ok := src.(dbConn); ok {
-		// F-13: validate READ sessions on both sides pin UTC
-		// (time_zone='+00:00', DSN-level so pooled semantics stay correct).
-		// The data-path pools (dc.DB() / tidb) are deliberately untouched —
-		// their wall-clock coupling with the write path is load-bearing;
-		// pinning only one side would shift writes −8h and fabricate real
-		// diffs (leader ruling seq640/641). MySQL source only; other kinds
-		// keep the legacy pools unchanged.
-		srcValDB, tgtValDB := dc.DB(), tidb
-		if srcType == "mysql" {
-			if db2, err := sql.Open("mysql", o.cfg.Source.DSNByType()); err == nil {
-				defer db2.Close()
-				srcValDB = db2
-			} else {
-				log.Warn("source-cir: pinned validate source pool failed, falling back to data pool", zap.Error(err))
-			}
-			if db2, err := sql.Open("mysql", o.cfg.Target.DSNPinnedUTC()); err == nil {
-				defer db2.Close()
-				tgtValDB = db2
-			} else {
-				log.Warn("source-cir: pinned validate target pool failed, falling back to data pool", zap.Error(err))
+	if pipelineCfg.SkipValidate {
+		log.Info("skipping validation (user requested)")
+	} else {
+		if o.cpMgr != nil {
+			_ = o.cpMgr.SetPhase("validate")
+			_ = o.cpMgr.StartPhase("validate")
+		}
+		log.Info("Phase: 数据验证", zap.String("source", srcType))
+		sampleSize := 0
+		if o.cfg.Compare.CompareMode != "quick" { // "" / "sample" / "checksum" → value-level
+			sampleSize = o.cfg.Compare.SampleRows
+			if sampleSize <= 0 {
+				sampleSize = 20
 			}
 		}
-		vr, verr := target.ValidateMigration(ctx, srcValDB, tgtValDB, cir, sampleSize)
-		if verr != nil {
-			log.Warn("source-cir: validation error", zap.Error(verr))
-			validateSuccess = false
-		} else {
-			log.Info("source-cir validation result",
-				zap.Int("tables", vr.TotalTables), zap.Int("failed", vr.FailedTables),
-				zap.Int("sample_size", sampleSize))
-			if !vr.AllPassed {
+		type dbConn interface{ DB() *sql.DB }
+		if dc, ok := src.(dbConn); ok {
+			// F-13: validate READ sessions on both sides pin UTC
+			// (time_zone='+00:00', DSN-level so pooled semantics stay correct).
+			// The data-path pools (dc.DB() / tidb) are deliberately untouched —
+			// their wall-clock coupling with the write path is load-bearing;
+			// pinning only one side would shift writes −8h and fabricate real
+			// diffs (leader ruling seq640/641). MySQL source only; other kinds
+			// keep the legacy pools unchanged.
+			srcValDB, tgtValDB := dc.DB(), tidb
+			if srcType == "mysql" {
+				if db2, err := sql.Open("mysql", o.cfg.Source.DSNByType()); err == nil {
+					defer db2.Close()
+					srcValDB = db2
+				} else {
+					log.Warn("source-cir: pinned validate source pool failed, falling back to data pool", zap.Error(err))
+				}
+				if db2, err := sql.Open("mysql", o.cfg.Target.DSNPinnedUTC()); err == nil {
+					defer db2.Close()
+					tgtValDB = db2
+				} else {
+					log.Warn("source-cir: pinned validate target pool failed, falling back to data pool", zap.Error(err))
+				}
+			}
+			vr, verr := cirValidateMigration(ctx, srcValDB, tgtValDB, cir, sampleSize)
+			if verr != nil {
+				log.Warn("source-cir: validation error", zap.Error(verr))
 				validateSuccess = false
-				for _, tv := range vr.Tables {
-					if !tv.Passed {
-						log.Warn("validation mismatch",
-							zap.String("table", tv.Name),
-							zap.Int64("source", tv.SourceRows),
-							zap.Int64("target", tv.TargetRows),
-							zap.Int("sample_checked", tv.SampleChecked),
-							zap.Int("sample_mismatches", tv.SampleMismatches))
+			} else {
+				log.Info("source-cir validation result",
+					zap.Int("tables", vr.TotalTables), zap.Int("failed", vr.FailedTables),
+					zap.Int("sample_size", sampleSize))
+				if !vr.AllPassed {
+					validateSuccess = false
+					for _, tv := range vr.Tables {
+						if !tv.Passed {
+							log.Warn("validation mismatch",
+								zap.String("table", tv.Name),
+								zap.Int64("source", tv.SourceRows),
+								zap.Int64("target", tv.TargetRows),
+								zap.Int("sample_checked", tv.SampleChecked),
+								zap.Int("sample_mismatches", tv.SampleMismatches))
+						}
 					}
 				}
 			}
@@ -406,17 +477,29 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context) ([]PipelineResult, erro
 	if o.cpMgr != nil {
 		_ = o.cpMgr.SetPhaseWithReload("completed")
 	}
-	if validateSuccess {
-		o.finishPhase("validate", nil, false)
-	} else {
-		o.finishPhase("validate", fmt.Errorf("source-cir: validation failed"), false)
+	if !pipelineCfg.SkipValidate {
+		if validateSuccess {
+			o.finishPhase("validate", nil, false)
+		} else {
+			o.finishPhase("validate", fmt.Errorf("source-cir: validation failed"), false)
+		}
 	}
 
-	return []PipelineResult{
-		{Phase: PhaseSchema, Success: true},
-		{Phase: PhaseData, Success: true},
-		{Phase: PhaseValidate, Success: validateSuccess},
-	}, nil
+	// Mirror the PG path: a result row only for phases actually executed.
+	results := make([]PipelineResult, 0, 4)
+	if !pipelineCfg.SkipPrecheck {
+		results = append(results, PipelineResult{Phase: PhasePrecheck, Success: true})
+	}
+	if !pipelineCfg.SkipSchema {
+		results = append(results, PipelineResult{Phase: PhaseSchema, Success: true})
+	}
+	if !pipelineCfg.SkipData {
+		results = append(results, PipelineResult{Phase: PhaseData, Success: true})
+	}
+	if !pipelineCfg.SkipValidate {
+		results = append(results, PipelineResult{Phase: PhaseValidate, Success: validateSuccess})
+	}
+	return results, nil
 }
 
 func (o *Orchestrator) runPrecheck(ctx context.Context) PipelineResult {
