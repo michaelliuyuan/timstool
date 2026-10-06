@@ -1,26 +1,25 @@
-// MS-10c 笔⑨姊妹锚（assessDynamicLabel.spec.ts 家族，DDL 导出面）：
-// DDL 导出页手工形区段标签采通用形「源数据库」——类型由 DataSourcePicker
-// 承载（刘源调整①同款口径），区段文案不得写死类型括注。
+// MS-10c 笔⑨姊妹锚（assessDynamicLabel.spec.ts 家族）：
+// DDL/评估/对比三页的手工形区段标签统一通用形「源数据库」——类型由
+// DataSourcePicker 承载（刘源调整①同款口径，leader seq797 ①②③ 三处顺收）。
+// 锚形约束：精确断言区段标签文本==「源数据库」，禁页面级盲扫——
+// AssessView「手工连接仅支持 PostgreSQL」hint=合法 PG-only 结构性说明字面。
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-const viewSrc = () =>
-  readFileSync(resolve(__dirname, 'DDLExportView.vue'), 'utf8')
+const srcOf = (f: string) =>
+  readFileSync(resolve(__dirname, f), 'utf8')
 
-describe('DDLExportView generic section label (MS-10c commit 9)', () => {
-  it('source section divider is generic (no type annotation)', () => {
-    const src = viewSrc()
-    expect(src).toContain('>源数据库</el-divider>')
-  })
+const genericDivider = /<el-divider content-position="left">源数据库<\/el-divider>/
+const annotatedDivider = /<el-divider[^>]*>源数据库（/
 
-  it('divider does not hardcode or ternary-dispatch a source type', () => {
-    const src = viewSrc()
-    const dividers = src.match(/<el-divider[^>]*>[^<]*<\/el-divider>/g) ?? []
-    for (const d of dividers) {
-      expect(d, `divider leaks a type: ${d}`).not.toContain('PostgreSQL')
-      expect(d, `divider leaks a type: ${d}`).not.toContain('effectiveSourceType')
-      expect(d, `divider leaks a type: ${d}`).not.toContain('（postgres')
-    }
-  })
+describe('generic source-section divider (MS-10c commit 9, sites 1-3)', () => {
+  it.each(['DDLExportView.vue', 'AssessView.vue', 'CompareView.vue'])(
+    '%s divider is exactly 源数据库 (no type annotation)',
+    (f) => {
+      const src = srcOf(f)
+      expect(src, `${f} lacks the generic divider`).toMatch(genericDivider)
+      expect(src, `${f} still has an annotated divider`).not.toMatch(annotatedDivider)
+    },
+  )
 })

@@ -237,7 +237,7 @@ function copyDDL() {
         <!-- v1: the legacy inline form stays PG-only (MS-10-FE scope) — a
              MySQL source must come in as a datasource reference above. -->
         <template v-if="!sourceRef">
-          <el-divider content-position="left">源数据库（PostgreSQL）</el-divider>
+          <el-divider content-position="left">源数据库</el-divider>
           <el-form-item>
             <div style="font-size: var(--tims-font-sm); color: var(--el-text-color-secondary); line-height: 1.6;">
               手工连接仅支持 PostgreSQL；MySQL 源请使用上方数据源引用。

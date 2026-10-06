@@ -711,7 +711,7 @@ onUnmounted(() => {
       <el-form label-width="120px" :disabled="!optionsLoaded" v-loading="!optionsLoaded">
         <el-row :gutter="24">
           <el-col :span="12">
-            <el-divider content-position="left">源数据库（{{ effectiveSourceType === 'postgres' ? 'PostgreSQL' : effectiveSourceType }}）</el-divider>
+            <el-divider content-position="left">源数据库</el-divider>
             <el-form-item label="数据源">
               <DataSourcePicker v-model="sourceRef" :types="comparePickerTypes" />
             </el-form-item>
