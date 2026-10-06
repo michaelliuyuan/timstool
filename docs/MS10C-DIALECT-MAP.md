@@ -16,7 +16,7 @@
 | procedures.sql | pg_get_functiondef | `SHOW CREATE PROCEDURE`（DDL 列 idx 2） | 同上 |
 | triggers.sql | pg_get_triggerdef | `SHOW CREATE TRIGGER`（DDL 列 idx 2） | 同上 |
 | types.sql | enum/composite/domain 三查 | **降级注记文件** | MySQL 无用户自定义类型对象 |
-| tidb-tables.sql | schema 采集+DDLBuilder 转换 | **manifest skip**（PG catalog 专用路径，MySQL 源不支持） | 不使导出失败；skip 面在 zip manifest+服务端 Warn 可见；**10c2 候选**：SHOW CREATE TABLE 结果经 mysql→TiDB 类型映射出 TiDB 转换版（候刘源点单；防「10c 完成」被误读为迁移主线 DDL 面闭环——导出面暂仅产原生形） |
+| tidb-tables.sql | schema 采集+DDLBuilder 转换 | **CIR 转换版（MS-10c2 起）**：source adapter SchemaReader 走 information_schema 入 CIR（列级 mysqlTypeMapper 已出 TiDBType）→ target `RenderCreateTable` 渲染 | 转换版可信度=覆盖率明示：1:1 passthrough 列类型（未映射 verbatim/几何族）逐类型入 manifest skip 台账（禁静默吞）；函数式索引键部按 I_S EXPRESSION 原文 verbatim 重放（见注记 7）；锚：TestMySQLTiDBTablesConversion |
 
 ## 关键语义注记
 
@@ -33,8 +33,25 @@
    四集（与 mysqlWatermarkDialect SystemSchemas 同口径，锚：TestMySQLDatabaseFilter）。
 5. **schema 语义**：MySQL 的「schema」即数据库；`NewExporter` 的 `public` 兜底是 PG-only
    （MySQL 保留调用方清单原样，锚：TestMySQLSchemaDefaultKept）。
-6. **权限面**：SHOW CREATE VIEW 需 SHOW VIEW 权、FUNCTION/PROCEDURE 需对应创建权限——
-   权限缺失走 skip() 面呈现（与 PG exporter 对象级失败同契约）。
+ 6. **权限面**：SHOW CREATE VIEW 需 SHOW VIEW 权、FUNCTION/PROCEDURE 需对应创建权限——
+    权限缺失走 skip() 面呈现（与 PG exporter 对象级失败同契约）。
+ 7. **函数式索引键部重放原文纪律（MS-10c2）**：apply/转换面 `target.renderIndexPart`
+    对键部二态——合法标识符形（`^[A-Za-z0-9_$\x{0080}-\x{FFFF}]+$`）反引号包裹，
+    其余（MySQL 8.0.13+ `information_schema.STATISTICS.EXPRESSION` 文本，如
+    `(`a` + 1)`/`(lower(`b`))`）**verbatim 裸发：禁二次包裹、禁剥括号**（I_S 原文
+    即合法 DDL）；不做 SQL parse（二态判据足够——表达式含反引号即标识符字符集外，
+    裸发即 SHOW CREATE 原语义）。重放等价锚：渲染产物过真 ApplyDDL 执行链逐字节
+    断言（TestApplyDDLReplaysFunctionalKeyPartsVerbatim，F-15 同源夹具）。
+ 8. **README 双版（MS-10c2）**：`readmeFile(schema, srcType)` 分派——PG 版（""/postgres）
+    逐字节冻结（锚：TestReadmePGByteIdentity）；MySQL 版按本 map 撰（SHOW CREATE 应用
+    序、DEFINER 原样、非原子快照、函数式索引保真、会话时区、5.7 地板、passthrough
+    台账注记；零 PG 字样，负锚只扫模板字面段、DB 名等用户数据不误伤，
+    锚：TestReadmeMySQLTemplate）。
+ 9. **TiDB 转换覆盖率台账（MS-10c2）**：MySQL 源 tidb-tables.sql 转换逐列经
+    mysqlTypeMapper（35+ case）；判定 passthrough=TiDBType 与 SourceType 逐字节相等
+    （mapper default 支 verbatim 回显=未映射）或几何族（GEOMETRY/POINT/…，拼写保留
+    但无转换语义）→ 每 schema 每类型一条 manifest skip 台账（`type:<TYPE>`），原生 1:1
+    整数族（BIGINT 等映射拼写）不入台账——大小写敏感比较区分「映射产出」与「原文回显」。
 
 ## 5.7 地板
 
