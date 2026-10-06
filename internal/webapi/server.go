@@ -2427,7 +2427,7 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 	assessor := assess.NewAssessor()
 	dims := assessor.Assess(result)
 
-	rg := assess.NewReportGenerator(dims, driver)
+	rg := assess.NewReportGenerator(dims, connCfg.SourceType())
 
 	// If HTML format requested, return HTML
 	if req.Format == "html" {

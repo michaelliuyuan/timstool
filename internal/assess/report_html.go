@@ -17,7 +17,7 @@ const htmlReportTemplate = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{{.SourceLabel}} → TiDB 兼容性评估报告</title>
+<title>{{.SourceLabelShort}} → TiDB 兼容性评估报告</title>
 <style>
 {{.ReportCSS}}
 h1 { text-align: center; color: #0C1222; margin-bottom: 8px; font-size: 28px; }

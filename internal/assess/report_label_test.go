@@ -51,12 +51,21 @@ func TestHTMLReportDynamicLabels(t *testing.T) {
 		if strings.Contains(html, "PostgreSQL") {
 			t.Errorf("mysql report leaked PostgreSQL label")
 		}
+		// P3-2: the PG short form must not leak either (title/header shape).
+		if strings.Contains(html, ">PG<") {
+			t.Errorf("mysql report leaked PG short-form label (>PG<)")
+		}
+		if strings.Contains(html, "PG →") {
+			t.Errorf("mysql report leaked PG short-form label (PG →)")
+		}
 	})
 
 	t.Run("pg legacy byte-identity", func(t *testing.T) {
 		for _, srcType := range []string{"postgres", ""} {
 			html := render(srcType)
-			if !strings.Contains(html, "<title>PostgreSQL → TiDB 兼容性评估报告</title>") {
+			// True byte-identity baseline (positive seq784, taken from 11ac509):
+			// the title keeps the legacy SHORT form.
+			if !strings.Contains(html, "<title>PG → TiDB 兼容性评估报告</title>") {
 				t.Errorf("title changed for PG source (%q)", srcType)
 			}
 			if !strings.Contains(html, "<h1>PostgreSQL → TiDB 兼容性评估报告</h1>") {
