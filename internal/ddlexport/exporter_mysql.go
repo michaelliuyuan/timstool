@@ -240,6 +240,10 @@ func (e *Exporter) mysqlTiDBTables(ctx context.Context, schemaName string) (stri
 		e.skip(schemaName, "tidb-tables.sql", schemaName, err.Error())
 		return "", 0, err
 	}
+	// Deterministic replay: sort tables by name before rendering so the
+	// same request twice renders a byte-identical tidb-tables.sql
+	// (defense on top of the reader's ORDER BY; MS-10c2 black-box note B).
+	sort.Slice(sch.Tables, func(i, j int) bool { return sch.Tables[i].Name < sch.Tables[j].Name })
 	seen := map[string]bool{}
 	var b strings.Builder
 	n := 0

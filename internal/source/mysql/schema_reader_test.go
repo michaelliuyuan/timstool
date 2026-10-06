@@ -33,18 +33,22 @@ func (idxStubConn) Begin() (driver.Tx, error)           { return nil, fmt.Errorf
 
 func (idxStubConn) QueryContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Rows, error) {
 	idxStubQuery = q
-	// The stub emulates what a REAL 8.0.13+ server returns for the
-	// COALESCE(COLUMN_NAME, EXPRESSION) select: the functional part arrives
-	// as its expression text, never NULL.
+	// The stub emulates what a REAL 8.0.13+ server returns when the two
+	// key-part columns are selected separately: plain parts carry
+	// COLUMN_NAME with EXPRESSION NULL; functional parts carry COLUMN_NAME
+	// NULL and the EXPRESSION original — in BOTH shapes seen in the wild:
+	// parenthesized (fixtures) and the deployed-server form WITHOUT outer
+	// parens (black-box seq848: lower(`a-b`)).
 	return &idxStubRows{
-		cols: []string{"INDEX_NAME", "COLUMN_NAME", "NON_UNIQUE", "SEQ_IN_INDEX"},
+		cols: []string{"INDEX_NAME", "COLUMN_NAME", "EXPRESSION", "NON_UNIQUE", "SEQ_IN_INDEX"},
 		rows: [][]driver.Value{
 			// Regular column part.
-			{"idx_a", "a", int64(1), int64(1)},
-			// Functional key part coalesced to its expression text.
-			{"idx_a", "(`a` + 1)", int64(1), int64(2)},
-			{"idx_fn", "(lower(`b`))", int64(0), int64(1)},
-			{"PRIMARY", "id", int64(0), int64(1)},
+			{"idx_a", "a", nil, int64(1), int64(1)},
+			// Functional key part, parenthesized fixture shape.
+			{"idx_a", nil, "(`a` + 1)", int64(1), int64(2)},
+			{"idx_fn", nil, "(lower(`b`))", int64(0), int64(1)},
+			{"idx_live", nil, "lower(`a-b`)", int64(1), int64(1)},
+			{"PRIMARY", "id", nil, int64(0), int64(1)},
 		},
 	}, nil
 }
@@ -83,41 +87,61 @@ var idxStubNames []string
 
 type sourceIndex = source.Index
 
-// Functional key parts must arrive as expression text (server-side
-// COALESCE), enter the Columns list, and never abort the scan; PRIMARY
-// stays skipped.
+// Functional key parts must survive the scan and arrive TYPE-AWARE
+// (MS-10c2 pen-5): COLUMN_NAME NULL ⇒ EXPRESSION original in Value with
+// IsExpression=true — including the deployed-server shape WITHOUT outer
+// parens (black-box seq848); plain columns carry IsExpression=false.
+// PRIMARY stays skipped.
 func TestReadIndexesSurvivesFunctionalKeyParts(t *testing.T) {
 	r := &schemaReader{src: &Source{}}
 	indexes, err := r.readIndexes(context.Background(), openIdxStub(t), "db1", "t1")
 	if err != nil {
 		t.Fatalf("readIndexes: %v", err)
 	}
-	if len(indexes) != 2 {
-		t.Fatalf("expected idx_a + idx_fn (PRIMARY skipped), got %+v", indexes)
+	if len(indexes) != 3 {
+		t.Fatalf("expected idx_a + idx_fn + idx_live (PRIMARY skipped), got %+v", indexes)
 	}
 	byName := map[string]sourceIndex{}
 	for _, idx := range indexes {
 		byName[idx.Name] = idx
 	}
-	if len(byName["idx_a"].Columns) != 2 || byName["idx_a"].Unique {
+	if len(byName["idx_a"].Parts) != 2 || byName["idx_a"].Unique {
 		t.Errorf("idx_a = %+v (two parts, non-unique)", byName["idx_a"])
 	}
-	if len(byName["idx_fn"].Columns) != 1 || !byName["idx_fn"].Unique {
-		t.Errorf("idx_fn = %+v (one functional part, unique)", byName["idx_fn"])
+	if byName["idx_a"].Parts[0].IsExpression || byName["idx_a"].Parts[0].Value != "a" {
+		t.Errorf("plain part must be column-flagged: %+v", byName["idx_a"].Parts[0])
 	}
-	if byName["idx_fn"].Columns[0] != "(lower(`b`))" {
-		t.Errorf("functional part must carry the expression text, got %q", byName["idx_fn"].Columns[0])
+	if !byName["idx_a"].Parts[1].IsExpression || byName["idx_a"].Parts[1].Value != "(`a` + 1)" {
+		t.Errorf("mixed functional part must be expression-flagged: %+v", byName["idx_a"].Parts[1])
+	}
+	fn := byName["idx_fn"]
+	if len(fn.Parts) != 1 || !fn.Unique {
+		t.Errorf("idx_fn = %+v (one functional part, unique)", fn)
+	}
+	if !fn.Parts[0].IsExpression || fn.Parts[0].Value != "(lower(`b`))" {
+		t.Errorf("functional part must carry the expression original with the flag, got %+v", fn.Parts[0])
+	}
+	// Deployed-server shape: EXPRESSION WITHOUT outer parens stays
+	// verbatim in Value (the renderer canonicalizes the wrapping).
+	live := byName["idx_live"]
+	if len(live.Parts) != 1 || !live.Parts[0].IsExpression || live.Parts[0].Value != "lower(`a-b`)" {
+		t.Errorf("no-paren live shape must be preserved verbatim + flagged, got %+v", live.Parts[0])
 	}
 }
 
-// SQL shape anchor: the COALESCE probe must ride the STATISTICS query.
-func TestReadIndexesSQLCoalescesFunctionalParts(t *testing.T) {
+// SQL shape anchor (pen-5): the STATISTICS query selects COLUMN_NAME and
+// EXPRESSION as SEPARATE columns — the type-aware flag is COLUMN_NAME IS
+// NULL, not a string-shape guess (the old COALESCE probe retired).
+func TestReadIndexesSelectsFunctionalPartsSeparately(t *testing.T) {
 	r := &schemaReader{src: &Source{}}
 	if _, err := r.readIndexes(context.Background(), openIdxStub(t), "db1", "t1"); err != nil {
 		t.Fatalf("readIndexes: %v", err)
 	}
-	if !strings.Contains(idxStubQuery, "COALESCE(COLUMN_NAME, EXPRESSION)") {
-		t.Errorf("STATISTICS query must coalesce functional key parts, got: %s", idxStubQuery)
+	if !strings.Contains(idxStubQuery, "INDEX_NAME, COLUMN_NAME, EXPRESSION, NON_UNIQUE, SEQ_IN_INDEX") {
+		t.Errorf("STATISTICS query must select the two key-part columns separately, got: %s", idxStubQuery)
+	}
+	if strings.Contains(idxStubQuery, "COALESCE") {
+		t.Errorf("COALESCE string-shape probe retired (pen-5), got: %s", idxStubQuery)
 	}
 	if !strings.Contains(idxStubQuery, "TABLE_SCHEMA = ?") {
 		t.Errorf("STATISTICS query must stay parameterized, got: %s", idxStubQuery)

@@ -88,7 +88,7 @@ func RenderCreateTable(t source.Table) string {
 		b.WriteString("INDEX ")
 		b.WriteString(QuoteIdent(idx.Name))
 		b.WriteString(" (")
-		for i, part := range idx.Columns {
+		for i, part := range idx.Parts {
 			if i > 0 {
 				b.WriteString(", ")
 			}
@@ -133,23 +133,26 @@ func writeIdentList(b *strings.Builder, names []string) {
 	}
 }
 
-// renderIndexPart renders one index key part. Functional parts (MySQL
-// 80.13+ information_schema.STATISTICS EXPRESSION text) always arrive in
-// parenthesized form — "(lower(`b`))" — and are emitted VERBATIM (no
-// re-wrap, no paren strip: the I_S original is already valid DDL, the
-// rendered output must replay it byte-for-byte). Everything else — plain
-// column names INCLUDING legal-but-non-bare reference identifiers like
-// "my col" or "a-b" — is backtick-quoted (MS-10c2 P2 c-fix: the earlier
-// character-class allowlist misclassified those as expressions and
-// emitted invalid DDL). A pathological column literally starting with "("
-// but not ending with ")" quotes as an identifier; a bare "()" would
-// verbatim-replay, but no scanner produces that shape.
-func renderIndexPart(b *strings.Builder, part string) {
-	if strings.HasPrefix(part, "(") && strings.HasSuffix(part, ")") {
-		b.WriteString(part)
+// renderIndexPart renders one index key part, driven by the type-aware
+// IsExpression flag (MS-10c2 pen-5): expression parts replay their
+// information_schema EXPRESSION original verbatim, wrapped in exactly one
+// paren pair if the server emitted it WITHOUT outer parens (the deployed
+// I_S shape, black-box seq848 — SHOW CREATE canonical form is "(expr)";
+// the paren-shape string test survives ONLY inside this branch as the
+// wrap de-dup defense, never overriding the flag). Column parts are
+// backtick-quoted REGARDLESS of their string shape — which dissolves the
+// pathological "(x)" column-name family (a column named "(x)" is
+// unbuildable in practice and previously loud-failed anyway).
+func renderIndexPart(b *strings.Builder, part source.IndexPart) {
+	if part.IsExpression {
+		expr := part.Value
+		if !(strings.HasPrefix(expr, "(") && strings.HasSuffix(expr, ")")) {
+			expr = "(" + expr + ")"
+		}
+		b.WriteString(expr)
 		return
 	}
-	b.WriteString(QuoteIdent(part))
+	b.WriteString(QuoteIdent(part.Value))
 }
 
 // QuoteIdent quotes a TiDB/MySQL identifier with backticks (doubled internally).

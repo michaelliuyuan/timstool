@@ -35,17 +35,19 @@
    （MySQL 保留调用方清单原样，锚：TestMySQLSchemaDefaultKept）。
  6. **权限面**：SHOW CREATE VIEW 需 SHOW VIEW 权、FUNCTION/PROCEDURE 需对应创建权限——
     权限缺失走 skip() 面呈现（与 PG exporter 对象级失败同契约）。
- 7. **函数式索引键部重放原文纪律（MS-10c2）**：apply/转换面 `target.renderIndexPart`
-    对键部二态——**括号形判别**（I_S EXPRESSION 恒 `(…)` 形）：`(` 起 `)` 止 →
-    verbatim 裸发（禁二次包裹、禁剥括号——I_S 原文即合法 DDL）；**其余一律反引号
-    包裹**（含 `my col`/`a-b` 等合法引用标识符非裸形——首版字符类白名单曾把此类
-    误判为表达式直发无效 DDL，P2 c-fix 回归；pathological `(` 开头列名不成对→按
-    标识符包裹记档；**成对 `(x)` 怪形列名同档记档**：判据会走 verbatim →TiDB
-    响错拒绝（loud-fail 非静默）——不加剥括号 inner 判别（真功能形简单括号化
-    `(a)` 的 inner 恰为 plain 标识符，剥判会误伤可达形，裁定 seq831 记档不修））。
-    重放等价锚：渲染产物过真 ApplyDDL 执行链逐字节断言
-    （TestApplyDDLReplaysFunctionalKeyPartsVerbatim，F-15 同源夹具）；PG 恒等锚
-    =idx.Columns 全列名 quote 与旧 writeIdentList 同值（TestRenderIndexPartPGParity）。
+ 7. **函数式索引键部重放原文纪律（MS-10c2 笔⑤ flag 路线）**：键部**类型感知 flag 驱动**——
+    scan 侧 `information_schema.STATISTICS` 分选 COLUMN_NAME/EXPRESSION 两列，
+    `COLUMN_NAME IS NULL` ⇒ `IndexPart{IsExpression:true}`（10b IsExpression 探针同源；
+    旧 COALESCE 字符串形探针退役——黑盒 seq848 实证部署版 I_S EXPRESSION 可**无外括号**
+    `lower(\`a-b\`)` 形，字符串启发不可辨）；渲染 `target.renderIndexPart`：
+    expression→EXPRESSION 原文 verbatim + **外括号 ensure-wrap**（未括号形补一层 `(...)`，
+    SHOW CREATE 规范可建形；首尾字符串判据降级为该分支内 wrap 去重防御层）；
+    column→**一律反引号包裹（与形无关）**——`(x)` 成对怪形列名病理族随之自然消解
+    （flag 路线副产物）。重放等价锚：渲染产物过真 ApplyDDL 执行链逐字节断言
+    （TestApplyDDLReplaysFunctionalKeyPartsVerbatim，含无外括号 live 形 wrap 规范式）；
+    PG 恒等锚=idx 键部全列名 quote 与旧 writeIdentList 同值（TestRenderIndexPartPGParity）。
+    注：tidb-tables.sql 渲染前按表名排序（stub 乱序入→名字序出+两跑逐字节锚），
+    GEOMETRY 等无 TiDB 型=台账记档不修（注记 9 覆盖）。
  8. **README 双版（MS-10c2）**：`readmeFile(schema, srcType)` 分派——PG 版（""/postgres）
     逐字节冻结（锚：TestReadmePGByteIdentity）；MySQL 版按本 map 撰（SHOW CREATE 应用
     序、DEFINER 原样、非原子快照、函数式索引保真、会话时区、5.7 地板、passthrough

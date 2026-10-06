@@ -176,12 +176,19 @@ func (r *schemaReader) readColumns(ctx context.Context, db *sql.DB, database, ta
 	return columns, pk, rows.Err()
 }
 
+// readIndexes walks STATISTICS with COLUMN_NAME and EXPRESSION selected
+// SEPARATELY (MS-10c2 pen-5): the functional-key-part flag is
+// COLUMN_NAME IS NULL — a type-aware signal, replacing the earlier
+// COALESCE string-shape probe that could not tell a non-parenthesized
+// expression (lower(`a-b`), the deployed-server I_S shape) from a legal
+// column name.
 func (r *schemaReader) readIndexes(ctx context.Context, db *sql.DB, database, table string) ([]source.Index, error) {
 	query := `
-		SELECT INDEX_NAME, COALESCE(COLUMN_NAME, EXPRESSION), NON_UNIQUE, SEQ_IN_INDEX
+		SELECT INDEX_NAME, COLUMN_NAME, EXPRESSION, NON_UNIQUE, SEQ_IN_INDEX
 		FROM information_schema.STATISTICS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-		ORDER BY INDEX_NAME, SEQ_IN_INDEX`
+		ORDER BY INDEX_NAME, SEQ_IN_INDEX
+	`
 
 	rows, err := db.QueryContext(ctx, query, database, table)
 	if err != nil {
@@ -193,13 +200,14 @@ func (r *schemaReader) readIndexes(ctx context.Context, db *sql.DB, database, ta
 		name   string
 		unique bool
 	}
-	idxMap := make(map[idxKey][]string)
+	idxMap := make(map[idxKey][]source.IndexPart)
 	var idxOrder []idxKey
 
 	for rows.Next() {
-		var idxName, colName string
+		var idxName string
+		var colName, expr sql.NullString
 		var nonUnique, seq int
-		if err := rows.Scan(&idxName, &colName, &nonUnique, &seq); err != nil {
+		if err := rows.Scan(&idxName, &colName, &expr, &nonUnique, &seq); err != nil {
 			return nil, err
 		}
 		// Skip PRIMARY (already in PK column list from readColumns)
@@ -210,18 +218,34 @@ func (r *schemaReader) readIndexes(ctx context.Context, db *sql.DB, database, ta
 		if _, exists := idxMap[key]; !exists {
 			idxOrder = append(idxOrder, key)
 		}
-		idxMap[key] = append(idxMap[key], colName)
+		idxMap[key] = append(idxMap[key], source.IndexPart{
+			Value:        exprString(colName, expr),
+			IsExpression: !colName.Valid,
+		})
 	}
 
 	var indexes []source.Index
 	for _, key := range idxOrder {
 		indexes = append(indexes, source.Index{
-			Name:    key.name,
-			Columns: idxMap[key],
-			Unique:  key.unique,
+			Name:   key.name,
+			Parts:  idxMap[key],
+			Unique: key.unique,
 		})
 	}
 	return indexes, rows.Err()
+}
+
+// exprString picks the key-part text: the plain column name when present,
+// otherwise the EXPRESSION original (verbatim, parens or not — the
+// renderer canonicalizes the wrapping).
+func exprString(colName, expr sql.NullString) string {
+	if colName.Valid {
+		return colName.String
+	}
+	if expr.Valid {
+		return expr.String
+	}
+	return ""
 }
 
 // schemaReader is the MySQL SchemaReader implementation.

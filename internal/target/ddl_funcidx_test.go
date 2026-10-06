@@ -31,15 +31,22 @@ func TestRenderCreateTableFunctionalKeyParts(t *testing.T) {
 		},
 		PK: []string{"a"},
 		Indexes: []source.Index{
-			// Mixed parts: plain identifier + F-15 expression shapes.
-			{Name: "idx_a", Columns: []string{"a", f15ExprArith}},
-			{Name: "idx_fn", Columns: []string{f15ExprLower}, Unique: true},
+			// Mixed parts: plain identifier + F-15 expression shapes
+			// (paren fixture form).
+			{Name: "idx_a", Parts: []source.IndexPart{
+				{Value: "a"}, {Value: f15ExprArith, IsExpression: true},
+			}},
+			// Deployed-server live shape: EXPRESSION WITHOUT outer parens
+			// (black-box seq848) — the renderer must ensure the wrap.
+			{Name: "idx_fn", Unique: true, Parts: []source.IndexPart{
+				{Value: "lower(`a-b`)", IsExpression: true},
+			}},
 		},
 	}
 	got := RenderCreateTable(tbl)
 	wants := []string{
 		"INDEX `idx_a` (`a`, (`a` + 1))",
-		"UNIQUE INDEX `idx_fn` ((lower(`b`)))",
+		"UNIQUE INDEX `idx_fn` ((lower(`a-b`)))",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
@@ -61,31 +68,41 @@ func TestRenderCreateTableFunctionalKeyParts(t *testing.T) {
 // character-class allowlist verbatim-emitted them as broken DDL). Only
 // the parenthesized EXPRESSION shape verbatim-replays.
 func TestRenderIndexPartQuotedNonBareIdentifiers(t *testing.T) {
-	cases := map[string]string{
-		"my col": "`my col`", // legal quoted identifier (space) — NOT an expression
-		"a-b":    "`a-b`",    // hyphen: verbatim would parse as subtraction
-		"123abc": "`123abc`", // digit-leading bare form
-		"(abc":   "`(abc`",   // pathological paren prefix, unbalanced -> identifier
-		"col":    "`col`",    // plain column
+	cases := []struct {
+		part source.IndexPart
+		want string
+	}{
+		// Column-flagged parts quote REGARDLESS of string shape — the
+		// pathological "(x)" family dissolves (flag路线, pen-5).
+		{source.IndexPart{Value: "my col"}, "`my col`"},
+		{source.IndexPart{Value: "a-b"}, "`a-b`"},
+		{source.IndexPart{Value: "123abc"}, "`123abc`"},
+		{source.IndexPart{Value: "(abc"}, "`(abc`"},
+		{source.IndexPart{Value: "(x)"}, "`(x)`"},
+		{source.IndexPart{Value: "col"}, "`col`"},
+		// Expression-flagged: parens ensured exactly once (both shapes —
+		// wrap de-dup is the surviving string-test defense layer).
+		{source.IndexPart{Value: "lower(`a-b`)", IsExpression: true}, "(lower(`a-b`))"},
+		{source.IndexPart{Value: "(lower(`b`))", IsExpression: true}, "(lower(`b`))"},
 	}
-	for part, want := range cases {
+	for _, tc := range cases {
 		var b strings.Builder
-		renderIndexPart(&b, part)
-		if got := b.String(); got != want {
-			t.Errorf("renderIndexPart(%q) = %q, want %q", part, got, want)
+		renderIndexPart(&b, tc.part)
+		if got := b.String(); got != tc.want {
+			t.Errorf("renderIndexPart(%+v) = %q, want %q", tc.part, got, tc.want)
 		}
 	}
 }
 
-// TestRenderIndexPartPGParity pins the PG-identity face: index Columns
-// from the PG collector are plain column names, so every part renders
-// quoted — the exact bytes the pre-MS-10c2 writeIdentList produced.
+// TestRenderIndexPartPGParity pins the PG-identity face: index parts from
+// the PG collector are plain column names, so every part renders quoted —
+// the exact bytes the pre-MS-10c2 writeIdentList produced.
 func TestRenderIndexPartPGParity(t *testing.T) {
 	got := RenderCreateTable(source.Table{
 		Name:    "tp",
 		Columns: []source.Column{{Name: "id", TiDBType: "BIGINT"}},
 		PK:      []string{"id"},
-		Indexes: []source.Index{{Name: "ix", Columns: []string{"user_name", "data"}}},
+		Indexes: []source.Index{{Name: "ix", Parts: []source.IndexPart{{Value: "user_name"}, {Value: "data"}}}},
 	})
 	if !strings.Contains(got, "INDEX `ix` (`user_name`, `data`)") {
 		t.Errorf("PG-collector index parts must render fully quoted (writeIdentList parity):\n%s", got)
@@ -137,7 +154,9 @@ func TestApplyDDLReplaysFunctionalKeyPartsVerbatim(t *testing.T) {
 				{Name: "b", TiDBType: "VARCHAR(50)", Nullable: true},
 			},
 			Indexes: []source.Index{
-				{Name: "idx_fn", Columns: []string{f15ExprLower}},
+				{Name: "idx_fn", Parts: []source.IndexPart{{Value: f15ExprLower, IsExpression: true}}},
+				// Live no-paren shape replays wrap-canonicalized (pen-5).
+				{Name: "idx_live", Parts: []source.IndexPart{{Value: "lower(`a-b`)", IsExpression: true}}},
 			},
 		}},
 	}
@@ -160,5 +179,10 @@ func TestApplyDDLReplaysFunctionalKeyPartsVerbatim(t *testing.T) {
 	}
 	if i+len(f15ExprLower) < len(executed) && executed[i+len(f15ExprLower)] == '`' {
 		t.Errorf("expression was backtick-wrapped after the original:\n%s", executed)
+	}
+	// Live shape: the no-paren EXPRESSION original replays with exactly
+	// one ensured paren pair (SHOW CREATE canonical, TiDB-buildable).
+	if !strings.Contains(executed, "INDEX `idx_live` ((lower(`a-b`)))") {
+		t.Errorf("no-paren live shape must replay wrap-canonicalized:\n%s", executed)
 	}
 }

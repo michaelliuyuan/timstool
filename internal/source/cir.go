@@ -45,9 +45,24 @@ type Column struct {
 
 // Index is a DB-neutral index definition.
 type Index struct {
-	Name    string
-	Columns []string
-	Unique  bool
+	Name   string
+	Parts  []IndexPart
+	Unique bool
+}
+
+// IndexPart is one ordered index key part. A plain column reference
+// carries IsExpression=false; a functional key part (MySQL 8.0.13+
+// information_schema STATISTICS: COLUMN_NAME IS NULL, EXPRESSION holds
+// the text) carries IsExpression=true with the EXPRESSION original in
+// Value — which may arrive WITHOUT outer parens depending on server
+// build, so the renderer wraps expression parts in one paren pair (the
+// SHOW CREATE canonical shape). The flag travels with the part because
+// string-shape heuristics cannot distinguish a non-parenthesized
+// expression like lower(`a-b`) from a legal column name (MS-10c2 black-
+// box finding; leader ruling: type-aware flag, no more string guessing).
+type IndexPart struct {
+	Value        string
+	IsExpression bool
 }
 
 // View is a DB-neutral view definition (definition is source SQL; may need

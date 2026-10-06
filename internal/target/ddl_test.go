@@ -17,8 +17,8 @@ func TestRenderCreateTable(t *testing.T) {
 		},
 		PK: []string{"id"},
 		Indexes: []source.Index{
-			{Name: "idx_name", Columns: []string{"name"}},
-			{Name: "uk_email", Columns: []string{"email"}, Unique: true},
+			{Name: "idx_name", Parts: []source.IndexPart{{Value: "name"}}},
+			{Name: "uk_email", Parts: []source.IndexPart{{Value: "email"}}, Unique: true},
 		},
 	}
 	got := RenderCreateTable(tbl)

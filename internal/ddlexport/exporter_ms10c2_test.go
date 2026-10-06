@@ -86,15 +86,26 @@ func (c *convConn) Prepare(string) (driver.Stmt, error) { return nil, fmt.Errorf
 func (c *convConn) Close() error                        { return nil }
 func (c *convConn) Begin() (driver.Tx, error)           { return nil, fmt.Errorf("not implemented") }
 
-func (c *convConn) QueryContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Rows, error) {
+func (c *convConn) QueryContext(_ context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
 	c.queries = append(c.queries, q)
 	switch {
 	case strings.Contains(q, "information_schema.STATISTICS"):
-		return &convRows{cols: []string{"INDEX_NAME", "COLUMN_NAME", "NON_UNIQUE", "SEQ_IN_INDEX"}, rows: [][]driver.Value{
-			{"idx_fn", "(lower(`b`))", int64(1), int64(1)},
-			{"PRIMARY", "id", int64(0), int64(1)},
+		return &convRows{cols: []string{"INDEX_NAME", "COLUMN_NAME", "EXPRESSION", "NON_UNIQUE", "SEQ_IN_INDEX"}, rows: [][]driver.Value{
+			{"idx_fn", nil, "lower(`b`)", int64(1), int64(1)},
+			{"PRIMARY", "id", nil, int64(0), int64(1)},
 		}}, nil
 	case strings.Contains(q, "information_schema.COLUMNS"):
+		// Per-table answer keyed on the second placeholder (TABLE_NAME).
+		tbl := ""
+		if len(args) > 1 {
+			tbl = fmt.Sprintf("%v", args[1].Value)
+		}
+		if tbl == "t0" {
+			return &convRows{cols: []string{"COLUMN_NAME", "DATA_TYPE", "COLUMN_TYPE", "IS_NULLABLE", "COLUMN_DEFAULT",
+				"EXTRA", "COLUMN_COMMENT", "NUMERIC_PRECISION", "NUMERIC_SCALE", "COLUMN_KEY", "DATETIME_PRECISION"}, rows: [][]driver.Value{
+				{"z", "int", "int(11)", "NO", nil, "", nil, int64(11), int64(0), "PRI", nil},
+			}}, nil
+		}
 		return &convRows{cols: []string{"COLUMN_NAME", "DATA_TYPE", "COLUMN_TYPE", "IS_NULLABLE", "COLUMN_DEFAULT",
 			"EXTRA", "COLUMN_COMMENT", "NUMERIC_PRECISION", "NUMERIC_SCALE", "COLUMN_KEY", "DATETIME_PRECISION"}, rows: [][]driver.Value{
 			{"id", "bigint", "bigint", "NO", nil, "", nil, int64(20), int64(0), "PRI", nil},
@@ -102,7 +113,9 @@ func (c *convConn) QueryContext(_ context.Context, q string, _ []driver.NamedVal
 			{"loc", "geometry", "geometry", "YES", nil, "", nil, nil, nil, nil, nil},
 		}}, nil
 	case strings.Contains(q, "information_schema.TABLES"):
-		return &convRows{cols: []string{"TABLE_NAME"}, rows: [][]driver.Value{{"t1"}}}, nil
+		// Deliberately NOT name-ordered: the exporter must sort before
+		// rendering (deterministic replay, black-box note B).
+		return &convRows{cols: []string{"TABLE_NAME"}, rows: [][]driver.Value{{"t1"}, {"t0"}}}, nil
 	}
 	return nil, fmt.Errorf("unexpected query: %s", q)
 }
@@ -202,19 +215,37 @@ func TestMySQLTiDBTablesConversion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mysqlTiDBTables: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("converted %d tables, want 1", n)
+	if n != 2 {
+		t.Fatalf("converted %d tables, want 2 (t1 + t0)", n)
 	}
 	wants := []string{
 		"CREATE TABLE IF NOT EXISTS `t1`",
 		"`id` BIGINT NOT NULL",
 		"`b` VARCHAR(50)",
+		// Live no-paren EXPRESSION shape replays wrap-canonicalized (pen-5).
 		"INDEX `idx_fn` ((lower(`b`)))",
+		// Second stub table also converted.
+		"CREATE TABLE IF NOT EXISTS `t0`",
+		"`z` INT NOT NULL",
 	}
 	for _, w := range wants {
 		if !strings.Contains(ddl, w) {
 			t.Errorf("tidb-tables.sql missing %q\ngot:\n%s", w, ddl)
 		}
+	}
+	// Deterministic replay (note B): the stub yields tables NOT in name
+	// order; the render must be name-sorted (t0 before t1) and two runs
+	// over the same data render byte-identical output.
+	if strings.Index(ddl, "`t0`") > strings.Index(ddl, "`t1`") {
+		t.Errorf("tables must render in name order:\n%s", ddl)
+	}
+	e2 := NewExporter(openConvDB(t, &convConn{}), Options{SourceType: "mysql"})
+	ddl2, _, err := e2.mysqlTiDBTables(context.Background(), "db1")
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if ddl2 != ddl {
+		t.Errorf("two runs over identical data must be byte-identical:\n1:\n%s\n2:\n%s", ddl, ddl2)
 	}
 	// Coverage ledger: geometry passed through 1:1 — one skip entry per
 	// distinct type, nothing silently swallowed.
