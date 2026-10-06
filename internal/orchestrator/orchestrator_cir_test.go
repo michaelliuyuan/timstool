@@ -18,7 +18,8 @@ import (
 )
 
 // fakeCIRSource is a source.Source that reports one table and touches
-// nothing else. It deliberately does NOT implement DB() *sql.DB.
+// nothing else. It implements DB() with a lazy handle (the validate wiring
+// requires the dbConn probe; every consumer seam is replaced).
 type fakeCIRSource struct{ closed bool }
 
 func (f *fakeCIRSource) Name() string                      { return "mysql" }

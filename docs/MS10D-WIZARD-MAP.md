@@ -31,7 +31,7 @@ Orchestrator.Run(pipelineCfg)
 
 - InitPhases 种子=Run 入口 pipelineCfg 真值；「precheck:true」override 已废除（未设开关不再显 skipped——静默谎 bug 类根除）。
 - result 语义镜像 PG：只列实际执行 phase。
-- precheck 失败=中止（镜像 PG 路语义）；OnErrorContinue 不豁免 precheck（与 PG 路 runPrecheck 行为一致）。
+- **precheck 失败语义（与 PG 路真差异记档，adversarial P2-b+positive concur）**：source-CIR 路 precheck 失败**无条件硬停**（return err）；PG 路 OnErrorContinue=true 可豁免续跑（Run:147）。差异仅 CLI 可达——webapi 建任务硬编码 OnError="abort" 且不设 OnErrorContinue。候点单池「CIR/PG 语义对齐批」：豁免对齐（续跑+result 行 Success=false 非静默绿）。
 - FE 零分域（裁定 b）：四开关全源有效；skip_precheck 对 MySQL=真跳探活。
 
 ## precheck v1 口径（裁定 a 最小形）
@@ -50,3 +50,4 @@ cirOpenSource/cirOpenTargetDB/cirApplyDDL/cirLoadData/cirRunLightning/cirDropTab
 3. **CDC gate**：WizardView cdc_chain postgres-only（CapCDC false 守卫，CDCView:65 邻面同批不扩刀）——CDC epic 域。
 4. **scoped-CSS hash 机理**（笔②实证）：`data-v-*` 派生 SFC 源内容——**改模板文案亦变 CSS hash**（10b2「CSS 不变」先例的机理边界：彼次未动 WizardView SFC）；字节数恒 382,885、样式语义零变（唯 data-v 段 byte-diff）。
 5. **dumpling.Dump 未 seam**：dumpling 快路仅 mysql+二进制在场时进入，锚以 cirFindDumpling="" 强制 stream 路；快路真库验证归黑盒。
+6. **全 skip 非零 I/O（adversarial P2-a+positive concur，真差异记档）**：四开关全开仍无条件 source.Open+Connect+ReadSchema+cirOpenTargetDB（CIR=未跳相位执行计划），且 **ReadSchema 失败硬停**（「验源后空跑」非谎——phases 显 skipped 如实）；PG 路全 skip=纯零 I/O 空跑。**候点单池「CIR/PG 语义对齐批」**：全 skip 短路早退（牵 phase result 语义与 UI phases 展示，刀大于 docs）。
