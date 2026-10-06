@@ -26,3 +26,29 @@
 5. **大库/无分页（P2）**：九扫描器串行全量 I_S 扫，挂 chi 120s 组单 ctx；九条查询非单事务（并发 DDL 下跨维非原子快照）。v1 典型规模护栏：建议 ≤ 数万列级。
 6. **5.7 地板**：IS_VISIBLE 为 8.0+ 列（沿 MS-10a 尾批池同项）；**EXPRESSION 同限**（F-15 笔③：schema_reader readIndexes 的 `COALESCE(COLUMN_NAME, EXPRESSION)` 同为 8.0+ 地板，沿 IS_VISIBLE 同项——5.7 无函数式索引故 COLUMN_NAME 恒非 NULL，但查询引用 EXPRESSION 列本身在 5.7 报错；产品 MySQL 面宣称 8.0.x）。
 7. **SET SESSION 亲缘（P2，adversarial 增量票记档）**：`group_concat_max_len` 会话钉扎依赖 database/sql 池的隐式行为（handler 私有 srcDB+顺序单 goroutine→LIFO 单连接复用=实际有效）——**非 API 保证**，未来并行化/复用池即失效；改进=`db.SetMaxOpenConns(1)` 显式钉死或维持假设记档。
+
+## MS-10b2 校准裁定落档（基线 3259197；笔①1e588dc/笔②ce4379a/笔③7f975de）
+
+> 9 项裁定（裁①-⑨）+ 渲染口径（裁③ FE 面）落地记档；本节为权威口径字典，报告/代码/文档三方共源。
+
+### 项级映射
+
+| 项 | 落点 | 口径 |
+|---|---|---|
+| ① 视图方言 | checker.go viewDialectDetail | PG-only 方言词 **7 词子集**（裁定 :269）；MySQL 源视图定义只匹配该子集（WHERE/OR/JOIN 等 PG/MySQL 共有词不算方言），命中记 PG 方言风险；文案 seam=「PostgreSQL（口径：TiDB 目标兼容性）」 |
+| ② 类型分级 | checker.go checkDataTypesMySQL | **mysql.NewTypeMapper 共享真源**（source/mysql）：恒等族（int/bigint/varchar/…/MEDIUMINT/YEAR）=Convertible（YEAR 注记 1:1 保留语义差异，非恒等）；bool/real/text 族+blob 族=Convertible（良性转换）；geometry/未知=ManualNeeded；九维分级锚=checker_ms10b2_test.go |
+| ③ N/A 三态 | types.go Applicable *bool omitempty | 空集维（如 MySQL 源的 enums/extensions/sequences）→markApplicability 标 N/A+Score 0；聚合分子分母同剔 N/A 权重（全维 N/A 时分母=剩余权重和，全适用时=1.0 无痕）；PG 报告 JSON 键零出现=逐字节恒等 |
+| ④ 口径行 | report.go CaliberLine | PG 源：「PostgreSQL（口径：TiDB 目标兼容性）」；MySQL 源：「MySQL（口径：TiDB 目标兼容性）」；HTML/JSON 双面 |
+| ⑤ schema 兜底 | scanner_mysql.go | newMySQLScanner 空 schema **fail-loud**（errSchemaRequired）——「public」兜底移除（上文边界 4 关闭）；HTTP 级 400 锚=webapi assessSchemaRejected（TrimSpace 封尾空白绕过形） |
+| ⑥ 快照原子性 | scanner_mysql.go BeginTx | 九扫描器单 tx 快照（修边界 5 非原子项）；maxScanObjects=20000 护栏（件门超限拒） |
+| ⑦ AutoIncr 探针 | checker.go IsAutoIncr | EXTRA 列探针 `auto_increment` →结构维标注 |
+| ⑧ 系统库集 | source/mysql SystemDatabases | 上提共享真源；ddlexport 改引；webapi 400 guard |
+| ⑨ 池钉扎 | scanner_mysql.go | SetMaxOpenConns(1)+Stats() save/restore（边界 7 关闭：会话变量钉扎由隐式→显式） |
+| ③ FE | AssessView.vue | `applicable === false` 精确三态判→灰卡「N/A 不适用」#9AA3AF+进度条 v-else 不可达+兼容性列「—」；缺省键=适用零扰（PG 恒等）；FE 不重算聚合（report.score 后端已归一） |
+
+### Latent 记档（非阻断）
+
+- **HTTP 400 断言留黑盒**（seq881 采信）：assess guard 的 handler 无 stub 源连接基建，HTTP 级 400 真源断言记黑盒工单（真隧道单例接管演练同批）。
+- **5.7 地板沿边界 6**：EXPRESSION/IS_VISIBLE 8.0+ 限不改（产品 MySQL 面宣称 8.0.x）。
+- **视图 DDL 降级空沿表 1**：不付 per-view SHOW CREATE VIEW 往返（笔①未改此面）。
+- **group_concat 截断沿边界 3**（笔⑨池钉扎后仍会话内有效，上限默认 1024 不变）。
