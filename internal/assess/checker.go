@@ -3,15 +3,31 @@ package assess
 import (
 	"fmt"
 	"strings"
+
+	"github.com/michaelliuyuan/timstool/internal/source/mysql"
 )
 
-// Assessor runs all compatibility checks on a ScanResult.
-type Assessor struct{}
+// Assessor runs all compatibility checks on a ScanResult. The srcKind
+// (MS-10b2) calibrates the checker wording/mappings per source dialect:
+// "" keeps the legacy PG-calibrated behavior byte-identical (PG parity
+// anchor), "mysql" routes the source-aware branches.
+type Assessor struct {
+	srcKind string
+}
 
-// NewAssessor creates a new Assessor.
+// NewAssessor creates a new PG-calibrated Assessor (legacy shape).
 func NewAssessor() *Assessor {
 	return &Assessor{}
 }
+
+// NewAssessorFor creates an Assessor calibrated for the given source kind
+// (the routed driver name; unknown/empty kinds keep the PG calibration).
+func NewAssessorFor(kind string) *Assessor {
+	return &Assessor{srcKind: kind}
+}
+
+// isMySQL reports whether the checker runs the MySQL-calibrated branches.
+func (a *Assessor) isMySQL() bool { return a.srcKind == "mysql" }
 
 // Assess runs all checkers and returns dimension results.
 func (a *Assessor) Assess(result *ScanResult) []DimensionResult {
@@ -65,6 +81,9 @@ func (s *scorer) result(dimension string) DimensionResult {
 // --- Data Types Checker ---
 
 func (a *Assessor) checkDataTypes(result *ScanResult) DimensionResult {
+	if a.isMySQL() {
+		return a.checkDataTypesMySQL(result)
+	}
 	s := &scorer{}
 
 	for _, col := range result.Columns {
@@ -291,6 +310,128 @@ func (a *Assessor) checkDataTypes(result *ScanResult) DimensionResult {
 	return s.result(DimDataType)
 }
 
+// mysqlTypeBase normalizes a lower-cased MySQL DATA_TYPE value to its base
+// name: strips the (...) argument clause and the UNSIGNED/SIGNED suffix so
+// "decimal(10,2) unsigned" grades as DECIMAL.
+func mysqlTypeBase(dt string) string {
+	base := dt
+	if idx := strings.IndexByte(base, '('); idx >= 0 {
+		base = base[:idx]
+	}
+	base = strings.TrimSpace(base)
+	base = strings.TrimSuffix(base, " unsigned")
+	base = strings.TrimSuffix(strings.TrimSpace(base), " signed")
+	return strings.TrimSpace(base)
+}
+
+// mysqlCompatibleBases are the MySQL DATA_TYPE bases that map to TiDB 1:1
+// (same type family, at most argument normalization like DECIMAL(10,2)).
+var mysqlCompatibleBases = map[string]bool{
+	"tinyint": true, "smallint": true, "int": true, "integer": true,
+	"bigint": true, "float": true, "double": true,
+	"decimal": true, "numeric": true, "dec": true, "fixed": true,
+	"char": true, "varchar": true, "binary": true, "varbinary": true,
+	"date": true, "time": true, "datetime": true, "timestamp": true,
+	"json": true, "bit": true, "text": true, "blob": true,
+	"enum": true, "set": true,
+}
+
+// checkDataTypesMySQL is the MS-10b2 item-2 calibration: MySQL native
+// types grade via the shared mysqlTypeMapper truth instead of falling
+// into the PG switch's conservative "需评估" default. Grading contract
+// (seq840): mapper-identity = Compatible; MEDIUMINT→INT / YEAR =
+// Convertible (conversion noted); geometry / unknown = ManualNeeded.
+func (a *Assessor) checkDataTypesMySQL(result *ScanResult) DimensionResult {
+	s := &scorer{}
+	tm := mysql.NewTypeMapper()
+
+	for _, col := range result.Columns {
+		dt := strings.ToLower(strings.TrimSpace(col.DataType))
+		base := mysqlTypeBase(dt)
+		objName := fmt.Sprintf("%s.%s.%s", col.TableSchema, col.TableName, col.ColumnName)
+		mapped := tm.MapType(col.DataType, col.NumericPrec, col.NumericScale).Name
+
+		switch {
+		case base == "geometry" || base == "point" || base == "linestring" ||
+			base == "polygon" || base == "multipoint" || base == "multilinestring" ||
+			base == "multipolygon" || base == "geometrycollection":
+			s.add(Finding{
+				Dimension: DimDataType, ObjectType: "column",
+				ObjectName: objName,
+				Level:      LevelManualNeeded,
+				PGDetail:   dt, TiDBDetail: "不支持几何类型",
+				Suggestion: "TiDB 不支持原生几何类型，需改为 JSON/WKB 或应用层处理（MS-10c2 skip 台账同口径）", AutoFix: false,
+			})
+		case base == "year":
+			s.add(Finding{
+				Dimension: DimDataType, ObjectType: "column",
+				ObjectName: objName,
+				Level:      LevelConvertible,
+				PGDetail:   dt, TiDBDetail: "YEAR",
+				Suggestion: "TiDB 原生支持 YEAR，迁移按 1:1 保留并注记显示宽度语义差异", AutoFix: true,
+			})
+		case base == "mediumint":
+			s.add(Finding{
+				Dimension: DimDataType, ObjectType: "column",
+				ObjectName: objName,
+				Level:      LevelConvertible,
+				PGDetail:   dt, TiDBDetail: "INT",
+				Suggestion: "TiDB 无 MEDIUMINT，自动映射 INT（24 位→32 位，取值范围放大）", AutoFix: true,
+			})
+		case base == "bool" || base == "boolean":
+			s.add(Finding{
+				Dimension: DimDataType, ObjectType: "column",
+				ObjectName: objName,
+				Level:      LevelConvertible,
+				PGDetail:   dt, TiDBDetail: "TINYINT(1)",
+				Suggestion: "布尔别名映射 TINYINT(1)", AutoFix: true,
+			})
+		case base == "real":
+			s.add(Finding{
+				Dimension: DimDataType, ObjectType: "column",
+				ObjectName: objName,
+				Level:      LevelConvertible,
+				PGDetail:   dt, TiDBDetail: "DOUBLE",
+				Suggestion: "REAL 映射 DOUBLE", AutoFix: true,
+			})
+		case base == "tinytext" || base == "mediumtext" || base == "longtext":
+			s.add(Finding{
+				Dimension: DimDataType, ObjectType: "column",
+				ObjectName: objName,
+				Level:      LevelConvertible,
+				PGDetail:   dt, TiDBDetail: "TEXT",
+				Suggestion: "TEXT 家族归一 TEXT（无损放大）", AutoFix: true,
+			})
+		case base == "tinyblob" || base == "mediumblob" || base == "longblob":
+			s.add(Finding{
+				Dimension: DimDataType, ObjectType: "column",
+				ObjectName: objName,
+				Level:      LevelConvertible,
+				PGDetail:   dt, TiDBDetail: "BLOB",
+				Suggestion: "BLOB 家族归一 BLOB（无损放大）", AutoFix: true,
+			})
+		case mysqlCompatibleBases[base]:
+			s.add(Finding{
+				Dimension: DimDataType, ObjectType: "column",
+				ObjectName: objName,
+				Level:      LevelCompatible,
+				PGDetail:   dt, TiDBDetail: mapped,
+				Suggestion: "", AutoFix: true,
+			})
+		default:
+			s.add(Finding{
+				Dimension: DimDataType, ObjectType: "column",
+				ObjectName: objName,
+				Level:      LevelManualNeeded,
+				PGDetail:   dt, TiDBDetail: "需评估",
+				Suggestion: fmt.Sprintf("数据类型 %s 需手动评估兼容性", dt), AutoFix: false,
+			})
+		}
+	}
+
+	return s.result(DimDataType)
+}
+
 // --- Structure Checker ---
 
 func (a *Assessor) checkStructure(result *ScanResult) DimensionResult {
@@ -312,6 +453,24 @@ func (a *Assessor) checkStructure(result *ScanResult) DimensionResult {
 				Level:      LevelManualNeeded,
 				PGDetail:   "无主键", TiDBDetail: "建议添加主键",
 				Suggestion: "TiDB 强烈建议每张表都有主键，影响性能和数据校验", AutoFix: false,
+			})
+		}
+	}
+
+	// MS-10b2 item 7: AUTO_INCREMENT columns (MySQL EXTRA probe) get an
+	// explicit TiDB-compatible structure annotation — the benign MySQL→
+	// TiDB case the empty sequences dimension used to hide.
+	if a.isMySQL() {
+		for _, col := range result.Columns {
+			if !col.IsAutoIncr {
+				continue
+			}
+			s.add(Finding{
+				Dimension: DimStructure, ObjectType: "column_auto_increment",
+				ObjectName: fmt.Sprintf("%s.%s.%s", col.TableSchema, col.TableName, col.ColumnName),
+				Level:      LevelCompatible,
+				PGDetail:   "AUTO_INCREMENT", TiDBDetail: "AUTO_INCREMENT",
+				Suggestion: "TiDB 原生支持 AUTO_INCREMENT，1:1 保留", AutoFix: true,
 			})
 		}
 	}
@@ -466,7 +625,12 @@ func (a *Assessor) checkViews(result *ScanResult) DimensionResult {
 		def := strings.ToUpper(view.Definition)
 
 		issues := 0
-		// Check for PG-specific syntax
+		// Check for PG-specific syntax. MS-10b2 item 1: the 22-word list
+		// below is the PG-calibrated truth (PG parity anchor: unchanged).
+		// On the MySQL path NOW()/ROW_NUMBER()/CAST(/CURRENT_DATE etc. are
+		// MySQL-native too — flagging them was a full false-positive family
+		// for MySQL 8 views — so the MySQL branch checks only the true
+		// PG-only subset (seq840 item 1, 7 words).
 		pgSyntax := []string{
 			"ARRAY_AGG", "STRING_AGG", "BOOL_AND", "BOOL_OR",
 			"EXTRACT(EPOCH", "TO_CHAR", "TO_NUMBER", "TO_DATE",
@@ -475,6 +639,13 @@ func (a *Assessor) checkViews(result *ScanResult) DimensionResult {
 			"LATERAL", "WITH RECURSIVE",
 			"ILIKE", "SIMILAR TO",
 			"::", "CAST(", "NOW()", "CURRENT_DATE",
+		}
+		if a.isMySQL() {
+			pgSyntax = []string{
+				"ILIKE", "SIMILAR TO", "::",
+				"ARRAY_AGG", "STRING_AGG",
+				"GENERATE_SERIES", "EXTRACT(EPOCH",
+			}
 		}
 
 		for _, syntax := range pgSyntax {
@@ -503,7 +674,7 @@ func (a *Assessor) checkViews(result *ScanResult) DimensionResult {
 				Dimension: DimView, ObjectType: "view",
 				ObjectName: objName,
 				Level:      LevelConvertible,
-				PGDetail:   fmt.Sprintf("含 %d 个 PG 特有语法", issues), TiDBDetail: "需改写",
+				PGDetail:   a.viewDialectDetail(issues), TiDBDetail: "需改写",
 				Suggestion: "部分函数需要手动改写", AutoFix: false,
 			})
 		default:
@@ -511,7 +682,7 @@ func (a *Assessor) checkViews(result *ScanResult) DimensionResult {
 				Dimension: DimView, ObjectType: "view",
 				ObjectName: objName,
 				Level:      LevelManualNeeded,
-				PGDetail:   fmt.Sprintf("含 %d 个 PG 特有语法", issues), TiDBDetail: "需大量改写",
+				PGDetail:   a.viewDialectDetail(issues), TiDBDetail: "需大量改写",
 				Suggestion: "视图需要大量改写，建议逐步迁移", AutoFix: false,
 			})
 		}
@@ -521,6 +692,17 @@ func (a *Assessor) checkViews(result *ScanResult) DimensionResult {
 		return DimensionResult{Dimension: DimView, Score: 100}
 	}
 	return s.result(DimView)
+}
+
+// viewDialectDetail calibrates the finding wording per source kind
+// (MS-10b2 item 1): the PG wording stays byte-identical to the pre-batch
+// text (PG parity), the MySQL wording names PostgreSQL as the dialect the
+// checked constructs belong to.
+func (a *Assessor) viewDialectDetail(issues int) string {
+	if a.isMySQL() {
+		return fmt.Sprintf("含 %d 个 PostgreSQL 方言特有语法", issues)
+	}
+	return fmt.Sprintf("含 %d 个 PG 特有语法", issues)
 }
 
 // --- Function Checker ---

@@ -30,6 +30,7 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/lightning"
 	"github.com/michaelliuyuan/timstool/internal/orchestrator"
 	"github.com/michaelliuyuan/timstool/internal/source"
+	"github.com/michaelliuyuan/timstool/internal/source/mysql"
 	"github.com/michaelliuyuan/timstool/internal/store"
 	"go.uber.org/zap"
 )
@@ -2404,6 +2405,16 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// MS-10b2 item 8: a MySQL system schema (mysql/information_schema/
+	// performance_schema/sys/metrics_schema) is rejected 400 up front —
+	// the scanner would otherwise happily return a 200 empty/builtin-only
+	// set. The guard reads the shared exported source/mysql.SystemDatabases
+	// (single truth, same set the ddlexport SHOW DATABASES walk uses).
+	if driver == "mysql" && mysql.SystemDatabases[strings.ToLower(schema)] {
+		s.writeError(w, http.StatusBadRequest, "schema: 系统库不支持兼容评估（"+schema+"）")
+		return
+	}
+
 	srcDB, err := openSourceTestConn(connCfg)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
@@ -2424,7 +2435,10 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	assessor := assess.NewAssessor()
+	// MS-10b2: the assessor is calibrated for the routed source kind —
+	// MySQL grades native types via the shared mapper truth and the view
+	// dialect subset; PG (and legacy "" inline) stays byte-identical.
+	assessor := assess.NewAssessorFor(driver)
 	dims := assessor.Assess(result)
 
 	rg := assess.NewReportGenerator(dims, connCfg.SourceType())

@@ -3,6 +3,7 @@ package assess
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 )
 
@@ -61,9 +62,9 @@ type mysqlScanner struct {
 }
 
 func newMySQLScanner(db *sql.DB, schema string) *mysqlScanner {
-	if schema == "" {
-		schema = "public"
-	}
+	// MS-10b2 item 5: no "public" PG-ism default here anymore — an empty
+	// schema fails loud in ScanAll; callers (the handler) own the
+	// database-as-schema normalization.
 	return &mysqlScanner{db: db, schema: schema}
 }
 
@@ -96,7 +97,8 @@ const mysqlColumnsSQL = `
 				AND s.COLUMN_NAME = c.COLUMN_NAME
 				AND s.INDEX_NAME = 'PRIMARY'
 		),
-		c.ORDINAL_POSITION
+		c.ORDINAL_POSITION,
+		COALESCE(c.EXTRA, '') LIKE '%auto_increment%'
 	FROM information_schema.COLUMNS c
 	WHERE c.TABLE_SCHEMA = ?
 	ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION
@@ -147,45 +149,83 @@ const mysqlTriggersSQL = `
 // per the leader c-fix ticket). 1 MiB covers any realistic index shape.
 const mysqlGroupConcatPin = `SET SESSION group_concat_max_len = 1048576`
 
+// maxScanObjects caps the total scanned object count (MS-10b2 item 6,
+// same contract as the ddlexport defaultMaxObjects guard): a runaway scan
+// of a very large catalog fails loud instead of exhausting memory.
+const maxScanObjects = 20000
+
+// mysqlQueryer is the single query surface every catalog query goes
+// through: the consistent-snapshot transaction opened in ScanAll (ruling
+// seq843-⑥ hard constraint (a) — one tx object, not just one session).
+type mysqlQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 func (s *mysqlScanner) ScanAll(ctx context.Context) (*ScanResult, error) {
-	if rows, err := s.db.QueryContext(ctx, mysqlGroupConcatPin); err == nil {
-		rows.Close()
-	} else {
+	if s.schema == "" {
+		// MS-10b2 item 5: the PG-ism "public" default is gone — an empty
+		// schema fails loud; the handler owns the database-as-schema
+		// normalization (MS-10a incSchema shape).
+		return nil, wrapScanErr("scan schema", errSchemaRequired)
+	}
+
+	// MS-10b2 item 9 (ruling seq843-⑥ constraint (b)): pin the pool to a
+	// single connection for the scanner's lifetime so the session-level
+	// GROUP_CONCAT pin and the snapshot tx never ride different conns;
+	// the previous limit is restored on the way out (no pool side effects
+	// leak into later ddlexport/assess reuse of the same *sql.DB).
+	prevMaxOpen := s.db.Stats().MaxOpenConnections
+	s.db.SetMaxOpenConns(1)
+	defer s.db.SetMaxOpenConns(prevMaxOpen)
+
+	// MS-10b2 item 6: one consistent-snapshot transaction carries every
+	// catalog query (REPEATABLE READ establishes the read view at the
+	// first statement inside the tx), so tables/columns/indexes/views/
+	// routines/triggers describe one coherent catalog moment even on a
+	// live schema under DDL.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, wrapScanErr("begin snapshot tx", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, mysqlGroupConcatPin); err != nil {
 		return nil, wrapScanErr("pin group_concat_max_len", err)
 	}
+
 	result := &ScanResult{}
 
-	tables, err := s.queryTables(ctx)
+	tables, err := s.queryTables(ctx, tx)
 	if err != nil {
 		return nil, wrapScanErr("scan tables", err)
 	}
 	result.Tables = tables
 
-	columns, err := s.queryColumns(ctx)
+	columns, err := s.queryColumns(ctx, tx)
 	if err != nil {
 		return nil, wrapScanErr("scan columns", err)
 	}
 	result.Columns = columns
 
-	indexes, err := s.queryIndexes(ctx)
+	indexes, err := s.queryIndexes(ctx, tx)
 	if err != nil {
 		return nil, wrapScanErr("scan indexes", err)
 	}
 	result.Indexes = indexes
 
-	views, err := s.queryViews(ctx)
+	views, err := s.queryViews(ctx, tx)
 	if err != nil {
 		return nil, wrapScanErr("scan views", err)
 	}
 	result.Views = views
 
-	functions, err := s.queryFunctions(ctx)
+	functions, err := s.queryFunctions(ctx, tx)
 	if err != nil {
 		return nil, wrapScanErr("scan functions", err)
 	}
 	result.Functions = functions
 
-	triggers, err := s.queryTriggers(ctx)
+	triggers, err := s.queryTriggers(ctx, tx)
 	if err != nil {
 		return nil, wrapScanErr("scan triggers", err)
 	}
@@ -198,8 +238,18 @@ func (s *mysqlScanner) ScanAll(ctx context.Context) (*ScanResult, error) {
 	result.Extensions = nil
 	result.Sequences = nil
 
+	// MS-10b2 item 6: large-catalog guard (ddlexport same contract).
+	total := len(result.Tables) + len(result.Columns) + len(result.Indexes) +
+		len(result.Views) + len(result.Functions) + len(result.Triggers)
+	if total > maxScanObjects {
+		return nil, wrapScanErr("scan object guard", fmt.Errorf("object count %d exceeds limit %d", total, maxScanObjects))
+	}
+
 	return result, nil
 }
+
+// errSchemaRequired backs the item-5 fail-loud empty-schema guard.
+var errSchemaRequired = fmt.Errorf("schema is required (MySQL schema == database; the handler normalizes)")
 
 func wrapScanErr(stage string, err error) error {
 	return &scanError{stage: stage, err: err}
@@ -213,8 +263,8 @@ type scanError struct {
 func (e *scanError) Error() string { return e.stage + ": " + e.err.Error() }
 func (e *scanError) Unwrap() error { return e.err }
 
-func (s *mysqlScanner) queryTables(ctx context.Context) ([]TableInfo, error) {
-	rows, err := s.db.QueryContext(ctx, mysqlTablesSQL, s.schema)
+func (s *mysqlScanner) queryTables(ctx context.Context, q mysqlQueryer) ([]TableInfo, error) {
+	rows, err := q.QueryContext(ctx, mysqlTablesSQL, s.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -231,8 +281,8 @@ func (s *mysqlScanner) queryTables(ctx context.Context) ([]TableInfo, error) {
 	return tables, rows.Err()
 }
 
-func (s *mysqlScanner) queryColumns(ctx context.Context) ([]ColumnInfo, error) {
-	rows, err := s.db.QueryContext(ctx, mysqlColumnsSQL, s.schema)
+func (s *mysqlScanner) queryColumns(ctx context.Context, q mysqlQueryer) ([]ColumnInfo, error) {
+	rows, err := q.QueryContext(ctx, mysqlColumnsSQL, s.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +293,8 @@ func (s *mysqlScanner) queryColumns(ctx context.Context) ([]ColumnInfo, error) {
 		var c ColumnInfo
 		if err := rows.Scan(&c.TableSchema, &c.TableName, &c.ColumnName,
 			&c.DataType, &c.MaxLength, &c.NumericPrec, &c.NumericScale,
-			&c.IsNullable, &c.ColumnDefault, &c.IsPrimary, &c.OrdinalPosition); err != nil {
+			&c.IsNullable, &c.ColumnDefault, &c.IsPrimary, &c.OrdinalPosition,
+			&c.IsAutoIncr); err != nil {
 			return nil, err
 		}
 		columns = append(columns, c)
@@ -251,8 +302,8 @@ func (s *mysqlScanner) queryColumns(ctx context.Context) ([]ColumnInfo, error) {
 	return columns, rows.Err()
 }
 
-func (s *mysqlScanner) queryIndexes(ctx context.Context) ([]IndexInfo, error) {
-	rows, err := s.db.QueryContext(ctx, mysqlIndexesSQL, s.schema)
+func (s *mysqlScanner) queryIndexes(ctx context.Context, q mysqlQueryer) ([]IndexInfo, error) {
+	rows, err := q.QueryContext(ctx, mysqlIndexesSQL, s.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -275,8 +326,8 @@ func (s *mysqlScanner) queryIndexes(ctx context.Context) ([]IndexInfo, error) {
 	return indexes, rows.Err()
 }
 
-func (s *mysqlScanner) queryViews(ctx context.Context) ([]ViewInfo, error) {
-	rows, err := s.db.QueryContext(ctx, mysqlViewsSQL, s.schema)
+func (s *mysqlScanner) queryViews(ctx context.Context, q mysqlQueryer) ([]ViewInfo, error) {
+	rows, err := q.QueryContext(ctx, mysqlViewsSQL, s.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -294,8 +345,8 @@ func (s *mysqlScanner) queryViews(ctx context.Context) ([]ViewInfo, error) {
 	return views, rows.Err()
 }
 
-func (s *mysqlScanner) queryFunctions(ctx context.Context) ([]FunctionInfo, error) {
-	rows, err := s.db.QueryContext(ctx, mysqlRoutinesSQL, s.schema)
+func (s *mysqlScanner) queryFunctions(ctx context.Context, q mysqlQueryer) ([]FunctionInfo, error) {
+	rows, err := q.QueryContext(ctx, mysqlRoutinesSQL, s.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -313,8 +364,8 @@ func (s *mysqlScanner) queryFunctions(ctx context.Context) ([]FunctionInfo, erro
 	return functions, rows.Err()
 }
 
-func (s *mysqlScanner) queryTriggers(ctx context.Context) ([]TriggerInfo, error) {
-	rows, err := s.db.QueryContext(ctx, mysqlTriggersSQL, s.schema)
+func (s *mysqlScanner) queryTriggers(ctx context.Context, q mysqlQueryer) ([]TriggerInfo, error) {
+	rows, err := q.QueryContext(ctx, mysqlTriggersSQL, s.schema)
 	if err != nil {
 		return nil, err
 	}

@@ -17,16 +17,10 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/target"
 )
 
-// mysqlSystemDatabases mirrors the mysqlWatermarkDialect SystemSchemas
-// set (MS-10a): SHOW DATABASES output minus these is the user surface.
-var mysqlSystemDatabases = map[string]bool{
-	"mysql":              true,
-	"information_schema": true,
-	"performance_schema": true,
-	"sys":                true,
-	// TiDB (MySQL-compatible surface) reports its own system schemas.
-	"metrics_schema": true,
-}
+// System-schema filtering reads the shared exported set from the MySQL
+// source adapter (MS-10b2 item 8: single source of truth; assess consumes
+// the same copy — no private mirrors).
+// MS-10a note: SHOW DATABASES output minus these is the user surface.
 
 // qiB quotes a MySQL identifier with backticks (doubling embedded ones).
 func qiB(ident string) string {
@@ -49,7 +43,7 @@ func listMySQLDatabases(ctx context.Context, db *sql.DB) ([]string, error) {
 		}
 		// Case-insensitive: TiDB (and Windows MySQL builds) report the
 		// system databases upper/mixed-case (INFORMATION_SCHEMA etc.).
-		if mysqlSystemDatabases[strings.ToLower(s)] {
+		if mysql.SystemDatabases[strings.ToLower(s)] {
 			continue
 		}
 		out = append(out, s)

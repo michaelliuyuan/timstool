@@ -25,9 +25,30 @@ var mysqlQueries []string
 
 func (mysqlStubConn) Prepare(string) (driver.Stmt, error) { return nil, errNotImpl }
 func (mysqlStubConn) Close() error                        { return nil }
-func (mysqlStubConn) Begin() (driver.Tx, error)           { return nil, errNotImpl }
+func (mysqlStubConn) Begin() (driver.Tx, error)           { return mysqlStubTx{}, nil }
+
+// ExecContext serves the MS-10b2 session pin (SET SESSION
+// group_concat_max_len) issued inside the snapshot tx.
+func (mysqlStubConn) ExecContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Result, error) {
+	mysqlQueries = append(mysqlQueries, q)
+	return mysqlStubResult{}, nil
+}
+
+type mysqlStubTx struct{}
+
+func (mysqlStubTx) Commit() error   { return nil }
+func (mysqlStubTx) Rollback() error { return nil }
+
+type mysqlStubResult struct{}
+
+func (mysqlStubResult) LastInsertId() (int64, error) { return 0, nil }
+func (mysqlStubResult) RowsAffected() (int64, error) { return 0, nil }
 
 var errNotImpl = fmt.Errorf("not implemented")
+
+// mysqlStubTableRows lets a test grow the canned TABLES result set so the
+// large-catalog guard (MS-10b2 item 6) can be exercised for real.
+var mysqlStubTableRows = [][]driver.Value{{"db1", "t1"}}
 
 func (mysqlStubConn) QueryContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Rows, error) {
 	mysqlQueries = append(mysqlQueries, q)
@@ -35,12 +56,12 @@ func (mysqlStubConn) QueryContext(_ context.Context, q string, _ []driver.NamedV
 	case strings.Contains(q, "information_schema.TABLES"):
 		return &stubRows{
 			cols: []string{"TABLE_SCHEMA", "TABLE_NAME"},
-			rows: [][]driver.Value{{"db1", "t1"}},
+			rows: mysqlStubTableRows,
 		}, nil
 	case strings.Contains(q, "information_schema.COLUMNS"):
 		return &stubRows{
-			cols: []string{"s", "t", "c", "dt", "ml", "np", "ns", "nu", "def", "pk", "pos"},
-			rows: [][]driver.Value{{"db1", "t1", "id", "int", int64(0), int64(10), int64(0), false, "", true, int64(1)}},
+			cols: []string{"s", "t", "c", "dt", "ml", "np", "ns", "nu", "def", "pk", "pos", "ai"},
+			rows: [][]driver.Value{{"db1", "t1", "id", "int", int64(0), int64(10), int64(0), false, "", true, int64(1), true}},
 		}, nil
 	case strings.Contains(q, "information_schema.STATISTICS"):
 		return &stubRows{
@@ -185,16 +206,69 @@ func TestMySQLScannerDegradedEmptySets(t *testing.T) {
 	}
 }
 
-// Schema fallback anchor: the scanner itself keeps the conservative
-// "public" default (same shape as the PG scanner); the handler-level
-// database-as-schema fallback is the caller's job (MS-10a incSchema shape).
-func TestMySQLScannerSchemaFallback(t *testing.T) {
+// Schema fail-loud anchor (MS-10b2 item 5): the PG-ism "public" default is
+// gone — an empty schema must error out of ScanAll instead of silently
+// scanning a nonexistent "public" database; the handler owns the
+// database-as-schema normalization.
+func TestMySQLScannerSchemaRequired(t *testing.T) {
 	db := openMySQLStub(t)
-	if got := newMySQLScanner(db, "").schema; got != "public" {
-		t.Errorf("empty schema fallback = %q, want public", got)
+	s := newMySQLScanner(db, "")
+	if _, err := s.ScanAll(context.Background()); err == nil {
+		t.Error("empty schema must fail loud in ScanAll")
+	} else if !strings.Contains(err.Error(), "schema") {
+		t.Errorf("error text = %q, want schema-required wording", err.Error())
 	}
 	if got := newMySQLScanner(db, "db1").schema; got != "db1" {
 		t.Errorf("explicit schema = %q, want db1", got)
+	}
+}
+
+// Snapshot-tx + session-pin affinity anchor (MS-10b2 items 6+9, ruling
+// seq843-⑥): the GROUP_CONCAT pin rides the same single transaction as
+// every catalog query (one tx object, not just one session), and the
+// pool's MaxOpenConns is pinned to 1 for the scan and restored after.
+func TestMySQLScannerSnapshotTxAffinity(t *testing.T) {
+	db := openMySQLStub(t)
+	db.SetMaxOpenConns(3)
+	mysqlQueries = nil
+	s := newMySQLScanner(db, "db1")
+	if _, err := s.ScanAll(context.Background()); err != nil {
+		t.Fatalf("ScanAll: %v", err)
+	}
+	joined := strings.Join(mysqlQueries, "\n---\n")
+	if !strings.Contains(joined, "group_concat_max_len = 1048576") {
+		t.Error("session pin missing from the recorded query stream")
+	}
+	// The pin must be the FIRST statement (inside the tx, before any
+	// catalog query touches the session).
+	if mysqlQueries[0] != "SET SESSION group_concat_max_len = 1048576" {
+		t.Errorf("pin must precede catalog queries, stream starts with %q", mysqlQueries[0])
+	}
+	// Pool restore: the pre-scan limit must survive the scan.
+	if got := db.Stats().MaxOpenConnections; got != 3 {
+		t.Errorf("MaxOpenConns restore = %d, want 3", got)
+	}
+}
+
+// Large-catalog guard anchor (MS-10b2 item 6, ddlexport same contract):
+// a scan whose total object count exceeds maxScanObjects fails loud with
+// the guard wording instead of exhausting memory.
+func TestMySQLScannerObjectGuard(t *testing.T) {
+	if maxScanObjects != 20000 {
+		t.Errorf("maxScanObjects = %d, want 20000 (ddlexport defaultMaxObjects parity)", maxScanObjects)
+	}
+	prev := mysqlStubTableRows
+	mysqlStubTableRows = make([][]driver.Value, maxScanObjects+1)
+	for i := range mysqlStubTableRows {
+		mysqlStubTableRows[i] = []driver.Value{"db1", fmt.Sprintf("t%d", i)}
+	}
+	defer func() { mysqlStubTableRows = prev }()
+
+	db := openMySQLStub(t)
+	s := newMySQLScanner(db, "db1")
+	_, err := s.ScanAll(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "object guard") {
+		t.Errorf("over-limit scan must fail loud with the object guard, got %v", err)
 	}
 }
 

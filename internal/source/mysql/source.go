@@ -21,6 +21,21 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
+// SystemDatabases is the shared MySQL system-schema set (MS-10b2 item 8,
+// ruling seq843-⑧): every consumer that must exclude server system schemas
+// (ddlexport SHOW DATABASES walk, assess system-schema guard, …) reads this
+// single exported copy instead of re-declaring a private mirror. Lowercase
+// keys; callers compare via strings.ToLower (TiDB/Windows builds report
+// INFORMATION_SCHEMA etc. in upper/mixed case).
+var SystemDatabases = map[string]bool{
+	"mysql":              true,
+	"information_schema": true,
+	"performance_schema": true,
+	"sys":                true,
+	// TiDB (MySQL-compatible surface) reports its own system schemas.
+	"metrics_schema": true,
+}
+
 func init() {
 	source.Register("mysql", func(cfg source.SourceConfig) (source.Source, error) {
 		return &Source{cfg: cfg}, nil
@@ -169,6 +184,11 @@ func (mysqlDialect) LimitOffsetSQL(limit, offset int64) string {
 // --- TypeMapper (3d: stub passthrough for now; full mapping in step 3d) ---
 
 type mysqlTypeMapper struct{}
+
+// NewTypeMapper exposes the MySQL→TiDB type mapping for non-orchestrator
+// consumers (MS-10b2 item 2: the assess checker grades MySQL native types
+// via the same single mapping truth the migration pipeline uses).
+func NewTypeMapper() source.TypeMapper { return mysqlTypeMapper{} }
 
 func (mysqlTypeMapper) MapType(srcType string, precision, scale int) source.TiDBType {
 	// Full type mapping is implemented in step 3d.

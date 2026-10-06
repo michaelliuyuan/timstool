@@ -84,6 +84,7 @@ type ColumnInfo struct {
 	ColumnDefault   string
 	IsPrimary       bool
 	OrdinalPosition int
+	IsAutoIncr      bool // MySQL EXTRA auto_increment (MS-10b2 item 7; PG never sets it)
 }
 
 // IndexInfo represents a PG index.
