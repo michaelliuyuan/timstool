@@ -139,6 +139,57 @@ func openConvDB(t *testing.T, conn *convConn) *sql.DB {
 	return db
 }
 
+// TestMySQLTiDBTablesErrorPathNoFile pins the adversarial note-1 c-fix:
+// when the CIR walk fails, the skip ledger entry is the whole record —
+// no empty tidb-tables.sql file lands in the zip (an empty file reads as
+// "zero tables converted").
+func TestMySQLTiDBTablesErrorPathNoFile(t *testing.T) {
+	e := NewExporter(openErrDB(t), Options{SourceType: "mysql"})
+	ddl, n, err := e.mysqlTiDBTables(context.Background(), "db1")
+	if err == nil {
+		t.Fatalf("error path must surface err (ddl=%q n=%d)", ddl, n)
+	}
+	files, ferr := e.mysqlSchemaFiles(context.Background(), "db1")
+	if ferr != nil {
+		t.Fatalf("mysqlSchemaFiles: %v", ferr)
+	}
+	if _, ok := files["tidb-tables.sql"]; ok {
+		t.Error("error path must not write an (empty) tidb-tables.sql entry")
+	}
+	if len(e.manifest.Skipped) == 0 {
+		t.Error("error path must leave the skip ledger entry in the manifest")
+	}
+}
+
+type errDriver struct{}
+
+func (errDriver) Open(string) (driver.Conn, error) { return errConn{}, nil }
+
+type errConn struct{}
+
+func (errConn) Prepare(string) (driver.Stmt, error) { return nil, fmt.Errorf("not implemented") }
+func (errConn) Close() error                        { return nil }
+func (errConn) Begin() (driver.Tx, error)           { return nil, fmt.Errorf("not implemented") }
+
+func (errConn) QueryContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Rows, error) {
+	return nil, fmt.Errorf("stub: information_schema unavailable: %s", q)
+}
+
+var errNames []string
+
+func openErrDB(t *testing.T) *sql.DB {
+	t.Helper()
+	name := fmt.Sprintf("conv-err-%d", len(errNames))
+	errNames = append(errNames, name)
+	sql.Register(name, errDriver{})
+	db, err := sql.Open(name, "")
+	if err != nil {
+		t.Fatalf("open err stub: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
 // TestMySQLTiDBTablesConversion pins the MS-10c2 conversion contract:
 // the CIR walk renders CREATE TABLE via the target renderer with the
 // mysqlTypeMapper types, functional key parts replay their EXPRESSION
@@ -147,7 +198,10 @@ func openConvDB(t *testing.T, conn *convConn) *sql.DB {
 func TestMySQLTiDBTablesConversion(t *testing.T) {
 	conn := &convConn{}
 	e := NewExporter(openConvDB(t, conn), Options{SourceType: "mysql"})
-	ddl, n := e.mysqlTiDBTables(context.Background(), "db1")
+	ddl, n, err := e.mysqlTiDBTables(context.Background(), "db1")
+	if err != nil {
+		t.Fatalf("mysqlTiDBTables: %v", err)
+	}
 	if n != 1 {
 		t.Fatalf("converted %d tables, want 1", n)
 	}

@@ -212,9 +212,14 @@ ORDER BY TRIGGER_NAME`, "SHOW CREATE TRIGGER %s.%s", 2)
 	}
 
 	if e.opts.IncludeTiDB && t.Tables {
-		ddl, n := e.mysqlTiDBTables(ctx, schemaName)
-		files["tidb-tables.sql"] = ddl
-		e.countN(schemaName, "tidb-tables.sql", n)
+		// Error path: the skip ledger entry is the whole record — no empty
+		// tidb-tables.sql file lands in the zip (an empty file reads as
+		// "zero tables converted", MS-10c2 adversarial note 1).
+		ddl, n, convErr := e.mysqlTiDBTables(ctx, schemaName)
+		if convErr == nil {
+			files["tidb-tables.sql"] = ddl
+			e.countN(schemaName, "tidb-tables.sql", n)
+		}
 	}
 
 	return files, nil
@@ -229,11 +234,11 @@ ORDER BY TRIGGER_NAME`, "SHOW CREATE TRIGGER %s.%s", 2)
 // 1:1 (no conversion applied — ENUM/SET fidelity, the geometry family
 // fallback) are recorded per distinct type in the manifest skip ledger
 // instead of silently passing (coverage accounting, MS10C-DIALECT-MAP.md).
-func (e *Exporter) mysqlTiDBTables(ctx context.Context, schemaName string) (string, int) {
+func (e *Exporter) mysqlTiDBTables(ctx context.Context, schemaName string) (string, int, error) {
 	sch, err := mysql.NewSchemaReaderForDB(e.db, schemaName).ReadSchema(ctx, source.Filter{})
 	if err != nil {
 		e.skip(schemaName, "tidb-tables.sql", schemaName, err.Error())
-		return "", 0
+		return "", 0, err
 	}
 	seen := map[string]bool{}
 	var b strings.Builder
@@ -250,7 +255,7 @@ func (e *Exporter) mysqlTiDBTables(ctx context.Context, schemaName string) (stri
 			}
 		}
 	}
-	return b.String(), n
+	return b.String(), n, nil
 }
 
 // passthroughType reports a column whose TiDB type is a 1:1 fallback, not

@@ -55,6 +55,43 @@ func TestRenderCreateTableFunctionalKeyParts(t *testing.T) {
 	}
 }
 
+// TestRenderIndexPartQuotedNonBareIdentifiers pins the P2 c-fix: legal
+// reference identifiers that are NOT bare forms — spaces, hyphens, digit
+// prefixes — must be backtick-quoted like any plain column (the earlier
+// character-class allowlist verbatim-emitted them as broken DDL). Only
+// the parenthesized EXPRESSION shape verbatim-replays.
+func TestRenderIndexPartQuotedNonBareIdentifiers(t *testing.T) {
+	cases := map[string]string{
+		"my col": "`my col`", // legal quoted identifier (space) — NOT an expression
+		"a-b":    "`a-b`",    // hyphen: verbatim would parse as subtraction
+		"123abc": "`123abc`", // digit-leading bare form
+		"(abc":   "`(abc`",   // pathological paren prefix, unbalanced -> identifier
+		"col":    "`col`",    // plain column
+	}
+	for part, want := range cases {
+		var b strings.Builder
+		renderIndexPart(&b, part)
+		if got := b.String(); got != want {
+			t.Errorf("renderIndexPart(%q) = %q, want %q", part, got, want)
+		}
+	}
+}
+
+// TestRenderIndexPartPGParity pins the PG-identity face: index Columns
+// from the PG collector are plain column names, so every part renders
+// quoted — the exact bytes the pre-MS-10c2 writeIdentList produced.
+func TestRenderIndexPartPGParity(t *testing.T) {
+	got := RenderCreateTable(source.Table{
+		Name:    "tp",
+		Columns: []source.Column{{Name: "id", TiDBType: "BIGINT"}},
+		PK:      []string{"id"},
+		Indexes: []source.Index{{Name: "ix", Columns: []string{"user_name", "data"}}},
+	})
+	if !strings.Contains(got, "INDEX `ix` (`user_name`, `data`)") {
+		t.Errorf("PG-collector index parts must render fully quoted (writeIdentList parity):\n%s", got)
+	}
+}
+
 // --- replay stub: captures the DDL ApplyDDL executes (ExecContext) ---
 
 type replayDriver struct{ conn *replayConn }

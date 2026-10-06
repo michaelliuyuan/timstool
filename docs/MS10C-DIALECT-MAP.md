@@ -36,12 +36,13 @@
  6. **权限面**：SHOW CREATE VIEW 需 SHOW VIEW 权、FUNCTION/PROCEDURE 需对应创建权限——
     权限缺失走 skip() 面呈现（与 PG exporter 对象级失败同契约）。
  7. **函数式索引键部重放原文纪律（MS-10c2）**：apply/转换面 `target.renderIndexPart`
-    对键部二态——合法标识符形（`^[A-Za-z0-9_$\x{0080}-\x{FFFF}]+$`）反引号包裹，
-    其余（MySQL 8.0.13+ `information_schema.STATISTICS.EXPRESSION` 文本，如
-    `(`a` + 1)`/`(lower(`b`))`）**verbatim 裸发：禁二次包裹、禁剥括号**（I_S 原文
-    即合法 DDL）；不做 SQL parse（二态判据足够——表达式含反引号即标识符字符集外，
-    裸发即 SHOW CREATE 原语义）。重放等价锚：渲染产物过真 ApplyDDL 执行链逐字节
-    断言（TestApplyDDLReplaysFunctionalKeyPartsVerbatim，F-15 同源夹具）。
+    对键部二态——**括号形判别**（I_S EXPRESSION 恒 `(…)` 形）：`(` 起 `)` 止 →
+    verbatim 裸发（禁二次包裹、禁剥括号——I_S 原文即合法 DDL）；**其余一律反引号
+    包裹**（含 `my col`/`a-b` 等合法引用标识符非裸形——首版字符类白名单曾把此类
+    误判为表达式直发无效 DDL，P2 c-fix 回归；pathological `(` 开头列名不成对→按
+    标识符包裹记档）。重放等价锚：渲染产物过真 ApplyDDL 执行链逐字节断言
+    （TestApplyDDLReplaysFunctionalKeyPartsVerbatim，F-15 同源夹具）；PG 恒等锚
+    =idx.Columns 全列名 quote 与旧 writeIdentList 同值（TestRenderIndexPartPGParity）。
  8. **README 双版（MS-10c2）**：`readmeFile(schema, srcType)` 分派——PG 版（""/postgres）
     逐字节冻结（锚：TestReadmePGByteIdentity）；MySQL 版按本 map 撰（SHOW CREATE 应用
     序、DEFINER 原样、非原子快照、函数式索引保真、会话时区、5.7 地板、passthrough
@@ -52,6 +53,9 @@
     （mapper default 支 verbatim 回显=未映射）或几何族（GEOMETRY/POINT/…，拼写保留
     但无转换语义）→ 每 schema 每类型一条 manifest skip 台账（`type:<TYPE>`），原生 1:1
     整数族（BIGINT 等映射拼写）不入台账——大小写敏感比较区分「映射产出」与「原文回显」。
+    **消费端口径**：manifest.Skipped 中 `type:` 前缀条目=覆盖记账（非对象级失败
+    skip），zip 消费方按前缀区分两类语义；转换 walk 失败时仅留 skip 条目、不落空
+    tidb-tables.sql 文件（空文件会误读为「零表转换」）。
 
 ## 5.7 地板
 
