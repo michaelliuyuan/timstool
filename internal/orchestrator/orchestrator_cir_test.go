@@ -209,6 +209,38 @@ func TestRunSourceCIRPrecheckFailureAborts(t *testing.T) {
 	}
 }
 
+// TestRunSourceCIRValidateFailureSetsError: a failing validation must set
+// the result row's Error (with a table-count message) alongside
+// Success=false — parity with the PG path's runValidation (:697/:712);
+// Success=false with Error=nil is the "failure with no message" bug class.
+func TestRunSourceCIRValidateFailureSetsError(t *testing.T) {
+	var c cirCounters
+	restore := installCIRSeams(&c)
+	defer restore()
+	prev := cirValidateMigration
+	cirValidateMigration = func(ctx context.Context, sdb, tdb *sql.DB, s *source.Schema, n int) (*target.ValidationReport, error) {
+		c.validate++
+		return &target.ValidationReport{TotalTables: 2, FailedTables: 1, AllPassed: false}, nil
+	}
+	defer func() { cirValidateMigration = prev }()
+
+	o := cirTestOrch()
+	results, err := o.runSourceCIR(context.Background(), PipelineConfig{})
+	if err != nil {
+		t.Fatalf("runSourceCIR: %v", err)
+	}
+	if len(results) != 4 {
+		t.Fatalf("results = %v, want all four phases", results)
+	}
+	last := results[len(results)-1]
+	if last.Phase != PhaseValidate || last.Success {
+		t.Fatalf("last result = %+v, want validate/Success=false", last)
+	}
+	if last.Error == nil || last.Error.Error() != "source-cir: validation failed: 1/2 tables failed" {
+		t.Fatalf("Error = %v, want table-count message (PG-path parity)", last.Error)
+	}
+}
+
 // TestRunSourceCIRRoutingPreconditions pins the dispatch preconditions the
 // zero-regression guarantee rests on: mysql routes source-CIR, the legacy
 // empty-type default stays postgres (PG pipeline), so PG never enters

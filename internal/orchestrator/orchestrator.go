@@ -410,6 +410,7 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context, pipelineCfg PipelineCon
 	// "row-count green but values corrupt" hole — e.g. a bad CSV separator
 	// corrupts every value while row counts still match).
 	validateSuccess := true
+	var validateErr error
 	if pipelineCfg.SkipValidate {
 		log.Info("skipping validation (user requested)")
 	} else {
@@ -453,12 +454,14 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context, pipelineCfg PipelineCon
 			if verr != nil {
 				log.Warn("source-cir: validation error", zap.Error(verr))
 				validateSuccess = false
+				validateErr = fmt.Errorf("source-cir: validation error: %w", verr)
 			} else {
 				log.Info("source-cir validation result",
 					zap.Int("tables", vr.TotalTables), zap.Int("failed", vr.FailedTables),
 					zap.Int("sample_size", sampleSize))
 				if !vr.AllPassed {
 					validateSuccess = false
+					validateErr = fmt.Errorf("source-cir: validation failed: %d/%d tables failed", vr.FailedTables, vr.TotalTables)
 					for _, tv := range vr.Tables {
 						if !tv.Passed {
 							log.Warn("validation mismatch",
@@ -481,7 +484,7 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context, pipelineCfg PipelineCon
 		if validateSuccess {
 			o.finishPhase("validate", nil, false)
 		} else {
-			o.finishPhase("validate", fmt.Errorf("source-cir: validation failed"), false)
+			o.finishPhase("validate", validateErr, false)
 		}
 	}
 
@@ -497,7 +500,7 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context, pipelineCfg PipelineCon
 		results = append(results, PipelineResult{Phase: PhaseData, Success: true})
 	}
 	if !pipelineCfg.SkipValidate {
-		results = append(results, PipelineResult{Phase: PhaseValidate, Success: validateSuccess})
+		results = append(results, PipelineResult{Phase: PhaseValidate, Success: validateSuccess, Error: validateErr})
 	}
 	return results, nil
 }
