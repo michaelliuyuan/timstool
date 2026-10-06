@@ -83,6 +83,56 @@ function Invoke-Psql {
 }
 
 # ---------------------------------------------------------------------------
+# PG wire-level readiness gate (R1, 2026-10-06, track C race diagnosis seq834)
+# ---------------------------------------------------------------------------
+
+function Test-PgPort {
+    # SSLRequest probe: 8 bytes 00 00 00 08 04 D2 16 2F; a live PG answers a
+    # single byte 'S' (83) or 'N' (78). A port-forward listener bound before
+    # its SSH forward is ready ACCEPTS the connection but never answers -
+    # exactly the accepted-then-stall signature, caught here in ~1s instead
+    # of surfacing as a 15s PingContext first-red in the precheck face.
+    param([string]$HostName, [int]$Port, [int]$ProbeTimeoutMs = 1500)
+    $client = New-Object Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect($HostName, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($ProbeTimeoutMs)) { return $false }
+        $client.EndConnect($iar)
+        $stream = $client.GetStream()
+        $stream.WriteTimeout = $ProbeTimeoutMs
+        $stream.ReadTimeout = $ProbeTimeoutMs
+        $probe = [byte[]](0,0,0,8,4,0xD2,0x16,0x2F)
+        $stream.Write($probe, 0, 8)
+        $stream.Flush()
+        $b = $stream.ReadByte()
+        return ($b -eq 83 -or $b -eq 78)
+    } catch {
+        return $false
+    } finally {
+        $client.Close()
+    }
+}
+
+function Wait-PgReady {
+    # retry the SSLRequest probe until PG answers or the deadline passes.
+    # Defaults: 60s / 500ms interval (covers a plink restart cycle).
+    param($Cfg, [int]$TimeoutSec = 60, [int]$IntervalMs = 500)
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $attempt = 0
+    while ((Get-Date) -lt $deadline) {
+        $attempt++
+        if (Test-PgPort -HostName $Cfg.pg.host -Port ([int]$Cfg.pg.port)) {
+            if ($attempt -gt 1) {
+                Write-Host "  [pg-ready] PG answered SSLRequest after $attempt probes (forward race absorbed)"
+            }
+            return
+        }
+        Start-Sleep -Milliseconds $IntervalMs
+    }
+    throw "PG at $($Cfg.pg.host):$($Cfg.pg.port) failed the SSLRequest readiness probe for ${TimeoutSec}s (tunnel half-dead? restart the port-forward)"
+}
+
+# ---------------------------------------------------------------------------
 # instance lifecycle
 # ---------------------------------------------------------------------------
 

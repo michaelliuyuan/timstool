@@ -44,17 +44,38 @@ if ($needBlackBox -and ([string]::IsNullOrWhiteSpace("$endpointAck"))) {
 
 Write-Host "pg-gate: faces=[$($faces -join ', ')] repo=$repoRoot endpoint=$endpointAck"
 
+# R1 (2026-10-06, track C race diagnosis seq834): workdir is ARCHIVED, never
+# deleted - first-red forensics depend on web.log/web.err.log surviving the
+# next run. Runs rotate into <workdir>-arch\run-<timestamp>, newest 20 kept.
 $workDir = "$($Cfg.gate.workdir)"
 if ([string]::IsNullOrWhiteSpace($workDir)) {
     $workDir = Join-Path ([IO.Path]::GetTempPath()) 'pg-gate-run'
 }
-if (Test-Path -LiteralPath $workDir) { Remove-Item -Recurse -Force -LiteralPath $workDir }
+if (Test-Path -LiteralPath $workDir) {
+    $archRoot = "${workDir}-arch"
+    New-Item -ItemType Directory -Force -Path $archRoot | Out-Null
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $dest = Join-Path $archRoot "run-$stamp"
+    $n = 0
+    while (Test-Path -LiteralPath $dest) { $n++; $dest = Join-Path $archRoot "run-$stamp-$n" }
+    Move-Item -LiteralPath $workDir -Destination $dest
+    Get-ChildItem -LiteralPath $archRoot -Directory |
+        Sort-Object Name -Descending | Select-Object -Skip 20 |
+        ForEach-Object { Remove-Item -Recurse -Force -LiteralPath $_.FullName -ErrorAction SilentlyContinue }
+    Write-Host "pg-gate: previous run archived to $dest"
+}
 New-Item -ItemType Directory -Force -Path $workDir | Out-Null
 
 $results = @()
 $script:GateInst = $null
 try {
     if ($needBlackBox) {
+        # R1 (2026-10-06, track C race diagnosis seq834): a freshly (re)started
+        # port-forward can have its local listener bound BEFORE the SSH forward
+        # is ready (bind-before-forward window) - a precheck ping then fails
+        # with a flaky first-red. Refuse to boot until PG answers an SSLRequest
+        # probe at the wire level.
+        Wait-PgReady -Cfg $cfg
         Write-Host "pg-gate: booting scratch instance (port $($cfg.gate.port), workdir $workDir)"
         $script:GateInst = Start-GateInstance -Cfg $cfg -RepoRoot $repoRoot -WorkDir $workDir
         Assert-SourceMatrix
