@@ -171,6 +171,14 @@ func (s *Server) handleCDCStart(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// MS-11 pen 3, ruling #3: MySQL dual-increment mutex — refuse starting
+	// the binlog CDC child while a polling run is live on the same source.
+	if s.blockCDCStartForIncremental() {
+		s.writeJSON(w, http.StatusConflict, map[string]interface{}{
+			"ok": false, "message": dualIncrementMsg,
+		})
+		return
+	}
 	st, err := s.cdcSupervisor.Start(r.Context())
 	if errors.Is(err, ErrCDCDisabled) {
 		s.writeJSON(w, http.StatusConflict, map[string]interface{}{

@@ -323,6 +323,11 @@ type CDCConfig struct {
 
 	// CheckpointFile is the LSN checkpoint file path.
 	CheckpointFile string `yaml:"checkpoint_file" json:"checkpointFile"`
+
+	// ServerID is the MySQL binlog dump registration id (MS-11). Must be
+	// non-zero and unique in the replication topology when the source is
+	// MySQL. Unused for PostgreSQL sources.
+	ServerID uint32 `yaml:"server_id" json:"serverId,omitempty"`
 }
 
 // ValidCDCModes are the accepted values for CDCConfig.Mode.
@@ -582,6 +587,18 @@ func (c *Config) Validate() error {
 		}
 		if !ValidCDCConflictStrategies[c.CDC.ConflictStrategy] {
 			return fmt.Errorf("cdc.conflict_strategy must be one of replace, insert_ignore, upsert, skip")
+		}
+		// MS-11 v1 (ruling seq 953 #2): MySQL binlog CDC is DML-only —
+		// online DDL hard-stops the stream with an explicit remediation
+		// message, so DDL tracking is rejected up front (never silently
+		// ignored).
+		if c.Source.SourceType() == "mysql" {
+			if c.CDC.ServerID == 0 {
+				return fmt.Errorf("cdc.server_id must be a non-zero unique replication id for MySQL binlog CDC")
+			}
+			if c.CDC.SyncDDL {
+				return fmt.Errorf("cdc.sync_ddl 不支持 MySQL 源（v1 仅 DML；在线 DDL 会硬停链）——请设 sync_ddl: false")
+			}
 		}
 	}
 	return nil

@@ -267,6 +267,14 @@ func (s *Server) handleCDCPrecheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p := s.cdcProber()
+
+	// MS-11 pen 3: MySQL sources route to the binlog precheck (six-item
+	// mirror + binlog resume point); PG keeps this path untouched.
+	if cfg.Source.SourceType() == "mysql" {
+		s.handleCDCPrecheckMySQL(w, cfg)
+		return
+	}
+
 	resp := cdcPrecheckResponse{CheckedAt: time.Now()}
 
 	// ① source reachability + version

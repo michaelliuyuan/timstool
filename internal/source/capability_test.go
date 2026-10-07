@@ -135,8 +135,10 @@ func TestCapableSingleTruth(t *testing.T) {
 // prune their fixture lines; MS-12 asserts the map is empty.
 var typeBranchFixture = map[string]int{
 	// config-level legacy default + MS-08 DSNByType driver-DSN dispatch
-	// (routing, not feature gating - the capability guard stays in webapi).
-	"internal/common/config/config.go": 2,
+	// (routing, not feature gating - the capability guard stays in webapi)
+	// + MS-11 pen 3: the MySQL CDC v1 config rules (server_id required,
+	// sync_ddl rejected — sanctioned dispatch, ruling seq 953).
+	"internal/common/config/config.go": 3,
 	// MS-08 source-dialect/driver assembly dispatch (NewValidator/
 	// srcDriverName/sourceSchema - legitimate routing, not gating).
 	"internal/validator/validator.go": 1,
@@ -169,6 +171,14 @@ var typeBranchFixture = map[string]int{
 	// MS-08d UTC pin, everything else pgx byte-identical — routing, not
 	// gating; the capability guards stay at the handlers).
 	"internal/webapi/dbconn.go": 1,
+	// MS-11 pen 3: `timstool cdc` MySQL routing to the binlog runner
+	// (sanctioned dispatch, ruling seq 953 — PG path untouched).
+	"cmd/cdc.go": 1,
+	// MS-11 pen 3: CDC precheck MySQL route (six-item mirror; PG path
+	// untouched).
+	"internal/webapi/cdc_precheck.go": 1,
+	// MS-11 pen 3: dual-increment mutex single kind branch (sourceIsMySQL).
+	"internal/webapi/cdc_mutex_guard.go": 1,
 }
 
 // Ruling pattern (seq 82): catches .Type/srcType/SourceType() compares plus

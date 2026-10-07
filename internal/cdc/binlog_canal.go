@@ -152,6 +152,10 @@ func (s *canalStreamer) Start(ctx context.Context, from *BinlogPosition) (<-chan
 	pos := mysql.Position{Name: from.File, Pos: from.Pos}
 	go func() {
 		defer close(s.done)
+		// Closing the events channel when the stream ends (fatal or clean)
+		// lets the applier drain and exit — mirrors the PG source's
+		// streamLoop exit semantics; the runner then surfaces streamer.Err().
+		defer close(s.events)
 		s.log.Info("binlog source: dumping from", zap.String("position", from.String()))
 		if err := s.canal.RunFrom(pos); err != nil {
 			s.setFatal(fmt.Errorf("binlog source: stream stopped: %w", err))

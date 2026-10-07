@@ -1350,6 +1350,15 @@ func (s *Server) handleRunIncrementalJob(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	job := list[idx]
+	// MS-11 pen 3, ruling #3: MySQL dual-increment mutex — refuse a polling
+	// run while binlog CDC is live on the same MySQL source (choose-one).
+	if src, err := s.resolveDataSourceRef(job.SourceRef); err == nil {
+		if s.blockIncrementalRunForCDC(dataSourceToSourceConfig(src)) {
+			incMu.Unlock()
+			s.writeError(w, http.StatusConflict, dualIncrementMsg)
+			return
+		}
+	}
 	// Drop a running stub into history immediately and return 202: the run
 	// itself executes detached from this request (client polls GET /jobs).
 	stub := incRunRecord{
