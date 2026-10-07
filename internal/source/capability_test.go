@@ -2,7 +2,7 @@ package source_test
 
 // MS-01 anchors (ruling seq 82 final):
 //   A1 — capability-bit snapshots per registered kind: postgres all-true,
-//        mysql all-true except CDC (the last PG-only flow), tidb ALL-false
+//        mysql all-true (CDC flipped by MS-11), tidb ALL-false
 //        (target-only status quo), stubs all-false. Pins the matrix the
 //        UI greying reads.
 //   A2 — NormalizeKind single-default semantics: ""→postgres, unknown
@@ -64,9 +64,10 @@ func TestCapabilityMatrixSnapshot(t *testing.T) {
 	if !myc.DDLExport {
 		t.Error("mysql capability \"ddl_export\" = false; want true since MS-10c")
 	}
-	// CDC is the last PG-only source flow (CDC epic): it must stay false.
-	if myc.CDC {
-		t.Error("mysql capability \"cdc\" = true; want false until the CDC epic lands")
+	// MS-11 pen 4: cdc flipped ON for mysql (binlog CDC via the canal
+	// adapter, v1 DML-only + file:pos; DDL is a loud error state).
+	if !myc.CDC {
+		t.Error("mysql capability \"cdc\" = false; want true since MS-11")
 	}
 
 	// Ruling seq 82 ①: tidb is a registered kind with EVERY bit false —
@@ -146,8 +147,9 @@ var typeBranchFixture = map[string]int{
 	// F-13 validate-read-session UTC pin dispatch (mysql-only pinned pools;
 	// same #t79 class — routing, not gating).
 	"internal/orchestrator/orchestrator.go": 4,
-	// CDC source guard + target-tidb guard (M4 binlog work).
-	"internal/webapi/cdc_config.go": 2,
+	// target-tidb guard only (the source guard became a CapCDC capability
+	// read in MS-11 pen 4 — single truth, fixture pruned 2→1).
+	"internal/webapi/cdc_config.go": 1,
 	// compare source guards absorbed into the capability read (MS-08: raw
 	// shape-1 :393 + normalized shape-2 :423); target-tidb guard remains.
 	"internal/webapi/compare.go": 1,

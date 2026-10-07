@@ -38,7 +38,7 @@
       </div>
       <div class="detail-row">
         <span class="detail-label">CDC 参数:</span>
-        <code>{{ connCfg.cdc.mode }} · slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }} · parallel={{ connCfg.cdc.parallel }} · 冲突={{ connCfg.cdc.conflict_strategy }} · DDL={{ connCfg.cdc.sync_ddl ? '同步' : '不同步' }}</code>
+        <code>{{ connCfg.cdc.mode }}<template v-if="connCfg.cdc.slot_name"> · slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }}</template> · parallel={{ connCfg.cdc.parallel }} · 冲突={{ connCfg.cdc.conflict_strategy }} · DDL={{ connCfg.cdc.sync_ddl ? '同步' : '不同步' }}</code>
       </div>
       <div class="control-actions" style="margin-top: 10px;">
         <el-button v-if="!editingConn" @click="startEditConn">编辑连接</el-button>
@@ -47,9 +47,9 @@
       <!-- F-02 D4: one-click import from saved datasources -->
       <div class="control-actions ds-import" v-if="!editingConn">
         <span class="ds-import-label">从数据源导入：</span>
-        <el-select v-model="dsSourceRef" class="ds-import-select" placeholder="源端（PG 数据源）" size="small">
-          <el-option label="源端（PG 数据源）" value="" />
-          <el-option v-for="d in dsByType(['postgres'])" :key="d.id" :value="d.id" :label="d.name" />
+        <el-select v-model="dsSourceRef" class="ds-import-select" placeholder="源端（PG/MySQL 数据源）" size="small">
+          <el-option label="源端（PG/MySQL 数据源）" value="" />
+          <el-option v-for="d in dsByType(['postgres', 'mysql'])" :key="d.id" :value="d.id" :label="d.name" />
         </el-select>
         <span class="ds-import-arrow">→</span>
         <el-select v-model="dsTargetRef" class="ds-import-select" placeholder="目标端（TiDB 数据源）" size="small">
@@ -62,7 +62,7 @@
       </div>
       <!-- Inline edit form (A1 manual edit) -->
       <div v-if="editingConn" class="conn-edit">
-        <div class="conn-edit-section">源端（PostgreSQL）</div>
+        <div class="conn-edit-section">源端数据库（PostgreSQL / MySQL）</div>
         <div class="conn-grid">
           <label>主机<el-input v-model="editForm.source.host" size="small" /></label>
           <label>端口<el-input-number v-model="editForm.source.port" :min="1" :max="65535" controls-position="right" size="small" class="conn-grid-num" /></label>
@@ -94,7 +94,9 @@
         <span class="precheck-dot">{{ it.level === 'ok' ? '✓' : it.level === 'warn' ? '!' : '✗' }}</span>
         <span class="precheck-label">{{ it.label }}</span>
         <span class="precheck-detail">{{ it.detail }}</span>
-        <el-button v-if="it.item === 'no_pk_tables' && it.level === 'warn' && noPKTables.length"
+        <!-- REPLICA IDENTITY is a PG-only mechanism — the mysql no-PK precheck
+             warn carries its own guidance (add a PK for row-accurate UPDATE/DELETE). -->
+        <el-button v-if="it.item === 'no_pk_tables' && it.level === 'warn' && noPKTables.length && connCfg?.source?.type !== 'mysql'"
           size="small" style="margin-left: auto; flex: none;"
           @click="openNoPKFix">修复（REPLICA IDENTITY FULL）</el-button>
       </div>

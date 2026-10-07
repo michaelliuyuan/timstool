@@ -135,22 +135,31 @@ func (s *Server) startCDCChainAfterSuccess(taskID string, cfg *config.Config) {
 		}
 		if seedErr := s.seedChainCheckpoint(taskID, cfg); seedErr != nil {
 			ok = false
-			msg = fmt.Sprintf("CDC 自动衔接失败（预置 checkpoint 出错）：%v；slot 已保留 WAL，请手动启动 CDC 并核对起点", seedErr)
+			msg = fmt.Sprintf("CDC 自动衔接失败（预置 checkpoint 出错）：%v；请手动启动 CDC 并核对起点", seedErr)
 			break
 		}
 		if _, err := s.cdcSupervisor.Start(context.Background()); err != nil {
 			ok = false
-			msg = fmt.Sprintf("CDC 自动衔接失败：%v（slot 已保留 WAL，请手动启动 CDC，无数据丢失）", err)
+			if sourceIsMySQL(cfg.Source) {
+				msg = fmt.Sprintf("CDC 自动衔接失败：%v（binlog 天然保留，请手动启动 CDC，无数据丢失）", err)
+			} else {
+				msg = fmt.Sprintf("CDC 自动衔接失败：%v（slot 已保留 WAL，请手动启动 CDC，无数据丢失）", err)
+			}
 		} else {
 			if s.cdcWatchdog != nil {
 				s.cdcWatchdog.NotifyStarted()
 			}
-			lsn := cfg.Migration.ChainStartLSN
-			if lsn == "" {
-				lsn = "slot 创建点位（见任务日志）"
+			pos := cfg.Migration.ChainStartLSN
+			if pos == "" && !sourceIsMySQL(cfg.Source) {
+				pos = "slot 创建点位（见任务日志）"
 			}
-			msg = fmt.Sprintf("增量已自动衔接：已按记录 LSN=%s 预置 checkpoint，CDC 将从该点位重放迁移窗口的变更（slot=%s，publication=%s；conflict_strategy=%s 幂等去重）",
-				lsn, chainSlotName(cfg), chainPublicationName(cfg), chainConflictStrategy(cfg))
+			if sourceIsMySQL(cfg.Source) {
+				msg = fmt.Sprintf("增量已自动衔接：已按记录位点 %s 预置 checkpoint，CDC 将从该位点重放迁移窗口的变更（binlog 天然保留；conflict_strategy=%s 幂等去重；v1 不支持 DDL——遇 DDL 将停链报错）",
+					pos, chainConflictStrategy(cfg))
+			} else {
+				msg = fmt.Sprintf("增量已自动衔接：已按记录 LSN=%s 预置 checkpoint，CDC 将从该点位重放迁移窗口的变更（slot=%s，publication=%s；conflict_strategy=%s 幂等去重）",
+					pos, chainSlotName(cfg), chainPublicationName(cfg), chainConflictStrategy(cfg))
+			}
 		}
 	}
 	if ok {
@@ -169,6 +178,10 @@ func (s *Server) startCDCChainAfterSuccess(taskID string, cfg *config.Config) {
 // child will load — unless a checkpoint already exists (resume semantics: an
 // existing checkpoint is always ≥ the chain point and wins).
 func (s *Server) seedChainCheckpoint(taskID string, cfg *config.Config) error {
+	if sourceIsMySQL(cfg.Source) {
+		// MS-11 pen 4: the MySQL seed (file:pos form, never rewind).
+		return s.seedChainCheckpointMySQL(taskID, cfg)
+	}
 	if cfg.Migration.ChainStartLSN == "" {
 		return nil // nothing recorded (e.g. slot reused pre-chain); child falls back to slot semantics
 	}

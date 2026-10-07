@@ -57,10 +57,9 @@ var mysqlMeta = source.SourceMeta{
 	// ddl_export flipped on by MS-10c (SHOW CREATE exporter dialect);
 	// compare flipped on by MS-08 (the compare validator speaks the MySQL
 	// wire); watermark (suggest + incremental) flipped on by MS-10a
-	// (mysqlWatermarkDialect). The remaining bit (CDC) stays false so the
-	// UI greys it out and the API 400-guards reject it (single truth,
-	// no scattered type branches) — CDC is the last PG-only source flow.
-	Capabilities: source.Capabilities{Schema: true, Data: true, CDC: false, Compare: true, Watermark: true, Assess: true, DDLExport: true},
+	// (mysqlWatermarkDialect); cdc flipped on by MS-11 (binlog CDC via the
+	// canal adapter, v1 DML-only + file:pos — DDL is a loud error state).
+	Capabilities: source.Capabilities{Schema: true, Data: true, CDC: true, Compare: true, Watermark: true, Assess: true, DDLExport: true},
 	Fields: []source.FieldSpec{
 		{Key: "host", Label: "主机地址", Type: "text", Required: true, Default: "localhost", Placeholder: "localhost", Group: "common"},
 		{Key: "port", Label: "端口", Type: "number", Required: true, Default: 3306, Group: "common"},

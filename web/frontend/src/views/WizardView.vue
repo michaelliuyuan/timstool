@@ -29,6 +29,8 @@ const effectiveSourceType = computed(() =>
   sourceRef.value ? (getDataSource(sourceRef.value)?.type || 'postgres') : sourceType.value)
 const sourceDS = computed(() => (sourceRef.value ? getDataSource(sourceRef.value) : undefined))
 const targetDS = computed(() => (targetRef.value ? getDataSource(targetRef.value) : undefined))
+// MS-11 pen 4: cdc_chain sources — PG (slot 保留 WAL) + MySQL (binlog 天然保留).
+const cdcChainCapable = computed(() => ['postgres', 'mysql'].includes(effectiveSourceType.value))
 
 const availableTables = ref<{name: string; row_estimate: number}[]>([])
 const loadingTables = ref(false)
@@ -344,7 +346,7 @@ async function submit() {
         skip_schema: form.opts.skip_schema,
         skip_data: form.opts.skip_data,
         skip_validate: form.opts.skip_validate,
-        cdc_chain: form.opts.cdc_chain && effectiveSourceType.value === 'postgres',
+        cdc_chain: form.opts.cdc_chain && cdcChainCapable.value,
         target_policy: form.opts.target_policy,
         compare_mode: form.opts.compare_mode,
         sample_ratio: form.opts.sample_ratio,
@@ -684,12 +686,13 @@ function prevStep() {
               <span style="color: var(--tims-brand); font-weight: 600;">全量+增量衔接</span>
             </template>
             <div class="chain-emphasis" style="width: 100%;">
-              <el-switch v-model="form.opts.cdc_chain" :disabled="effectiveSourceType !== 'postgres'" />
+              <el-switch v-model="form.opts.cdc_chain" :disabled="!cdcChainCapable" />
               <div style="color: var(--tims-text-2); font-size: 12px; margin-top: 4px;">
-                仅 PostgreSQL 源端可用。开启后任务启动前会自动预建 CDC 的 publication + replication
-                slot，全量期间源端 WAL 被保留；全量成功后自动启动 CDC 增量同步，从预建点位重放，实现零丢失衔接
-                （重放与全量重叠的数据按 conflict_strategy=replace 幂等去重）。注意：全量期间源端
-                WAL 会持续累积，max_slot_wal_keep_size 不要设置过小。
+                仅 PostgreSQL / MySQL 源端可用。PostgreSQL 开启后任务启动前会自动预建 CDC 的 publication + replication
+                slot，全量期间源端 WAL 被保留；MySQL 记录当前 master binlog 位点，binlog 天然保留。全量成功后自动启动
+                CDC 增量同步，从记录点位重放，实现零丢失衔接（重放与全量重叠的数据按
+                conflict_strategy=replace 幂等去重）。注意：PostgreSQL 全量期间源端 WAL 会持续累积，
+                max_slot_wal_keep_size 不要设置过小；MySQL 需保证 binlog 保留期覆盖全量窗口。
               </div>
             </div>
           </el-form-item>
@@ -768,7 +771,7 @@ function prevStep() {
             </el-descriptions-item>
             <el-descriptions-item label="数据临时目录">{{ form.opts.temp_dir }}</el-descriptions-item>
             <el-descriptions-item label="全量+增量衔接">
-              <el-tag v-if="form.opts.cdc_chain && effectiveSourceType === 'postgres'" type="success">已开启（预建 slot，零丢失）</el-tag>
+              <el-tag v-if="form.opts.cdc_chain && cdcChainCapable" type="success">已开启（衔接增量，零丢失）</el-tag>
               <template v-else>否</template>
             </el-descriptions-item>
             <el-descriptions-item label="数据冲突策略">

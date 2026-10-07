@@ -390,8 +390,12 @@ func TestSrcCapable(t *testing.T) {
 	if !srcCapable("postgres", source.CapAssess) {
 		t.Fatal(`srcCapable("postgres", CapAssess) = false`)
 	}
-	if srcCapable("oracle", source.CapCDC) || srcCapable("mysql", source.CapCDC) || srcCapable("tidb", source.CapCDC) {
-		t.Fatal("srcCapable(<non-pg>, CapCDC) = true; CDC is PG-only in v1")
+	if srcCapable("oracle", source.CapCDC) || srcCapable("tidb", source.CapCDC) {
+		t.Fatal("srcCapable(oracle/tidb, CapCDC) = true; CDC needs the real binlog/logical-replication engines")
+	}
+	// MS-11 pen 4: cdc flipped ON for mysql (binlog CDC, canal adapter).
+	if !srcCapable("mysql", source.CapCDC) {
+		t.Fatal(`srcCapable("mysql", CapCDC) = false; want true since MS-11`)
 	}
 	if !srcCapable("postgres", source.CapCDC) {
 		t.Fatal(`srcCapable("postgres", CapCDC) = false`)

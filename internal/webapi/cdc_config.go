@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/source"
 	"github.com/michaelliuyuan/timstool/internal/store"
 	"gopkg.in/yaml.v3"
 )
@@ -374,9 +375,10 @@ func (s *Server) handleImportCDCFromDataSource(w http.ResponseWriter, r *http.Re
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return
 	}
-	if srcEntry.Type != "postgres" {
-		// CDC capability read lands with the M4 binlog work (ruling seq 82).
-		s.writeError(w, http.StatusBadRequest, "source_ref: CDC 仅支持 PostgreSQL 源端数据源")
+	// MS-11 pen 4: the source gate is a capability read (single truth) —
+	// postgres (logical replication) and mysql (binlog CDC) both pass.
+	if ok, err := source.Capable(srcEntry.Type, source.CapCDC); err != nil || !ok {
+		s.writeError(w, http.StatusBadRequest, "source_ref: CDC 仅支持 PostgreSQL/MySQL 源端数据源")
 		return
 	}
 	tgtEntry, err := s.resolveDataSourceRef(req.TargetRef)

@@ -1275,18 +1275,19 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 全量+增量衔接 (P1): provision publication + slot BEFORE the migration
-	// starts so the migration window's WAL is retained. Any failure aborts the
-	// start — better not to run than to silently lose the window.
+	// 全量+增量衔接 (P1): provision the CDC start point BEFORE the migration
+	// starts so the migration window's changes are retained (PG: publication +
+	// slot retain WAL; MySQL: the binlog itself is the retention). Any failure
+	// aborts the start — better not to run than to silently lose the window.
 	if cfg.Migration.CDCChain {
 		if !srcCapable(cfg.Source.SourceType(), source.CapCDC) {
 			// MS-06 absorbs this guard (ruling seq 347): SourceType()
 			// normalizes "" to postgres, so the legacy empty-means-postgres
 			// ALLOW behavior is kept (C1 two-shape table, MS06-DIALECT-MAP).
-			s.writeError(w, http.StatusBadRequest, "cdc_chain 仅支持 PostgreSQL 源端")
+			s.writeError(w, http.StatusBadRequest, "cdc_chain 仅支持 PostgreSQL/MySQL 源端")
 			return
 		}
-		lsn, reused, err := s.prepareCDCChain(&cfg)
+		lsn, reused, err := s.prepareCDCChainFor(&cfg)
 		if err != nil {
 			s.store.SetTaskError(taskID, err.Error())
 			s.writeError(w, http.StatusConflict, "全量+增量衔接预建失败，任务未启动："+err.Error())
@@ -1301,9 +1302,17 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 				task.ConfigJSON = string(cfgBytes)
 			}
 		}
-		s.logCollector.Append(taskID, "INFO",
-			fmt.Sprintf("CDC chain 预建完成：slot=%s（%s，起点 LSN=%s）；全量期间源端 WAL 将被保留，注意 max_slot_wal_keep_size 不要设置过小",
-				chainSlotName(&cfg), map[bool]string{true: "复用已有", false: "新建"}[reused], lsn), "")
+		if sourceIsMySQL(cfg.Source) {
+			// MS-11 pen 4: no slot/publication — the binlog retains the
+			// window natively; the recorded master file:pos is the replay start.
+			s.logCollector.Append(taskID, "INFO",
+				fmt.Sprintf("CDC chain 预建完成：已记录源端 master 位点 %s；全量期间 binlog 天然保留（注意 expire_logs_days/binlog 空间），成功后自动衔接增量（conflict_strategy=%s 幂等去重）",
+					lsn, chainConflictStrategy(&cfg)), "")
+		} else {
+			s.logCollector.Append(taskID, "INFO",
+				fmt.Sprintf("CDC chain 预建完成：slot=%s（%s，起点 LSN=%s）；全量期间源端 WAL 将被保留，注意 max_slot_wal_keep_size 不要设置过小",
+					chainSlotName(&cfg), map[bool]string{true: "复用已有", false: "新建"}[reused], lsn), "")
+		}
 	}
 
 	// F-08 (adversarial 🟡, order fix): swapRunning BEFORE writing Running —

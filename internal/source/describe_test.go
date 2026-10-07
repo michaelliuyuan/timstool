@@ -42,8 +42,8 @@ func TestDescribeImplementedVsStub(t *testing.T) {
 		t.Errorf("postgres meta = %+v, want Implemented/5432/CDC=true", pg)
 	}
 	my, _ := source.Describe("mysql")
-	if !my.Implemented || my.DefaultPort != 3306 || my.Capabilities.CDC {
-		t.Errorf("mysql meta = %+v, want Implemented/3306/CDC=false", my)
+	if !my.Implemented || my.DefaultPort != 3306 || !my.Capabilities.CDC {
+		t.Errorf("mysql meta = %+v, want Implemented/3306/CDC=true (MS-11)", my)
 	}
 	ora, err := source.Describe("oracle")
 	if err != nil {

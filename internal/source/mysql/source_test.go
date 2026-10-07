@@ -175,8 +175,9 @@ func TestMySQLDescribe(t *testing.T) {
 	if charset.Group != "source" {
 		t.Errorf("charset.Group = %q, want source", charset.Group)
 	}
-	if !meta.Capabilities.Data || meta.Capabilities.CDC {
-		t.Errorf("mysql capabilities = %+v, want Data=true CDC=false", meta.Capabilities)
+	// MS-11 pen 4: cdc flipped ON (binlog CDC via the canal adapter).
+	if !meta.Capabilities.Data || !meta.Capabilities.CDC {
+		t.Errorf("mysql capabilities = %+v, want Data=true CDC=true (MS-11)", meta.Capabilities)
 	}
 }
 
