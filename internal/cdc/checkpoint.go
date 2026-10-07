@@ -60,7 +60,7 @@ func (c *CheckpointManager) Load() (*Checkpoint, error) {
 	c.dirty = false
 
 	c.log.Info("cdc checkpoint loaded",
-		zap.String("lsn", cp.LSN.String()),
+		zap.String("position", cp.Position()),
 		zap.Time("timestamp", cp.Timestamp),
 	)
 	return &cp, nil
@@ -85,7 +85,7 @@ func (c *CheckpointManager) Save() error {
 
 	c.dirty = false
 	c.log.Debug("cdc checkpoint saved",
-		zap.String("lsn", cp.LSN.String()),
+		zap.String("position", cp.Position()),
 	)
 	return nil
 }
@@ -108,11 +108,43 @@ func (c *CheckpointManager) GetLSN() pglogrepl.LSN {
 	return c.checkpoint.LSN
 }
 
+// UpdateBinlog records a new MySQL binlog position (MS-11 pen 1, dual-source
+// shape; the PG Update(lsn) path is untouched). Call after a successfully
+// applied batch; Save() persists.
+func (c *CheckpointManager) UpdateBinlog(bp BinlogPosition) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.checkpoint.Binlog = &bp
+	c.checkpoint.Timestamp = time.Now()
+	c.dirty = true
+}
+
+// GetBinlog returns a copy of the current MySQL binlog position, nil when the
+// checkpoint is a PG one (or fresh).
+func (c *CheckpointManager) GetBinlog() *BinlogPosition {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.checkpoint.Binlog == nil {
+		return nil
+	}
+	bp := *c.checkpoint.Binlog
+	return &bp
+}
+
 // GetCheckpoint returns a copy of the current checkpoint.
 func (c *CheckpointManager) GetCheckpoint() Checkpoint {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.checkpoint
+}
+
+// Position renders the source-neutral checkpoint marker (PG LSN text /
+// MySQL binlog file:pos) — MS-11 pen 1.
+func (c *CheckpointManager) Position() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.checkpoint.Position()
 }
 
 // IsDirty returns true if there are unpersisted LSN updates.

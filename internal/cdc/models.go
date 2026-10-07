@@ -3,6 +3,7 @@
 package cdc
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -31,6 +32,36 @@ type CDCEvent struct {
 	OldColumns []ColumnValue `json:"old_columns,omitempty"` // UPDATE old values
 	DDL        string        `json:"ddl,omitempty"`         // DDL statement text
 	RawData    []byte        `json:"-"`                     // raw pgoutput message (for replay)
+
+	// Binlog is the MySQL source position (MS-11 pen 1, dual-source shape).
+	// Nil on PG events; LSN is the PG marker. Exactly one of the two is set
+	// for a real event from a live source.
+	Binlog *BinlogPosition `json:"binlog,omitempty"`
+}
+
+// Position renders the source-neutral progress marker of this event:
+// PG → WAL LSN text, MySQL → binlog file:pos (MS-11 pen 1).
+func (e *CDCEvent) Position() string {
+	if e.Binlog != nil {
+		return e.Binlog.String()
+	}
+	return e.LSN.String()
+}
+
+// BinlogPosition is a MySQL binlog coordinate (MS-11 v1: file:pos; GTID is a
+// v2 candidate — deliberately NOT carried here to keep one positioning
+// semantic per struct).
+type BinlogPosition struct {
+	File string `json:"file"` // binlog file name, e.g. "mysql-bin.000003"
+	Pos  uint32 `json:"pos"`  // byte offset within the file
+}
+
+// String renders the canonical "file:pos" display form.
+func (p *BinlogPosition) String() string {
+	if p == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", p.File, p.Pos)
 }
 
 // ColumnValue is a single column name/value pair in a CDC event.
@@ -42,15 +73,30 @@ type ColumnValue struct {
 	Unchanged bool        `json:"unchanged,omitempty"` // pgoutput 'u': unchanged TOASTed value, not sent — must never be rendered as a literal
 }
 
-// Checkpoint records the last successfully processed LSN.
+// Checkpoint records the last successfully processed position (dual-source
+// shape, MS-11 pen 1): LSN is the PG WAL marker (legacy field — existing
+// checkpoint files keep parsing unchanged), Binlog the MySQL marker.
 type Checkpoint struct {
-	LSN       pglogrepl.LSN `json:"lsn"`
-	Timestamp time.Time     `json:"timestamp"`
-	SlotName  string        `json:"slot_name"`
+	LSN       pglogrepl.LSN   `json:"lsn"`
+	Timestamp time.Time       `json:"timestamp"`
+	SlotName  string          `json:"slot_name"`
+	Binlog    *BinlogPosition `json:"binlog,omitempty"`
 	// LastDDLID is the last applied pg2tidb_ddl_log.id (DDL replication resume,
 	// #t59). At-least-once: on restart, DDL poll resumes from here so already-
 	// applied DDL isn't replayed.
 	LastDDLID int64 `json:"last_ddl_id,omitempty"`
+}
+
+// Position renders the source-neutral checkpoint marker: PG → WAL LSN text,
+// MySQL → binlog file:pos (MS-11 pen 1).
+func (cp *Checkpoint) Position() string {
+	if cp == nil {
+		return ""
+	}
+	if cp.Binlog != nil {
+		return cp.Binlog.String()
+	}
+	return cp.LSN.String()
 }
 
 // SourceConfig configures the PG logical replication source.

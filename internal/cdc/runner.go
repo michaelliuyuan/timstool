@@ -315,7 +315,7 @@ func (r *Runner) writeStatus() {
 		FatalError:  fatal,
 		Stats:       stats,
 		Checkpoint: CDCStatusCheckpoint{
-			LSN:       cp.LSN.String(),
+			LSN:       cp.Position(),
 			UpdatedAt: cp.Timestamp,
 		},
 	}
@@ -330,7 +330,7 @@ func (r *Runner) Stats() map[string]interface{} {
 		"source_events":  r.source.EventsReceived(),
 		"source_lsn":     r.source.CurrentLSN().String(),
 		"source_running": r.source.IsRunning(),
-		"checkpoint_lsn": r.checkpoint.GetLSN().String(),
+		"checkpoint_lsn": r.checkpoint.Position(),
 	}
 
 	if r.applier != nil {

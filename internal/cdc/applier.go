@@ -376,7 +376,7 @@ func (a *Applier) worker(ctx context.Context, workCh <-chan *CDCEvent, id int) {
 		} else {
 			a.stats.mu.Lock()
 			a.stats.EventsApplied++
-			a.stats.LastLSN = event.LSN.String()
+			a.stats.LastLSN = event.Position()
 			a.stats.LastFlushTime = time.Now()
 			a.stats.mu.Unlock()
 		}
