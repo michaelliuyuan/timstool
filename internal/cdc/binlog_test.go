@@ -6,9 +6,7 @@ package cdc
 // render canonically; the pen-2 seam fails loud.
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -119,8 +117,11 @@ func TestCheckpointManagerBinlogRoundtrip(t *testing.T) {
 }
 
 func TestNewBinlogSourceFailLoud(t *testing.T) {
-	if _, err := newBinlogSource(BinlogSourceConfig{ServerID: 1}); !errors.Is(err, ErrBinlogNotWired) {
-		t.Fatalf("pen-1 seam must fail loud with ErrBinlogNotWired, got %v", err)
+	// Seam wiring: the default constructor is the canal adapter (pen 2) —
+	// constructing with an invalid ServerID must fail loud with a clear
+	// validation error, before any network attempt.
+	_, err := newBinlogSource(BinlogSourceConfig{ServerID: 0, Host: "127.0.0.1", Port: 3306})
+	if err == nil || !strings.Contains(err.Error(), "ServerID") {
+		t.Fatalf("ServerID=0 must fail loud with a ServerID validation error, got %v", err)
 	}
-	_ = context.Background()
 }

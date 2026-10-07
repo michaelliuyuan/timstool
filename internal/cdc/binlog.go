@@ -1,19 +1,22 @@
 package cdc
 
 // binlog.go — MS-11 pen 1 seams: the source-neutral plug points the MySQL
-// binlog collection layer (pen 2) wires into and the runner reuses for
-// MySQL chains (pen 3). Nothing here runs yet — newBinlogSource is a
-// fail-loud slot, and the PG pipeline (Source/Runner) is untouched.
+// binlog collection layer (pen 2, binlog_canal.go) wires into and the runner
+// reuses for MySQL chains (pen 3). The PG pipeline (Source/Runner) is
+// untouched.
 
 import (
 	"context"
-	"errors"
 
 	// Pin the binlog collection dependency (MS-11 pen 1) so go.mod carries it
-	// as a direct require and go.sum is complete before pen 2 wires the canal
-	// adapter in. Pure Go, CGO=0 preserved.
+	// as a direct require and go.sum is complete. Pure Go, CGO=0 preserved.
+	// binlog_canal.go (pen 2) imports it for real.
 	_ "github.com/go-mysql-org/go-mysql/canal"
 )
+
+type errorString string
+
+func (e errorString) Error() string { return string(e) }
 
 // BinlogSourceConfig configures the MySQL binlog replication source
 // (MS-11 v1: file:pos positioning; GTID is a v2 candidate).
@@ -33,10 +36,17 @@ type BinlogSourceConfig struct {
 	ExcludeTables []string
 }
 
-// ErrBinlogNotWired is returned by the pen-1 seam until pen 2 lands the
-// canal-based implementation. Fail-loud by design: a configured-but-missing
-// binlog source must never silently no-op.
-var ErrBinlogNotWired = errors.New("mysql binlog source not wired (MS-11 pen 2)")
+// newBinlogSource is the constructor seam (canal adapter since pen 2).
+// Package-level var so tests can stub it exactly like the orchestrator CIR
+// seams; the default wires the canal implementation (init in
+// binlog_canal.go).
+var newBinlogSource = func(cfg BinlogSourceConfig) (binlogStreamer, error) {
+	return nil, errBinlogSourceNil
+}
+
+// errBinlogSourceNil is replaced by binlog_canal.go's init wiring; seeing it
+// means the wiring was removed — fail loud rather than nil-stream.
+var errBinlogSourceNil = errorString("binlog source not wired (canal adapter missing)")
 
 // binlogStreamer is the contract the pen-2 collection layer implements —
 // shaped to mirror the PG *Source surface the Runner already drives:
@@ -57,12 +67,4 @@ type binlogStreamer interface {
 
 	// Close tears the stream down.
 	Close() error
-}
-
-// newBinlogSource is the pen-2 fill-in seam (canal adapter vs raw
-// replication stream is a ruled pen-2 decision). Package-level var so tests
-// can stub it exactly like the orchestrator CIR seams. Implementations
-// follow the house pattern: constructor + SetLogger.
-var newBinlogSource = func(cfg BinlogSourceConfig) (binlogStreamer, error) {
-	return nil, ErrBinlogNotWired
 }
