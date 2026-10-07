@@ -25,7 +25,7 @@ type fakeMySQLChainProber struct {
 	masterErr  error
 }
 
-func (f *fakeMySQLChainProber) PingTarget(cfg *config.Config) error   { return nil }
+func (f *fakeMySQLChainProber) PingTarget(cfg *config.Config) error { return nil }
 func (f *fakeMySQLChainProber) PingMySQL(cfg *config.Config) (string, error) {
 	return "8.0.36", nil
 }
