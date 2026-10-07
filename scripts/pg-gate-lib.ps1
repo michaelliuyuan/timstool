@@ -452,8 +452,18 @@ function Invoke-FaceStatic {
         if ($exp -ne '') {
             $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'
             try {
+                # Determinism guard (MS-11 pen 1 anchor incident): vcs stamping
+                # makes the hash depend on tree location (clone vs linked
+                # worktree) and untracked files (vcs.modified). The MS-10a
+                # ruling already fixed the reporting convention - anchor
+                # builds carry -buildvcs=false. Refuse to hash a dirty tree
+                # so stragglers can never sneak into an anchor run.
+                $dirty = & git status --porcelain 2>&1 | Out-String
+                if ("$dirty".Trim() -ne '') {
+                    throw "artifact hash refused: working tree not clean (untracked/modified files can taint anchor builds): $($dirty.Trim())"
+                }
                 $art = Join-Path $env:TEMP "pg-gate-artifact-$([IO.Path]::GetRandomFileName().Replace('.',''))"
-                & go build -trimpath -ldflags "-s -w" -o $art . 2>&1 | Out-Null
+                & go build -trimpath -buildvcs=false -ldflags "-s -w" -o $art . 2>&1 | Out-Null
                 $hash = (Get-FileHash -Algorithm SHA256 $art).Hash
                 Remove-Item $art -Force -ErrorAction SilentlyContinue
                 if ($hash -ne $exp) {
