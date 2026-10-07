@@ -59,7 +59,7 @@ timstool cdc（cmd/cdc.go 单入口）
 - 笔③：config.go 2→3（server_id/sync_ddl v1 规则，sanctioned dispatch）；新目 cmd/cdc.go×1、cdc_precheck.go×1、cdc_mutex_guard.go×1。
 - 笔④：cdc_config.go **2→1**（字面分派→CapCDC 能力读，only-decrease 正典形）；chain/seed 分派零新正则命中面。
 
-## latent 总账（10 条；①-⑤原账+箭①②④⑦⑧⑨ 双轨票记档；leader 裁定全部非阻塞）
+## latent 总账（11 条；①-⑤原账+箭①②④⑦⑧⑨ 双轨票记档+箭③ parser 失败面；leader 裁定全部非阻塞）
 
 1. GTID 断点（v2 候选）：binlog file:pos 在源端 reset master/切主后失效——重建链（同 DDL 话术路径）。
 2. DDL 同步（v2 候选）：error 态硬语义为 v1 边界，非缺陷。
@@ -71,3 +71,4 @@ timstool cdc（cmd/cdc.go 单入口）
 8. **binlogBefore 文件序=字典序**（箭⑦ micro）：binlog 文件名 >6 位数字后缀或非定宽命名破序——seed 不倒退判据可能误判；主流命名（mysql-bin.000003 定宽 6 位）不触。
 9. **Tables/ExcludeTables 跨源语义断层**（箭⑧）：PG=glob（`*`）/MySQL=regex（canal）同字段异义——`users_*` 携 glob 意图在 regex 语义零表匹配 **fail-visible**（起链拒，非静默）；v2 统一。
 10. **repl_privs 探针子串匹配假绿面**（箭⑨真发现，非阻塞）：cdc_precheck_mysql.go `Contains(up,"SUPER")` 子串误配（库名 superstore 类）+MySQL 8.0 SUPER 不蕴含 REPLICATION SLAVE（视为充分=第二假绿面）——后果=canal dump 阶段迟到 loud 失败，非静默丢失；v2 词元级解析。
+11. **canal parser 失败面 DDL 豁口**（箭③，seq971 明令记档）：parser 不识别的 DDL（CREATE TRIGGER 类）→canal sync.go:147 静默跳→OnDDL 不触发——『DDL 禁静默跳』在 parser 失败面有洞；缓解=DiscardNoMetaRowEvent=false+fail-loud 下游兜底；v2 候选=parser 失败显式上抛。
