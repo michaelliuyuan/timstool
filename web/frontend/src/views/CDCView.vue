@@ -3,7 +3,7 @@
     <PageHeader title="CDC 实时同步" subtitle="基于数据库日志的推式实时管道，自动捕获 INSERT/UPDATE/DELETE，常驻运行" />
 
     <!-- S1-UI-06: which-one-to-use card (shared with the watermark backfill page) -->
-    <SyncCompareCard current="cdc" :cdc-source-req="srcIsMySQL ? 'binlog（ROW 格式 + REPLICATION 权限）' : undefined" />
+    <SyncCompareCard v-if="connCfg" current="cdc" :cdc-source-req="srcIsMySQL ? 'binlog（ROW 格式 + REPLICATION 权限）' : undefined" />
 
     <!-- Module disabled (cdc.enable=false) -->
     <!-- P1 巡检修复 #7：div → el-card，白底/边框/圆角由 el-card 皮肤提供 -->
@@ -16,6 +16,7 @@
     <template v-else>
     <!-- Signature pipeline strip -->
     <DataPipelineStrip
+      v-if="connCfg"
       :source="srcIsMySQL ? 'MySQL' : 'PostgreSQL'"
       :status="pipelineStatus"
       :badges="pipelineBadges"
@@ -253,7 +254,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import apiClient from '../api'
 import DataPipelineStrip from '../components/DataPipelineStrip.vue'
@@ -349,11 +350,21 @@ const precheckPassed = computed(() => precheck.value?.warn_only === true)
 // (:99) — connCfg.source.type. PG branch keeps every string byte-identical.
 const srcIsMySQL = computed(() => connCfg.value?.source?.type === 'mysql')
 
+// MS-11a pen 4c: any source switch (saveConn / importConn / importFromDS all
+// funnel through loadConnConfig) re-runs the slot fetch — the mysql branch
+// clears a stale PG slot card immediately instead of waiting a poll cycle.
+watch(srcIsMySQL, () => refreshSlot())
+
 async function loadConnConfig() {
   try {
     const { data } = await apiClient.getCDCConfig()
     connCfg.value = data
-  } catch {}
+  } catch (e) {
+    // MS-11a pen 4b: a silent failure here would freeze the page on PG-shaped
+    // copy forever — make it visible once instead.
+    console.error('load CDC config failed', e)
+    ElMessage.warning('CDC 配置加载失败，页面显示可能不准确')
+  }
 }
 
 function startEditConn() {

@@ -105,4 +105,15 @@ describe('CDCView source-aware copy (MS-11a pens 1+2)', () => {
     const c = cmpSrc()
     expect(c).toContain(`{ cdcSourceReq: '逻辑复制 slot（wal_level=logical、复制权限）' }`)
   })
+
+  it('pen4a: no first-frame PG flash — pipeline strip and compare card render only after connCfg loads', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<SyncCompareCard v-if="connCfg" current="cdc"`)
+    expect(src).toContain(`<DataPipelineStrip\n      v-if="connCfg"`)
+  })
+
+  it('pen4c: source switches re-run the slot fetch — stale PG slot card cleared on switch to mysql', () => {
+    const src = viewSrc()
+    expect(src).toContain(`watch(srcIsMySQL, () => refreshSlot())`)
+  })
 })
