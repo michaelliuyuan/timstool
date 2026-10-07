@@ -121,10 +121,16 @@ func (r *BinlogRunner) Run(ctx context.Context) error {
 	// Source-event counter: wrap the stream so Stats/writeStatus see the
 	// receive count (the PG source counts internally; the streamer contract
 	// keeps it runner-side).
+	// MS-11 pen 7 (blackbox finding): the goroutine must capture the ORIGINAL
+	// channel VALUE, not the `events` variable — `events = counted` below
+	// reassigns it, and a not-yet-scheduled goroutine ranging the variable
+	// would instead range `counted` itself (self-deadlock: the stream channel
+	// fills, nothing drains it, zero events delivered).
 	counted := make(chan *CDCEvent, 1024)
+	srcCh := events
 	go func() {
 		defer close(counted)
-		for ev := range events {
+		for ev := range srcCh {
 			r.eventsReceived.Add(1)
 			counted <- ev
 		}
