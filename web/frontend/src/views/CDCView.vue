@@ -3,19 +3,20 @@
     <PageHeader title="CDC 实时同步" subtitle="基于数据库日志的推式实时管道，自动捕获 INSERT/UPDATE/DELETE，常驻运行" />
 
     <!-- S1-UI-06: which-one-to-use card (shared with the watermark backfill page) -->
-    <SyncCompareCard current="cdc" />
+    <SyncCompareCard current="cdc" :cdc-source-req="srcIsMySQL ? 'binlog（ROW 格式 + REPLICATION 权限）' : undefined" />
 
     <!-- Module disabled (cdc.enable=false) -->
     <!-- P1 巡检修复 #7：div → el-card，白底/边框/圆角由 el-card 皮肤提供 -->
     <el-card class="disabled-card" v-if="disabled">
       <h3>CDC 模块未启用</h3>
       <p>当前部署未开启 CDC 实时同步（<code>cdc.enable: false</code>）。</p>
-      <p class="hint">如需使用：在 config.yaml 设置 <code>cdc.enable: true</code>，或用 <code>pg2tidb cdc --enable-cdc</code> 启动。</p>
+      <p class="hint">如需使用：在 config.yaml 设置 <code>cdc.enable: true</code>，或用 <code>timstool cdc --enable-cdc</code> 启动。</p>
     </el-card>
 
     <template v-else>
     <!-- Signature pipeline strip -->
     <DataPipelineStrip
+      :source="srcIsMySQL ? 'MySQL' : 'PostgreSQL'"
       :status="pipelineStatus"
       :badges="pipelineBadges"
     />
@@ -38,7 +39,7 @@
       </div>
       <div class="detail-row">
         <span class="detail-label">CDC 参数:</span>
-        <code>{{ connCfg.cdc.mode }}<template v-if="connCfg.cdc.slot_name"> · slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }}</template> · parallel={{ connCfg.cdc.parallel }} · 冲突={{ connCfg.cdc.conflict_strategy }} · DDL={{ connCfg.cdc.sync_ddl ? '同步' : '不同步' }}</code>
+        <code>{{ connCfg.cdc.mode }}<template v-if="srcIsMySQL"> · binlog 采集（file:pos 位点续传）</template><template v-else-if="connCfg.cdc.slot_name"> · slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }}</template> · parallel={{ connCfg.cdc.parallel }} · 冲突={{ connCfg.cdc.conflict_strategy }} · DDL={{ connCfg.cdc.sync_ddl ? '同步' : '不同步' }}</code>
       </div>
       <div class="control-actions" style="margin-top: 10px;">
         <el-button v-if="!editingConn" @click="startEditConn">编辑连接</el-button>
@@ -47,8 +48,8 @@
       <!-- F-02 D4: one-click import from saved datasources -->
       <div class="control-actions ds-import" v-if="!editingConn">
         <span class="ds-import-label">从数据源导入：</span>
-        <el-select v-model="dsSourceRef" class="ds-import-select" placeholder="源端（PG/MySQL 数据源）" size="small">
-          <el-option label="源端（PG/MySQL 数据源）" value="" />
+        <el-select v-model="dsSourceRef" class="ds-import-select" placeholder="源端数据源" size="small">
+          <el-option label="源端数据源" value="" />
           <el-option v-for="d in dsByType(['postgres', 'mysql'])" :key="d.id" :value="d.id" :label="d.name" />
         </el-select>
         <span class="ds-import-arrow">→</span>
@@ -130,8 +131,8 @@
         <span class="status-text">{{ cardLabel }}</span>
       </div>
       <div class="status-meta">
-        <span v-if="status.running && status.lsn">LSN: {{ status.lsn }}</span>
-        <span v-else-if="inStartup">CDC 启动中…（control 通道确认运行，等待 CDC 连接 PG/TiDB 写首条状态，约 8-90s）</span>
+        <span v-if="status.running && status.lsn">{{ srcIsMySQL ? '同步位点' : 'LSN' }}: {{ status.lsn }}</span>
+        <span v-else-if="inStartup">CDC 启动中…（control 通道确认运行，等待 CDC 连接 {{ srcIsMySQL ? 'MySQL' : 'PG' }}/TiDB 写首条状态，约 8-90s）</span>
         <span v-else>{{ status.message || 'CDC 未运行，点上方「启动 CDC」开始' }}</span>
       </div>
       <div class="status-meta" v-if="status.fatal_error" style="color: #fff; opacity: 0.95;">
@@ -180,7 +181,7 @@
     <el-card class="detail-card" v-if="checkpoint && checkpoint.lsn">
       <h3>检查点</h3>
       <div class="detail-row">
-        <span class="detail-label">LSN:</span>
+        <span class="detail-label">{{ srcIsMySQL ? '同步位点:' : 'LSN:' }}</span>
         <code>{{ checkpoint.lsn }}</code>
       </div>
       <div class="detail-row" v-if="status.slot">
@@ -344,6 +345,10 @@ const slotView = ref<CDCSlotView | null>(null)
 
 const precheckPassed = computed(() => precheck.value?.warn_only === true)
 
+// MS-11a: source-aware copy. Same truth as the REPLICA IDENTITY guard above
+// (:99) — connCfg.source.type. PG branch keeps every string byte-identical.
+const srcIsMySQL = computed(() => connCfg.value?.source?.type === 'mysql')
+
 async function loadConnConfig() {
   try {
     const { data } = await apiClient.getCDCConfig()
@@ -444,6 +449,11 @@ async function runPrecheck() {
 }
 
 async function refreshSlot() {
+  // Slot view is a PG-only surface; skip the fetch for MySQL chains.
+  if (srcIsMySQL.value) {
+    slotView.value = null
+    return
+  }
   try {
     const { data } = await apiClient.cdcSlot()
     slotView.value = data
@@ -511,7 +521,7 @@ async function resetCheckpoint() {
   let answer: string
   try {
     const { value } = await ElMessageBox.prompt(
-      '危险操作：删除 checkpoint 断点文件。重启后将从 slot restart_lsn 重放（宁重放不丢数据）。输入 DELETE 确认：',
+      `危险操作：删除 checkpoint 断点文件。重启后将从${srcIsMySQL.value ? ' checkpoint 记录的 binlog 位点重放' : ' slot restart_lsn 重放'}（宁重放不丢数据）。输入 DELETE 确认：`,
       '危险操作',
       { type: 'warning', confirmButtonText: '确认', cancelButtonText: '取消' },
     )
@@ -555,7 +565,7 @@ const pipelineStatus = computed<'running' | 'warn' | 'stopped'>(() => {
 })
 const pipelineBadges = computed(() => {
   const b: { label: string; value: string }[] = []
-  if (status.value.lsn) b.push({ label: 'LSN', value: status.value.lsn })
+  if (status.value.lsn) b.push({ label: srcIsMySQL.value ? 'Binlog' : 'LSN', value: status.value.lsn })
   if (stats.value) {
     b.push({ label: '吞吐', value: (stats.value.throughput_rps?.toFixed(1) || '0') + '/s' })
     b.push({ label: '延迟', value: (stats.value.lag_seconds?.toFixed(1) || '0') + 's' })

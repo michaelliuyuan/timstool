@@ -24,9 +24,11 @@ describe('CDCView source surface (MS-11 pen 4)', () => {
     expect(src).not.toContain(`源端（PostgreSQL）`)
   })
 
-  it('slot/pub segment renders only when a slot is configured (mysql has none)', () => {
+  it('CDC params row forks by source: mysql shows binlog wording, slot/pub stays PG-only', () => {
     const src = viewSrc()
-    expect(src).toContain(`<template v-if="connCfg.cdc.slot_name"> · slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }}</template>`)
+    // MS-11a: mysql branch shows the binlog wording; PG branch keeps the
+    // original slot/pub segment byte-identical.
+    expect(src).toContain(`<template v-if="srcIsMySQL"> · binlog 采集（file:pos 位点续传）</template><template v-else-if="connCfg.cdc.slot_name"> · slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }}</template>`)
   })
 
   it('REPLICA IDENTITY no-PK assist is hidden for mysql sources (PG-only mechanism)', () => {

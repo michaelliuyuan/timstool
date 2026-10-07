@@ -3,7 +3,16 @@
 // sync pages (CDC real-time vs timestamp-watermark backfill), so each page
 // states its own nature AND points at the other module. Collapsible to keep
 // the first screen clean; module-specific boundary notes go in the slot.
-defineProps<{ current: 'cdc' | 'watermark' }>()
+// MS-11a: CDC "源端要求" row is source-aware — the CDC page passes the MySQL
+// wording when the live chain's source is MySQL; default keeps the PG text so
+// the watermark page (no prop) is byte-identical.
+withDefaults(
+  defineProps<{
+    current: 'cdc' | 'watermark'
+    cdcSourceReq?: string
+  }>(),
+  { cdcSourceReq: '逻辑复制 slot（wal_level=logical、复制权限）' },
+)
 
 import { ref } from 'vue'
 const active = ref<string[]>([])
@@ -37,7 +46,7 @@ const active = ref<string[]>([])
           </tr>
           <tr>
             <td class="cmp-key">源端要求</td>
-            <td>逻辑复制 slot（wal_level=logical、复制权限）</td>
+            <td>{{ cdcSourceReq }}</td>
             <td>时间戳/整数水位列（建议建索引，否则可能全表扫描）</td>
           </tr>
           <tr>
