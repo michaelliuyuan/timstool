@@ -181,6 +181,10 @@ var typeBranchFixture = map[string]int{
 	"internal/webapi/cdc_precheck.go": 1,
 	// MS-11 pen 3: dual-increment mutex single kind branch (sourceIsMySQL).
 	"internal/webapi/cdc_mutex_guard.go": 1,
+	// MS-11b pen 2: MySQL server_id pre-start gate in handleCDCStart —
+	// sanctioned dispatch (single SourceType()=="mysql" branch, mirrors the
+	// mutex-guard shape; PG never hits the gate).
+	"internal/webapi/cdc_handler.go": 1,
 }
 
 // Ruling pattern (seq 82): catches .Type/srcType/SourceType() compares plus
