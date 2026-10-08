@@ -208,6 +208,10 @@ func TestCanalHandlerDDLOutsideTargetIgnored(t *testing.T) {
 		{"", "DROP TABLE `db`.`t`"},                    // backticked form
 		{"other", "ALTER TABLE db.t ADD COLUMN c INT"}, // defaulted elsewhere, qualified target
 		{"", "alter table DB.T add column c int"},      // case-insensitive
+		{"", "CREATE INDEX i ON db.t (c)"},             // non-prefix reference (te ammo #4)
+		{"", "RENAME TABLE other.a TO db.b"},           // target on the TO right side (te ammo #3)
+		{"", "DROP TABLE db.t1, other.t2"},             // multi-table (te ammo #3)
+		{"", "TRUNCATE TABLE Db.T"},                    // TRUNCATE kind + lctn fold shape
 	} {
 		if err := sh.OnDDL(&replication.EventHeader{}, mysql.Position{}, &replication.QueryEvent{
 			Schema: []byte(tc.schema), Query: []byte(tc.query),
@@ -215,12 +219,16 @@ func TestCanalHandlerDDLOutsideTargetIgnored(t *testing.T) {
 			t.Fatalf("qualified target-db DDL (schema=%q, %q) must halt", tc.schema, tc.query)
 		}
 	}
-	// Non-target qualified names and near-miss identifiers stay ignored:
-	// my_db prefix, other-db references, a column named like target.
+	// Non-target statements stay ignored: other-db qualified names,
+	// near-miss identifiers, and ADMIN DDL with an empty schema (ALTER
+	// USER is not table-kind — the pen8 scan is verb-gated so the admin
+	// noise face keeps the MS-11e A ignore).
 	for _, q := range []string{
 		"ALTER TABLE other.t ADD COLUMN c INT",
 		"ALTER TABLE my_db.t ADD COLUMN c INT",
 		"ALTER TABLE o.t ADD COLUMN xdb INT", // substring, not a qualifier of target
+		"ALTER USER 'db.x'@'%' IDENTIFIED BY 'pw'",
+		"CREATE USER dbadmin",
 	} {
 		if err := h.OnDDL(&replication.EventHeader{}, mysql.Position{}, &replication.QueryEvent{
 			Schema: []byte(""), Query: []byte(q),

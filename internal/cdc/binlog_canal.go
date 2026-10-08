@@ -266,16 +266,26 @@ func (h *canalHandler) OnDDL(header *replication.EventHeader, nextPos mysql.Posi
 	return err
 }
 
-// ddlMentionsTargetDB reports whether the DDL text carries a target-db-
-// qualified object reference (tgt.t / `tgt`.`t`). Coarse by design: a false
-// positive halts with remediation wording (safe), a false negative needs a
-// fully-qualified DDL that never names the target db (impossible — the
-// reference IS the target it modifies).
+// ddlTableKind matches the table-object DDL verbs whose statements may
+// carry qualified table references (pen8 ruling: the coarse scan is gated
+// on this kind set so admin DDL like ALTER USER keeps the plain ignore).
+var ddlTableKind = regexp.MustCompile(`(?i)\b(ALTER\s+TABLE|CREATE\s+(TABLE|UNIQUE\s+INDEX|INDEX)|DROP\s+(TABLE|INDEX)|TRUNCATE(\s+TABLE)?|RENAME\s+TABLE)\b`)
+
+// ddlMentionsTargetDB reports whether a TABLE-kind DDL text carries a
+// target-db-qualified object reference (tgt.t / `tgt`.`t`, anywhere in the
+// statement — RENAME ... TO tgt.b and CREATE INDEX ... ON tgt.t included).
+// Coarse by design: a false positive halts with remediation wording (safe),
+// a false negative needs a statement that modifies the target db without
+// ever naming it (impossible for table DDL).
 func ddlMentionsTargetDB(query, target string) bool {
 	if target == "" || query == "" {
 		return false
 	}
-	// Accept `tgt`. / tgt. (backticks optional on either side, gap-tolerant).
+	if !ddlTableKind.MatchString(query) {
+		return false
+	}
+	// Accept `tgt`. / tgt. (backticks optional on either side, gap-tolerant);
+	// the leading boundary stops my_tgt/xdb substrings from matching.
 	q := regexp.QuoteMeta(target)
 	re := regexp.MustCompile("(?i)(^|[^0-9A-Za-z_$\\x{0080}-\\x{ffff}])`?" + q + "`?\\s*\\.")
 	return re.MatchString(query)
