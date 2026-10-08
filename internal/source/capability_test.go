@@ -226,6 +226,12 @@ func TestTypeBranchFrozenBaseline(t *testing.T) {
 			switch info.Name() {
 			case ".git", "node_modules", "dist", "frontend":
 				return filepath.SkipDir
+			case "canalpatch":
+				// MS-11g 笔①: vendored go-mysql canal copy (upstream v1.11.0
+				// + additive delivery patch). Its type switches are upstream
+				// canal internals, not our capability routing — out of scope
+				// for this registry guard by construction, not by review.
+				return filepath.SkipDir
 			}
 			return nil
 		}

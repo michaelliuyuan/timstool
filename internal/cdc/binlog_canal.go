@@ -8,6 +8,9 @@ package cdc
 //      from canal — CurrentPosition reports what this streamer observed.
 //   2. canal types stay inside this adapter file. The contract surface is
 //      binlogStreamer/CDCEvent (source-neutral) — no canal type leaks.
+//      (MS-11g 笔①: the canal package itself is vendored at
+//      internal/canalpatch — upstream v1.11.0 plus the additive
+//      UnrecognizedQueryHandler face; see that directory's README.)
 //   3. Fail-loud error mapping: canal auto-retry is disabled
 //      (DisableRetrySync) and DiscardNoMetaRowEvent stays false, so
 //      disconnect / permission / missing-table-schema errors surface as a
@@ -16,7 +19,10 @@ package cdc
 // v1 hard semantics (ruling seq 953 #2): a binlog Query(DDL) event on the
 // TARGET database halts the task with an explicit remediation message —
 // silent DDL skipping is forbidden. DDL outside the target database is
-// logged and ignored (MS-11e A).
+// logged and ignored (MS-11e A). MS-11g 笔①: Query events canal itself
+// cannot classify (parse failures, zero-table-node statements) reach the
+// same gate via the canalpatch delivery — the blind spot upstream skipped
+// silently.
 
 import (
 	"context"
@@ -27,9 +33,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-mysql-org/go-mysql/canal"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
+	canal "github.com/michaelliuyuan/timstool/internal/canalpatch"
 	"go.uber.org/zap"
 )
 
@@ -245,15 +251,18 @@ func (h *canalHandler) OnTableChanged(header *replication.EventHeader, schemaNam
 // this scan the empty-schema ignore branch silently skipped
 // TARGET-database DDL (te black-box red #1). Coarse match errs toward
 // halting — fail-closed, same direction as EqualFold.
-func (h *canalHandler) OnDDL(header *replication.EventHeader, nextPos mysql.Position, queryEvent *replication.QueryEvent) error {
-	schema := string(queryEvent.Schema)
+// gateDDLQuery applies the DDL red-line gate to one Query event payload:
+// a DDL on the TARGET database halts (ruling seq 953 #2 — silent DDL
+// skipping is forbidden); DDL outside the target (or with an empty schema)
+// cannot affect the replicated tables and is logged and ignored (MS-11e A)
+// — unless the statement itself mentions the target database (pen8/pen9
+// scan, comment-stripped, admin-whitelisted; details in the comment block
+// above OnDDL).
+func (h *canalHandler) gateDDLQuery(schema, query string) error {
 	target := h.s.cfg.Database
-	query := string(queryEvent.Query)
 	if schema == "" || !strings.EqualFold(schema, target) {
 		if ddlMentionsTargetDB(query, target) {
-			err := ddlUnsupportedError(query)
-			h.s.setFatal(err)
-			return err
+			return ddlUnsupportedError(query)
 		}
 		h.s.log.Info("binlog source: DDL outside target database ignored",
 			zap.String("schema", schema),
@@ -261,9 +270,41 @@ func (h *canalHandler) OnDDL(header *replication.EventHeader, nextPos mysql.Posi
 			zap.String("query", ddlQuerySummary(query)))
 		return nil
 	}
-	err := ddlUnsupportedError(query)
-	h.s.setFatal(err)
-	return err
+	return ddlUnsupportedError(query)
+}
+
+// OnDDL receives Query events canal CLASSIFIED as table DDL (parseStmt
+// seven-type whitelist, canalpatch sync.go). The comparison is
+// case-insensitive (EqualFold, fail-closed — MS-11e pen7) and the statement
+// itself is coarsely scanned for target-qualified names before any ignore
+// (MS-11e pen8/pen9 — full rationale in the gateDDLQuery call chain above).
+func (h *canalHandler) OnDDL(header *replication.EventHeader, nextPos mysql.Position, queryEvent *replication.QueryEvent) error {
+	if err := h.gateDDLQuery(string(queryEvent.Schema), string(queryEvent.Query)); err != nil {
+		h.s.setFatal(err)
+		return err
+	}
+	return nil
+}
+
+// OnUnrecognizedQuery (MS-11g 笔①, canalpatch additive face): Query events
+// canal itself cannot classify — parse failures (CREATE TRIGGER, stored
+// procedures) and parseable-but-zero-table-node statements (VIEW family).
+// Same red-line gate as OnDDL (single source, gateDDLQuery); the canal
+// reason rides into the halt error so the remediation message says WHY the
+// statement could not be classified.
+func (h *canalHandler) OnUnrecognizedQuery(header *replication.EventHeader, nextPos mysql.Position, queryEvent *replication.QueryEvent, reason string) error {
+	schema := string(queryEvent.Schema)
+	query := string(queryEvent.Query)
+	h.s.log.Warn("binlog source: unclassifiable Query event at gate",
+		zap.String("reason", reason),
+		zap.String("schema", schema),
+		zap.String("query", ddlQuerySummary(query)))
+	if err := h.gateDDLQuery(schema, query); err != nil {
+		err = fmt.Errorf("%w [canal 未识别: %s]", err, reason)
+		h.s.setFatal(err)
+		return err
+	}
+	return nil
 }
 
 // ddlAdminKind matches ADMINISTRATIVE statements that never carry

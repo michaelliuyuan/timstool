@@ -10,10 +10,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-mysql-org/go-mysql/canal"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/go-mysql-org/go-mysql/schema"
+	canal "github.com/michaelliuyuan/timstool/internal/canalpatch"
 	"go.uber.org/zap"
 )
 
