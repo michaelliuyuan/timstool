@@ -35,7 +35,7 @@ describe('CDCView source surface (MS-11 pen 4)', () => {
     const src = viewSrc()
     // MS-11c pen4 P3-c: 并轨单真源 — the guard rides srcIsMySQL itself
     // (same computed the copy forks use), not a second type probe.
-    expect(src).toContain(`noPKTables.length && !srcIsMySQL`)
+    expect(src).toContain(`noPKTables.length && connCfg && !srcIsMySQL`)
     expect(src).not.toContain(`connCfg?.source?.type !== 'mysql'`)
   })
 })

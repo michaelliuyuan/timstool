@@ -107,7 +107,10 @@
         <!-- merged card: checkpoint + config + slot (three cards → one, fields deduped) -->
         <el-card class="detail-card" v-if="hasPositionInfo">
           <h3>位点 / 复制槽 / 进程</h3>
-          <div class="detail-row" v-if="checkpoint && checkpoint.lsn">
+          <!-- MS-11c pen5: the forked 位点 label gates on connCfg too — a MySQL
+               chain must never flash "LSN:" before /cdc/config lands (the
+               checkpoint poll races it independently). -->
+          <div class="detail-row" v-if="connCfg && checkpoint && checkpoint.lsn">
             <span class="detail-label">{{ srcIsMySQL ? '同步位点:' : 'LSN:' }}</span>
             <code>{{ checkpoint.lsn }}</code>
           </div>
@@ -240,7 +243,9 @@
             <span class="precheck-detail">{{ it.detail }}</span>
             <!-- REPLICA IDENTITY is a PG-only mechanism — the mysql no-PK precheck
                  warn carries its own guidance (add a PK for row-accurate UPDATE/DELETE). -->
-            <el-button v-if="it.item === 'no_pk_tables' && it.level === 'warn' && noPKTables.length && !srcIsMySQL"
+            <!-- MS-11c pen5: connCfg-gated — the PG-only mechanism button must
+                 not appear in the pre-connCfg transient either. -->
+            <el-button v-if="it.item === 'no_pk_tables' && it.level === 'warn' && noPKTables.length && connCfg && !srcIsMySQL"
               size="small" style="margin-left: auto; flex: none;"
               @click="openNoPKFix">修复（REPLICA IDENTITY FULL）</el-button>
           </div>

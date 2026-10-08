@@ -128,3 +128,24 @@ describe('CDCView pen4 fixes (adversarial P2/P3 closure)', () => {
     expect(src).toContain(`lsn.slice(0, idx).split('.').pop()`)
   })
 })
+
+describe('CDCView pen5 closure (merged-card flash + transient button)', () => {
+  it('pen5: merged-card forked 位点 label gates on connCfg — no "LSN:" flash on mysql chains', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<div class="detail-row" v-if="connCfg && checkpoint && checkpoint.lsn">`)
+    const gateIdx = src.indexOf(`<div class="detail-row" v-if="connCfg && checkpoint && checkpoint.lsn">`)
+    const forkIdx = src.indexOf(`{{ srcIsMySQL ? '同步位点:' : 'LSN:' }}`)
+    expect(forkIdx).toBeGreaterThan(gateIdx)
+  })
+
+  it('pen5: no-PK assist button stays hidden in the pre-connCfg transient', () => {
+    const src = viewSrc()
+    expect(src).toContain(`noPKTables.length && connCfg && !srcIsMySQL`)
+  })
+
+  it('pen5: fail predicates pinned — auto-activate and badge ride level === "fail", never warn', () => {
+    const src = viewSrc()
+    expect(src).toContain(`.some(it => it.level === 'fail')`)
+    expect(src).toContain(`const precheckHasFail = computed(() => (precheck.value?.items || []).some(it => it.level === 'fail'))`)
+  })
+})
