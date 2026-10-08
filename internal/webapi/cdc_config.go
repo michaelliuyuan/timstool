@@ -3,6 +3,7 @@ package webapi
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -273,9 +274,10 @@ type cdcParamPut struct {
 	Mode     *string `json:"mode"`
 }
 
-// applyCDCPut applies the narrow cdc sub-object. server_id <= 0 is rejected
-// (never silently zero the field — the pre-start gate depends on it); mode
-// must be a whitelisted value.
+// applyCDCPut applies the narrow cdc sub-object. server_id must be a positive
+// integer within uint32 range (<= 0 or > math.MaxUint32 rejected — never
+// silently zero or truncate the field, the pre-start gate depends on it);
+// mode must be a whitelisted value.
 func applyCDCPut(dst *config.CDCConfig, p *cdcParamPut) error {
 	if p == nil {
 		return nil
@@ -283,6 +285,9 @@ func applyCDCPut(dst *config.CDCConfig, p *cdcParamPut) error {
 	if p.ServerID != nil {
 		if *p.ServerID <= 0 {
 			return fmt.Errorf("cdc.server_id 必须为正整数")
+		}
+		if *p.ServerID > math.MaxUint32 {
+			return fmt.Errorf("cdc.server_id 必须为正整数（不超过 %d）", uint64(math.MaxUint32))
 		}
 		dst.ServerID = uint32(*p.ServerID)
 	}

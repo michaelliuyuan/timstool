@@ -67,6 +67,33 @@ func TestCDCConfigPutCDCSubfieldsPersist(t *testing.T) {
 			t.Fatalf("guard body %s = %d (want 400)", body, w.Code)
 		}
 	}
+
+	// MS-11b pen 5: upper bound — 2^32 overflows uint32 truncation, must 400.
+	w, req = doReq("PUT", "/api/v1/cdc/config", `{"cdc":{"server_id":4294967296}}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("server_id 2^32 = %d (want 400)", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "server_id") {
+		t.Fatalf("upper-bound guard must name server_id, got %s", w.Body.String())
+	}
+	// 2^32-1 is the uint32 ceiling and must pass.
+	w, req = doReq("PUT", "/api/v1/cdc/config", `{"cdc":{"server_id":4294967295}}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("server_id 2^32-1 = %d (want 200): %s", w.Code, w.Body.String())
+	}
+	cfg, _ = config.Load(s.cdcCfgFile())
+	if cfg.CDC.ServerID != 4294967295 {
+		t.Fatalf("boundary server_id not stored verbatim: %d", cfg.CDC.ServerID)
+	}
+	// Restore the small value so the zero-mutation check below stays sharp.
+	w, req = doReq("PUT", "/api/v1/cdc/config", `{"cdc":{"server_id":42}}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("restore put = %d", w.Code)
+	}
+
 	cfg, _ = config.Load(s.cdcCfgFile())
 	if cfg.CDC.ServerID != 42 || cfg.CDC.Mode != "incr_only" {
 		t.Fatalf("rejected put mutated config: %+v", cfg.CDC)
