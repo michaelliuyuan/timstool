@@ -68,6 +68,31 @@ func (realCDCMySQLProber) PingMySQL(cfg *config.Config) (string, error) {
 	return version, nil
 }
 
+// mysqlVarSQL renders SHOW GLOBAL VARIABLES with the variable name inlined.
+// MS-11b: name is an internal whitelist constant (log_bin / binlog_format /
+// binlog_row_image — see handleCDCPrecheckMySQL), never user input; some
+// MySQL 8 builds reject the parameterized LIKE, so we mirror the literal
+// form already proven at the binlog_expire_logs_seconds probe below.
+func mysqlVarSQL(name string) string {
+	return "SHOW GLOBAL VARIABLES LIKE '" + name + "'"
+}
+
+// mysqlNoPKSQL renders the no-PK table scan with the schema name inlined as
+// an escaped string literal. MS-11b: information_schema refuses the `?`
+// placeholder on some builds (schema is config-controlled, not operator
+// free-typed at runtime); quoting is the same ”-doubling shape as
+// incQuoteSQLLiteral.
+func mysqlNoPKSQL(schema string) string {
+	return fmt.Sprintf(`
+		SELECT t.TABLE_NAME
+		FROM information_schema.TABLES t
+		WHERE t.TABLE_SCHEMA = %s AND t.TABLE_TYPE = 'BASE TABLE'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM information_schema.KEY_COLUMN_USAGE k
+		    WHERE k.TABLE_SCHEMA = t.TABLE_SCHEMA AND k.TABLE_NAME = t.TABLE_NAME
+		      AND k.CONSTRAINT_NAME = 'PRIMARY')`, incQuoteSQLLiteral(schema))
+}
+
 func (realCDCMySQLProber) MySQLVar(cfg *config.Config, name string) (string, error) {
 	db, err := myDB(cfg)
 	if err != nil {
@@ -75,7 +100,7 @@ func (realCDCMySQLProber) MySQLVar(cfg *config.Config, name string) (string, err
 	}
 	defer db.Close()
 	var key, val string
-	if err := db.QueryRow("SHOW GLOBAL VARIABLES LIKE ?", name).Scan(&key, &val); err != nil {
+	if err := db.QueryRow(mysqlVarSQL(name)).Scan(&key, &val); err != nil {
 		return "", err
 	}
 	return val, nil
@@ -115,14 +140,7 @@ func (realCDCMySQLProber) MySQLNoPKTables(cfg *config.Config) ([]string, error) 
 		return nil, err
 	}
 	defer db.Close()
-	rows, err := db.Query(`
-		SELECT t.TABLE_NAME
-		FROM information_schema.TABLES t
-		WHERE t.TABLE_SCHEMA = ? AND t.TABLE_TYPE = 'BASE TABLE'
-		  AND NOT EXISTS (
-		    SELECT 1 FROM information_schema.KEY_COLUMN_USAGE k
-		    WHERE k.TABLE_SCHEMA = t.TABLE_SCHEMA AND k.TABLE_NAME = t.TABLE_NAME
-		      AND k.CONSTRAINT_NAME = 'PRIMARY')`)
+	rows, err := db.Query(mysqlNoPKSQL(cfg.Source.Database))
 	if err != nil {
 		return nil, err
 	}
@@ -139,22 +157,41 @@ func (realCDCMySQLProber) MySQLNoPKTables(cfg *config.Config) ([]string, error) 
 	return out, rows.Err()
 }
 
+// rowScanner abstracts *sql.Row so the master-status scan shapes are unit
+// testable without a live server.
+type rowScanner interface{ Scan(dest ...any) error }
+
+// scanMasterStatus5 scans the modern 5-column SHOW MASTER STATUS row
+// (file, position, binlog_do_db, binlog_ignore_db, executed_gtid_set) — the
+// three trailing columns are discarded via *any sinks (MS-11b: nil dests
+// panic on some drivers; new(any) is the discard form).
+func scanMasterStatus5(row rowScanner) (file string, pos sql.NullInt64, err error) {
+	var d1, d2, d3 any
+	err = row.Scan(&file, &pos, &d1, &d2, &d3)
+	return file, pos, err
+}
+
+// scanMasterStatus2 scans the legacy two-column form (file, position) —
+// kept as the fallback for older column layouts after a 5-column mismatch.
+func scanMasterStatus2(row rowScanner) (file string, pos sql.NullInt64, err error) {
+	err = row.Scan(&file, &pos)
+	return file, pos, err
+}
+
 func (realCDCMySQLProber) MySQLMasterStatus(cfg *config.Config) (string, uint32, int64, error) {
 	db, err := myDB(cfg)
 	if err != nil {
 		return "", 0, 0, err
 	}
 	defer db.Close()
-	var file string
-	var pos sql.NullInt64
-	if err := db.QueryRow("SHOW MASTER STATUS").Scan(&file, &pos, nil, nil, nil); err != nil {
+	file, pos, err := scanMasterStatus5(db.QueryRow("SHOW MASTER STATUS"))
+	if err != nil {
 		if err == sql.ErrNoRows {
 			return "", 0, 0, fmt.Errorf("SHOW MASTER STATUS 无结果（log_bin 未开启？）")
 		}
 		// Column count varies across versions; fall back to a two-column scan.
-		var f2 string
-		var p2 sql.NullInt64
-		if err2 := db.QueryRow("SHOW MASTER STATUS").Scan(&f2, &p2); err2 != nil {
+		f2, p2, err2 := scanMasterStatus2(db.QueryRow("SHOW MASTER STATUS"))
+		if err2 != nil {
 			return "", 0, 0, err
 		}
 		file, pos = f2, p2
