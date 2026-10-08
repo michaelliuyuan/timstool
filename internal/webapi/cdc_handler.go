@@ -112,10 +112,49 @@ func (s *Server) cdcStatus() cdcStatusView {
 	return s.cdcProvider.StatusView()
 }
 
+// reconcileStatusFace (MS-11g 笔② 🟢2, ruling seq148): reconciles the
+// file-derived read face with the supervisor's control truth so operators
+// never see contradictory transitional states. Response-shaping ONLY —
+// cdcStatus()/ComputeLiveness/the anomaly checker are untouched (their
+// semantics are red-line faces from MS-11f).
+//
+//   - halted is NEVER overridden (the fatal-error red line keeps its face)
+//   - a stopped chain whose status file lingers (dead pid ⇒ stale wording
+//     "may have crashed") reads not_running instead
+//   - a LIVE file under a stopped control (someone started `timstool cdc`
+//     by hand after a web stop) keeps the file truth — adoption respect
+//   - a starting/running control whose file still carries the previous
+//     incarnation (old pid, or no first write yet) shows the control pid
+//     and a "starting" state until the child's first status write
+//     converges (the FE's inStartup card already renders this window)
+func reconcileStatusFace(v cdcStatusView, ctrl *CDCControlStatus) cdcStatusView {
+	if ctrl == nil || v.State == string(cdc.LivenessHalted) {
+		return v
+	}
+	switch ctrl.State {
+	case StateStopped:
+		if v.State == string(cdc.LivenessRunning) && v.Running {
+			return v // outside-supervisor live chain: the file is the truth
+		}
+		return cdcStatusView{State: string(cdc.LivenessNotRunning)}
+	case StateStarting, StateRunning:
+		if v.PID > 0 && v.PID != ctrl.PID {
+			return cdcStatusView{State: "starting", PID: ctrl.PID}
+		}
+		if v.State == string(cdc.LivenessNotRunning) {
+			// first-status-write window (missing/blank file, PID 0)
+			return cdcStatusView{State: "starting", PID: ctrl.PID}
+		}
+	}
+	return v
+}
+
 func cdcMessage(v cdcStatusView) string {
 	switch v.State {
 	case string(cdc.LivenessRunning):
 		return "CDC running (LSN: " + v.LSN + ")"
+	case "starting":
+		return "CDC 正在启动（等待子进程首次状态上报收敛）"
 	case string(cdc.LivenessHalted):
 		if v.FatalError != "" {
 			return "CDC halted: " + v.FatalError
@@ -142,6 +181,14 @@ func (s *Server) handleCDCStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v := s.cdcStatus()
+	var ctrl *CDCControlStatus
+	if s.cdcSupervisor != nil {
+		cs := s.cdcSupervisor.Status()
+		ctrl = &cs
+		// MS-11g 笔② 🟢2: shape the read face with the control truth
+		// (stale flash after stops / old-pid flash after starts).
+		v = reconcileStatusFace(v, ctrl)
+	}
 	resp := CDCStatusResponse{
 		Available:     true,
 		Enabled:       true,
@@ -156,10 +203,7 @@ func (s *Server) handleCDCStatus(w http.ResponseWriter, r *http.Request) {
 		FatalError:    v.FatalError,
 		Stats:         v.Stats,
 	}
-	if s.cdcSupervisor != nil {
-		cs := s.cdcSupervisor.Status()
-		resp.Control = &cs
-	}
+	resp.Control = ctrl
 	if s.cdcWatchdog != nil {
 		ws := s.cdcWatchdog.Status()
 		resp.Watchdog = &ws

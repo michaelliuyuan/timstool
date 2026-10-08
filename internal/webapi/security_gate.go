@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/cdc"
@@ -193,6 +194,11 @@ func (s *Server) appendAudit(e auditEntry) {
 	if e.Action == "cdc.stop" && e.Result == "success" {
 		s.lastStopAuditAt = e.TS
 	}
+	// MS-11g 笔② 🟢1: a successful audited start seeds the anomaly
+	// checker's attribution clock (narrow first-tick-window kill coverage).
+	if e.Action == "cdc.start" && e.Result == "success" {
+		s.cdcAnomaly.seedStartAudit(e.TS)
+	}
 	s.auditMu.Unlock()
 
 	if s.dataDir == "" {
@@ -281,8 +287,11 @@ type cdcAnomalyChecker struct {
 
 	// lastSeenRunningAt is the last tick that observed a live CDC in this
 	// web process; zero until then (a fresh web start never alarms — no
-	// observed transition, zero false positives).
+	// observed transition, zero false positives). Guarded by seenMu: the
+	// tick goroutine reads/writes it and the audited-start seeding
+	// (MS-11g 笔② 🟢1) writes it from HTTP goroutines.
 	lastSeenRunningAt time.Time
+	seenMu            sync.Mutex
 	// pendingSince is the first tick that observed an un-audited stop; the
 	// alarm fires on the NEXT tick still un-audited (one-tick grace: the
 	// audit line lands milliseconds after the state flip, the checker ticks
@@ -336,7 +345,7 @@ func (c *cdcAnomalyChecker) check() {
 	}
 	if v := s.cdcStatus(); v.State == string(cdc.LivenessHalted) {
 		// Known cause: the fail-closed DDL halt. Edge consumed silently.
-		c.lastSeenRunningAt = time.Time{}
+		c.setLastSeen(time.Time{})
 		c.pendingSince = time.Time{}
 		c.nonTerminalSince = time.Time{}
 		return
@@ -344,7 +353,7 @@ func (c *cdcAnomalyChecker) check() {
 	st := s.cdcSupervisor.Status()
 	switch st.State {
 	case StateRunning, StateAdopted:
-		c.lastSeenRunningAt = time.Now()
+		c.setLastSeen(time.Now())
 		c.pendingSince = time.Time{}
 		c.nonTerminalSince = time.Time{}
 		return
@@ -357,7 +366,7 @@ func (c *cdcAnomalyChecker) check() {
 			c.nonTerminalSince = time.Now()
 		}
 		if time.Since(c.nonTerminalSince) <= 3*c.interval {
-			c.lastSeenRunningAt = time.Now()
+			c.setLastSeen(time.Now())
 			c.pendingSince = time.Time{}
 			return
 		}
@@ -369,13 +378,14 @@ func (c *cdcAnomalyChecker) check() {
 	default:
 		return
 	}
-	if c.lastSeenRunningAt.IsZero() {
+	lastSeen := c.lastSeen()
+	if lastSeen.IsZero() {
 		return // never saw it running in this process: nothing to attribute
 	}
 	// A tie counts as covered: the audit line lands strictly after the
 	// arming observation in wall order, but time.Now() can return the SAME
 	// tick for both — After() would then false-alarm on an audited stop.
-	if lastStop := s.lastStopAuditTime(); !lastStop.IsZero() && !lastStop.Before(c.lastSeenRunningAt) {
+	if lastStop := s.lastStopAuditTime(); !lastStop.IsZero() && !lastStop.Before(lastSeen) {
 		c.pendingSince = time.Time{} // an audited operator stop covers it
 		c.nonTerminalSince = time.Time{}
 		return
@@ -385,12 +395,40 @@ func (c *cdcAnomalyChecker) check() {
 		return
 	}
 	c.pushAnomalyAlarm(st.State, st.PID)
-	c.lastSeenRunningAt = time.Time{} // edge consumed; re-arms on next running
+	c.setLastSeen(time.Time{}) // edge consumed; re-arms on next running
 	c.pendingSince = time.Time{}
 	// nonTerminalSince stays AGED on purpose: a limbo that persists must not
 	// re-enter the budget window (or it would flip-flop between the running
 	// cluster and the dead cluster and re-alarm every few intervals). It
 	// clears when the state actually leaves the non-terminal pair.
+}
+
+func (c *cdcAnomalyChecker) lastSeen() time.Time {
+	c.seenMu.Lock()
+	defer c.seenMu.Unlock()
+	return c.lastSeenRunningAt
+}
+
+func (c *cdcAnomalyChecker) setLastSeen(ts time.Time) {
+	c.seenMu.Lock()
+	c.lastSeenRunningAt = ts
+	c.seenMu.Unlock()
+}
+
+// seedStartAudit (MS-11g 笔② 🟢1, adversarial seq130 candidate + ruling
+// seq142): a successful audited start proves the chain was running at ts —
+// seed the attribution clock so a kill inside the checker's first-tick
+// window (before any poll observed running — te seq118 narrow-window
+// observation) still alarms. The startup zero-false-positive guard stays
+// intact for adopt / no-audit shapes (no seed, no attribution). Monotonic:
+// only moves the clock forward, never back.
+func (c *cdcAnomalyChecker) seedStartAudit(ts time.Time) {
+	if c == nil || ts.IsZero() {
+		return
+	}
+	if cur := c.lastSeen(); cur.IsZero() || ts.After(cur) {
+		c.setLastSeen(ts)
+	}
 }
 
 func (c *cdcAnomalyChecker) pushAnomalyAlarm(state CDCState, pid int) {

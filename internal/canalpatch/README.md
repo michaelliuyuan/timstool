@@ -1,7 +1,9 @@
 # canalpatch — vendored go-mysql canal package (MS-11g 笔①)
 
 Local copy of `github.com/go-mysql-org/go-mysql@v1.11.0` package `canal`
-(8 non-test .go files + upstream LICENSE, Apache-2.0). All sibling packages
+(8 non-test .go files + upstream LICENSE, **MIT** — Copyright (c) 2014
+siddontang; pen-2 correction: this README first said Apache-2.0, the
+upstream license file itself was always correct). All sibling packages
 (mysql / replication / schema / client / dump / utils) still resolve from the
 pinned upstream module — only this package is vendored.
 

@@ -450,6 +450,17 @@ func (s *Server) handlePutCDCConfig(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "nothing to update: source, target or cdc required")
 		return
 	}
+	// MS-11g 笔② 🟡 (te seq143, ruling seq144): an explicitly empty /
+	// whitespace-only source.database used to land in config.yaml (the PUT
+	// path skips config.Validate — only the load/start path enforces it),
+	// leaving a "database:" (empty) config that the next CDC start rejects.
+	// Field-conditional on purpose: partial updates that do not carry the
+	// field stay legal (ruling: no partial-update false rejections); same
+	// 400-guard family as server_id (MS-11b pen 3).
+	if req.Source != nil && req.Source.Database != nil && strings.TrimSpace(*req.Source.Database) == "" {
+		s.writeError(w, http.StatusBadRequest, "source database cannot be empty")
+		return
+	}
 
 	cdcCfgMu.Lock()
 	defer cdcCfgMu.Unlock()
