@@ -29,11 +29,15 @@
           <span class="status-text">{{ cardLabel }}</span>
           <span v-if="control && control.restarts > 0" class="control-restarts hero-restarts">自动重启 {{ control.restarts }} 次</span>
         </div>
-        <div class="status-meta">
+        <!-- MS-11c pen4 P2-⑤: hero meta stays neutral until connCfg arrives —
+             the forked wording (同步位点/LSN, MySQL/PG) must never flash on a
+             first frame whose source type is not yet known. -->
+        <div class="status-meta" v-if="connCfg">
           <span v-if="status.running && status.lsn">{{ srcIsMySQL ? '同步位点' : 'LSN' }}: {{ status.lsn }}</span>
           <span v-else-if="inStartup">CDC 启动中…（control 通道确认运行，等待 CDC 连接 {{ srcIsMySQL ? 'MySQL' : 'PG' }}/TiDB 写首条状态，约 8-90s）</span>
           <span v-else>{{ status.message || 'CDC 未运行，点右侧「启动 CDC」开始' }}</span>
         </div>
+        <div class="status-meta" v-else>连接配置加载中…</div>
         <div class="status-meta hero-summary" v-if="stats">
           <span>延迟 {{ stats.lag_seconds?.toFixed(1) || '0' }}s</span>
           <span>吞吐 {{ stats.throughput_rps?.toFixed(1) || '0' }}/s</span>
@@ -226,7 +230,7 @@
       <el-tab-pane name="precheck">
         <template #label>
           启动预检
-          <span v-if="precheck && !precheckPassed" class="tab-dot" :class="precheckHasFail ? 'fail' : 'warn'" :title="precheckHasFail ? '预检存在未通过项' : '预检存在警告项'"></span>
+          <span v-if="precheck && !precheckPassed" class="tab-dot" :class="precheckHasFail ? 'fail' : 'warn'" role="status" :aria-label="precheckHasFail ? '预检存在未通过项' : '预检存在警告项'" :title="precheckHasFail ? '预检存在未通过项' : '预检存在警告项'"></span>
         </template>
         <el-card class="detail-card" v-if="precheck">
           <h3>启动预检 <el-button size="small" style="margin-left: 8px;" @click="runPrecheck" :disabled="checking" :loading="checking">{{ checking ? '检查中…' : '重新检查' }}</el-button></h3>
@@ -236,20 +240,23 @@
             <span class="precheck-detail">{{ it.detail }}</span>
             <!-- REPLICA IDENTITY is a PG-only mechanism — the mysql no-PK precheck
                  warn carries its own guidance (add a PK for row-accurate UPDATE/DELETE). -->
-            <el-button v-if="it.item === 'no_pk_tables' && it.level === 'warn' && noPKTables.length && connCfg?.source?.type !== 'mysql'"
+            <el-button v-if="it.item === 'no_pk_tables' && it.level === 'warn' && noPKTables.length && !srcIsMySQL"
               size="small" style="margin-left: auto; flex: none;"
               @click="openNoPKFix">修复（REPLICA IDENTITY FULL）</el-button>
           </div>
+          <!-- MS-11c pen4 P2-④: a failed re-run must be visible, never silently
+               keep the stale result dressed as fresh. -->
+          <div v-if="precheckError" class="control-msg error" style="margin-bottom: 8px;">预检请求失败（{{ precheckError }}），显示的是上次结果，请重新检查</div>
           <!-- MS-11c: ok items folded by default — only warn/fail need eyes. -->
           <div v-if="precheckOkItems.length" class="precheck-fold">
-            <el-button link size="small" @click="showOkItems = !showOkItems">{{ showOkItems ? '收起通过项' : `显示通过项（${precheckOkItems.length}）` }}</el-button>
-            <template v-if="showOkItems">
+            <el-button link size="small" :aria-expanded="showOkItems" aria-controls="precheck-ok-list" @click="showOkItems = !showOkItems">{{ showOkItems ? '收起通过项' : `显示通过项（${precheckOkItems.length}）` }}</el-button>
+            <div v-if="showOkItems" id="precheck-ok-list">
               <div v-for="it in precheckOkItems" :key="it.item" class="precheck-row ok">
                 <span class="precheck-dot">✓</span>
                 <span class="precheck-label">{{ it.label }}</span>
                 <span class="precheck-detail">{{ it.detail }}</span>
               </div>
-            </template>
+            </div>
           </div>
           <div class="resume-box">
             <strong>断点/起点：</strong>{{ precheck.conclusion }}
@@ -369,8 +376,25 @@ const showOkItems = ref(false)
 
 // MS-11c ②: a failing precheck auto-activates the precheck tab (warn-only
 // never steals focus — operator judgement stays on the overview).
+// MS-11c pen4 P2-①: hijack suppression — only the no-fail→fail TRANSITION
+// fires, and once the operator manually leaves the tab this fail episode
+// never drags them back (reset when fail clears).
+let precheckFailActive = false
+let userLeftPrecheckTab = false
 watch(precheck, p => {
-  if (p && (p.items || []).some(it => it.level === 'fail')) activeTab.value = 'precheck'
+  const hasFail = !!(p && (p.items || []).some(it => it.level === 'fail'))
+  if (!hasFail) {
+    precheckFailActive = false
+    userLeftPrecheckTab = false
+    return
+  }
+  if (!precheckFailActive && !userLeftPrecheckTab) {
+    precheckFailActive = true
+    activeTab.value = 'precheck'
+  }
+})
+watch(activeTab, t => {
+  if (t !== 'precheck') userLeftPrecheckTab = true
 })
 
 // MS-11a: source-aware copy. Same truth as the REPLICA IDENTITY guard in the
@@ -476,12 +500,19 @@ async function importFromDS() {
   }
 }
 
+const precheckError = ref('')
+
 async function runPrecheck() {
   checking.value = true
   try {
     const { data } = await apiClient.cdcPrecheck()
     precheck.value = data
-  } catch {} finally {
+    precheckError.value = ''
+  } catch (e: any) {
+    // MS-11c pen4 P2-④: never swallow — the visible stale result must be
+    // labeled stale, and the red banner lives in the precheck tab.
+    precheckError.value = e?.response?.data?.error || e?.message || '网络错误'
+  } finally {
     checking.value = false
   }
 }
@@ -605,21 +636,25 @@ const positionHistory = ref<number[]>([])
 const positionLatest = ref('')
 function parsePosition(lsn?: string): number | null {
   if (!lsn) return null
+  // MS-11c pen4 P3-a: every branch funnels into the finite/non-negative gate —
+  // Infinity (overflow) and bare negatives never enter the history.
+  const accept = (n: number): number | null => (!Number.isFinite(n) || n < 0 ? null : n)
   if (lsn.includes('/')) {
     const [hi, lo] = lsn.split('/')
     const h = parseInt(hi, 16), l = parseInt(lo, 16)
     if (Number.isNaN(h) || Number.isNaN(l)) return null
-    return h * 0x100000000 + l
+    return accept(h * 0x100000000 + l)
   }
   const idx = lsn.lastIndexOf(':')
   if (idx > 0) {
-    const file = parseInt(lsn.slice(0, idx).replace(/\D/g, ''), 10)
+    // MS-11c pen4 P3-b: only the digits after the LAST '.' are the rotation
+    // index (mysql-bin.000123 — the "2" in "bin2" is not part of it).
+    const file = parseInt((lsn.slice(0, idx).split('.').pop() || '').replace(/\D/g, ''), 10)
     const pos = parseInt(lsn.slice(idx + 1), 10)
     if (Number.isNaN(pos)) return null
-    return (Number.isNaN(file) ? 0 : file) * 1e9 + pos
+    return accept((Number.isNaN(file) ? 0 : file) * 1e9 + pos)
   }
-  const n = parseInt(lsn, 10)
-  return Number.isNaN(n) ? null : n
+  return accept(parseInt(lsn, 10))
 }
 function pushPosition(lsn?: string) {
   const v = parsePosition(lsn)

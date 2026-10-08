@@ -73,7 +73,7 @@ describe('CDCView layout (MS-11c pens 1+2)', () => {
     const src = viewSrc()
     expect(src).toContain(`<span v-if="precheck && !precheckPassed" class="tab-dot"`)
     expect(src).toContain(`watch(precheck, p => {`)
-    expect(src).toContain(`if (p && (p.items || []).some(it => it.level === 'fail')) activeTab.value = 'precheck'`)
+    expect(src).toContain(`activeTab.value = 'precheck'`)
   })
 
   it('pen2: 位点推进 sparkline parses PG LSN and MySQL file:pos, skips junk', () => {
@@ -83,5 +83,48 @@ describe('CDCView layout (MS-11c pens 1+2)', () => {
     expect(src).toContain(`* 1e9 + pos`)
     expect(src).toContain(`if (v === null) return`)
     expect(src).toContain(`pushPosition(statusRes?.lsn || cpRes?.lsn)`)
+  })
+})
+
+describe('CDCView pen4 fixes (adversarial P2/P3 closure)', () => {
+  it('P2-⑤: hero meta is neutral until connCfg arrives — no forked-word first-frame flash', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<div class="status-meta" v-if="connCfg">`)
+    expect(src).toContain(`<div class="status-meta" v-else>连接配置加载中…</div>`)
+    // the forked literals still live INSIDE the connCfg-gated block
+    const gateIdx = src.indexOf(`<div class="status-meta" v-if="connCfg">`)
+    const forkIdx = src.indexOf(`{{ srcIsMySQL ? '同步位点' : 'LSN' }}: {{ status.lsn }}`)
+    expect(forkIdx).toBeGreaterThan(gateIdx)
+  })
+
+  it('P2-①: fail auto-activate fires only on the no-fail→fail transition and never after the operator leaves', () => {
+    const src = viewSrc()
+    expect(src).toContain(`if (!precheckFailActive && !userLeftPrecheckTab) {`)
+    expect(src).toContain(`precheckFailActive = true`)
+    expect(src).toContain(`watch(activeTab, t => {`)
+    // fail-clear resets the episode so a NEW fail may activate again
+    expect(src).toContain(`precheckFailActive = false`)
+    expect(src).toContain(`userLeftPrecheckTab = false`)
+  })
+
+  it('P2-② + P3-d: tab dot and ok-fold are accessible', () => {
+    const src = viewSrc()
+    expect(src).toContain(`class="tab-dot" :class="precheckHasFail ? 'fail' : 'warn'" role="status"`)
+    expect(src).toContain(`:aria-expanded="showOkItems" aria-controls="precheck-ok-list"`)
+    expect(src).toContain(`id="precheck-ok-list"`)
+  })
+
+  it('P2-④: runPrecheck failure is visible — stale result labeled, never dressed as fresh', () => {
+    const src = viewSrc()
+    expect(src).toContain(`precheckError.value = e?.response?.data?.error || e?.message || '网络错误'`)
+    expect(src).toContain(`显示的是上次结果，请重新检查`)
+    // success clears the banner
+    expect(src).toContain(`precheckError.value = ''`)
+  })
+
+  it('P3-a/P3-b: parsePosition gates finite/non-negative and reads the post-dot rotation index only', () => {
+    const src = viewSrc()
+    expect(src).toContain(`(!Number.isFinite(n) || n < 0 ? null : n)`)
+    expect(src).toContain(`lsn.slice(0, idx).split('.').pop()`)
   })
 })

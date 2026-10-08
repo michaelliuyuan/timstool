@@ -33,7 +33,10 @@ describe('CDCView source surface (MS-11 pen 4)', () => {
 
   it('REPLICA IDENTITY no-PK assist is hidden for mysql sources (PG-only mechanism)', () => {
     const src = viewSrc()
-    expect(src).toContain(`noPKTables.length && connCfg?.source?.type !== 'mysql'`)
+    // MS-11c pen4 P3-c: 并轨单真源 — the guard rides srcIsMySQL itself
+    // (same computed the copy forks use), not a second type probe.
+    expect(src).toContain(`noPKTables.length && !srcIsMySQL`)
+    expect(src).not.toContain(`connCfg?.source?.type !== 'mysql'`)
   })
 })
 
