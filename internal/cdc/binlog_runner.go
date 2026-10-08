@@ -80,7 +80,8 @@ func (r *BinlogRunner) Run(ctx context.Context) error {
 	r.log.Info("binlog runner: starting")
 	r.startTime = time.Now()
 
-	cp, err := r.checkpoint.Load()
+	// MS-11d: refuse cross-source stale files (a PG LSN is not a binlog pos).
+	cp, err := r.checkpoint.LoadForSource(SourceKindMySQL)
 	if err != nil {
 		return fmt.Errorf("binlog runner: load checkpoint: %w", err)
 	}

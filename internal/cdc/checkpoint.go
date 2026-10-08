@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,6 +67,72 @@ func (c *CheckpointManager) Load() (*Checkpoint, error) {
 		zap.Time("timestamp", cp.Timestamp),
 	)
 	return &cp, nil
+}
+
+// pgLSNShape pins the PG checkpoint position form (MS-11d): upper-case hex
+// hi/lo separated by a slash, e.g. 0/1A2B3C4.
+var pgLSNShape = regexp.MustCompile(`^[0-9A-F]+/[0-9A-F]+$`)
+
+// Source kinds accepted by LoadForSource.
+const (
+	SourceKindPostgres = "postgres"
+	SourceKindMySQL    = "mysql"
+)
+
+// checkpointMatchesSource reports whether the loaded checkpoint belongs to
+// the configured source kind: PG = bare LSN in hi/lo hex form; MySQL = a
+// binlog file:pos pair (File non-empty with a rotation suffix, Pos > 0).
+func checkpointMatchesSource(cp *Checkpoint, kind string) bool {
+	if cp == nil {
+		return false
+	}
+	switch kind {
+	case SourceKindMySQL:
+		return cp.Binlog != nil && binlogPositionShapeOK(cp.Binlog)
+	case SourceKindPostgres:
+		return cp.Binlog == nil && cp.LSN > 0 && pgLSNShape.MatchString(cp.LSN.String())
+	}
+	return false
+}
+
+// binlogPositionShapeOK: the file name carries a numeric rotation suffix
+// ("binlog.000005") and the position is positive.
+func binlogPositionShapeOK(bp *BinlogPosition) bool {
+	if bp == nil || bp.File == "" || bp.Pos <= 0 {
+		return false
+	}
+	dot := strings.LastIndex(bp.File, ".")
+	if dot <= 0 || dot == len(bp.File)-1 {
+		return false
+	}
+	suffix := bp.File[dot+1:]
+	_, err := strconv.Atoi(suffix)
+	return err == nil
+}
+
+// LoadForSource loads the checkpoint but REFUSES one written by the other
+// source kind (MS-11d root fix): a MySQL chain must never resume from a PG
+// LSN and vice versa — the positions are not comparable. On mismatch the
+// stale file is discarded (removed) and a nil checkpoint returned so the
+// runner starts from the current position; the discard is logged, never
+// fatal (a cross-source switch legitimately has no resumable position).
+func (c *CheckpointManager) LoadForSource(kind string) (*Checkpoint, error) {
+	cp, err := c.Load()
+	if err != nil || cp == nil {
+		return cp, err
+	}
+	if checkpointMatchesSource(cp, kind) {
+		return cp, nil
+	}
+	c.log.Info("cdc checkpoint: 旧源 checkpoint 已弃用（source type changed），从当前位点起步",
+		zap.String("position", cp.Position()),
+		zap.String("source_kind", kind),
+	)
+	if rmErr := os.Remove(c.filePath); rmErr != nil && !os.IsNotExist(rmErr) {
+		return nil, fmt.Errorf("cdc checkpoint: discard stale file: %w", rmErr)
+	}
+	c.Reset()
+	return nil, nil
 }
 
 // Save writes the current checkpoint to disk.

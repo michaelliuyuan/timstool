@@ -244,15 +244,21 @@ func (s *Server) handleCDCStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCDCCheckpoint handles GET /api/v1/cdc/checkpoint.
+// MS-11d pen 3: the endpoint reads the DISK truth (loadCheckpointInfo, same
+// source as /cdc/slot and the precheck resume box) instead of the status.json
+// embedded copy — one truth, no split-brain between the child's last status
+// write and the file on disk.
 func (s *Server) handleCDCCheckpoint(w http.ResponseWriter, r *http.Request) {
 	if !s.cdcEnabled {
 		s.writeJSON(w, http.StatusOK, struct{}{})
 		return
 	}
-	v := s.cdcStatus()
-	if v.Checkpoint == nil {
-		s.writeJSON(w, http.StatusOK, struct{}{})
+	cdcCfgMu.Lock()
+	cfg, err := s.loadCDCConfig()
+	cdcCfgMu.Unlock()
+	if err != nil {
+		s.writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, v.Checkpoint)
+	s.writeJSON(w, http.StatusOK, loadCheckpointInfo(cfg))
 }

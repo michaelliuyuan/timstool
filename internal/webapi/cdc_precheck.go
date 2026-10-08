@@ -228,7 +228,9 @@ func loadCheckpointInfo(cfg *config.Config) cdcCheckpointInfo {
 		return info
 	}
 	info.Exists = true
-	info.LSN = cp.LSN.String()
+	// MS-11d pen 3: source-neutral render — a MySQL checkpoint (binlog
+	// file:pos) must not surface as a bare "0/0" LSN.
+	info.LSN = cp.Position()
 	info.UpdatedAt = cp.Timestamp
 	return info
 }

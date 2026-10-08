@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -419,6 +420,13 @@ func (s *Server) handlePutCDCConfig(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
+	// MS-11d pen 2: remember the source KIND before the PUT lands — a type
+	// switch discards the old source's checkpoint (positions are not
+	// comparable across sources; the runner-side LoadForSource is the root
+	// fix, this clears the residue at switch time). Rerouted through the
+	// local sourceKind mirror so the A3 type-branch baseline stays frozen
+	// (no new .SourceType() dispatch in this file).
+	prevKind := sourceKind(cfg.Source.Type)
 	applySourcePut(&cfg.Source, req.Source)
 	applyTargetPut(&cfg.Target, req.Target)
 	if err := applyCDCPut(&cfg.CDC, req.CDC); err != nil {
@@ -437,9 +445,41 @@ func (s *Server) handlePutCDCConfig(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "写入 config.yaml 失败："+err.Error())
 		return
 	}
+	if sourceKind(cfg.Source.Type) != prevKind {
+		dropStaleCheckpoint(cfg, prevKind)
+	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok": true, "message": "已更新 config.yaml（CDC 下次启动生效）",
 	})
+}
+
+// sourceKind mirrors config.SourceConfig.SourceType (empty = postgres) for
+// the PUT-time switch detection — kept as a mirror, NOT a second dispatch:
+// the A3 type-branch baseline pins SourceType() call sites, and this file
+// must not grow another one (MS-11d pen 2 reroute note).
+func sourceKind(t string) string {
+	if t == "" {
+		return "postgres"
+	}
+	return t
+}
+
+// dropStaleCheckpoint removes the checkpoint file after a source TYPE switch
+// (same type, different host keeps it — the position format still matches).
+// Best-effort: a failed remove is logged but never fails the PUT (the
+// runner-side LoadForSource guard still refuses the mismatched file).
+func dropStaleCheckpoint(cfg *config.Config, prevKind string) {
+	path := cfg.CDC.CheckpointFile
+	if path == "" {
+		path = ".cdc_checkpoint.json"
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Printf("cdc config: source type switched %q -> %q but checkpoint %s remove failed: %v",
+			prevKind, cfg.Source.SourceType(), path, err)
+		return
+	}
+	log.Printf("cdc config: source type switched %q -> %q, old-source checkpoint %s discarded",
+		prevKind, cfg.Source.SourceType(), path)
 }
 
 // handleImportCDCFromDataSource (F-02 D4): write a postgres datasource (source)

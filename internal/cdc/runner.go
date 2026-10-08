@@ -116,8 +116,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.log.Info("cdc runner: starting")
 	r.startTime = time.Now()
 
-	// Load checkpoint for resume
-	cp, err := r.checkpoint.Load()
+	// Load checkpoint for resume (MS-11d: refuse cross-source stale files).
+	cp, err := r.checkpoint.LoadForSource(SourceKindPostgres)
 	if err != nil {
 		return fmt.Errorf("cdc runner: load checkpoint: %w", err)
 	}
