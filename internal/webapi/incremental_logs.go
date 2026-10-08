@@ -295,7 +295,14 @@ func (s *Server) handleIncrementalRunLogs(w http.ResponseWriter, r *http.Request
 // the builders (no shared mutable state) — changing one must not drift the
 // other silently, which is why the anchors pin both sides.
 
+// incQuoteSQLLiteral doubles both ' and \ inside a single-quoted literal.
+// ' doubling is the SQL-standard minimum; \ doubling additionally closes the
+// MySQL backslash-escape injection (a raw \' would otherwise terminate the
+// literal early). Under NO_BACKSLASH_ESCAPES the doubled \\ renders as an
+// inert literal backslash pair — degraded but never unsafe. Single fixpoint
+// for both consumers (log renderers + the MySQL no-PK probe).
 func incQuoteSQLLiteral(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
 	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 }
 

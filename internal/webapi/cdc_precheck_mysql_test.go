@@ -119,6 +119,28 @@ func TestCDCConfigPutCDCSubfieldsPersist(t *testing.T) {
 	if !strings.Contains(string(raw2), "server_id: 7") {
 		t.Fatalf("server_id not written as int scalar:\n%s", raw2)
 	}
+
+	// MS-11b pen 6: a hand-edited non-mapping / case-variant `cdc:` key must
+	// be refused (400), never rewritten by appending a duplicate key (would
+	// break the next load). yaml struct unmarshal is case-insensitive, so
+	// `CDC:` loads into cfg.CDC while mappingValue("cdc") misses it — the
+	// reachable duplicate-append path.
+	broken := filepath.Join(t.TempDir(), "config3.yaml")
+	os.WriteFile(broken, []byte("source:\n  host: a\n  port: 1\ntarget:\n  host: b\n  port: 2\nCDC: oops\n"), 0o600)
+	s.SetCDCConfigFile(broken)
+	w, req = doReq("PUT", "/api/v1/cdc/config", `{"cdc":{"server_id":9}}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("scalar cdc section = %d (want 400): %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "cdc") {
+		t.Fatalf("refusal must name the cdc section: %s", w.Body.String())
+	}
+	// File untouched — no duplicate `cdc:` key appended.
+	raw3, _ := os.ReadFile(broken)
+	if strings.Count(strings.ToLower(string(raw3)), "cdc:") != 1 {
+		t.Fatalf("duplicate cdc key appended (config would break next load):\n%s", raw3)
+	}
 }
 
 func TestMySQLVarSQLLiteralForm(t *testing.T) {
@@ -149,6 +171,15 @@ func TestMySQLNoPKSQLLiteralEscaping(t *testing.T) {
 	}
 	if strings.Contains(evil, "' --'") && !strings.Contains(evil, "'' --") {
 		t.Fatalf("unescaped quote leaked:\n%s", evil)
+	}
+	// MS-11b pen 6: backslash injection — a raw \' terminates the literal
+	// early under MySQL default backslash escapes; the fix doubles \ too.
+	bs := mysqlNoPKSQL(`db\' OR 1=1 -- `)
+	if !strings.Contains(bs, `'db\\'' OR 1=1 -- '`) {
+		t.Fatalf("backslash not doubled (literal breakable):\n%s", bs)
+	}
+	if strings.Contains(bs, "db\\'") {
+		t.Fatalf("raw backslash-quote pair survived:\n%s", bs)
 	}
 }
 

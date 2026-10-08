@@ -2,6 +2,7 @@ package webapi
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -109,6 +110,11 @@ func (s *Server) loadCDCConfig() (*config.Config, error) {
 	return config.Load(f)
 }
 
+// errCDCSectionNotMapping: config.yaml holds a `cdc:` key whose value is not
+// a mapping (hand-edited). writeCDCConfig refuses rather than appending a
+// duplicate key; the handler maps this to a 400 with remediation wording.
+var errCDCSectionNotMapping = errors.New("cdc section is not a yaml mapping")
+
 // writeCDCConfig persists cfg back to config.yaml atomically. The write is a
 // structured yaml round-trip that PRESERVES comments and untouched sections:
 // only the source/target mapping values are edited in place on the parsed
@@ -164,6 +170,13 @@ func (s *Server) writeCDCConfig(cfg *config.Config) error {
 	if cfg.CDC.ServerID != 0 || cfg.CDC.Mode != "" {
 		cdcMap := mappingValue(root, "cdc")
 		if cdcMap == nil {
+			// Absent key -> create the section. But a PRESENT key that is not
+			// a mapping (hand-edited to a scalar/list) must be refused —
+			// blindly appending would write a duplicate `cdc:` key and break
+			// the next config load. Reject, never silently rewrite.
+			if hasMappingKey(root, "cdc") {
+				return errCDCSectionNotMapping
+			}
 			cdcMap = &yaml.Node{Kind: yaml.MappingNode}
 			root.Content = append(root.Content,
 				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "cdc"}, cdcMap)
@@ -197,6 +210,21 @@ func mappingValue(m *yaml.Node, key string) *yaml.Node {
 		}
 	}
 	return nil
+}
+
+// hasMappingKey reports whether key is present at all (any node kind, key
+// compared case-insensitively because yaml struct unmarshal is case-
+// insensitive — `CDC:` loads into cfg.CDC but mappingValue("cdc") misses it,
+// and blindly appending would write a duplicate `cdc:` key that breaks the
+// next load). Distinguishes "absent" (safe to create) from "present but not
+// usable" (must refuse).
+func hasMappingKey(m *yaml.Node, key string) bool {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if strings.EqualFold(m.Content[i].Value, key) {
+			return true
+		}
+	}
+	return false
 }
 
 // setMapFields updates/creates scalar fields on a yaml mapping node in place,
@@ -402,6 +430,10 @@ func (s *Server) handlePutCDCConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.writeCDCConfig(cfg); err != nil {
+		if errors.Is(err, errCDCSectionNotMapping) {
+			s.writeError(w, http.StatusBadRequest, "config.yaml 的 cdc 段不是映射结构，拒绝改写（请手工修正后再试）")
+			return
+		}
 		s.writeError(w, http.StatusInternalServerError, "写入 config.yaml 失败："+err.Error())
 		return
 	}

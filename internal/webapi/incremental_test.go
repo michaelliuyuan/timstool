@@ -453,6 +453,25 @@ func TestIncLogsRenderersQuoteFragments(t *testing.T) {
 	}
 }
 
+// MS-11b pen 6: the log renderers share incQuoteSQLLiteral with the MySQL
+// no-PK probe — the backslash injection shape must be inert on this consumer
+// too (raw \' would terminate the literal early under MySQL default escapes).
+func TestIncLogsRendererBackslashEscaping(t *testing.T) {
+	evil := `db\' OR 1=1 -- `
+	for _, rendered := range []string{
+		incRenderSelectSQL(incSourceDialect, "s", "t", []string{"id"}, "wm", false, evil, 10),
+		incRenderDrainSQL(incSourceDialect, "s", "t", []string{"id"}, "wm", evil),
+		incRenderNextWatermarkSQL(incSourceDialect, "s", "t", "wm", evil),
+	} {
+		if !strings.Contains(rendered, `'db\\'' OR 1=1 -- '`) {
+			t.Fatalf("backslash not doubled (literal breakable):\n%s", rendered)
+		}
+		if strings.Contains(rendered, "db\\'") {
+			t.Fatalf("raw backslash-quote pair survived:\n%s", rendered)
+		}
+	}
+}
+
 func TestIncDrainAndJumpSQL(t *testing.T) {
 	got := incSourceDialect.BuildDrainSQL("public", "users", []string{"id", "update_time"}, "update_time")
 	want := `SELECT "id", "update_time" FROM "public"."users" WHERE "update_time" = $1`
