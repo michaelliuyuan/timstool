@@ -52,6 +52,65 @@ func (f *fakeProc) Kill() error {
 	return nil
 }
 
+// pen3 root fix (ruling seq109 #1): a respawn that cannot be spawned or
+// started is a HARD error — the supervisor falls to the FAILED terminal
+// state, closes done (Stop can never hang on an orphaned channel again)
+// and leaves an ERROR line. The old `continue` was a dead path: s.proc was
+// nil, the loop-top guard returned with NO terminal state and done never
+// closed (te seq107: kill + failed revival leaked StateStarting forever;
+// Stop then hung 15s + forever on <-done).
+func TestSupervisorRespawnFailureFallsToFailed(t *testing.T) {
+	// shape A: factory itself fails
+	t.Run("factory_error", func(t *testing.T) {
+		respawnFailsTo(t, func() (supervisedProcess, error) {
+			return nil, errors.New("spawn cdc: no such file")
+		})
+	})
+	// shape B: factory succeeds but Start fails (te's chmod -x shape)
+	t.Run("start_error", func(t *testing.T) {
+		respawnFailsTo(t, func() (supervisedProcess, error) {
+			return &fakeProc{pid: 5150, startErr: errors.New("permission denied")}, nil
+		})
+	})
+}
+
+func respawnFailsTo(t *testing.T, broken func() (supervisedProcess, error)) {
+	t.Helper()
+	s := newTestSupervisor(t, true)
+	healthy := newFakeProc(4242)
+	s.SetFactory(func() (supervisedProcess, error) { return healthy, nil })
+	if _, err := s.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !waitForState(t, s, StateRunning, 2*time.Second) {
+		t.Fatalf("never reached running")
+	}
+
+	// crash the child; the respawn now fails (te's kill + revival-failure)
+	s.SetFactory(broken)
+	healthy.Terminate() // unblocks Wait → crash path → backoff(0) → respawn fails
+
+	if !waitForState(t, s, StateFailed, 2*time.Second) {
+		t.Fatalf("respawn failure must fall to StateFailed, got %s", s.Status().State)
+	}
+	if got := s.Status().PID; got != 0 {
+		t.Fatalf("failed terminal must clear the pid, got %d", got)
+	}
+	// done must be closed (finish sets it nil) — the orphaned-channel hang
+	// is structurally impossible.
+	s.mu.Lock()
+	doneNil := s.done == nil
+	s.mu.Unlock()
+	if !doneNil {
+		t.Fatalf("done must be closed (nil) after failRespawn")
+	}
+	// Stop on the FAILED terminal returns promptly (no 15s + forever hang).
+	st := s.Stop(context.Background())
+	if st.State != StateFailed {
+		t.Fatalf("Stop on failed must report failed, got %s", st.State)
+	}
+}
+
 // crashingProc exits immediately on Wait (simulates a crash loop).
 type crashingProc struct{ pid int }
 

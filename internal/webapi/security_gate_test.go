@@ -336,6 +336,104 @@ func TestAnomalyAlarmSilentAtStartup(t *testing.T) {
 	}
 }
 
+// pen3 trigger form (ruling seq109 #2, te seq102/107 🔴1): a NON-TERMINAL
+// supervisor state ({Starting, Stopping}) that lingers past 3×interval is a
+// dead chain in limbo — it joins the dead cluster and alarms exactly once;
+// the limbo persisting must NOT re-enter the budget window (no periodic
+// re-alarm). Both leak shapes are pinned: the Starting leak (pure kill +
+// failed revival) and the Stopping leak (stop stuck on an orphaned done).
+func TestAnomalyAlarmFiresOnLingeringNonTerminal(t *testing.T) {
+	for _, shape := range []struct {
+		name  string
+		state CDCState
+	}{
+		{"starting_leak", StateStarting}, // te seq107: pure kill+revival-fail
+		{"stopping_leak", StateStopping}, // te seq102: stop in the limbo
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			s, sup, prov := newAnomalyServer(t)
+			c := newCDCAnomalyChecker(s, time.Hour, nil)
+			c.check() // running observed
+
+			// pin the limbo shape: control pinned, liveness stale
+			sup.mu.Lock()
+			sup.state = shape.state
+			sup.mu.Unlock()
+			prov.state = "stale"
+
+			c.check() // first non-terminal tick: arms the clock, running cluster
+			if c.nonTerminalSince.IsZero() {
+				t.Fatalf("non-terminal tick must arm the linger clock")
+			}
+			if got := len(s.cdcAlarms()); got != 0 {
+				t.Fatalf("within budget must not alarm: %d", got)
+			}
+
+			// age the linger clock past 3×interval (4× to be unambiguous)
+			c.nonTerminalSince = time.Now().Add(-4 * c.interval)
+			c.check() // past budget: enters the judgment — grace tick
+			if got := len(s.cdcAlarms()); got != 0 {
+				t.Fatalf("grace tick must not alarm yet: %d", got)
+			}
+			c.check() // still un-audited ⇒ alarm (wording names the state)
+			alarms := s.cdcAlarms()
+			if len(alarms) != 1 || !strings.Contains(alarms[0].Message, "滞留非终态") ||
+				!strings.Contains(alarms[0].Message, string(shape.state)) {
+				t.Fatalf("lingering %s must alarm once with the state named: %+v", shape.state, alarms)
+			}
+			c.check() // limbo persists: no re-alarm (aged clock, no re-entry)
+			c.check()
+			if got := len(s.cdcAlarms()); got != 1 {
+				t.Fatalf("persistent limbo must not re-alarm: %d", got)
+			}
+		})
+	}
+}
+
+// pen3 no-trigger form: NORMAL transitions pass through the non-terminal
+// pair well inside the budget — still counting toward the running cluster,
+// and the audited stop keeps the alarm silent; leaving the pair clears the
+// clock (a Starting segment followed by Stopping keeps it armed — the clock
+// spans the pair).
+func TestAnomalyAlarmSilentWhenNonTerminalWithinBudget(t *testing.T) {
+	s, sup, prov := newAnomalyServer(t)
+	c := newCDCAnomalyChecker(s, time.Hour, nil)
+	c.check() // running observed
+
+	// restart in flight: Starting observed within the budget
+	sup.mu.Lock()
+	sup.state = StateStarting
+	sup.mu.Unlock()
+	c.check()
+	if c.nonTerminalSince.IsZero() {
+		t.Fatalf("non-terminal tick must arm the linger clock")
+	}
+
+	// graceful stop right after (Starting → Stopping: same clock, no reset)
+	sup.mu.Lock()
+	sup.state = StateStopping
+	sup.mu.Unlock()
+	c.check()
+	if c.nonTerminalSince.IsZero() {
+		t.Fatalf("clock must span the non-terminal pair")
+	}
+
+	// audit lands + process exits: stopped, covered by the audited stop
+	s.appendAudit(auditEntry{Action: "cdc.stop", Result: "success"})
+	sup.mu.Lock()
+	sup.state = StateStopped
+	sup.mu.Unlock()
+	prov.state = string(cdc.LivenessNotRunning)
+	c.check()
+	c.check()
+	if got := len(s.cdcAlarms()); got != 0 {
+		t.Fatalf("budgeted transition + audited stop must not alarm: %d", got)
+	}
+	if !c.nonTerminalSince.IsZero() {
+		t.Fatalf("leaving the non-terminal pair must clear the linger clock")
+	}
+}
+
 // /cdc/status surfaces the alarm ring (.alarms) once one exists.
 func TestCDCStatusSurfacesAlarms(t *testing.T) {
 	s, _ := newTestServer(t)

@@ -288,6 +288,15 @@ type cdcAnomalyChecker struct {
 	// audit line lands milliseconds after the state flip, the checker ticks
 	// seconds later — but the race is real and must not false-alarm).
 	pendingSince time.Time
+	// nonTerminalSince is the first tick that observed a NON-TERMINAL
+	// supervisor state ({Starting, Stopping}) persisting (pen3, ruling
+	// seq109 #2): lingering past 3×interval is a dead chain in limbo
+	// (kill + failed revival → Starting leak; stop stuck on an orphaned
+	// done → Stopping leak — te seq102/107: 8min stale, zero alarms). The
+	// clock spans the PAIR (Starting→Stopping keeps it armed) and clears
+	// when the state leaves the pair in any direction. Past the budget the
+	// state joins the dead cluster and never refreshes lastSeenRunningAt.
+	nonTerminalSince time.Time
 
 	stop chan struct{}
 }
@@ -329,14 +338,32 @@ func (c *cdcAnomalyChecker) check() {
 		// Known cause: the fail-closed DDL halt. Edge consumed silently.
 		c.lastSeenRunningAt = time.Time{}
 		c.pendingSince = time.Time{}
+		c.nonTerminalSince = time.Time{}
 		return
 	}
 	st := s.cdcSupervisor.Status()
 	switch st.State {
-	case StateRunning, StateAdopted, StateStarting, StateStopping:
+	case StateRunning, StateAdopted:
 		c.lastSeenRunningAt = time.Now()
 		c.pendingSince = time.Time{}
+		c.nonTerminalSince = time.Time{}
 		return
+	case StateStarting, StateStopping:
+		// pen3 (ruling seq109 #2): within the linger budget a non-terminal
+		// state is a transition in flight — keep counting toward the
+		// running cluster (restart backoff ≤16s, graceful stops pass in
+		// milliseconds; both far inside 3×interval).
+		if c.nonTerminalSince.IsZero() {
+			c.nonTerminalSince = time.Now()
+		}
+		if time.Since(c.nonTerminalSince) <= 3*c.interval {
+			c.lastSeenRunningAt = time.Now()
+			c.pendingSince = time.Time{}
+			return
+		}
+		// Lingered past the budget: a dead chain stuck in limbo — join the
+		// dead cluster (never refresh lastSeenRunningAt while it persists)
+		// and fall through to the un-audited-stop judgment below.
 	case StateStopped, StateFailed:
 		// fall through to the un-audited-stop judgment
 	default:
@@ -350,6 +377,7 @@ func (c *cdcAnomalyChecker) check() {
 	// tick for both — After() would then false-alarm on an audited stop.
 	if lastStop := s.lastStopAuditTime(); !lastStop.IsZero() && !lastStop.Before(c.lastSeenRunningAt) {
 		c.pendingSince = time.Time{} // an audited operator stop covers it
+		c.nonTerminalSince = time.Time{}
 		return
 	}
 	if c.pendingSince.IsZero() {
@@ -359,10 +387,22 @@ func (c *cdcAnomalyChecker) check() {
 	c.pushAnomalyAlarm(st.State, st.PID)
 	c.lastSeenRunningAt = time.Time{} // edge consumed; re-arms on next running
 	c.pendingSince = time.Time{}
+	// nonTerminalSince stays AGED on purpose: a limbo that persists must not
+	// re-enter the budget window (or it would flip-flop between the running
+	// cluster and the dead cluster and re-alarm every few intervals). It
+	// clears when the state actually leaves the non-terminal pair.
 }
 
 func (c *cdcAnomalyChecker) pushAnomalyAlarm(state CDCState, pid int) {
-	msg := fmt.Sprintf("CDC 异常停止（状态=%s，PID=%d）：无对应的 stop 审计记录——不是操作员经 API 停止，进程被外部终止或链路异常退出，请立即核查。", state, pid)
+	var msg string
+	switch state {
+	case StateStarting, StateStopping:
+		// pen3 (ruling seq109 #2): a limbo, not a clean stop — the wording
+		// names the lingering state (respawn-failure / stuck stop).
+		msg = fmt.Sprintf("CDC 滞留非终态（状态=%s，PID=%d）已超过 3×巡检周期：链路死滞（复活失败或停止卡死），无对应 stop 审计——请立即核查。", state, pid)
+	default:
+		msg = fmt.Sprintf("CDC 异常停止（状态=%s，PID=%d）：无对应的 stop 审计记录——不是操作员经 API 停止，进程被外部终止或链路异常退出，请立即核查。", state, pid)
+	}
 	c.s.pushAlarm(msg)
 	if c.log != nil {
 		c.log.Error("cdc anomaly: stopped without an audited stop",

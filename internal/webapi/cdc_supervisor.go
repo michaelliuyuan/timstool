@@ -276,31 +276,39 @@ func (s *CDCSupervisor) supervise(stopCh chan struct{}) {
 			s.finish()
 			return
 		}
+		// pen3 root fix (ruling seq109 #1): a failed respawn is a HARD error
+		// (bad binary / bad config), not a transient crash — the old
+		// `continue` was a dead path (s.proc is nil, the loop-top guard
+		// returned without a terminal state and without closing done, so
+		// Stop() hung forever on <-done). Fall to the FAILED terminal state,
+		// cap or no cap.
 		proc2, err := s.factory()
-		if err != nil {
-			if s.restarts >= maxRestarts {
-				s.state = StateFailed
-				s.mu.Unlock()
-				s.finish()
-				return
-			}
-			s.mu.Unlock()
-			continue
+		if err == nil {
+			err = proc2.Start()
 		}
-		if err := proc2.Start(); err != nil {
-			if s.restarts >= maxRestarts {
-				s.state = StateFailed
-				s.mu.Unlock()
-				s.finish()
-				return
-			}
+		if err != nil {
 			s.mu.Unlock()
-			continue
+			s.failRespawn(err)
+			return
 		}
 		s.proc = proc2
 		s.pid = proc2.PID()
 		s.state = StateRunning
 		s.mu.Unlock()
+	}
+}
+
+// failRespawn moves the supervisor to the FAILED terminal state after a
+// respawn could not be spawned/started: clears the pid, closes done exactly
+// once (unblocks Stop) and leaves an ERROR line on the supervisor logger.
+func (s *CDCSupervisor) failRespawn(err error) {
+	s.mu.Lock()
+	s.state = StateFailed
+	s.pid = 0
+	s.mu.Unlock()
+	s.finish()
+	if s.log != nil {
+		s.log.Error("cdc supervisor: respawn failed; state=failed", zap.Error(err))
 	}
 }
 
