@@ -1,9 +1,6 @@
 <template>
   <div class="cdc-container tims-page">
-    <PageHeader title="CDC 实时同步" subtitle="基于数据库日志的推式实时管道，自动捕获 INSERT/UPDATE/DELETE，常驻运行" />
-
-    <!-- S1-UI-06: which-one-to-use card (shared with the watermark backfill page) -->
-    <SyncCompareCard v-if="connCfg" current="cdc" :cdc-source-req="srcIsMySQL ? 'binlog（ROW 格式 + REPLICATION 权限）' : undefined" />
+    <PageHeader title="CDC 实时同步" subtitle="基于数据库日志的推式实时同步管道，自动捕获 INSERT/UPDATE/DELETE，常驻运行" />
 
     <!-- Module disabled (cdc.enable=false) -->
     <!-- P1 巡检修复 #7：div → el-card，白底/边框/圆角由 el-card 皮肤提供 -->
@@ -14,7 +11,7 @@
     </el-card>
 
     <template v-else>
-    <!-- Signature pipeline strip -->
+    <!-- D: signature pipeline strip stays above the hero bar -->
     <DataPipelineStrip
       v-if="connCfg"
       :source="srcIsMySQL ? 'MySQL' : 'PostgreSQL'"
@@ -22,126 +19,40 @@
       :badges="pipelineBadges"
     />
 
-    <!-- Connection card (A1): the live config.yaml the CDC child uses -->
-    <!-- P1 巡检修复 #7：div → el-card（下同） -->
-    <el-card class="detail-card" v-if="connCfg">
-      <h3>连接信息（CDC 实际使用）</h3>
-      <div class="detail-row">
-        <span class="detail-label">配置文件:</span>
-        <code>{{ connCfg.cfg_file }}</code>
-      </div>
-      <div class="detail-row">
-        <span class="detail-label">源端:</span>
-        <code>{{ connCfg.source.host }}:{{ connCfg.source.port }}/{{ connCfg.source.database }} · {{ connCfg.source.user }}<span v-if="!connCfg.has_password" style="color:#cf1322;">（未设密码）</span></code>
-      </div>
-      <div class="detail-row">
-        <span class="detail-label">目标端:</span>
-        <code>{{ connCfg.target.host }}:{{ connCfg.target.port }}/{{ connCfg.target.database }} · {{ connCfg.target.user }}</code>
-      </div>
-      <div class="detail-row">
-        <span class="detail-label">CDC 参数:</span>
-        <code>{{ connCfg.cdc.mode }}<template v-if="srcIsMySQL"> · binlog 采集（file:pos 位点续传）</template><template v-else-if="connCfg.cdc.slot_name"> · slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }}</template> · parallel={{ connCfg.cdc.parallel }} · 冲突={{ connCfg.cdc.conflict_strategy }} · DDL={{ connCfg.cdc.sync_ddl ? '同步' : '不同步' }}</code>
-      </div>
-      <div class="control-actions" style="margin-top: 10px;">
-        <el-button v-if="!editingConn" @click="startEditConn">编辑连接</el-button>
-        <el-button @click="importConn" :disabled="busy || isActive || editingConn">从最近迁移任务导入</el-button>
-      </div>
-      <!-- F-02 D4: one-click import from saved datasources -->
-      <div class="control-actions ds-import" v-if="!editingConn">
-        <span class="ds-import-label">从数据源导入：</span>
-        <el-select v-model="dsSourceRef" class="ds-import-select" placeholder="源端数据源" size="small">
-          <el-option label="源端数据源" value="" />
-          <el-option v-for="d in dsByType(['postgres', 'mysql'])" :key="d.id" :value="d.id" :label="d.name" />
-        </el-select>
-        <span class="ds-import-arrow">→</span>
-        <el-select v-model="dsTargetRef" class="ds-import-select" placeholder="目标端（TiDB 数据源）" size="small">
-          <el-option label="目标端（TiDB 数据源）" value="" />
-          <el-option v-for="d in dsByType(['tidb'])" :key="d.id" :value="d.id" :label="d.name" />
-        </el-select>
-        <el-button size="small" @click="importFromDS" :disabled="busy || isActive || !dsSourceRef || !dsTargetRef || importingDS" :loading="importingDS">
-          {{ importingDS ? '导入中…' : '导入' }}
-        </el-button>
-      </div>
-      <!-- Inline edit form (A1 manual edit) -->
-      <div v-if="editingConn" class="conn-edit">
-        <div class="conn-edit-section">源端数据库（PostgreSQL / MySQL）</div>
-        <div class="conn-grid">
-          <label>主机<el-input v-model="editForm.source.host" size="small" /></label>
-          <label>端口<el-input-number v-model="editForm.source.port" :min="1" :max="65535" controls-position="right" size="small" class="conn-grid-num" /></label>
-          <label>用户名<el-input v-model="editForm.source.user" size="small" /></label>
-          <label>密码<el-input v-model="editForm.source.password" type="password" show-password placeholder="留空保持不变" size="small" /></label>
-          <label>数据库<el-input v-model="editForm.source.database" size="small" /></label>
-          <label>Schema<el-input v-model="editForm.source.schema" size="small" /></label>
+    <!-- MS-11c A: hero status bar — state dot + word + lsn/lag/uptime summary
+         + inline start/stop/refresh actions (absorbs the old control card and
+         status card; four-state colors run through hero + tab badges). -->
+    <div class="status-card hero" :class="cardState">
+      <div class="hero-main">
+        <div class="status-indicator">
+          <span class="status-dot" :class="{ active: status.running || inStartup }"></span>
+          <span class="status-text">{{ cardLabel }}</span>
+          <span v-if="control && control.restarts > 0" class="control-restarts hero-restarts">自动重启 {{ control.restarts }} 次</span>
         </div>
-        <div class="conn-edit-section">目标端（TiDB）</div>
-        <div class="conn-grid">
-          <label>主机<el-input v-model="editForm.target.host" size="small" /></label>
-          <label>端口<el-input-number v-model="editForm.target.port" :min="1" :max="65535" controls-position="right" size="small" class="conn-grid-num" /></label>
-          <label>用户名<el-input v-model="editForm.target.user" size="small" /></label>
-          <label>密码<el-input v-model="editForm.target.password" type="password" show-password placeholder="留空保持不变" size="small" /></label>
-          <label>数据库<el-input v-model="editForm.target.database" size="small" /></label>
+        <div class="status-meta">
+          <span v-if="status.running && status.lsn">{{ srcIsMySQL ? '同步位点' : 'LSN' }}: {{ status.lsn }}</span>
+          <span v-else-if="inStartup">CDC 启动中…（control 通道确认运行，等待 CDC 连接 {{ srcIsMySQL ? 'MySQL' : 'PG' }}/TiDB 写首条状态，约 8-90s）</span>
+          <span v-else>{{ status.message || 'CDC 未运行，点右侧「启动 CDC」开始' }}</span>
         </div>
-        <div class="control-actions" style="margin-top: 8px;">
-          <el-button type="success" @click="saveConn" :disabled="savingConn" :loading="savingConn">{{ savingConn ? '保存中…' : '保存' }}</el-button>
-          <el-button type="danger" plain @click="editingConn = false">取消</el-button>
+        <div class="status-meta hero-summary" v-if="stats">
+          <span>延迟 {{ stats.lag_seconds?.toFixed(1) || '0' }}s</span>
+          <span>吞吐 {{ stats.throughput_rps?.toFixed(1) || '0' }}/s</span>
+          <span>运行 {{ formatUptime(stats.uptime_seconds) }}</span>
         </div>
-        <div v-if="connMsg" class="control-msg" :class="{ error: connError }">{{ connMsg }}</div>
+        <div class="status-meta" v-if="status.fatal_error" style="color: #fff; opacity: 0.95;">
+          ⚠️ {{ status.fatal_error }}
+        </div>
       </div>
-    </el-card>
-
-    <!-- Precheck panel (A2): run before Start; fail items block -->
-    <el-card class="detail-card" v-if="precheck">
-      <h3>启动预检 <el-button size="small" style="margin-left: 8px;" @click="runPrecheck" :disabled="checking" :loading="checking">{{ checking ? '检查中…' : '重新检查' }}</el-button></h3>
-      <div v-for="it in precheck.items" :key="it.item" class="precheck-row" :class="it.level">
-        <span class="precheck-dot">{{ it.level === 'ok' ? '✓' : it.level === 'warn' ? '!' : '✗' }}</span>
-        <span class="precheck-label">{{ it.label }}</span>
-        <span class="precheck-detail">{{ it.detail }}</span>
-        <!-- REPLICA IDENTITY is a PG-only mechanism — the mysql no-PK precheck
-             warn carries its own guidance (add a PK for row-accurate UPDATE/DELETE). -->
-        <el-button v-if="it.item === 'no_pk_tables' && it.level === 'warn' && noPKTables.length && connCfg?.source?.type !== 'mysql'"
-          size="small" style="margin-left: auto; flex: none;"
-          @click="openNoPKFix">修复（REPLICA IDENTITY FULL）</el-button>
-      </div>
-      <div class="resume-box">
-        <strong>断点/起点：</strong>{{ precheck.conclusion }}
-        <span v-if="precheck.checkpoint.exists"> · checkpoint 文件 {{ precheck.checkpoint.file }}（更新于 {{ precheck.checkpoint.updated_at ? new Date(precheck.checkpoint.updated_at).toLocaleString() : '-' }}）</span>
-      </div>
-      <div class="control-actions" style="margin-top: 8px;" v-if="precheck.checkpoint.exists && !isActive">
-        <el-button type="danger" plain size="small" @click="resetCheckpoint">重置断点（危险）</el-button>
-      </div>
-    </el-card>
-
-    <!-- Control panel: one-click start/stop (#t55) -->
-    <!-- P1 巡检修复 #7：div → el-card -->
-    <el-card class="control-card">
-      <div class="control-head">
-        <span class="control-badge" :class="controlState">{{ controlLabel }}</span>
-        <span v-if="control && control.restarts > 0" class="control-restarts">自动重启 {{ control.restarts }} 次</span>
-      </div>
-      <div class="control-actions">
-        <el-button type="success" :disabled="busy || isActive || !precheckPassed" @click="startCDC" :title="precheckPassed ? '' : '预检未通过或有未完成的预检项，请先点击预检面板重新检查'">{{ startLabel }}</el-button>
+      <div class="hero-actions">
+        <el-button type="success" :disabled="busy || isActive || !precheckPassed" @click="startCDC" :title="precheckPassed ? '' : '预检未通过或有未完成的预检项，请先在「启动预检」Tab 重新检查'">{{ startLabel }}</el-button>
         <el-button type="danger" :disabled="busy || !canStop" @click="confirmStopCDC">停止 CDC</el-button>
+        <el-button @click="refresh">刷新</el-button>
+        <span class="auto-refresh hero-refresh">自动刷新: {{ refreshInterval }}s</span>
       </div>
-      <div v-if="controlMsg" class="control-msg" :class="{ error: controlError }">{{ controlMsg }}</div>
-    </el-card>
-
-    <!-- Status Card -->
-    <div class="status-card" :class="cardState">
-      <div class="status-indicator">
-        <span class="status-dot" :class="{ active: status.running || inStartup }"></span>
-        <span class="status-text">{{ cardLabel }}</span>
-      </div>
-      <div class="status-meta">
-        <span v-if="status.running && status.lsn">{{ srcIsMySQL ? '同步位点' : 'LSN' }}: {{ status.lsn }}</span>
-        <span v-else-if="inStartup">CDC 启动中…（control 通道确认运行，等待 CDC 连接 {{ srcIsMySQL ? 'MySQL' : 'PG' }}/TiDB 写首条状态，约 8-90s）</span>
-        <span v-else>{{ status.message || 'CDC 未运行，点上方「启动 CDC」开始' }}</span>
-      </div>
-      <div class="status-meta" v-if="status.fatal_error" style="color: #fff; opacity: 0.95;">
-        ⚠️ {{ status.fatal_error }}
-      </div>
+      <div v-if="controlMsg" class="control-msg hero-msg" :class="{ error: controlError }">{{ controlMsg }}</div>
     </div>
 
-    <!-- Stats Grid -->
+    <!-- B: stats grid right under the hero -->
     <div class="stats-grid" v-if="stats">
       <div class="stat-item">
         <div class="stat-value">{{ formatNumber(stats.source_events) }}</div>
@@ -178,77 +89,155 @@
       </div>
     </div>
 
-    <!-- Checkpoint Card -->
-    <el-card class="detail-card" v-if="checkpoint && checkpoint.lsn">
-      <h3>检查点</h3>
-      <div class="detail-row">
-        <span class="detail-label">{{ srcIsMySQL ? '同步位点:' : 'LSN:' }}</span>
-        <code>{{ checkpoint.lsn }}</code>
-      </div>
-      <div class="detail-row" v-if="status.slot">
-        <span class="detail-label">Slot:</span>
-        <code>{{ status.slot }}</code>
-      </div>
-      <div class="detail-row">
-        <span class="detail-label">更新时间:</span>
-        <span>{{ checkpoint.updated_at ? new Date(checkpoint.updated_at).toLocaleString() : '-' }}</span>
-      </div>
-    </el-card>
+    <!-- MS-11c C: three tabs — overview / connection+config / precheck -->
+    <el-tabs v-model="activeTab" class="cdc-tabs">
+      <!-- Tab ①: overview (default) -->
+      <el-tab-pane label="概览" name="overview">
+        <!-- merged card: checkpoint + config + slot (three cards → one, fields deduped) -->
+        <el-card class="detail-card" v-if="hasPositionInfo">
+          <h3>位点 / 复制槽 / 进程</h3>
+          <div class="detail-row" v-if="checkpoint && checkpoint.lsn">
+            <span class="detail-label">{{ srcIsMySQL ? '同步位点:' : 'LSN:' }}</span>
+            <code>{{ checkpoint.lsn }}</code>
+          </div>
+          <div class="detail-row" v-if="status.slot">
+            <span class="detail-label">Slot:</span>
+            <code>{{ status.slot }}</code>
+          </div>
+          <div class="detail-row" v-if="status.publication">
+            <span class="detail-label">Publication:</span>
+            <code>{{ status.publication }}</code>
+          </div>
+          <div class="detail-row" v-if="status.pid">
+            <span class="detail-label">PID:</span>
+            <code>{{ status.pid }}</code>
+          </div>
+          <div class="detail-row" v-if="checkpoint && checkpoint.lsn">
+            <span class="detail-label">更新时间:</span>
+            <span>{{ checkpoint.updated_at ? new Date(checkpoint.updated_at).toLocaleString() : '-' }}</span>
+          </div>
+          <!-- A3 live slot fields (PG-only surface; mysql clears slotView) -->
+          <div class="detail-row" v-if="slotView && slotView.slot.exists && slotView.slot.restart_lsn">
+            <span class="detail-label">restart_lsn:</span>
+            <code>{{ slotView.slot.restart_lsn }}</code>
+            <span v-if="slotView.slot.active" class="tag-ok">active</span>
+            <span v-else class="tag-warn">inactive</span>
+          </div>
+          <div class="detail-row" v-if="slotView && slotView.slot.exists">
+            <span class="detail-label">滞留 WAL:</span>
+            <code :class="{ 'lag-warn': (slotView.slot.lag_bytes || 0) > 1073741824 }">{{ formatBytes(slotView.slot.lag_bytes) }}</code>
+            <span class="detail-hint">（当前 LSN {{ slotView.slot.current_lsn }}；CDC 停止期间持续增长）</span>
+          </div>
+          <div class="detail-row" v-if="slotView && slotView.checkpoint && slotView.checkpoint.exists && slotView.checkpoint.lsn && (!checkpoint || slotView.checkpoint.lsn !== checkpoint.lsn)">
+            <span class="detail-label">checkpoint:</span>
+            <code>{{ slotView.checkpoint.lsn }}</code>
+            <span class="detail-hint">（{{ Math.floor(slotView.checkpoint_age_seconds || 0) }}s 前更新）</span>
+          </div>
+        </el-card>
 
-    <!-- Config Card (from status: slot/publication/pid) -->
-    <el-card class="detail-card" v-if="status.slot || status.publication">
-      <h3>配置</h3>
-      <div class="detail-row" v-if="status.slot">
-        <span class="detail-label">Slot:</span>
-        <code>{{ status.slot }}</code>
-      </div>
-      <div class="detail-row" v-if="status.publication">
-        <span class="detail-label">Publication:</span>
-        <code>{{ status.publication }}</code>
-      </div>
-      <div class="detail-row" v-if="status.pid">
-        <span class="detail-label">PID:</span>
-        <code>{{ status.pid }}</code>
-      </div>
-      <div class="detail-row" v-if="status.uptime_seconds">
-        <span class="detail-label">运行时长:</span>
-        <span>{{ formatUptime(status.uptime_seconds) }}</span>
-      </div>
-    </el-card>
+        <!-- Recent error -->
+        <el-card class="error-card" v-if="stats && stats.last_error">
+          <h3>最近错误</h3>
+          <pre>{{ stats.last_error }}</pre>
+        </el-card>
+      </el-tab-pane>
 
-    <!-- Live slot / lag card (A3): restart_lsn + retained WAL + checkpoint age -->
-    <el-card class="detail-card" v-if="slotView && slotView.slot.exists">
-      <h3>Slot 与延迟</h3>
-      <div class="detail-row">
-        <span class="detail-label">restart_lsn:</span>
-        <code>{{ slotView.slot.restart_lsn }}</code>
-        <span v-if="slotView.slot.active" class="tag-ok">active</span>
-        <span v-else class="tag-warn">inactive</span>
-      </div>
-      <div class="detail-row">
-        <span class="detail-label">滞留 WAL:</span>
-        <code :class="{ 'lag-warn': (slotView.slot.lag_bytes || 0) > 1073741824 }">{{ formatBytes(slotView.slot.lag_bytes) }}</code>
-        <span class="detail-hint">（当前 LSN {{ slotView.slot.current_lsn }}；CDC 停止期间持续增长）</span>
-      </div>
-      <div class="detail-row" v-if="slotView.checkpoint.exists">
-        <span class="detail-label">checkpoint:</span>
-        <code>{{ slotView.checkpoint.lsn }}</code>
-        <span class="detail-hint">（{{ Math.floor(slotView.checkpoint_age_seconds || 0) }}s 前更新）</span>
-      </div>
-    </el-card>
+      <!-- Tab ②: connection & config -->
+      <el-tab-pane label="连接与配置" name="conn">
+        <!-- S1-UI-06: which-one-to-use card (moved into the config tab, MS-11c) -->
+        <SyncCompareCard v-if="connCfg" current="cdc" :cdc-source-req="srcIsMySQL ? 'binlog（ROW 格式 + REPLICATION 权限）' : undefined" />
 
-    <!-- Error display -->
-    <!-- P1 巡检修复 #7：div → el-card -->
-    <el-card class="error-card" v-if="stats && stats.last_error">
-      <h3>最近错误</h3>
-      <pre>{{ stats.last_error }}</pre>
-    </el-card>
+        <!-- Connection card (A1): the live config.yaml the CDC child uses -->
+        <el-card class="detail-card" v-if="connCfg">
+          <h3>连接信息（CDC 实际使用）</h3>
+          <div class="detail-row">
+            <span class="detail-label">配置文件:</span>
+            <code>{{ connCfg.cfg_file }}</code>
+          </div>
+          <div class="detail-row">
+            <span class="detail-label">源端:</span>
+            <code>{{ connCfg.source.host }}:{{ connCfg.source.port }}/{{ connCfg.source.database }} · {{ connCfg.source.user }}<span v-if="!connCfg.has_password" style="color:#cf1322;">（未设密码）</span></code>
+          </div>
+          <div class="detail-row">
+            <span class="detail-label">目标端:</span>
+            <code>{{ connCfg.target.host }}:{{ connCfg.target.port }}/{{ connCfg.target.database }} · {{ connCfg.target.user }}</code>
+          </div>
+          <div class="detail-row">
+            <span class="detail-label">CDC 参数:</span>
+            <code>{{ connCfg.cdc.mode }}<template v-if="srcIsMySQL"> · binlog 采集（file:pos 位点续传）</template><template v-else-if="connCfg.cdc.slot_name"> · slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }}</template> · parallel={{ connCfg.cdc.parallel }} · 冲突={{ connCfg.cdc.conflict_strategy }} · DDL={{ connCfg.cdc.sync_ddl ? '同步' : '不同步' }}</code>
+          </div>
+          <div class="control-actions" style="margin-top: 10px;">
+            <el-button v-if="!editingConn" @click="startEditConn">编辑连接</el-button>
+            <el-button @click="importConn" :disabled="busy || isActive || editingConn">从最近迁移任务导入</el-button>
+          </div>
+          <!-- F-02 D4: one-click import from saved datasources -->
+          <div class="control-actions ds-import" v-if="!editingConn">
+            <span class="ds-import-label">从数据源导入：</span>
+            <el-select v-model="dsSourceRef" class="ds-import-select" placeholder="源端数据源" size="small">
+              <el-option label="源端数据源" value="" />
+              <el-option v-for="d in dsByType(['postgres', 'mysql'])" :key="d.id" :value="d.id" :label="d.name" />
+            </el-select>
+            <span class="ds-import-arrow">→</span>
+            <el-select v-model="dsTargetRef" class="ds-import-select" placeholder="目标端（TiDB 数据源）" size="small">
+              <el-option label="目标端（TiDB 数据源）" value="" />
+              <el-option v-for="d in dsByType(['tidb'])" :key="d.id" :value="d.id" :label="d.name" />
+            </el-select>
+            <el-button size="small" @click="importFromDS" :disabled="busy || isActive || !dsSourceRef || !dsTargetRef || importingDS" :loading="importingDS">
+              {{ importingDS ? '导入中…' : '导入' }}
+            </el-button>
+          </div>
+          <!-- Inline edit form (A1 manual edit) -->
+          <div v-if="editingConn" class="conn-edit">
+            <div class="conn-edit-section">源端数据库（PostgreSQL / MySQL）</div>
+            <div class="conn-grid">
+              <label>主机<el-input v-model="editForm.source.host" size="small" /></label>
+              <label>端口<el-input-number v-model="editForm.source.port" :min="1" :max="65535" controls-position="right" size="small" class="conn-grid-num" /></label>
+              <label>用户名<el-input v-model="editForm.source.user" size="small" /></label>
+              <label>密码<el-input v-model="editForm.source.password" type="password" show-password placeholder="留空保持不变" size="small" /></label>
+              <label>数据库<el-input v-model="editForm.source.database" size="small" /></label>
+              <label>Schema<el-input v-model="editForm.source.schema" size="small" /></label>
+            </div>
+            <div class="conn-edit-section">目标端（TiDB）</div>
+            <div class="conn-grid">
+              <label>主机<el-input v-model="editForm.target.host" size="small" /></label>
+              <label>端口<el-input-number v-model="editForm.target.port" :min="1" :max="65535" controls-position="right" size="small" class="conn-grid-num" /></label>
+              <label>用户名<el-input v-model="editForm.target.user" size="small" /></label>
+              <label>密码<el-input v-model="editForm.target.password" type="password" show-password placeholder="留空保持不变" size="small" /></label>
+              <label>数据库<el-input v-model="editForm.target.database" size="small" /></label>
+            </div>
+            <div class="control-actions" style="margin-top: 8px;">
+              <el-button type="success" @click="saveConn" :disabled="savingConn" :loading="savingConn">{{ savingConn ? '保存中…' : '保存' }}</el-button>
+              <el-button type="danger" plain @click="editingConn = false">取消</el-button>
+            </div>
+            <div v-if="connMsg" class="control-msg" :class="{ error: connError }">{{ connMsg }}</div>
+          </div>
+        </el-card>
+      </el-tab-pane>
 
-    <!-- Refresh button -->
-    <div class="actions">
-      <el-button @click="refresh">刷新</el-button>
-      <span class="auto-refresh">自动刷新: {{ refreshInterval }}s</span>
-    </div>
+      <!-- Tab ③: startup precheck -->
+      <el-tab-pane label="启动预检" name="precheck">
+        <el-card class="detail-card" v-if="precheck">
+          <h3>启动预检 <el-button size="small" style="margin-left: 8px;" @click="runPrecheck" :disabled="checking" :loading="checking">{{ checking ? '检查中…' : '重新检查' }}</el-button></h3>
+          <div v-for="it in precheck.items" :key="it.item" class="precheck-row" :class="it.level">
+            <span class="precheck-dot">{{ it.level === 'ok' ? '✓' : it.level === 'warn' ? '!' : '✗' }}</span>
+            <span class="precheck-label">{{ it.label }}</span>
+            <span class="precheck-detail">{{ it.detail }}</span>
+            <!-- REPLICA IDENTITY is a PG-only mechanism — the mysql no-PK precheck
+                 warn carries its own guidance (add a PK for row-accurate UPDATE/DELETE). -->
+            <el-button v-if="it.item === 'no_pk_tables' && it.level === 'warn' && noPKTables.length && connCfg?.source?.type !== 'mysql'"
+              size="small" style="margin-left: auto; flex: none;"
+              @click="openNoPKFix">修复（REPLICA IDENTITY FULL）</el-button>
+          </div>
+          <div class="resume-box">
+            <strong>断点/起点：</strong>{{ precheck.conclusion }}
+            <span v-if="precheck.checkpoint.exists"> · checkpoint 文件 {{ precheck.checkpoint.file }}（更新于 {{ precheck.checkpoint.updated_at ? new Date(precheck.checkpoint.updated_at).toLocaleString() : '-' }}）</span>
+          </div>
+          <div class="control-actions" style="margin-top: 8px;" v-if="precheck.checkpoint.exists && !isActive">
+            <el-button type="danger" plain size="small" @click="resetCheckpoint">重置断点（危险）</el-button>
+          </div>
+        </el-card>
+      </el-tab-pane>
+    </el-tabs>
     </template>
   </div>
 </template>
@@ -330,6 +319,9 @@ interface CDCSlotView {
   checkpoint_age_seconds?: number
 }
 
+// MS-11c C: three-tab layout — overview is the default landing tab.
+const activeTab = ref<'overview' | 'conn' | 'precheck'>('overview')
+
 const connCfg = ref<CDCConnConfig | null>(null)
 const editingConn = ref(false)
 const savingConn = ref(false)
@@ -346,8 +338,8 @@ const slotView = ref<CDCSlotView | null>(null)
 
 const precheckPassed = computed(() => precheck.value?.warn_only === true)
 
-// MS-11a: source-aware copy. Same truth as the REPLICA IDENTITY guard above
-// (:99) — connCfg.source.type. PG branch keeps every string byte-identical.
+// MS-11a: source-aware copy. Same truth as the REPLICA IDENTITY guard in the
+// precheck tab — connCfg.source.type. PG branch keeps every string byte-identical.
 const srcIsMySQL = computed(() => connCfg.value?.source?.type === 'mysql')
 
 // MS-11a pen 4c: any source switch (saveConn / importConn / importFromDS all
@@ -616,16 +608,6 @@ const controlError = ref(false)
 const controlState = computed(() => control.value?.state || 'stopped')
 const isActive = computed(() => ['running', 'starting', 'adopted'].includes(controlState.value))
 const canStop = computed(() => ['running', 'starting', 'adopted'].includes(controlState.value))
-const controlLabel = computed(() => {
-  switch (controlState.value) {
-    case 'running': return '运行中'
-    case 'starting': return '启动中…'
-    case 'stopping': return '停止中…'
-    case 'failed': return '已失败（崩溃超限）'
-    case 'adopted': return '运行中（领养）'
-    default: return '未启动'
-  }
-})
 const startLabel = computed(() => {
   if (busy.value) return '处理中…'
   return controlState.value === 'failed' ? '重新启动 CDC' : '启动 CDC'
@@ -638,6 +620,12 @@ const startLabel = computed(() => {
 const inStartup = computed(() => isActive.value && !status.value.running)
 const cardState = computed(() => (inStartup.value ? 'starting' : statusState.value))
 const cardLabel = computed(() => (inStartup.value ? '启动中…（control 通道确认运行）' : statusLabel.value))
+
+// MS-11c ①: merged position card visibility — checkpoint lsn, live slot
+// fields, or any config-from-status row (slot/publication/pid) present.
+const hasPositionInfo = computed(() =>
+  !!(checkpoint.value?.lsn || status.value.slot || status.value.publication || status.value.pid ||
+    (slotView.value?.slot?.exists)))
 
 async function callCDC(action: 'start' | 'stop') {
   busy.value = true
@@ -752,21 +740,29 @@ onUnmounted(() => {
 }
 .cdc-container code { word-break: break-all; } /* #t2 375 视口长 LSN/配置串防御性换行 */
 
+/* MS-11c A: hero status bar — old status-card skin, now a flex row with the
+   start/stop/refresh actions inlined on the right. */
 .status-card {
-  border-radius: var(--tims-radius); padding: 24px; margin-bottom: 24px;
+  border-radius: var(--tims-radius); padding: 20px 24px; margin-bottom: 16px;
   box-shadow: var(--tims-shadow);
+  display: flex; align-items: center; gap: 24px; flex-wrap: wrap;
 }
-/* #t2 对比度二轮：状态横幅渐变两档白字均 ≥4.5 */
 .status-card.running { background: linear-gradient(135deg, #0b7a7a, #0d8484); color: #fff; }
 .status-card.starting { background: linear-gradient(135deg, #2c4a8f, #3d5ea3); color: #fff; }
 .status-card.stopped { background: #eef0f6; color: var(--tims-text-2); }
 .status-card.halted { background: linear-gradient(135deg, #c02f2f, #d03a3a); color: #fff; }
 .status-card.stale { background: linear-gradient(135deg, #9a5700, #a86200); color: #fff; }
+.hero-main { flex: 1 1 320px; min-width: 0; }
 .status-indicator { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-.status-dot { width: 12px; height: 12px; border-radius: 50%; background: #d9d9d9; }
+.status-dot { width: 12px; height: 12px; border-radius: 50%; background: #d9d9d9; flex: none; }
 .status-dot.active { background: #fff; animation: pulse 2s infinite; }
 .status-text { font-size: 18px; font-weight: 600; }
+.hero-restarts { background: rgba(255, 255, 255, 0.18); padding: 1px 8px; border-radius: 10px; }
 .status-meta { font-size: var(--tims-font-sm); opacity: 0.85; }
+.hero-summary { display: flex; gap: 16px; margin-top: 4px; }
+.hero-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.hero-refresh { flex: none; }
+.hero-msg { width: 100%; }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
@@ -775,7 +771,7 @@ onUnmounted(() => {
 
 .stats-grid {
   display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
-  margin-bottom: 24px;
+  margin-bottom: 16px;
 }
 .stat-item {
   background: var(--tims-card); border-radius: var(--tims-radius); padding: 16px 18px; text-align: left;
@@ -802,25 +798,17 @@ code { background: #f0f0f0; padding: 2px 8px; border-radius: 4px; font-size: var
 .error-card h3 { font-size: var(--tims-font-md); color: #cf1322; margin-bottom: 8px; }
 .error-card pre { font-size: var(--tims-font-sm); color: #cf1322; white-space: pre-wrap; word-break: break-all; }
 
-.actions {
-  display: flex; align-items: center; gap: 16px; margin-top: 16px;
-}
+/* MS-11c C: tab layout */
+.cdc-tabs { margin-top: 4px; }
+.cdc-tabs :deep(.el-tabs__content) { overflow: visible; } /* confirm/prompt popups inside tabs */
 
-/* P1 巡检修复 #7：div → el-card，外观由 el-card 提供，仅保留间距与纵向布局 */
-.control-card { margin-bottom: 24px; }
-.control-card :deep(.el-card__body) { display: flex; flex-direction: column; gap: 12px; }
-.control-head { display: flex; align-items: center; gap: 12px; }
-.control-badge {
-  font-size: var(--tims-font-sm); font-weight: 600; padding: 4px 12px; border-radius: 12px;
-  background: #f0f0f0; color: var(--tims-text-2); /* P1 巡检修复 #7 字号/灰阶；胶囊圆角保留 */
-}
-.control-badge.running, .control-badge.adopted { background: #f6ffed; color: var(--tims-ok-text); } /* P1 巡检修复 #9：#389e0d(3.37:1) → AA 绿 */
-.control-badge.starting, .control-badge.stopping { background: #e6f7ff; color: #1890ff; }
-.control-badge.failed { background: #fff1f0; color: #cf1322; }
-.control-restarts { font-size: 12px; color: var(--tims-tag-warning-text); } /* P1 巡检修复 #9：#faad14(≈2.2:1) → AA */
+/* P1 巡检修复 #9：tag 文字换 AA 深色（#389e0d/#d48806 不足 4.5:1）；胶囊圆角保留 */
+.control-restarts { font-size: 12px; color: var(--tims-tag-warning-text); }
 .control-actions { display: flex; gap: 12px; align-items: center; }
 .control-msg { font-size: var(--tims-font-sm); color: var(--tims-ok-text); } /* P1 巡检修复 #9：#52c41a → AA 绿；字号 #7 */
 .control-msg.error { color: #cf1322; }
+.stopped .control-msg { color: var(--tims-ok-text); }
+.stopped .control-msg.error { color: #cf1322; }
 
 /* P1 巡检修复 #7：div → el-card，保留 dashed 边框语义；灰阶/字号统一 */
 .disabled-card { border-style: dashed; text-align: center; color: var(--tims-text-2); }
