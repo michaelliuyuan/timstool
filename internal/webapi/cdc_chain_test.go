@@ -177,6 +177,33 @@ func TestCDCChain_SeedAdvancesStaleCheckpoint(t *testing.T) {
 	}
 }
 
+func TestCDCChain_SeedClearsDualFieldShape(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	// A dual-field file on disk (stale MySQL pair, LSN 0): the PG chain seed
+	// must overwrite the chain point AND clear the binlog field — otherwise
+	// LoadForSource(postgres) reads the mixed shape as cross-source and
+	// discards the very chain point the seeder just wrote (MS-11d pen 2).
+	dual := `{"lsn":0,"slot_name":"pg2tidb_cdc","binlog":{"file":"binlog.000005","pos":6636}}`
+	if err := os.WriteFile(chainCheckpointPathForTest(s), []byte(dual), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.Migration.ChainStartLSN = "0/3D0000A0"
+	if err := s.seedChainCheckpoint("taskX", cfg); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	cp, err := cdc.NewCheckpointManager(chainCheckpointPathForTest(s)).LoadForSource(cdc.SourceKindPostgres)
+	if err != nil || cp == nil {
+		t.Fatalf("load for source: %v %v", cp, err)
+	}
+	if cp.LSN.String() != "0/3D0000A0" {
+		t.Fatalf("chain point lost: %s", cp.LSN.String())
+	}
+	if cp.Binlog != nil {
+		t.Fatalf("dual-field shape survived the seed: %+v", cp.Binlog)
+	}
+}
+
 func TestCDCChain_SeedCheckpointEdgeCases(t *testing.T) {
 	s, _, _ := newCDCServer(t)
 

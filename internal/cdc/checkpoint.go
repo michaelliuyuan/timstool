@@ -166,6 +166,10 @@ func (c *CheckpointManager) Update(lsn pglogrepl.LSN) {
 	defer c.mu.Unlock()
 
 	c.checkpoint.LSN = lsn
+	// Exactly-one invariant (models.go: dual-source shape): a PG checkpoint
+	// never carries a binlog pair, so a re-seeded chain point cannot leave a
+	// stale MySQL field behind (which LoadForSource would read as cross-source).
+	c.checkpoint.Binlog = nil
 	c.checkpoint.Timestamp = time.Now()
 	c.dirty = true
 }
@@ -185,6 +189,9 @@ func (c *CheckpointManager) UpdateBinlog(bp BinlogPosition) {
 	defer c.mu.Unlock()
 
 	c.checkpoint.Binlog = &bp
+	// Exactly-one invariant (models.go: dual-source shape): a MySQL checkpoint
+	// never carries a PG LSN, so LoadForSource cannot misread a mixed shape.
+	c.checkpoint.LSN = 0
 	c.checkpoint.Timestamp = time.Now()
 	c.dirty = true
 }
