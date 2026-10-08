@@ -13,9 +13,10 @@ package cdc
 //      disconnect / permission / missing-table-schema errors surface as a
 //      fatal stream error, never a silent skip.
 //
-// v1 hard semantics (ruling seq 953 #2): a binlog Query(DDL) event halts the
-// task with an explicit remediation message — silent DDL skipping is
-// forbidden.
+// v1 hard semantics (ruling seq 953 #2): a binlog Query(DDL) event on the
+// TARGET database halts the task with an explicit remediation message —
+// silent DDL skipping is forbidden. DDL outside the target database is
+// logged and ignored (MS-11e A).
 
 import (
 	"context"
@@ -224,13 +225,35 @@ func (h *canalHandler) OnTableChanged(header *replication.EventHeader, schemaNam
 	return nil
 }
 
-// OnDDL implements the v1 hard semantics: any DDL Query event halts the
-// stream with an explicit remediation error (ruling seq 953 #2 — silent DDL
-// skipping is forbidden).
+// OnDDL implements the v1 hard semantics: a DDL Query event on the TARGET
+// database halts the stream with an explicit remediation error (ruling seq
+// 953 #2 — silent DDL skipping is forbidden). A DDL outside the target
+// database (or with an empty schema) cannot affect the replicated tables:
+// log it and keep streaming (MS-11e A — cross-database noise used to halt
+// healthy chains).
 func (h *canalHandler) OnDDL(header *replication.EventHeader, nextPos mysql.Position, queryEvent *replication.QueryEvent) error {
+	schema := string(queryEvent.Schema)
+	target := h.s.cfg.Database
+	if schema == "" || schema != target {
+		h.s.log.Info("binlog source: DDL outside target database ignored",
+			zap.String("schema", schema),
+			zap.String("target", target),
+			zap.String("query", ddlQuerySummary(string(queryEvent.Query))))
+		return nil
+	}
 	err := ddlUnsupportedError(string(queryEvent.Query))
 	h.s.setFatal(err)
 	return err
+}
+
+// ddlQuerySummary truncates a DDL statement for logs (full text stays in
+// the hard-stop error when it matters).
+func ddlQuerySummary(query string) string {
+	const max = 120
+	if len(query) <= max {
+		return query
+	}
+	return query[:max] + "...(truncated)"
 }
 
 func (h *canalHandler) OnXID(header *replication.EventHeader, nextPos mysql.Position) error {

@@ -125,8 +125,9 @@ func TestRowsEventMissingMetaFailsLoud(t *testing.T) {
 
 func TestCanalHandlerDDLHardStop(t *testing.T) {
 	s := testStreamer()
+	s.cfg.Database = "db" // the target database — DDL here halts (v1 red line)
 	h := &canalHandler{s: s}
-	q := &replication.QueryEvent{Query: []byte("ALTER TABLE db.t1 ADD COLUMN c INT")}
+	q := &replication.QueryEvent{Schema: []byte("db"), Query: []byte("ALTER TABLE db.t1 ADD COLUMN c INT")}
 	err := h.OnDDL(&replication.EventHeader{}, mysql.Position{Name: "mysql-bin.000001", Pos: 42}, q)
 	if !errors.Is(err, ErrMySQLDDLUnsupported) {
 		t.Fatalf("OnDDL err = %v, want ErrMySQLDDLUnsupported", err)
@@ -140,6 +141,48 @@ func TestCanalHandlerDDLHardStop(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("message %q missing %q", msg, want)
 		}
+	}
+	// The hard stop must not regress to a nil error (MS-11e A kept the
+	// target-database red line while adding the cross-database ignore).
+	if err := h.OnDDL(&replication.EventHeader{}, mysql.Position{}, &replication.QueryEvent{
+		Schema: []byte("db"), Query: []byte("DROP TABLE db.t1"),
+	}); err == nil || s.Err() == nil {
+		t.Fatalf("target-db DDL must keep halting")
+	}
+}
+
+// TestCanalHandlerDDLOutsideTargetIgnored anchors the MS-11e A filter: DDL
+// on a different database (or with an empty schema) cannot affect the
+// replicated tables and must be logged-and-ignored — the stream keeps
+// flowing and NO fatal is recorded.
+func TestCanalHandlerDDLOutsideTargetIgnored(t *testing.T) {
+	s := testStreamer()
+	s.cfg.Database = "db"
+	h := &canalHandler{s: s}
+
+	for _, schema := range []string{"other_db", ""} {
+		q := &replication.QueryEvent{Schema: []byte(schema), Query: []byte("ALTER TABLE t ADD COLUMN c INT")}
+		if err := h.OnDDL(&replication.EventHeader{}, mysql.Position{Name: "mysql-bin.000001", Pos: 42}, q); err != nil {
+			t.Fatalf("OnDDL(schema=%q) = %v, want nil (ignored)", schema, err)
+		}
+	}
+	if s.Err() != nil {
+		t.Fatalf("fatal = %v, want nil — cross-database DDL must not halt the stream", s.Err())
+	}
+	// The stream must still deliver row events afterwards (not closed).
+	ev := &canal.RowsEvent{
+		Table:  testTable(),
+		Action: canal.InsertAction,
+		Rows:   [][]interface{}{{int64(1), "a"}},
+		Header: &replication.EventHeader{LogPos: 99, Timestamp: 1},
+	}
+	if err := h.OnRow(ev); err != nil {
+		t.Fatalf("OnRow after ignored DDL: %v", err)
+	}
+	// (no rotate in this fixture — currentFile is empty, so the coordinate
+	// renders as ":99"; only the pos matters: the stream still delivers.)
+	if got := <-s.events; got.Binlog.String() != ":99" {
+		t.Fatalf("row event after ignored DDL = %v", got.Binlog)
 	}
 }
 
