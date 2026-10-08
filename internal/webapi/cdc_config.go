@@ -461,6 +461,15 @@ func (s *Server) handlePutCDCConfig(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "source database cannot be empty")
 		return
 	}
+	// MS-11g pen 3 (adversarial seq160 finding, ruling seq163): the target
+	// face of the same family — applyTargetPut wrote an empty/whitespace
+	// target.database into config.yaml with a 200 (the PUT path skips
+	// config.Validate; only the load/start path catches it). Same
+	// field-conditional shape as the source guard above.
+	if req.Target != nil && req.Target.Database != nil && strings.TrimSpace(*req.Target.Database) == "" {
+		s.writeError(w, http.StatusBadRequest, "target database cannot be empty")
+		return
+	}
 
 	cdcCfgMu.Lock()
 	defer cdcCfgMu.Unlock()

@@ -153,6 +153,43 @@ func TestPutCDCConfigRejectsEmptyDatabase(t *testing.T) {
 	}
 }
 
+// pen 3 (adversarial seq160, ruling seq163): the target face of the same
+// family — explicitly empty / whitespace target.database → 400, nothing
+// persisted; partial updates without the field stay 200.
+func TestPutCDCConfigRejectsEmptyTargetDatabase(t *testing.T) {
+	s, _, cfgFile := newCDCServer(t)
+	before := readFileOrEmpty(t, cfgFile)
+
+	for _, body := range []string{
+		`{"target":{"database":""}}`,
+		`{"target":{"database":"   "}}`,
+	} {
+		w, req := doReq("PUT", "/api/v1/cdc/config", body)
+		s.router.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "database") {
+			t.Fatalf("PUT %s = %d %s, want 400 naming database", body, w.Code, w.Body.String())
+		}
+	}
+	// rejected PUTs must not persist anything
+	if after := readFileOrEmpty(t, cfgFile); after != before {
+		t.Fatalf("rejected PUT must not touch config.yaml")
+	}
+
+	// partial update WITHOUT the database field stays legal (field-conditional guard)
+	w, req := doReq("PUT", "/api/v1/cdc/config", `{"target":{"password":"newsecret"}}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("partial PUT without database field = %d %s, want 200", w.Code, w.Body.String())
+	}
+
+	// legal explicit target.database stays 200
+	w, req = doReq("PUT", "/api/v1/cdc/config", `{"target":{"database":"targetdb"}}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("legal database PUT = %d %s, want 200", w.Code, w.Body.String())
+	}
+}
+
 func readFileOrEmpty(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)
