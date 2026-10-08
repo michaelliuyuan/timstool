@@ -162,4 +162,23 @@ describe('CDCView pen5 closure (merged-card flash + transient button)', () => {
     expect(src).toContain(`.some(it => it.level === 'fail')`)
     expect(src).toContain(`const precheckHasFail = computed(() => (precheck.value?.items || []).some(it => it.level === 'fail'))`)
   })
+
+  // MS-11e F: the pen2/pen5 anchors pinned the watch CALL and the computed
+  // full form, but the watch's own hasFail predicate line was only covered
+  // by the loose `.some(...)` substring — a regression that drops the null-p
+  // guard, the empty-items guard, or flips warn to count as fail would pass.
+  // Full-shape pin (MS-11d pen5 double-pins untouched: computed form above
+  // and the loose substring both stay byte-identical).
+  it('MS-11e F: watch hasFail predicate pinned full-shape — null p / empty items / warn never counts', () => {
+    const src = viewSrc()
+    expect(src).toContain(`const hasFail = !!(p && (p.items || []).some(it => it.level === 'fail'))`)
+    // predicate must be === 'fail', never a !== 'ok' shape (warn ≠ fail)
+    const wIdx = src.indexOf('const hasFail =')
+    expect(wIdx).toBeGreaterThan(-1)
+    const seg = src.slice(wIdx, src.indexOf('})', wIdx))
+    expect(seg).not.toContain(`!== 'ok'`)
+    // the no-fail branch resets BOTH episode flags (re-arm on a new fail)
+    expect(src).toContain(`precheckFailActive = false`)
+    expect(src).toContain(`userLeftPrecheckTab = false`)
+  })
 })
