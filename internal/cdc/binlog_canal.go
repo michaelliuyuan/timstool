@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -233,11 +234,16 @@ func (h *canalHandler) OnTableChanged(header *replication.EventHeader, schemaNam
 // 953 #2 — silent DDL skipping is forbidden). A DDL outside the target
 // database (or with an empty schema) cannot affect the replicated tables:
 // log it and keep streaming (MS-11e A — cross-database noise used to halt
-// healthy chains).
+// healthy chains). MS-11e pen7: the comparison is case-insensitive
+// (EqualFold, fail-closed) — under lower_case_table_names=1 the binlog
+// schema is always the folded storage name, so a byte-exact compare let a
+// mixed-case cfg.Database silently IGNORE target-database DDL (red-line
+// fail-open); EqualFold's worst case is a symmetric false halt, which is
+// the safe direction.
 func (h *canalHandler) OnDDL(header *replication.EventHeader, nextPos mysql.Position, queryEvent *replication.QueryEvent) error {
 	schema := string(queryEvent.Schema)
 	target := h.s.cfg.Database
-	if schema == "" || schema != target {
+	if schema == "" || !strings.EqualFold(schema, target) {
 		h.s.log.Info("binlog source: DDL outside target database ignored",
 			zap.String("schema", schema),
 			zap.String("target", target),

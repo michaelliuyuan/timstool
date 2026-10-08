@@ -157,6 +157,14 @@ func TestCanalHandlerDDLHardStop(t *testing.T) {
 	}); err == nil || s.Err() == nil {
 		t.Fatalf("target-db DDL must keep halting")
 	}
+	// MS-11e pen7: case variants of the target database still halt —
+	// lower_case_table_names=1 folds the binlog schema to lowercase while
+	// cfg.Database may be mixed-case; a byte-exact compare fail-opened here.
+	if err := h.OnDDL(&replication.EventHeader{}, mysql.Position{}, &replication.QueryEvent{
+		Schema: []byte("DB"), Query: []byte("ALTER TABLE t ADD COLUMN c INT"),
+	}); err == nil {
+		t.Fatalf("case-variant target-db DDL must halt (EqualFold, fail-closed)")
+	}
 }
 
 // TestCanalHandlerDDLOutsideTargetIgnored anchors the MS-11e A filter: DDL
@@ -173,6 +181,14 @@ func TestCanalHandlerDDLOutsideTargetIgnored(t *testing.T) {
 		if err := h.OnDDL(&replication.EventHeader{}, mysql.Position{Name: "mysql-bin.000001", Pos: 42}, q); err != nil {
 			t.Fatalf("OnDDL(schema=%q) = %v, want nil (ignored)", schema, err)
 		}
+	}
+	// MS-11e pen7: a DIFFERENT database whose name differs from the target
+	// by case only is still ignored — EqualFold narrows to the target, it
+	// must not swallow genuinely other databases.
+	if err := h.OnDDL(&replication.EventHeader{}, mysql.Position{}, &replication.QueryEvent{
+		Schema: []byte("Other_DB"), Query: []byte("ALTER TABLE t ADD COLUMN c INT"),
+	}); err != nil {
+		t.Fatalf("OnDDL(Other_DB vs db) = %v, want nil (different database, ignored)", err)
 	}
 	if s.Err() != nil {
 		t.Fatalf("fatal = %v, want nil — cross-database DDL must not halt the stream", s.Err())

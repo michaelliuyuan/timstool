@@ -259,10 +259,20 @@ func (t *DDLTracker) FetchNewDDL(ctx context.Context, sinceID int64) ([]DDLEntry
 		e.LSN = fmt.Sprintf("ddl_%d", id)
 		e.Schema = schema.String
 
-		// Transform DDL for TiDB
+		// Transform DDL for TiDB. MS-11e pen7 (H P3): a filtered-out row is
+		// dropped silently — with a whitelist configured, NULL-schema rows
+		// (whose key degrades to a bare table name) can never match a
+		// schema-qualified entry, so the drop was invisible outside
+		// pg2tidb_ddl_log itself. One info line makes it auditable.
 		if t.filter.Allow(e.Schema, e.ObjectName) {
 			e.TiDBDDL = t.transform.Transform(e.DDL, e.ObjectType)
 			entries = append(entries, e)
+		} else {
+			t.log.Info("ddl tracker: DDL row filtered out (not in table filter)",
+				zap.Int64("id", id),
+				zap.String("schema", e.Schema),
+				zap.String("object", e.ObjectName),
+				zap.Bool("null_schema", !schema.Valid))
 		}
 	}
 

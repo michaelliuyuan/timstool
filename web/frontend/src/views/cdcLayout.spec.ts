@@ -141,6 +141,26 @@ describe('CDCView pen4 fixes (adversarial P2/P3 closure)', () => {
     expect(src).toContain(`v-if="positionPrecisionRisk"`)
     expect(src).toContain(`推进小图暂停采样`)
   })
+
+  // MS-11e pen7: two drift fixes on the G gate — the banner said "paused"
+  // but outlived the pause, and the latest-position readout froze at the
+  // last safe value when a sample was skipped.
+  it('MS-11e pen7 G: risk flag clears on a safe sample; latest readout advances past skipped samples', () => {
+    const src = viewSrc()
+    // a SAFE sample resets the banner (accept returns n and clears the flag)
+    expect(src).toContain(`positionPrecisionRisk.value = false`)
+    // pushPosition advances the latest readout BEFORE the null early-return,
+    // so an unsafe sample no longer freezes positionLatest
+    const pIdx = src.indexOf('function pushPosition(')
+    expect(pIdx).toBeGreaterThan(-1)
+    const body = src.slice(pIdx, src.indexOf('}', src.indexOf('if (v === null) return', pIdx)))
+    const latestIdx = body.indexOf('if (lsn) positionLatest.value = lsn')
+    const nullIdx = body.indexOf('if (v === null) return')
+    expect(latestIdx).toBeGreaterThan(-1)
+    expect(nullIdx).toBeGreaterThan(latestIdx)
+    // banner wording de-absolutized (no "displayed as the raw string" claim)
+    expect(src).not.toContain(`无精度损失）`)
+  })
 })
 
 describe('CDCView pen5 closure (merged-card flash + transient button)', () => {

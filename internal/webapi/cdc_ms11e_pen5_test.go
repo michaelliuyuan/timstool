@@ -8,7 +8,10 @@ package webapi
 // router wherever a fixture allows it.
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -122,6 +125,52 @@ func TestCDCImportTaskSentinelIs400(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "cdc") {
 		t.Fatalf("refusal must name the cdc section: %s", w.Body.String())
+	}
+}
+
+// MS-11e pen7: the OTHER three hand-edit config.yaml defects normalize to
+// 400 through the shared writeCDCConfigError mapper (YAML syntax / root not
+// a mapping / missing source+target) — plus the sentinel keeps its 400 and
+// non-config write errors stay 500.
+func TestWriteCDCConfigErrorMapsHandFixableTo400(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	cases := []struct {
+		err  error
+		code int
+		want string
+	}{
+		{errCDCSectionNotMapping, http.StatusBadRequest, "cdc 段"},
+		{fmt.Errorf("%w: line 3: bad indent", errCDCYAMLUnparsable), http.StatusBadRequest, "语法错误"},
+		{errCDCRootNotMapping, http.StatusBadRequest, "根节点"},
+		{errCDCMissingSections, http.StatusBadRequest, "source/target"},
+		{errors.New("disk quota exceeded"), http.StatusInternalServerError, "写入 config.yaml 失败"},
+	}
+	for _, c := range cases {
+		w := httptest.NewRecorder()
+		s.writeCDCConfigError(w, c.err)
+		if w.Code != c.code || !strings.Contains(w.Body.String(), c.want) {
+			t.Fatalf("map(%v) = %d %q, want %d containing %q", c.err, w.Code, w.Body.String(), c.code, c.want)
+		}
+	}
+}
+
+// Behavioral: a config.yaml without source/target sections reaches
+// writeCDCConfig (Load defaults absorb it) and PUT answers 400 with the
+// remediation wording, not a 500.
+func TestCDCPutMissingSectionsIs400(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	plain := t.TempDir() + "\\config.yaml"
+	if err := os.WriteFile(plain, []byte("logging:\n  level: info\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.SetCDCConfigFile(plain)
+	w, req := doReq("PUT", "/api/v1/cdc/config", `{"source":{"host":"a"}}`)
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("PUT with section-less config.yaml = %d (want 400): %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "source/target") {
+		t.Fatalf("remediation must name source/target: %s", w.Body.String())
 	}
 }
 

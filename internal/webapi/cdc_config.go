@@ -127,6 +127,33 @@ func (s *Server) cdcCfgSnapshot() (*config.Config, error) {
 // duplicate key; the handler maps this to a 400 with remediation wording.
 var errCDCSectionNotMapping = errors.New("cdc section is not a yaml mapping")
 
+// MS-11e pen7 (E5 P3): the other three hand-edit config.yaml defects are
+// operator-fixable config errors too — same 400 face as the sentinel above,
+// never a 500 "write failed".
+var (
+	errCDCYAMLUnparsable  = errors.New("config.yaml is not parseable yaml")
+	errCDCRootNotMapping  = errors.New("config.yaml is not a yaml mapping")
+	errCDCMissingSections = errors.New("config.yaml missing source/target section")
+)
+
+// writeCDCConfigError renders a writeCDCConfig failure: config defects the
+// operator can fix by hand → 400 with remediation wording; anything else
+// (permissions, disk) stays a 500.
+func (s *Server) writeCDCConfigError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errCDCSectionNotMapping):
+		s.writeError(w, http.StatusBadRequest, "config.yaml 的 cdc 段不是映射结构，拒绝改写（请手工修正后再试）")
+	case errors.Is(err, errCDCYAMLUnparsable):
+		s.writeError(w, http.StatusBadRequest, "config.yaml 语法错误，无法解析（请手工修正后再试）："+err.Error())
+	case errors.Is(err, errCDCRootNotMapping):
+		s.writeError(w, http.StatusBadRequest, "config.yaml 根节点不是映射结构（请手工修正后再试）："+err.Error())
+	case errors.Is(err, errCDCMissingSections):
+		s.writeError(w, http.StatusBadRequest, "config.yaml 缺少 source/target 段（请手工补齐后再试）："+err.Error())
+	default:
+		s.writeError(w, http.StatusInternalServerError, "写入 config.yaml 失败："+err.Error())
+	}
+}
+
 // writeCDCConfig persists cfg back to config.yaml atomically. The write is a
 // structured yaml round-trip that PRESERVES comments and untouched sections:
 // only the source/target mapping values are edited in place on the parsed
@@ -153,19 +180,19 @@ func (s *Server) writeCDCConfig(cfg *config.Config) error {
 	}
 	var doc yaml.Node
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
-		return fmt.Errorf("parse config.yaml: %w", err)
+		return fmt.Errorf("%w: %v", errCDCYAMLUnparsable, err)
 	}
 	root := &doc
 	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
 		root = root.Content[0]
 	}
 	if root.Kind != yaml.MappingNode {
-		return fmt.Errorf("config.yaml is not a yaml mapping")
+		return errCDCRootNotMapping
 	}
 	srcMap := mappingValue(root, "source")
 	tgtMap := mappingValue(root, "target")
 	if srcMap == nil || tgtMap == nil {
-		return fmt.Errorf("config.yaml missing source/target section")
+		return errCDCMissingSections
 	}
 	setMapFields(srcMap, map[string]interface{}{
 		"type": cfg.Source.Type, "host": cfg.Source.Host, "port": cfg.Source.Port,
@@ -449,11 +476,7 @@ func (s *Server) handlePutCDCConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.writeCDCConfig(cfg); err != nil {
-		if errors.Is(err, errCDCSectionNotMapping) {
-			s.writeError(w, http.StatusBadRequest, "config.yaml 的 cdc 段不是映射结构，拒绝改写（请手工修正后再试）")
-			return
-		}
-		s.writeError(w, http.StatusInternalServerError, "写入 config.yaml 失败："+err.Error())
+		s.writeCDCConfigError(w, err) // MS-11e pen7: hand-fixable defects → 400
 		return
 	}
 	if sourceKind(cfg.Source.Type) != prevKind {
@@ -542,14 +565,7 @@ func (s *Server) handleImportCDCFromDataSource(w http.ResponseWriter, r *http.Re
 	cfg.Source = dataSourceToSourceConfig(srcEntry)
 	cfg.Target = dataSourceToTargetConfig(tgtEntry)
 	if err := s.writeCDCConfig(cfg); err != nil {
-		// MS-11e E5: the not-a-mapping sentinel is a config-file error the
-		// operator must fix by hand — 400 (same mapping as PUT /cdc/config),
-		// not a 500 "write failed".
-		if errors.Is(err, errCDCSectionNotMapping) {
-			s.writeError(w, http.StatusBadRequest, "config.yaml 的 cdc 段不是映射结构，拒绝改写（请手工修正后再试）")
-			return
-		}
-		s.writeError(w, http.StatusInternalServerError, "写入 config.yaml 失败："+err.Error())
+		s.writeCDCConfigError(w, err) // MS-11e pen7: hand-fixable defects → 400
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -596,12 +612,7 @@ func (s *Server) handleImportCDCConfig(w http.ResponseWriter, r *http.Request) {
 	cfg.Source = taskCfg.Source
 	cfg.Target = taskCfg.Target
 	if err := s.writeCDCConfig(cfg); err != nil {
-		// MS-11e E5: same sentinel mapping as PUT and import-from-datasource.
-		if errors.Is(err, errCDCSectionNotMapping) {
-			s.writeError(w, http.StatusBadRequest, "config.yaml 的 cdc 段不是映射结构，拒绝改写（请手工修正后再试）")
-			return
-		}
-		s.writeError(w, http.StatusInternalServerError, "写入 config.yaml 失败："+err.Error())
+		s.writeCDCConfigError(w, err) // MS-11e pen7: hand-fixable defects → 400
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{

@@ -89,8 +89,9 @@
         <div class="stat-value">{{ positionLatest || '-' }}</div>
         <div class="stat-label">位点推进</div>
         <SparkLine v-if="positionHistory.length > 1" :data="positionHistory" :height="34" />
-        <!-- MS-11e G: parsed-but-unsafe (>2^53) position — sampling paused, display raw -->
-        <div v-if="positionPrecisionRisk" class="stat-label" style="color: var(--el-color-warning);">位点超出 2^53 安全整数范围，推进小图暂停采样（显示为原串，无精度损失）</div>
+        <!-- MS-11e G: parsed-but-unsafe (>2^53) position — sampling paused; the
+             flag clears again once a safe sample lands (pen7). -->
+        <div v-if="positionPrecisionRisk" class="stat-label" style="color: var(--el-color-warning);">位点超出 2^53 安全整数范围，推进小图暂停采样</div>
       </div>
       <div class="stat-item">
         <div class="stat-value">{{ formatUptime(stats.uptime_seconds) }}</div>
@@ -657,6 +658,9 @@ function parsePosition(lsn?: string): number | null {
       positionPrecisionRisk.value = true
       return null
     }
+    // MS-11e pen7: a SAFE sample clears the risk flag — the banner says
+    // "paused", so it must not outlive the pause.
+    positionPrecisionRisk.value = false
     return n
   }
   if (lsn.includes('/')) {
@@ -678,8 +682,11 @@ function parsePosition(lsn?: string): number | null {
 }
 function pushPosition(lsn?: string) {
   const v = parsePosition(lsn)
+  // MS-11e pen7: an unparseable/unsafe sample skips the history push, but
+  // the latest-position readout still advances — freezing it at the last
+  // safe value misrepresents "latest".
+  if (lsn) positionLatest.value = lsn
   if (v === null) return
-  positionLatest.value = lsn || positionLatest.value
   positionHistory.value.push(v)
   if (positionHistory.value.length > 60) positionHistory.value.shift()
 }
