@@ -112,6 +112,13 @@ func TestCDCConfigPutCDCSubfieldsPersist(t *testing.T) {
 	if err != nil || cfg2.CDC.ServerID != 7 {
 		t.Fatalf("cdc section not created: %+v %v", cfg2.CDC, err)
 	}
+	// MS-11e E3: the materialized section carries the mode default too
+	// (full write path parity — a section with server_id but no mode would
+	// silently depend on Load-time defaults forever).
+	rawPlain, _ := os.ReadFile(plain)
+	if !strings.Contains(string(rawPlain), "mode: full_incr") {
+		t.Fatalf("materialized cdc section missing mode default:\n%s", rawPlain)
+	}
 	// And it round-trips as yaml (not a stringified int).
 	var doc yaml.Node
 	raw2, _ := os.ReadFile(plain)

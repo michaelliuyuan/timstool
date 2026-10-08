@@ -111,6 +111,17 @@ func (s *Server) loadCDCConfig() (*config.Config, error) {
 	return config.Load(f)
 }
 
+// cdcCfgSnapshot loads config.yaml under cdcCfgMu (MS-11e E2). PUT /cdc/config
+// and both import handlers rewrite this same file under that mutex; the CDC
+// start gate reads it too, so an unlocked read raced the writers (TOCTOU
+// stale cfg — the gate could validate a server_id that a concurrent PUT had
+// just cleared). Minimal v1 face of the v2 startup-snapshot direction.
+func (s *Server) cdcCfgSnapshot() (*config.Config, error) {
+	cdcCfgMu.Lock()
+	defer cdcCfgMu.Unlock()
+	return s.loadCDCConfig()
+}
+
 // errCDCSectionNotMapping: config.yaml holds a `cdc:` key whose value is not
 // a mapping (hand-edited). writeCDCConfig refuses rather than appending a
 // duplicate key; the handler maps this to a 400 with remediation wording.
@@ -531,6 +542,13 @@ func (s *Server) handleImportCDCFromDataSource(w http.ResponseWriter, r *http.Re
 	cfg.Source = dataSourceToSourceConfig(srcEntry)
 	cfg.Target = dataSourceToTargetConfig(tgtEntry)
 	if err := s.writeCDCConfig(cfg); err != nil {
+		// MS-11e E5: the not-a-mapping sentinel is a config-file error the
+		// operator must fix by hand — 400 (same mapping as PUT /cdc/config),
+		// not a 500 "write failed".
+		if errors.Is(err, errCDCSectionNotMapping) {
+			s.writeError(w, http.StatusBadRequest, "config.yaml 的 cdc 段不是映射结构，拒绝改写（请手工修正后再试）")
+			return
+		}
 		s.writeError(w, http.StatusInternalServerError, "写入 config.yaml 失败："+err.Error())
 		return
 	}
@@ -578,6 +596,11 @@ func (s *Server) handleImportCDCConfig(w http.ResponseWriter, r *http.Request) {
 	cfg.Source = taskCfg.Source
 	cfg.Target = taskCfg.Target
 	if err := s.writeCDCConfig(cfg); err != nil {
+		// MS-11e E5: same sentinel mapping as PUT and import-from-datasource.
+		if errors.Is(err, errCDCSectionNotMapping) {
+			s.writeError(w, http.StatusBadRequest, "config.yaml 的 cdc 段不是映射结构，拒绝改写（请手工修正后再试）")
+			return
+		}
 		s.writeError(w, http.StatusInternalServerError, "写入 config.yaml 失败："+err.Error())
 		return
 	}

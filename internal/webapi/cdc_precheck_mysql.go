@@ -175,10 +175,20 @@ func scanMasterStatus5(row rowScanner) (file string, pos sql.NullInt64, err erro
 	return file, pos, err
 }
 
-// scanMasterStatus2 scans the legacy two-column form (file, position) —
-// kept as the fallback for older column layouts after a 5-column mismatch.
+// scanMasterStatus2 scans the legacy two-column form (file, position) — the
+// final fallback for older column layouts.
 func scanMasterStatus2(row rowScanner) (file string, pos sql.NullInt64, err error) {
 	err = row.Scan(&file, &pos)
+	return file, pos, err
+}
+
+// scanMasterStatus4 scans the MariaDB 4-column form (file, position,
+// binlog_do_db, binlog_ignore_db — no executed_gtid_set column). MS-11e E4:
+// MariaDB fails BOTH the 5- and 2-column scans, and the surfaced wording
+// must name the layout problem instead of a raw column-count driver error.
+func scanMasterStatus4(row rowScanner) (file string, pos sql.NullInt64, err error) {
+	var d1, d2 any
+	err = row.Scan(&file, &pos, &d1, &d2)
 	return file, pos, err
 }
 
@@ -193,12 +203,17 @@ func (realCDCMySQLProber) MySQLMasterStatus(cfg *config.Config) (string, uint32,
 		if err == sql.ErrNoRows {
 			return "", 0, 0, fmt.Errorf("SHOW MASTER STATUS 无结果（log_bin 未开启？）")
 		}
-		// Column count varies across versions; fall back to a two-column scan.
-		f2, p2, err2 := scanMasterStatus2(db.QueryRow("SHOW MASTER STATUS"))
-		if err2 != nil {
-			return "", 0, 0, err
+		// Column count varies across versions: MySQL 8 = 5, MariaDB = 4
+		// (no executed_gtid_set), old MySQL = 2 (MS-11e E4 adds the 4-col
+		// branch so MariaDB no longer falls through to a raw driver error).
+		if f4, p4, err4 := scanMasterStatus4(db.QueryRow("SHOW MASTER STATUS")); err4 == nil {
+			file, pos = f4, p4
+		} else if f2, p2, err2 := scanMasterStatus2(db.QueryRow("SHOW MASTER STATUS")); err2 == nil {
+			file, pos = f2, p2
+		} else {
+			return "", 0, 0, fmt.Errorf(
+				"SHOW MASTER STATUS 列数不识别（5/4/2 列扫描均失败，非标布局或权限受限；原始错误：%v）", err)
 		}
-		file, pos = f2, p2
 	}
 	expire := int64(0)
 	var evKey, ev string
