@@ -124,8 +124,22 @@ describe('CDCView pen4 fixes (adversarial P2/P3 closure)', () => {
 
   it('P3-a/P3-b: parsePosition gates finite/non-negative and reads the post-dot rotation index only', () => {
     const src = viewSrc()
-    expect(src).toContain(`(!Number.isFinite(n) || n < 0 ? null : n)`)
     expect(src).toContain(`lsn.slice(0, idx).split('.').pop()`)
+    expect(src).toContain(`!Number.isFinite(n) || n < 0`)
+  })
+
+  it('MS-11e G: >2^53 positions are gated by Number.isSafeInteger — never silently lossy', () => {
+    const src = viewSrc()
+    // positive: the safe path still funnels through accept (sparkline keeps
+    // advancing for ordinary PG LSN / mysql file:pos coordinates)
+    expect(src).toContain(`positionHistory.value.push(v)`)
+    // negative: unsafe integers set the risk flag and return null — the
+    // sample is skipped, never plotted at a silently-rounded value
+    expect(src).toContain(`if (!Number.isSafeInteger(n)) {`)
+    expect(src).toContain(`positionPrecisionRisk.value = true`)
+    // and the risk surfaces in the UI (sampling paused, raw string shown)
+    expect(src).toContain(`v-if="positionPrecisionRisk"`)
+    expect(src).toContain(`推进小图暂停采样`)
   })
 })
 

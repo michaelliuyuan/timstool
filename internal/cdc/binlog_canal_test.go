@@ -142,6 +142,14 @@ func TestCanalHandlerDDLHardStop(t *testing.T) {
 			t.Fatalf("message %q missing %q", msg, want)
 		}
 	}
+	// MS-11e C: the sentinel is not re-formatted by the %w wrap, so a bare
+	// %s placeholder would render literally on screen — it must be gone.
+	if strings.Contains(msg, "%s") || strings.Contains(msg, "%!s") {
+		t.Fatalf("literal format placeholder leaked into message: %q", msg)
+	}
+	if strings.Contains(ErrMySQLDDLUnsupported.Error(), "%") {
+		t.Fatalf("sentinel still carries a placeholder: %q", ErrMySQLDDLUnsupported.Error())
+	}
 	// The hard stop must not regress to a nil error (MS-11e A kept the
 	// target-database red line while adding the cross-database ignore).
 	if err := h.OnDDL(&replication.EventHeader{}, mysql.Position{}, &replication.QueryEvent{

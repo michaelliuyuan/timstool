@@ -33,9 +33,12 @@ import (
 )
 
 // ErrMySQLDDLUnsupported is the v1 hard-stop error for online DDL. The task
-// must transition to error state with this message (no silent skip).
+// must transition to error state with this message (no silent skip). The
+// DDL statement is appended by ddlUnsupportedError's %w wrap — this
+// sentinel itself carries no format placeholder (MS-11e C: a bare %s here
+// would render literally, since the wrap layer does not re-format).
 var ErrMySQLDDLUnsupported = fmt.Errorf(
-	"MySQL CDC v1 不支持在线 DDL（binlog Query 事件：%%s）：请停止 CDC 链 → 在源/目标执行 DDL → 重跑全量后重建链。GTID 与在线 DDL 支持为 v2 候选")
+	"MySQL CDC v1 不支持在线 DDL（binlog Query 事件）：请停止 CDC 链 → 在源/目标执行 DDL → 重跑全量后重建链。GTID 与在线 DDL 支持为 v2 候选")
 
 // ddlUnsupportedError wraps the DDL statement into the hard-stop error.
 func ddlUnsupportedError(query string) error {

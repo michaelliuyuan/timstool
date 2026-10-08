@@ -89,6 +89,8 @@
         <div class="stat-value">{{ positionLatest || '-' }}</div>
         <div class="stat-label">位点推进</div>
         <SparkLine v-if="positionHistory.length > 1" :data="positionHistory" :height="34" />
+        <!-- MS-11e G: parsed-but-unsafe (>2^53) position — sampling paused, display raw -->
+        <div v-if="positionPrecisionRisk" class="stat-label" style="color: var(--el-color-warning);">位点超出 2^53 安全整数范围，推进小图暂停采样（显示为原串，无精度损失）</div>
       </div>
       <div class="stat-item">
         <div class="stat-value">{{ formatUptime(stats.uptime_seconds) }}</div>
@@ -639,11 +641,24 @@ function pushThroughput(v: number | undefined) {
 // integers pass through. Unparseable strings skip the sample (no fake flat).
 const positionHistory = ref<number[]>([])
 const positionLatest = ref('')
+// MS-11e G: a position string that PARSES but exceeds Number.MAX_SAFE_INTEGER
+// cannot enter the sparkline (silent precision loss = fake flat/wrong slope);
+// the raw string display is unaffected — we only flag the skipped sampling.
+const positionPrecisionRisk = ref(false)
 function parsePosition(lsn?: string): number | null {
   if (!lsn) return null
   // MS-11c pen4 P3-a: every branch funnels into the finite/non-negative gate —
   // Infinity (overflow) and bare negatives never enter the history.
-  const accept = (n: number): number | null => (!Number.isFinite(n) || n < 0 ? null : n)
+  // MS-11e G: unsafe integers (>2^53) are rejected too — parseInt keeps
+  // parsing past the safe range and the low bits rot silently.
+  const accept = (n: number): number | null => {
+    if (!Number.isFinite(n) || n < 0) return null
+    if (!Number.isSafeInteger(n)) {
+      positionPrecisionRisk.value = true
+      return null
+    }
+    return n
+  }
   if (lsn.includes('/')) {
     const [hi, lo] = lsn.split('/')
     const h = parseInt(hi, 16), l = parseInt(lo, 16)
