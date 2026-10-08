@@ -79,6 +79,13 @@
         <div class="stat-value">{{ stats.lag_seconds?.toFixed(1) || '0' }}s</div>
         <div class="stat-label">延迟(秒)</div>
       </div>
+      <!-- MS-11c D: 位点推进小图（SparkLine 复用，与吞吐并列）— series advances
+           as the checkpoint/LSN position moves; hidden until 2 samples. -->
+      <div class="stat-item">
+        <div class="stat-value">{{ positionLatest || '-' }}</div>
+        <div class="stat-label">位点推进</div>
+        <SparkLine v-if="positionHistory.length > 1" :data="positionHistory" :height="34" />
+      </div>
       <div class="stat-item">
         <div class="stat-value">{{ formatUptime(stats.uptime_seconds) }}</div>
         <div class="stat-label">运行时间</div>
@@ -214,11 +221,16 @@
         </el-card>
       </el-tab-pane>
 
-      <!-- Tab ③: startup precheck -->
-      <el-tab-pane label="启动预检" name="precheck">
+      <!-- Tab ③: startup precheck — ok items folded, warn/fail always shown;
+           red-dot badge + auto-activate while the precheck has not passed. -->
+      <el-tab-pane name="precheck">
+        <template #label>
+          启动预检
+          <span v-if="precheck && !precheckPassed" class="tab-dot" :class="precheckHasFail ? 'fail' : 'warn'" :title="precheckHasFail ? '预检存在未通过项' : '预检存在警告项'"></span>
+        </template>
         <el-card class="detail-card" v-if="precheck">
           <h3>启动预检 <el-button size="small" style="margin-left: 8px;" @click="runPrecheck" :disabled="checking" :loading="checking">{{ checking ? '检查中…' : '重新检查' }}</el-button></h3>
-          <div v-for="it in precheck.items" :key="it.item" class="precheck-row" :class="it.level">
+          <div v-for="it in precheckAttentionItems" :key="it.item" class="precheck-row" :class="it.level">
             <span class="precheck-dot">{{ it.level === 'ok' ? '✓' : it.level === 'warn' ? '!' : '✗' }}</span>
             <span class="precheck-label">{{ it.label }}</span>
             <span class="precheck-detail">{{ it.detail }}</span>
@@ -227,6 +239,17 @@
             <el-button v-if="it.item === 'no_pk_tables' && it.level === 'warn' && noPKTables.length && connCfg?.source?.type !== 'mysql'"
               size="small" style="margin-left: auto; flex: none;"
               @click="openNoPKFix">修复（REPLICA IDENTITY FULL）</el-button>
+          </div>
+          <!-- MS-11c: ok items folded by default — only warn/fail need eyes. -->
+          <div v-if="precheckOkItems.length" class="precheck-fold">
+            <el-button link size="small" @click="showOkItems = !showOkItems">{{ showOkItems ? '收起通过项' : `显示通过项（${precheckOkItems.length}）` }}</el-button>
+            <template v-if="showOkItems">
+              <div v-for="it in precheckOkItems" :key="it.item" class="precheck-row ok">
+                <span class="precheck-dot">✓</span>
+                <span class="precheck-label">{{ it.label }}</span>
+                <span class="precheck-detail">{{ it.detail }}</span>
+              </div>
+            </template>
           </div>
           <div class="resume-box">
             <strong>断点/起点：</strong>{{ precheck.conclusion }}
@@ -337,6 +360,18 @@ const checking = ref(false)
 const slotView = ref<CDCSlotView | null>(null)
 
 const precheckPassed = computed(() => precheck.value?.warn_only === true)
+
+// MS-11c ②: precheck attention split — ok items fold away, warn/fail stay.
+const precheckAttentionItems = computed(() => (precheck.value?.items || []).filter(it => it.level !== 'ok'))
+const precheckOkItems = computed(() => (precheck.value?.items || []).filter(it => it.level === 'ok'))
+const precheckHasFail = computed(() => (precheck.value?.items || []).some(it => it.level === 'fail'))
+const showOkItems = ref(false)
+
+// MS-11c ②: a failing precheck auto-activates the precheck tab (warn-only
+// never steals focus — operator judgement stays on the overview).
+watch(precheck, p => {
+  if (p && (p.items || []).some(it => it.level === 'fail')) activeTab.value = 'precheck'
+})
 
 // MS-11a: source-aware copy. Same truth as the REPLICA IDENTITY guard in the
 // precheck tab — connCfg.source.type. PG branch keeps every string byte-identical.
@@ -562,6 +597,38 @@ function pushThroughput(v: number | undefined) {
   if (throughputHistory.value.length > 60) throughputHistory.value.shift()
 }
 
+// MS-11c D: 位点推进 history — parse the source-native position string into a
+// monotonic number so the sparkline advances as replication moves: PG LSN
+// "X/Y" hex → byte offset; MySQL "file:pos" → file index * 1e9 + pos; bare
+// integers pass through. Unparseable strings skip the sample (no fake flat).
+const positionHistory = ref<number[]>([])
+const positionLatest = ref('')
+function parsePosition(lsn?: string): number | null {
+  if (!lsn) return null
+  if (lsn.includes('/')) {
+    const [hi, lo] = lsn.split('/')
+    const h = parseInt(hi, 16), l = parseInt(lo, 16)
+    if (Number.isNaN(h) || Number.isNaN(l)) return null
+    return h * 0x100000000 + l
+  }
+  const idx = lsn.lastIndexOf(':')
+  if (idx > 0) {
+    const file = parseInt(lsn.slice(0, idx).replace(/\D/g, ''), 10)
+    const pos = parseInt(lsn.slice(idx + 1), 10)
+    if (Number.isNaN(pos)) return null
+    return (Number.isNaN(file) ? 0 : file) * 1e9 + pos
+  }
+  const n = parseInt(lsn, 10)
+  return Number.isNaN(n) ? null : n
+}
+function pushPosition(lsn?: string) {
+  const v = parsePosition(lsn)
+  if (v === null) return
+  positionLatest.value = lsn || positionLatest.value
+  positionHistory.value.push(v)
+  if (positionHistory.value.length > 60) positionHistory.value.shift()
+}
+
 const pipelineStatus = computed<'running' | 'warn' | 'stopped'>(() => {
   if (isActive.value) return stats.value && stats.value.failed > 0 ? 'warn' : 'running'
   return 'stopped'
@@ -687,6 +754,9 @@ async function refresh() {
       pushThroughput(statsRes.throughput_rps)
     }
     if (cpRes && cpRes.lsn) checkpoint.value = cpRes
+    // MS-11c D: feed the 位点推进 sparkline (status lsn first, checkpoint as
+    // the fallback view when the status file has not caught up).
+    pushPosition(statusRes?.lsn || cpRes?.lsn)
     // A3: live slot lag alongside business stats.
     await refreshSlot()
   } catch {
@@ -801,6 +871,9 @@ code { background: #f0f0f0; padding: 2px 8px; border-radius: 4px; font-size: var
 /* MS-11c C: tab layout */
 .cdc-tabs { margin-top: 4px; }
 .cdc-tabs :deep(.el-tabs__content) { overflow: visible; } /* confirm/prompt popups inside tabs */
+.tab-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-left: 6px; vertical-align: middle; }
+.tab-dot.fail { background: #f5222d; }
+.tab-dot.warn { background: #faad14; }
 
 /* P1 巡检修复 #9：tag 文字换 AA 深色（#389e0d/#d48806 不足 4.5:1）；胶囊圆角保留 */
 .control-restarts { font-size: 12px; color: var(--tims-tag-warning-text); }
@@ -827,6 +900,7 @@ code { background: #f0f0f0; padding: 2px 8px; border-radius: 4px; font-size: var
 .conn-grid-num { width: 100%; }
 
 /* A2 precheck panel */
+.precheck-fold { margin-top: 4px; border-bottom: 1px dashed #f0f0f0; }
 .precheck-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 0; font-size: var(--tims-font-sm); border-bottom: 1px dashed #f0f0f0; } /* P1 巡检修复 #7 字号归一 */
 .precheck-dot { width: 18px; height: 18px; border-radius: 50%; color: #fff; font-size: 12px; display: inline-flex; align-items: center; justify-content: center; flex: none; align-self: center; }
 .precheck-row.ok .precheck-dot { background: #52c41a; }
