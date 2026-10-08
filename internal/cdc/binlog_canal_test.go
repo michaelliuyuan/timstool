@@ -212,6 +212,24 @@ func TestCanalHandlerDDLOutsideTargetIgnored(t *testing.T) {
 		{"", "RENAME TABLE other.a TO db.b"},           // target on the TO right side (te ammo #3)
 		{"", "DROP TABLE db.t1, other.t2"},             // multi-table (te ammo #3)
 		{"", "TRUNCATE TABLE Db.T"},                    // TRUNCATE kind + lctn fold shape
+		// MS-11e pen9 (adversarial red, seq38): unknown table-object verbs
+		// fell outside pen8's finite verb set = fail-open. The inverted gate
+		// (admin whitelist) lets them enter the scan automatically.
+		{"", "CREATE FULLTEXT INDEX ft ON db.t (text_col)"}, // seq38 red #1
+		{"", "CREATE SPATIAL INDEX sp ON db.t (geo)"},       // seq38 red #1
+		{"", "CREATE VIEW db.v AS SELECT 1"},                // object-class verb, new face
+		{"", "DROP TRIGGER db.tr"},                          // object-class verb, new face
+		// MS-11e pen9 (adversarial red, seq38): word-interstitial comments
+		// used to break the verb gate and the token scan — fail-open.
+		{"", "ALTER /*c*/ TABLE db.t ADD COLUMN c INT"},  // seq38 red #2
+		{"", "CREATE /*c*/ INDEX i ON db.t (c)"},         // seq38 red #2
+		{"", "ALTER TABLE db/*x*/.t ADD COLUMN c INT"},   // qualifier-interstitial comment
+		{"", "ALTER TABLE db.t ADD COLUMN c INT # tail"}, // line comment tail
+		// Over-halt intent pins (seq39): known false positives whose halt is
+		// the DELIBERATE fail-closed semantics — pin them so a future
+		// "fix" cannot silently flip the direction.
+		{"", "ALTER TABLE `my.db`.t ADD COLUMN c INT"},                          // target=db, backticked dotted name
+		{"", "ALTER TABLE t ADD COLUMN c VARCHAR(64) DEFAULT 'db.example.com'"}, // literal false positive
 	} {
 		if err := sh.OnDDL(&replication.EventHeader{}, mysql.Position{}, &replication.QueryEvent{
 			Schema: []byte(tc.schema), Query: []byte(tc.query),
@@ -229,6 +247,18 @@ func TestCanalHandlerDDLOutsideTargetIgnored(t *testing.T) {
 		"ALTER TABLE o.t ADD COLUMN xdb INT", // substring, not a qualifier of target
 		"ALTER USER 'db.x'@'%' IDENTIFIED BY 'pw'",
 		"CREATE USER dbadmin",
+		// MS-11e pen9: the admin whitelist keeps namespace/privilege/admin
+		// statements on the plain ignore even when they mention the target
+		// db — GRANT ON db.* is not a table-object mutation, and
+		// CREATE/DROP DATABASE semantics follow ruling note b (replication
+		// ends naturally + OnTableChanged backstop).
+		"GRANT SELECT ON db.* TO 'u'@'%'",
+		"REVOKE ALL ON db.* FROM 'u'@'%'",
+		"CREATE DATABASE db",
+		"DROP DATABASE other8",
+		"SET PASSWORD FOR 'db.x'@'%' = 'pw'",
+		"SET GLOBAL read_only = 1",
+		"USE db",
 	} {
 		if err := h.OnDDL(&replication.EventHeader{}, mysql.Position{}, &replication.QueryEvent{
 			Schema: []byte(""), Query: []byte(q),

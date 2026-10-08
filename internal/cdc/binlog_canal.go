@@ -266,29 +266,60 @@ func (h *canalHandler) OnDDL(header *replication.EventHeader, nextPos mysql.Posi
 	return err
 }
 
-// ddlTableKind matches the table-object DDL verbs whose statements may
-// carry qualified table references (pen8 ruling: the coarse scan is gated
-// on this kind set so admin DDL like ALTER USER keeps the plain ignore).
-var ddlTableKind = regexp.MustCompile(`(?i)\b(ALTER\s+TABLE|CREATE\s+(TABLE|UNIQUE\s+INDEX|INDEX)|DROP\s+(TABLE|INDEX)|TRUNCATE(\s+TABLE)?|RENAME\s+TABLE)\b`)
+// ddlAdminKind matches ADMINISTRATIVE statements that never carry
+// table-object references and keep the plain ignore (MS-11e pen9 ruling
+// seq39: the gate is INVERTED from pen8's table-verb set — anything that is
+// not an admin statement gets the target-token scan, so unknown table-object
+// verbs like CREATE FULLTEXT/SPATIAL INDEX or CREATE VIEW enter the gate
+// automatically instead of fail-open-ing past a finite verb list). The
+// whitelist's incompleteness cost is a false halt (fail-closed); the old
+// verb-gate's incompleteness cost was a silent ignore of target DDL
+// (fail-open — adversarial red, seq38).
+var ddlAdminKind = regexp.MustCompile(`(?is)^[ \t\r\n]*(` +
+	`SET|USE|GRANT|REVOKE|FLUSH|RESET|KILL|SAVEPOINT|RELEASE|ROLLBACK|BEGIN|COMMIT|START|LOCK|UNLOCK` +
+	`|(CREATE|ALTER|DROP)[ \t\r\n]+(USER|ROLE|DATABASE|SCHEMA|LOGFILE[ \t\r\n]+GROUP|SERVER|TABLESPACE)` +
+	`)\b`)
 
-// ddlMentionsTargetDB reports whether a TABLE-kind DDL text carries a
+// ddlBlockComment / ddlLineComment strip MySQL comments (block /*...*/ and
+// line #... — pen9: word-interstitial comments like ALTER /*c*/ TABLE or
+// db/*x*/.t used to break both the verb gate and the token scan,
+// fail-open). Stripping runs on the SCAN COPY only — the halt message still
+// carries the original statement. Stripping can only turn a miss into a
+// hit, never the reverse (a comment removed from inside a string literal
+// distorts the literal into a possible false positive = a halt, which is
+// the accepted fail-closed direction; ruling seq39).
+var (
+	ddlBlockComment = regexp.MustCompile(`(?s)/\*.*?\*/`)
+	ddlLineComment  = regexp.MustCompile(`#[^\n]*`)
+)
+
+func ddlStripComments(query string) string {
+	if !strings.Contains(query, "/*") && !strings.Contains(query, "#") {
+		return query
+	}
+	return ddlLineComment.ReplaceAllString(ddlBlockComment.ReplaceAllString(query, " "), " ")
+}
+
+// ddlMentionsTargetDB reports whether a non-admin DDL text carries a
 // target-db-qualified object reference (tgt.t / `tgt`.`t`, anywhere in the
 // statement — RENAME ... TO tgt.b and CREATE INDEX ... ON tgt.t included).
 // Coarse by design: a false positive halts with remediation wording (safe),
 // a false negative needs a statement that modifies the target db without
-// ever naming it (impossible for table DDL).
+// ever naming it (impossible for object DDL). Pen9: admin whitelist first,
+// then the token scan over the comment-stripped copy.
 func ddlMentionsTargetDB(query, target string) bool {
 	if target == "" || query == "" {
 		return false
 	}
-	if !ddlTableKind.MatchString(query) {
+	q := ddlStripComments(query)
+	if ddlAdminKind.MatchString(q) {
 		return false
 	}
 	// Accept `tgt`. / tgt. (backticks optional on either side, gap-tolerant);
 	// the leading boundary stops my_tgt/xdb substrings from matching.
-	q := regexp.QuoteMeta(target)
-	re := regexp.MustCompile("(?i)(^|[^0-9A-Za-z_$\\x{0080}-\\x{ffff}])`?" + q + "`?\\s*\\.")
-	return re.MatchString(query)
+	p := regexp.QuoteMeta(target)
+	re := regexp.MustCompile("(?i)(^|[^0-9A-Za-z_$\\x{0080}-\\x{ffff}])`?" + p + "`?\\s*\\.")
+	return re.MatchString(q)
 }
 
 // ddlQuerySummary truncates a DDL statement for logs (full text stays in
