@@ -165,17 +165,28 @@ func (s *Server) handleCDCStatus(w http.ResponseWriter, r *http.Request) {
 // handleCDCStart starts the CDC child via the supervisor (CONTROL channel, #t55).
 // Idempotent. Returns 409 + guidance when cdc.enable is false (does not bypass #t50).
 func (s *Server) handleCDCStart(w http.ResponseWriter, r *http.Request) {
-	if s.cdcSupervisor == nil {
-		s.writeJSON(w, http.StatusConflict, map[string]interface{}{
-			"ok": false, "state": "disabled", "message": "CDC control is not wired on this server.",
-		})
-		return
-	}
 	// MS-11 pen 3, ruling #3: MySQL dual-increment mutex — refuse starting
 	// the binlog CDC child while a polling run is live on the same source.
 	if s.blockCDCStartForIncremental() {
 		s.writeJSON(w, http.StatusConflict, map[string]interface{}{
 			"ok": false, "message": dualIncrementMsg,
+		})
+		return
+	}
+	// MS-11b pen 2: MySQL server_id pre-start gate. The child validates this
+	// too (config v1 rules), but without a gate here the supervisor would
+	// spawn-and-crash-loop a doomed child (te 🟡②, production seq1016).
+	// Runs before the supervisor wiring check so the gate is testable and
+	// fails fast even on a half-wired server.
+	if cfg, err := s.loadCDCConfig(); err == nil && cfg.Source.SourceType() == "mysql" && cfg.CDC.ServerID == 0 {
+		s.writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"ok": false, "message": "MySQL CDC 需要 cdc.server_id（1-2^32-1 内唯一整数）：在 config.yaml 设置后重试，例如 server_id: 910808。",
+		})
+		return
+	}
+	if s.cdcSupervisor == nil {
+		s.writeJSON(w, http.StatusConflict, map[string]interface{}{
+			"ok": false, "state": "disabled", "message": "CDC control is not wired on this server.",
 		})
 		return
 	}

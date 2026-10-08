@@ -2,8 +2,10 @@ package webapi
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/michaelliuyuan/timstool/internal/cdc"
@@ -149,5 +151,48 @@ func TestParseChainBinlogPos(t *testing.T) {
 		if _, err := parseChainBinlogPos(bad); err == nil {
 			t.Fatalf("parseChainBinlogPos(%q) accepted", bad)
 		}
+	}
+}
+
+// MS-11b pen 2 anchors: MySQL server_id pre-start gate — 400 + guidance
+// before the supervisor can spawn a doomed child; PG chains never hit the
+// gate (server_id is a MySQL-only concept).
+func TestCDCStartMySQLServerIDGate(t *testing.T) {
+	// MySQL + missing server_id → 400 with actionable wording (mutex gate
+	// passes: no live incremental run in tests).
+	s, _, _ := newMySQLChainServer(t)
+	cfg, _ := config.Load(s.cdcCfgFile())
+	if cfg.CDC.ServerID != 0 {
+		t.Fatalf("fixture must start without server_id, got %d", cfg.CDC.ServerID)
+	}
+	w, req := doReq("POST", "/api/v1/cdc/start", "")
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("gateless start = %d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "server_id") {
+		t.Fatalf("guidance missing: %s", w.Body.String())
+	}
+
+	// server_id set → gate passes (falls through to the unwired-supervisor
+	// 409, proving order: gate → wiring).
+	cfg.CDC.ServerID = 910808
+	raw, _ := yaml.Marshal(cfg)
+	if err := os.WriteFile(s.cdcCfgFile(), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, req = doReq("POST", "/api/v1/cdc/start", "")
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "not wired") {
+		t.Fatalf("server_id set should pass the gate: %d %s", w.Code, w.Body.String())
+	}
+
+	// PG chain + server_id 0 → gate never triggers (PG has no server_id).
+	sPG, _, cfgFile := newCDCServer(t)
+	_ = cfgFile
+	w, req = doReq("POST", "/api/v1/cdc/start", "")
+	sPG.router.ServeHTTP(w, req)
+	if w.Code == http.StatusBadRequest {
+		t.Fatalf("PG chain hit the MySQL-only gate: %s", w.Body.String())
 	}
 }
