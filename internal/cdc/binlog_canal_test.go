@@ -190,6 +190,44 @@ func TestCanalHandlerDDLOutsideTargetIgnored(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("OnDDL(Other_DB vs db) = %v, want nil (different database, ignored)", err)
 	}
+
+	// MS-11e pen8 (te black-box red #1): a FULLY-QUALIFIED target-db DDL
+	// executed with no default database carries schema="" in the binlog —
+	// the empty-schema ignore branch silently skipped it (red-line
+	// fail-open). The coarse statement scan must halt these; a false
+	// positive (halt on a mention) is the fail-closed direction. Separate
+	// streamer: these halts must not pollute the ignore-path fatal-nil
+	// assertions above/below.
+	sh := &canalHandler{s: func() *canalStreamer {
+		s2 := testStreamer()
+		s2.cfg.Database = "db"
+		return s2
+	}()}
+	for _, tc := range []struct{ schema, query string }{
+		{"", "ALTER TABLE db.t ADD COLUMN c INT"},      // te shape: no default db
+		{"", "DROP TABLE `db`.`t`"},                    // backticked form
+		{"other", "ALTER TABLE db.t ADD COLUMN c INT"}, // defaulted elsewhere, qualified target
+		{"", "alter table DB.T add column c int"},      // case-insensitive
+	} {
+		if err := sh.OnDDL(&replication.EventHeader{}, mysql.Position{}, &replication.QueryEvent{
+			Schema: []byte(tc.schema), Query: []byte(tc.query),
+		}); err == nil {
+			t.Fatalf("qualified target-db DDL (schema=%q, %q) must halt", tc.schema, tc.query)
+		}
+	}
+	// Non-target qualified names and near-miss identifiers stay ignored:
+	// my_db prefix, other-db references, a column named like target.
+	for _, q := range []string{
+		"ALTER TABLE other.t ADD COLUMN c INT",
+		"ALTER TABLE my_db.t ADD COLUMN c INT",
+		"ALTER TABLE o.t ADD COLUMN xdb INT", // substring, not a qualifier of target
+	} {
+		if err := h.OnDDL(&replication.EventHeader{}, mysql.Position{}, &replication.QueryEvent{
+			Schema: []byte(""), Query: []byte(q),
+		}); err != nil {
+			t.Fatalf("non-target statement must stay ignored: %q -> %v", q, err)
+		}
+	}
 	if s.Err() != nil {
 		t.Fatalf("fatal = %v, want nil — cross-database DDL must not halt the stream", s.Err())
 	}

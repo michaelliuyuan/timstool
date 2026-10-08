@@ -229,7 +229,6 @@ func (h *canalHandler) OnTableChanged(header *replication.EventHeader, schemaNam
 	return nil
 }
 
-// OnDDL implements the v1 hard semantics: a DDL Query event on the TARGET
 // database halts the stream with an explicit remediation error (ruling seq
 // 953 #2 — silent DDL skipping is forbidden). A DDL outside the target
 // database (or with an empty schema) cannot affect the replicated tables:
@@ -239,20 +238,47 @@ func (h *canalHandler) OnTableChanged(header *replication.EventHeader, schemaNam
 // schema is always the folded storage name, so a byte-exact compare let a
 // mixed-case cfg.Database silently IGNORE target-database DDL (red-line
 // fail-open); EqualFold's worst case is a symmetric false halt, which is
-// the safe direction.
+// the safe direction. MS-11e pen8: before ignoring, the statement itself
+// is coarsely scanned for a target-qualified object name (`tgt`.`t` /
+// tgt.t) — a fully-qualified DDL executed with no default database (or
+// defaulted elsewhere) carries schema=""/other in the binlog, and without
+// this scan the empty-schema ignore branch silently skipped
+// TARGET-database DDL (te black-box red #1). Coarse match errs toward
+// halting — fail-closed, same direction as EqualFold.
 func (h *canalHandler) OnDDL(header *replication.EventHeader, nextPos mysql.Position, queryEvent *replication.QueryEvent) error {
 	schema := string(queryEvent.Schema)
 	target := h.s.cfg.Database
+	query := string(queryEvent.Query)
 	if schema == "" || !strings.EqualFold(schema, target) {
+		if ddlMentionsTargetDB(query, target) {
+			err := ddlUnsupportedError(query)
+			h.s.setFatal(err)
+			return err
+		}
 		h.s.log.Info("binlog source: DDL outside target database ignored",
 			zap.String("schema", schema),
 			zap.String("target", target),
-			zap.String("query", ddlQuerySummary(string(queryEvent.Query))))
+			zap.String("query", ddlQuerySummary(query)))
 		return nil
 	}
-	err := ddlUnsupportedError(string(queryEvent.Query))
+	err := ddlUnsupportedError(query)
 	h.s.setFatal(err)
 	return err
+}
+
+// ddlMentionsTargetDB reports whether the DDL text carries a target-db-
+// qualified object reference (tgt.t / `tgt`.`t`). Coarse by design: a false
+// positive halts with remediation wording (safe), a false negative needs a
+// fully-qualified DDL that never names the target db (impossible — the
+// reference IS the target it modifies).
+func ddlMentionsTargetDB(query, target string) bool {
+	if target == "" || query == "" {
+		return false
+	}
+	// Accept `tgt`. / tgt. (backticks optional on either side, gap-tolerant).
+	q := regexp.QuoteMeta(target)
+	re := regexp.MustCompile("(?i)(^|[^0-9A-Za-z_$\\x{0080}-\\x{ffff}])`?" + q + "`?\\s*\\.")
+	return re.MatchString(query)
 }
 
 // ddlQuerySummary truncates a DDL statement for logs (full text stays in
