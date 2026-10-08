@@ -158,6 +158,24 @@ func (s *Server) writeCDCConfig(cfg *config.Config) error {
 		"host": cfg.Target.Host, "port": cfg.Target.Port, "user": cfg.Target.User,
 		"password": cfg.Target.Password, "database": cfg.Target.Database,
 	})
+	// MS-11b pen 3: the narrow cdc sub-fields PUT can edit (server_id / mode)
+	// persist too — create the section if the file lacks it.
+	if cfg.CDC.ServerID != 0 || cfg.CDC.Mode != "" {
+		cdcMap := mappingValue(root, "cdc")
+		if cdcMap == nil {
+			cdcMap = &yaml.Node{Kind: yaml.MappingNode}
+			root.Content = append(root.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "cdc"}, cdcMap)
+		}
+		fields := map[string]interface{}{}
+		if cfg.CDC.ServerID != 0 {
+			fields["server_id"] = int(cfg.CDC.ServerID)
+		}
+		if cfg.CDC.Mode != "" {
+			fields["mode"] = cfg.CDC.Mode
+		}
+		setMapFields(cdcMap, fields)
+	}
 	out, err := yaml.Marshal(&doc)
 	if err != nil {
 		return err
@@ -237,14 +255,45 @@ func (s *Server) handleGetCDCConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// cdcConfigPutBody is the PUT /cdc/config body. Only source/target
-// connection fields are editable here; the cdc section stays in config.yaml.
-// Passwords: a non-empty value updates config.yaml (the CDC child needs real
-// credentials); an empty/absent value keeps the stored one, and passwords are
-// never returned by GET.
+// cdcConfigPutBody is the PUT /cdc/config body. Source/target connection
+// fields plus a narrow cdc sub-object (server_id / mode — MS-11b pen 3:
+// previously these never persisted via PUT, forcing hand edits in prod);
+// every other cdc section field stays in config.yaml. Passwords: a non-empty
+// value updates config.yaml (the CDC child needs real credentials); an
+// empty/absent value keeps the stored one, and passwords are never returned
+// by GET.
 type cdcConfigPutBody struct {
 	Source *cdcSourcePut `json:"source"`
 	Target *cdcTargetPut `json:"target"`
+	CDC    *cdcParamPut  `json:"cdc"`
+}
+
+type cdcParamPut struct {
+	ServerID *int    `json:"server_id"`
+	Mode     *string `json:"mode"`
+}
+
+// applyCDCPut applies the narrow cdc sub-object. server_id <= 0 is rejected
+// (never silently zero the field — the pre-start gate depends on it); mode
+// must be a whitelisted value.
+func applyCDCPut(dst *config.CDCConfig, p *cdcParamPut) error {
+	if p == nil {
+		return nil
+	}
+	if p.ServerID != nil {
+		if *p.ServerID <= 0 {
+			return fmt.Errorf("cdc.server_id 必须为正整数")
+		}
+		dst.ServerID = uint32(*p.ServerID)
+	}
+	if p.Mode != nil {
+		m := strings.TrimSpace(*p.Mode)
+		if !config.ValidCDCModes[m] {
+			return fmt.Errorf("cdc.mode 仅支持 full_incr / incr_only")
+		}
+		dst.Mode = m
+	}
+	return nil
 }
 
 type cdcSourcePut struct {
@@ -325,8 +374,8 @@ func (s *Server) handlePutCDCConfig(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.Source == nil && req.Target == nil {
-		s.writeError(w, http.StatusBadRequest, "nothing to update: source or target required")
+	if req.Source == nil && req.Target == nil && req.CDC == nil {
+		s.writeError(w, http.StatusBadRequest, "nothing to update: source, target or cdc required")
 		return
 	}
 
@@ -339,6 +388,10 @@ func (s *Server) handlePutCDCConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	applySourcePut(&cfg.Source, req.Source)
 	applyTargetPut(&cfg.Target, req.Target)
+	if err := applyCDCPut(&cfg.CDC, req.CDC); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if cfg.Source.Host == "" || cfg.Target.Host == "" {
 		s.writeError(w, http.StatusBadRequest, "source and target host cannot be empty")
 		return
