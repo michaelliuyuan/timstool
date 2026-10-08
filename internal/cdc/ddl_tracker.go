@@ -249,13 +249,15 @@ func (t *DDLTracker) FetchNewDDL(ctx context.Context, sinceID int64) ([]DDLEntry
 	var entries []DDLEntry
 	for rows.Next() {
 		var id int64
+		var schema sql.NullString // schema_name is nullable: NULL → "" (H, MS-11e)
 		var e DDLEntry
-		if err := rows.Scan(&id, &e.LSN, &e.Schema, &e.ObjectName,
+		if err := rows.Scan(&id, &e.LSN, &schema, &e.ObjectName,
 			&e.ObjectType, &e.DDL); err != nil {
 			return nil, fmt.Errorf("scan ddl entry: %w", err)
 		}
 		e.ID = id
 		e.LSN = fmt.Sprintf("ddl_%d", id)
+		e.Schema = schema.String
 
 		// Transform DDL for TiDB
 		if t.filter.Allow(e.Schema, e.ObjectName) {
