@@ -6,6 +6,35 @@ const api = axios.create({
   timeout: 30000,
 })
 
+// MS-11f 笔①: destructive CDC endpoints require the X-Auth-Token header.
+// The token lives in sessionStorage — deliberately NOT localStorage: it
+// should die with the tab instead of persisting on a shared workstation.
+const AUTH_TOKEN_HEADER = 'X-Auth-Token'
+const AUTH_TOKEN_KEY = 'timstool-cdc-token'
+
+export function getAuthToken(): string {
+  try {
+    return sessionStorage.getItem(AUTH_TOKEN_KEY) || ''
+  } catch {
+    return '' // storage unavailable (privacy mode): requests go out ungated
+  }
+}
+
+export function setAuthToken(token: string): void {
+  try {
+    if (token) sessionStorage.setItem(AUTH_TOKEN_KEY, token)
+    else sessionStorage.removeItem(AUTH_TOKEN_KEY)
+  } catch {
+    /* best-effort: the gate will answer 401 and the prompt re-opens */
+  }
+}
+
+api.interceptors.request.use((config) => {
+  const token = getAuthToken()
+  if (token) config.headers[AUTH_TOKEN_HEADER] = token
+  return config
+})
+
 // Long-running endpoints (assess / ddl-export / cdc precheck / replica
 // identity ALTERs) scan whole databases server-side; they override the
 // global 30s timeout per request so axios never cuts them off mid-run.

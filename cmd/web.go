@@ -67,6 +67,10 @@ Default URL: http://localhost:8080`,
 		srv := webapi.NewServer(s, webHost, webPort, dataDir, StaticFS, cdcSup, statusFile, time.Duration(cdcStaleSec)*time.Second)
 		srv.SetCDCStatusProvider(webapi.NewFileCDCStatusProvider(statusFile, time.Duration(cdcStaleSec)*time.Second))
 		srv.SetCDCConfigFile(cfgFile)
+		// MS-11f 笔①: destructive-endpoint gate token — startup SNAPSHOT of
+		// config security.token (runtime config edits never affect the live
+		// gate; rotating the token requires a web restart by design).
+		srv.SetSecurityToken(cfg.Security.Token)
 		fmt.Fprintf(os.Stderr, "timstool web UI: http://%s:%d\n", webHost, webPort)
 		return srv.Start()
 	},

@@ -15,9 +15,15 @@ import (
 // {temp_dir, use_lightning, lightning_path} under dataDir; GET must return the
 // saved values and empty defaults when nothing was saved yet.
 
+// testAuthToken is the shared strong token for router-through tests
+// (MS-11f): newTestServer snapshots it and doReq presents it, so pre-gate
+// behavioral tests keep driving the six destructive routes unchanged.
+const testAuthToken = "test-token-0123456789abcdef"
+
 func doReq(method, path, body string) (*httptest.ResponseRecorder, *http.Request) {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Auth-Token", testAuthToken)
 	return httptest.NewRecorder(), req
 }
 

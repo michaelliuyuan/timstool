@@ -56,6 +56,17 @@
       <div v-if="controlMsg" class="control-msg hero-msg" :class="{ error: controlError }">{{ controlMsg }}</div>
     </div>
 
+    <!-- MS-11f 笔① c: anomaly-stop alarms — CDC stopped with no audited
+         operator stop (the 2h-silent external stop this batch roots out).
+         Newest first; the ring lives in the web process and clears on its
+         restart. -->
+    <div v-if="alarmRows.length" class="alarm-card">
+      <div v-for="(a, i) in alarmRows" :key="i" class="alarm-row">
+        <span class="alarm-time">{{ formatAlarmTS(a.ts) }}</span>
+        <span class="alarm-text">{{ a.message }}</span>
+      </div>
+    </div>
+
     <!-- B: stats grid right under the hero -->
     <div class="stats-grid" v-if="stats">
       <div class="stat-item">
@@ -283,7 +294,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import apiClient from '../api'
+import apiClient, { setAuthToken } from '../api'
 import DataPipelineStrip from '../components/DataPipelineStrip.vue'
 import SparkLine from '../components/SparkLine.vue'
 import PageHeader from '../components/PageHeader.vue'
@@ -304,6 +315,14 @@ interface CDCStatus {
   uptime_seconds?: number
   fatal_error?: string
   control?: CDCControl
+  // MS-11f 笔① c: anomaly-stop alarm ring (running→stopped with no audited
+  // operator stop) — absent while no alarm has fired in this web process.
+  alarms?: CDCAlarmRow[]
+}
+
+interface CDCAlarmRow {
+  ts: string
+  message: string
 }
 
 // CDCSupervisor control view (#t55 CONTROL channel).
@@ -440,7 +459,7 @@ function startEditConn() {
   connMsg.value = ''
 }
 
-async function saveConn() {
+async function saveConn(retriedAuth = false) {
   savingConn.value = true
   connMsg.value = ''
   connError.value = false
@@ -456,6 +475,10 @@ async function saveConn() {
     await loadConnConfig()
     await runPrecheck()
   } catch (e: any) {
+    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
+      savingConn.value = false
+      return saveConn(true)
+    }
     connError.value = true
     connMsg.value = e.response?.data?.error || e.message || '保存失败'
   } finally {
@@ -463,7 +486,7 @@ async function saveConn() {
   }
 }
 
-async function importConn() {
+async function importConn(retriedAuth = false) {
   try {
     await ElMessageBox.confirm('确认把最近一次成功迁移任务的源/目标连接导入 config.yaml？当前 CDC 使用的连接将被覆盖（cdc 配置段不变）。', '确认', { type: 'warning' })
   } catch { return }
@@ -475,6 +498,9 @@ async function importConn() {
     await loadConnConfig()
     await runPrecheck()
   } catch (e: any) {
+    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
+      return importConn(true)
+    }
     connError.value = true
     connMsg.value = e.response?.data?.error || e.message || '导入失败'
   }
@@ -487,7 +513,7 @@ const dsSourceRef = ref('')
 const dsTargetRef = ref('')
 const importingDS = ref(false)
 
-async function importFromDS() {
+async function importFromDS(retriedAuth = false) {
   if (!dsSourceRef.value || !dsTargetRef.value) return
   try {
     await ElMessageBox.confirm('确认把所选数据源的连接写入 config.yaml？当前 CDC 使用的连接将被覆盖（cdc 配置段不变）。', '确认', { type: 'warning' })
@@ -501,6 +527,10 @@ async function importFromDS() {
     await loadConnConfig()
     await runPrecheck()
   } catch (e: any) {
+    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
+      importingDS.value = false
+      return importFromDS(true)
+    }
     connError.value = true
     connMsg.value = e.response?.data?.error || e.message || '导入失败'
   } finally {
@@ -594,7 +624,7 @@ async function executeNoPKFix(tables: string[]) {
   }
 }
 
-async function resetCheckpoint() {
+async function resetCheckpoint(retriedAuth = false) {
   let answer: string
   try {
     const { value } = await ElMessageBox.prompt(
@@ -610,6 +640,9 @@ async function resetCheckpoint() {
     ElMessage.success(j.message || '已重置')
     await runPrecheck()
   } catch (e: any) {
+    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
+      return resetCheckpoint(true)
+    }
     ElMessage.error(e.response?.data?.error || e.message || '重置失败')
   }
 }
@@ -715,6 +748,15 @@ const statusState = computed(() => {
   }
 })
 
+// MS-11f 笔① c: anomaly-stop alarm rows, newest first (server ring is
+// oldest-first).
+const alarmRows = computed<CDCAlarmRow[]>(() => [...(status.value.alarms || [])].reverse())
+
+function formatAlarmTS(ts: string): string {
+  const d = new Date(ts)
+  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString()
+}
+
 const statusLabel = computed(() => {
   switch (status.value.state) {
     case 'running': return '运行中'
@@ -733,6 +775,32 @@ const control = ref<CDCControl | null>(null)
 const busy = ref(false)
 const controlMsg = ref('')
 const controlError = ref(false)
+
+// MS-11f 笔① d: 401 → token prompt. Single-flight flag guarantees no
+// stacked dialogs; each gated op carries a retriedAuth flag so a wrong
+// token prompts EXACTLY once per user action — the second 401 surfaces as
+// an error line instead of another dialog (MS-11c toast lesson, seq83 #4).
+let tokenPromptOpen = false
+
+async function promptForToken(): Promise<boolean> {
+  if (tokenPromptOpen) return false
+  tokenPromptOpen = true
+  try {
+    const { value } = await ElMessageBox.prompt(
+      '该操作需要管理令牌（对应服务端 config.yaml 的 security.token）：',
+      '身份验证',
+      { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消', inputType: 'password' },
+    )
+    const token = (value || '').trim()
+    if (!token) return false
+    setAuthToken(token)
+    return true
+  } catch {
+    return false
+  } finally {
+    tokenPromptOpen = false
+  }
+}
 
 const controlState = computed(() => control.value?.state || 'stopped')
 const isActive = computed(() => ['running', 'starting', 'adopted'].includes(controlState.value))
@@ -756,7 +824,7 @@ const hasPositionInfo = computed(() =>
   !!(checkpoint.value?.lsn || status.value.slot || status.value.publication || status.value.pid ||
     (slotView.value?.slot?.exists)))
 
-async function callCDC(action: 'start' | 'stop') {
+async function callCDC(action: 'start' | 'stop', retriedAuth = false) {
   busy.value = true
   controlMsg.value = ''
   controlError.value = false
@@ -770,8 +838,15 @@ async function callCDC(action: 'start' | 'stop') {
     }
     await refresh()
   } catch (e: any) {
+    // MS-11f: 401 → one token prompt + retry; a 403 (server token unset)
+    // falls through as a plain error line — no browser prompt can fix a
+    // server-side config gap.
+    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
+      busy.value = false
+      return callCDC(action, true)
+    }
     controlError.value = true
-    controlMsg.value = e.response?.data?.message || e.message || '请求失败'
+    controlMsg.value = e.response?.data?.error || e.response?.data?.message || e.message || '请求失败'
   } finally {
     busy.value = false
   }
@@ -947,7 +1022,16 @@ code { background: #f0f0f0; padding: 2px 8px; border-radius: 4px; font-size: var
 
 /* P1 巡检修复 #7：div → el-card，保留 dashed 边框语义；灰阶/字号统一 */
 .disabled-card { border-style: dashed; text-align: center; color: var(--tims-text-2); }
-.disabled-card :deep(.el-card__body) { padding: 32px 24px; }
+
+/* MS-11f 笔① c: anomaly-stop alarm rows — same semantic-red family as the
+   error card (#cf1322 / #fff1f0 AA contrast), mono timestamp. */
+.alarm-card {
+  background: #fff1f0; border: 1px solid #ffccc7; border-radius: var(--tims-radius);
+  padding: 10px 16px; margin-bottom: 16px;
+}
+.alarm-row { display: flex; gap: 12px; align-items: baseline; padding: 3px 0; }
+.alarm-time { font-family: var(--tims-font-mono); font-size: 12px; color: #cf1322; flex-shrink: 0; }
+.alarm-text { font-size: var(--tims-font-sm); color: #cf1322; }.disabled-card :deep(.el-card__body) { padding: 32px 24px; }
 .disabled-card h3 { font-size: var(--tims-font-md); color: var(--tims-text); margin-bottom: 12px; }
 .disabled-card p { font-size: 14px; margin: 6px 0; }
 .disabled-card .hint { color: var(--tims-text-2); font-size: var(--tims-font-sm); }

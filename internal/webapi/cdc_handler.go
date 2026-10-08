@@ -34,6 +34,11 @@ type CDCStatusResponse struct {
 	// Watchdog is the P1 revive-guard face: revives / last revive time and
 	// trigger state. Omitted when the watchdog isn't wired.
 	Watchdog *CDCWatchdogStatus `json:"watchdog,omitempty"`
+
+	// Alarms is the anomaly-stop ring (MS-11f 笔① c): CDC stopped without a
+	// covering audit stop — each entry is one transition edge. Omitted when
+	// no alarm has fired in this web process.
+	Alarms []CDCAlarm `json:"alarms,omitempty"`
 }
 
 // cdcStatusView is the web's computed view of the CDC process, read from the
@@ -158,6 +163,9 @@ func (s *Server) handleCDCStatus(w http.ResponseWriter, r *http.Request) {
 	if s.cdcWatchdog != nil {
 		ws := s.cdcWatchdog.Status()
 		resp.Watchdog = &ws
+	}
+	if alarms := s.cdcAlarms(); len(alarms) > 0 {
+		resp.Alarms = alarms
 	}
 	s.writeJSON(w, http.StatusOK, resp)
 }

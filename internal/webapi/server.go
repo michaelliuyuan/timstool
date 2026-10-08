@@ -97,6 +97,25 @@ type Server struct {
 	// log collection
 	logCollector *LogCollector
 	logCores     map[string]*TaskLogCore
+
+	// authToken is the STARTUP SNAPSHOT of config security.token (MS-11f
+	// 笔①): "" = fail-closed (all destructive CDC ops 403). Snapshot
+	// semantics — runtime config edits never affect the running gate.
+	authToken string
+
+	// audit trail (MS-11f 笔①): in-memory ring (backstop + anomaly-checker
+	// source) and the timestamp of the last SUCCESSFUL audited stop.
+	auditMu         sync.Mutex
+	auditRing       []auditEntry
+	lastStopAuditAt time.Time
+
+	// alarms is the anomaly-stop ring surfaced on /cdc/status .alarms.
+	alarmsMu sync.Mutex
+	alarms   []CDCAlarm
+
+	// cdcAnomaly watches for un-audited CDC stops (MS-11f 笔① c). nil when
+	// CDC control isn't wired (the checker needs the supervisor).
+	cdcAnomaly *cdcAnomalyChecker
 }
 
 // wsClient is one connected browser tab. Each client owns a dedicated
@@ -211,6 +230,12 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		// the previous web process. 30s tick = revive backoff.
 		s.cdcWatchdog = newCDCWatchdog(cdcSupervisor, cdcStatusFile, cdcStale, 30*time.Second, pidAlive, zap.L())
 		go s.cdcWatchdog.Run()
+		// MS-11f 笔① c: anomaly-stop checker — running→stopped without a
+		// covering audit stop raises exactly one ERROR alarm. Independent
+		// of the watchdog on purpose: an API stop clears desired and the
+		// watchdog's !desired early-return would skip exactly that case.
+		s.cdcAnomaly = newCDCAnomalyChecker(s, 30*time.Second, zap.L())
+		go s.cdcAnomaly.run()
 	}
 
 	// Compare tasks: a persisted "running" state means the previous process
@@ -244,7 +269,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Auth-Token"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
@@ -308,19 +333,22 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 				r.Post("/cancel", s.handleCancelCompare)
 				r.Delete("/", s.handleDeleteCompare)
 			})
-			// CDC endpoints (#t48 B: read CDC process status file)
+			// CDC endpoints (#t48 B: read CDC process status file). The six
+			// destructive routes go through the MS-11f token gate (snapshot
+			// of security.token; fail-closed 403 when unset, 401 on a
+			// missing/wrong token); reads stay open per the ticket.
 			r.Get("/cdc/status", s.handleCDCStatus)
 			r.Get("/cdc/stats", s.handleCDCStats)
 			r.Get("/cdc/checkpoint", s.handleCDCCheckpoint)
-			r.Post("/cdc/start", s.handleCDCStart)
-			r.Post("/cdc/stop", s.handleCDCStop)
+			r.Post("/cdc/start", s.requireCDCOpToken("cdc.start", s.handleCDCStart))
+			r.Post("/cdc/stop", s.requireCDCOpToken("cdc.stop", s.handleCDCStop))
 			// CDC connection config + precheck + resume inspection (A1/A2/A3)
 			r.Get("/cdc/config", s.handleGetCDCConfig)
-			r.Put("/cdc/config", s.handlePutCDCConfig)
-			r.Post("/cdc/config/import", s.handleImportCDCConfig)
-			r.Post("/cdc/config/import-from-datasource", s.handleImportCDCFromDataSource)
+			r.Put("/cdc/config", s.requireCDCOpToken("cdc.config.put", s.handlePutCDCConfig))
+			r.Post("/cdc/config/import", s.requireCDCOpToken("cdc.config.import", s.handleImportCDCConfig))
+			r.Post("/cdc/config/import-from-datasource", s.requireCDCOpToken("cdc.config.import_from_datasource", s.handleImportCDCFromDataSource))
 			r.Get("/cdc/slot", s.handleCDCSlot)
-			r.Post("/cdc/checkpoint/reset", s.handleCDCResetCheckpoint)
+			r.Post("/cdc/checkpoint/reset", s.requireCDCOpToken("cdc.checkpoint.reset", s.handleCDCResetCheckpoint))
 			// Timestamp-watermark incremental sync (F-04): pull-based table
 			// granularity jobs, manual trigger only, PostgreSQL sources only.
 			r.Get("/incremental/jobs", s.handleListIncrementalJobs)

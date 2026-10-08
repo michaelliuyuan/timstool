@@ -22,6 +22,17 @@ type Config struct {
 	Logging   LoggingConfig   `yaml:"logging" json:"logging"`
 	Web       WebConfig       `yaml:"web" json:"web"`
 	CDC       CDCConfig       `yaml:"cdc" json:"cdc"`
+	Security  SecurityConfig  `yaml:"security" json:"-"`
+}
+
+// SecurityConfig holds the web control-plane auth token (MS-11f P0-1). The
+// token gates the destructive CDC endpoints (X-Auth-Token header). Empty =
+// fail-closed: every destructive op is rejected until an operator sets a
+// token in config.yaml and restarts the web server. json:"-" on every face —
+// the value must never be echoed by any JSON response or persisted into
+// task config blobs (zero-echo constraint, ruling seq83 #1).
+type SecurityConfig struct {
+	Token string `yaml:"token" json:"-"`
 }
 
 // CompareConfig controls data comparison/validation behavior, especially for

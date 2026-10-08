@@ -36,6 +36,9 @@ func newTestServer(t *testing.T) (*Server, *store.Store) {
 	}
 	t.Cleanup(func() { st.Close() })
 	s := NewServer(st, "127.0.0.1", 0, dir, emptyFS, nil, "", 0)
+	// MS-11f: router-through tests pass the destructive-endpoint gate via
+	// the shared doReq header (the gate's own tests build bare servers).
+	s.SetSecurityToken(testAuthToken)
 	return s, st
 }
 
