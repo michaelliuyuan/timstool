@@ -164,6 +164,25 @@ func TestMySQLNoPKSQLLiteralEscaping(t *testing.T) {
 	if !strings.Contains(got, "TABLE_SCHEMA = 'migration_test'") {
 		t.Fatalf("schema literal missing:\n%s", got)
 	}
+	// MS-11e pen 3: anti-join shape — LEFT JOIN TABLE_CONSTRAINTS with the
+	// CONSTRAINT_NAME = 'PRIMARY' predicate in the ON clause and an
+	// IS NULL filter (the NOT EXISTS KEY_COLUMN_USAGE form misreported
+	// on te's 8.0.26 build).
+	if !strings.Contains(got, "LEFT JOIN information_schema.TABLE_CONSTRAINTS") {
+		t.Fatalf("LEFT JOIN anti-join missing:\n%s", got)
+	}
+	if !strings.Contains(got, "tc.CONSTRAINT_NAME = 'PRIMARY'") {
+		t.Fatalf("PRIMARY predicate not in the ON clause:\n%s", got)
+	}
+	if !strings.Contains(got, "tc.CONSTRAINT_NAME IS NULL") {
+		t.Fatalf("IS NULL filter missing (anti-join broken):\n%s", got)
+	}
+	if strings.Contains(got, "NOT EXISTS") {
+		t.Fatalf("old NOT EXISTS form survived:\n%s", got)
+	}
+	if strings.Contains(got, "KEY_COLUMN_USAGE") {
+		t.Fatalf("old KEY_COLUMN_USAGE probe survived:\n%s", got)
+	}
 	// Quote in the schema name must be ''-doubled (injection shape closes).
 	evil := mysqlNoPKSQL("db' --")
 	if !strings.Contains(evil, "'db'' --'") {

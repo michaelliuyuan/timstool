@@ -82,15 +82,19 @@ func mysqlVarSQL(name string) string {
 // placeholder on some builds (schema is config-controlled, not operator
 // free-typed at runtime); quoting is the same ”-doubling shape as
 // incQuoteSQLLiteral.
+// MS-11e pen 3: the NOT EXISTS subquery on KEY_COLUMN_USAGE misreports on
+// some 8.0 builds (notably te's 8.0.26 — PK and no-PK tables both skew);
+// the LEFT JOIN TABLE_CONSTRAINTS … IS NULL anti-join shape is the form
+// verified correct on that build, so v1 switches to it.
 func mysqlNoPKSQL(schema string) string {
 	return fmt.Sprintf(`
 		SELECT t.TABLE_NAME
 		FROM information_schema.TABLES t
+		LEFT JOIN information_schema.TABLE_CONSTRAINTS tc
+		  ON tc.TABLE_SCHEMA = t.TABLE_SCHEMA AND tc.TABLE_NAME = t.TABLE_NAME
+		 AND tc.CONSTRAINT_NAME = 'PRIMARY'
 		WHERE t.TABLE_SCHEMA = %s AND t.TABLE_TYPE = 'BASE TABLE'
-		  AND NOT EXISTS (
-		    SELECT 1 FROM information_schema.KEY_COLUMN_USAGE k
-		    WHERE k.TABLE_SCHEMA = t.TABLE_SCHEMA AND k.TABLE_NAME = t.TABLE_NAME
-		      AND k.CONSTRAINT_NAME = 'PRIMARY')`, incQuoteSQLLiteral(schema))
+		  AND tc.CONSTRAINT_NAME IS NULL`, incQuoteSQLLiteral(schema))
 }
 
 func (realCDCMySQLProber) MySQLVar(cfg *config.Config, name string) (string, error) {
