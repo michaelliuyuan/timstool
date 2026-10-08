@@ -64,6 +64,7 @@ var allCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(allCmd)
+	allCmd.Flags().String("source", "", "override config source.type (postgres | mysql)")
 	allCmd.Flags().Bool("skip-precheck", false, "skip pre-check step")
 	allCmd.Flags().Bool("skip-schema", false, "skip schema migration step")
 	allCmd.Flags().Bool("skip-data", false, "skip data migration step")

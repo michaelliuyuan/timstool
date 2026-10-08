@@ -5,7 +5,7 @@ package webapi
 // external IP POSTed /cdc/stop unauthenticated and CDC sat silent-dead for 2h.
 //
 // Three planes:
-//   1. gate — six destructive routes require X-Auth-Token == the STARTUP
+//   1. gate — seven destructive routes require X-Auth-Token == the STARTUP
 //      SNAPSHOT of config security.token (a mid-run config.yaml edit never
 //      affects the running gate; changing the token requires a web restart).
 //      Unset token = fail-closed 403; missing/wrong token = 401 (the FE uses

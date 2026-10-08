@@ -603,7 +603,7 @@ async function openNoPKFix() {
   await executeNoPKFix(tables)
 }
 
-async function executeNoPKFix(tables: string[]) {
+async function executeNoPKFix(tables: string[], retriedAuth = false) {
   noPKBusy.value = true
   try {
     const { data: j } = await apiClient.runReplicaIdentity(tables)
@@ -618,6 +618,9 @@ async function executeNoPKFix(tables: string[]) {
     )
     if (j.ok || (j.results || []).some((x: any) => x.ok)) await runPrecheck()
   } catch (e: any) {
+    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
+      return executeNoPKFix(tables, true)
+    }
     ElMessage.error('执行失败：' + (e.response?.data?.error || e.message))
   } finally {
     noPKBusy.value = false
@@ -1031,7 +1034,8 @@ code { background: #f0f0f0; padding: 2px 8px; border-radius: 4px; font-size: var
 }
 .alarm-row { display: flex; gap: 12px; align-items: baseline; padding: 3px 0; }
 .alarm-time { font-family: var(--tims-font-mono); font-size: 12px; color: #cf1322; flex-shrink: 0; }
-.alarm-text { font-size: var(--tims-font-sm); color: #cf1322; }.disabled-card :deep(.el-card__body) { padding: 32px 24px; }
+.alarm-text { font-size: var(--tims-font-sm); color: #cf1322; }
+.disabled-card :deep(.el-card__body) { padding: 32px 24px; }
 .disabled-card h3 { font-size: var(--tims-font-md); color: var(--tims-text); margin-bottom: 12px; }
 .disabled-card p { font-size: 14px; margin: 6px 0; }
 .disabled-card .hint { color: var(--tims-text-2); font-size: var(--tims-font-sm); }

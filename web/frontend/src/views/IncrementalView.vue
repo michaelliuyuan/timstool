@@ -781,7 +781,10 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
   <div class="tims-page">
     <PageHeader title="时间戳水位补齐" subtitle="基于更新时间列的拉式批同步，手动触发可重跑，适合无 CDC 权限或定时补齐场景" />
 
-    <SyncCompareCard current="watermark">
+    <!-- MS-11f 笔②: the CDC column's 源端要求 must be source-generic here —
+         this page has no chain-source awareness, and the prop-less default
+         is PG-only wording (misleading on a mysql-chain deployment). -->
+    <SyncCompareCard current="watermark" :cdc-source-req="'逻辑复制 slot（PG 源）/ binlog ROW 格式（MySQL 源）'">
       <el-alert type="warning" :closable="false" style="margin-top: 4px;">
         <p>本模块边界：① 源端 DELETE 不会被捕获（可用「数据比对」兜底核对）；② 不更新水位列的 UPDATE 会漏同步；③ 默认 ≥ 模式每轮会重读边界时刻的行（保证同秒迟到行不丢，代价极小）。</p>
       </el-alert>

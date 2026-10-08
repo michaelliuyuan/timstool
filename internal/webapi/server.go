@@ -376,7 +376,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 			r.Post("/ddl-export/schemas", s.handleDDLSchemas)
 			r.Post("/ddl-export", s.handleDDLExport)
 			r.Get("/cdc/precheck", s.handleCDCPrecheck)
-			r.Post("/cdc/replica-identity", s.handleCDCReplicaIdentity)
+			r.Post("/cdc/replica-identity", s.requireCDCOpToken("cdc.replica_identity", s.handleCDCReplicaIdentity))
 		})
 	})
 

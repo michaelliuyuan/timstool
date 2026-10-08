@@ -41,19 +41,20 @@ describe('CDCView 401 token prompt (MS-11f 笔① d)', () => {
 
   it('every gated op carries the 401 retry path', () => {
     const src = viewSrc()
-    // start/stop, PUT config, both imports, checkpoint reset — six faces
+    // start/stop, PUT config, both imports, checkpoint reset, replica-identity — seven faces
     for (const anchor of [
       `async function callCDC(action: 'start' | 'stop', retriedAuth = false)`,
       `async function saveConn(retriedAuth = false)`,
       `async function importConn(retriedAuth = false)`,
       `async function importFromDS(retriedAuth = false)`,
       `async function resetCheckpoint(retriedAuth = false)`,
+      `async function executeNoPKFix(tables: string[], retriedAuth = false)`,
     ]) {
       expect(src).toContain(anchor)
     }
     // and each one's catch wires the same 401 branch
     const branches = src.split(`e.response?.status === 401 && !retriedAuth && await promptForToken()`).length - 1
-    expect(branches).toBe(5)
+    expect(branches).toBe(6)
   })
 
   it('403 surfaces as a plain error line — no prompt can fix a server-side gap', () => {

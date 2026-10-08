@@ -65,6 +65,41 @@ func TestSecurityGateThreeStates(t *testing.T) {
 	}
 }
 
+// MS-11f 笔② 增补件 (adversarial P2, seq95 ruling): the seventh CDC write
+// endpoint POST /cdc/replica-identity is gated too — same three states, with
+// the 200 face driven through the real handler (config + fake executor).
+func TestSecurityGateReplicaIdentitySeventhRoute(t *testing.T) {
+	s, _, _ := newCDCServer(t)
+	s.replicaIdentityExec = &fakeReplicaExec{canAlter: map[string]bool{"public.a": true}}
+	body := `{"confirm":"ALTER","tables":["a"]}`
+
+	s.SetSecurityToken("") // unset: fail-closed
+	w, req := doReqToken("POST", "/api/v1/cdc/replica-identity", body, "")
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "security.token") {
+		t.Fatalf("unset token: %d (want 403+hint): %s", w.Code, w.Body.String())
+	}
+
+	s.SetSecurityToken("gate-token-0123456789")
+	w, req = doReqToken("POST", "/api/v1/cdc/replica-identity", body, "wrong-token-value")
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token: %d (want 401): %s", w.Code, w.Body.String())
+	}
+	w, req = doReqToken("POST", "/api/v1/cdc/replica-identity", body, "")
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("missing token: %d (want 401): %s", w.Code, w.Body.String())
+	}
+
+	// matching token reaches the handler: fake executor alters public.a => 200 ok
+	w, req = doReqToken("POST", "/api/v1/cdc/replica-identity", body, "gate-token-0123456789")
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"ok":true`) {
+		t.Fatalf("matching token: %d (want 200 ok:true): %s", w.Code, w.Body.String())
+	}
+}
+
 // Reads stay open (ruling: GET/status faces carry little leakage): /cdc/status
 // answers 200 with no token at all.
 func TestSecurityGateReadsStayOpen(t *testing.T) {
