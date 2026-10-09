@@ -303,8 +303,15 @@ func (r *Report) ToHTML() string {
 			if t.DiffRows != 0 {
 				diffStr = fmt.Sprintf("%d", t.DiffRows)
 			}
+			// Honest "—" for a table with no measurable duration (e.g. the
+			// CIR dumpling path has no per-table start point) instead of a
+			// silently blank cell.
+			durStr := t.Duration
+			if durStr == "" {
+				durStr = "—"
+			}
 			sb.WriteString(fmt.Sprintf(`<tr><td class="num">%d</td><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%d</td><td class="num">%d</td><td class="num">%s</td><td class="num">%s</td><td>%s</td></tr>`,
-				i+1, htmlEsc(t.TableName), badgeClass, htmlEsc(statusCN(string(t.Status))), t.SourceRows, t.TargetRows, diffStr, htmlEsc(t.Duration), errStr))
+				i+1, htmlEsc(t.TableName), badgeClass, htmlEsc(statusCN(string(t.Status))), t.SourceRows, t.TargetRows, diffStr, htmlEsc(durStr), errStr))
 		}
 		sb.WriteString(`</tbody></table></div>`)
 	}

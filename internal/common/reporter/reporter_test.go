@@ -3,6 +3,7 @@ package reporter
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -118,5 +119,22 @@ func TestSaveAutoFormat(t *testing.T) {
 	txtPath := filepath.Join(dir, "report.txt")
 	if err := r.Save(txtPath); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// MS-11n: a table with no measurable duration (e.g. the CIR dumpling path
+// has no per-table start point, so the server leaves Duration empty) must
+// render as an honest "—" instead of a silently blank cell.
+func TestHTMLShowsDashForMissingTableDuration(t *testing.T) {
+	r := NewReport("data")
+	r.AddTableReport(TableReport{TableName: "users", Status: StatusPass, SourceRows: 100, TargetRows: 100})
+	r.AddTableReport(TableReport{TableName: "orders", Status: StatusPass, SourceRows: 5, TargetRows: 5, Duration: "1.234s"})
+	r.Finish(StatusPass, "")
+	html := r.ToHTML()
+	if !strings.Contains(html, `<td class="num">—</td>`) {
+		t.Error("empty per-table duration must render as an em-dash cell")
+	}
+	if !strings.Contains(html, `<td class="num">1.234s</td>`) {
+		t.Error("a real duration must still render verbatim")
 	}
 }

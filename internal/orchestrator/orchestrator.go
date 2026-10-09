@@ -352,11 +352,26 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context, pipelineCfg PipelineCon
 		}
 
 		if exportMode == "stream" {
+			// Per-table start stamps: the CIR stream exporter walks tables
+			// sequentially, so table k starts when table k-1 finishes —
+			// stamp the first table now and each successor inside the
+			// completion callback. Queue wait never inflates a table's own
+			// duration.
+			nextIdx := 1
+			if o.cpMgr != nil && len(cir.Tables) > 0 {
+				o.cpMgr.GetOrCreateTable(cir.Tables[0].Name, 0)
+				_ = o.cpMgr.MarkTableRunning(cir.Tables[0].Name)
+			}
 			if err := cirLoadData(ctx, src, cir, o.cfg.Target, tempDir, func(name string, rows int64) {
 				// progress parity: each exported table feeds tables_done/rows to the UI.
 				if o.cpMgr != nil {
 					o.cpMgr.GetOrCreateTable(name, rows)
 					_ = o.cpMgr.MarkTableCompleted(name, rows)
+					if nextIdx < len(cir.Tables) {
+						o.cpMgr.GetOrCreateTable(cir.Tables[nextIdx].Name, 0)
+						_ = o.cpMgr.MarkTableRunning(cir.Tables[nextIdx].Name)
+						nextIdx++
+					}
 				}
 			}); err != nil {
 				o.finishPhase("data", err, false)

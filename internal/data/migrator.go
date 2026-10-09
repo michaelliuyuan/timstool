@@ -210,8 +210,18 @@ func (m *Migrator) Run(ctx context.Context, opts common.DataOpts) (*common.DataR
 		} else {
 			m.cpMgr.SetImportedTables(len(tables))
 			for _, table := range tables {
-				tc := m.cpMgr.GetOrCreateTable(table, 0)
-				m.cpMgr.MarkTableCompleted(table, tc.RowsTotal)
+				m.cpMgr.GetOrCreateTable(table, 0)
+				// Pure row-count convergence (double insurance with the
+				// sticky guard in MarkTableCompleted): a completed table
+				// settles RowsDone to its denominator, but State and
+				// timestamps are never re-stamped here — the export
+				// phase's first-completion FinishedAt survives the
+				// Lightning-end refresh, so per-table durations stay real.
+				_ = m.cpMgr.UpdateTable(table, func(tc *checkpoint.TableCheckpoint) {
+					if tc.State == checkpoint.StateCompleted {
+						tc.RowsDone = tc.RowsTotal
+					}
+				})
 			}
 			m.cpMgr.Flush()
 			logger.Info("[DEBUG] Lightning completed, checkpoint flushed",
@@ -1312,7 +1322,6 @@ func (m *Migrator) importViaSQL(ctx context.Context, opts common.DataOpts) error
 				m.setExactRowsTotal(table, rowCount)
 			}
 			m.cpMgr.GetOrCreateTable(table, rowCount)
-			m.cpMgr.MarkTableRunning(table)
 
 			sem <- struct{}{}
 			wg.Add(1)
@@ -1320,6 +1329,11 @@ func (m *Migrator) importViaSQL(ctx context.Context, opts common.DataOpts) error
 			go func(tableName string, estimatedRows int64) {
 				defer wg.Done()
 				defer func() { <-sem }()
+
+				// Stamped inside the goroutine (canon: Lightning export
+				// path above) — semaphore queue wait must not inflate the
+				// table's own duration.
+				m.cpMgr.MarkTableRunning(tableName)
 
 				if err := m.streamTable(ctx, tidbDB, schema, tableName, batchSize, estimatedRows); err != nil {
 					m.cpMgr.MarkTableFailed(tableName, err.Error())

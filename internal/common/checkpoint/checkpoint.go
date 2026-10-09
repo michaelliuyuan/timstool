@@ -215,14 +215,20 @@ func (m *Manager) MarkTableRunning(tableName string) error {
 
 func (m *Manager) MarkTableCompleted(tableName string, rowsDone int64) error {
 	return m.UpdateTable(tableName, func(tc *TableCheckpoint) {
-		tc.State = StateCompleted
+		// Sticky completion (mirrors MarkSchemaTableCompleted): once a
+		// table is completed, a later re-mark only converges the row
+		// counters — State stays completed and the FIRST completion's
+		// FinishedAt is never rewritten, so per-table durations stay real.
+		if tc.State != StateCompleted {
+			tc.State = StateCompleted
+			tc.FinishedAt = time.Now()
+		}
 		// Raise the denominator if more rows were actually exported than the
 		// registered estimate, so aggregated progress never exceeds 100%.
 		if rowsDone > tc.RowsTotal {
 			tc.RowsTotal = rowsDone
 		}
 		tc.RowsDone = rowsDone
-		tc.FinishedAt = time.Now()
 	})
 }
 
