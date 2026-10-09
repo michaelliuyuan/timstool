@@ -59,14 +59,16 @@ describe('CDCView layout (MS-11c pens 1+2)', () => {
     expect(cmpIdx).toBeGreaterThan(tabIdx)
   })
 
-  it('pen2: precheck folds ok items — warn/fail always rendered first', () => {
+  it('pen2+MS-11l P5: ok items folded by default — single global toggle, ok rows gated inside groups', () => {
     const src = viewSrc()
-    expect(src).toContain(`v-for="it in precheckAttentionItems"`)
-    expect(src).toContain(`v-for="it in precheckOkItems"`)
+    // single global fold ref + toggle wording (MS-11c semantics preserved)
     expect(src).toContain(`showOkItems = !showOkItems`)
     expect(src).toContain(`显示通过项（${'${precheckOkItems.length}'}）`)
-    // the folded ok rows render the plain ok shape, never the no-PK fix button
+    // ok rows now live INSIDE group cards, hidden unless the fold is expanded
+    expect(src).toContain(`v-show="it.level !== 'ok' || showOkItems"`)
+    // attention/ok split computeds still define the fold semantics
     expect(src).toContain(`const precheckAttentionItems = computed(() => (precheck.value?.items || []).filter(it => it.level !== 'ok'))`)
+    expect(src).toContain(`const precheckOkItems = computed(() => (precheck.value?.items || []).filter(it => it.level === 'ok'))`)
   })
 
   it('pen2: precheck tab badge + fail auto-activate (warn-only never steals focus)', () => {
@@ -268,5 +270,54 @@ describe('CDCView conn tab layout (MS-11h)', () => {
     expect(src).toContain(`@media (max-width: 900px)`)
     expect(src).toContain(`.conn-cards { grid-template-columns: 1fr; }`)
     expect(src).toContain(`.conn-flow { transform: rotate(90deg); padding: 2px 0; }`)
+  })
+})
+
+describe('CDCView MS-11l precheck re-layout (P1-P6)', () => {
+  it('P1: three semantic group cards + unknown-item fallback tail group', () => {
+    const src = viewSrc()
+    expect(src).toContain(`const PRECHECK_GROUP_DEFS = [`)
+    expect(src).toContain(`{ key: 'conn', title: '连通性', items: ['source_conn', 'target_conn'] }`)
+    expect(src).toContain(`{ key: 'repl', title: '复制配置', items: ['log_bin', 'binlog_format', 'binlog_row_image', 'repl_privs', 'wal_level', 'repl_role', 'slot'] }`)
+    expect(src).toContain(`{ key: 'base', title: '基线与位点', items: ['base_migration', 'master_status'] }`)
+    // drift safety: future backend item ids land in 其他, never silently dropped
+    expect(src).toContain(`groups.push({ key: 'other', title: '其他检查项', items: rest })`)
+    expect(src).toContain(`v-for="g in precheckGroups"`)
+    expect(src).toContain(`v-for="it in g.items"`)
+  })
+
+  it('P2: two-line entries — dot+label main row, detail as indented sub-row', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<div class="precheck-main">`)
+    // the old fixed-width label that squeezed details on the same line is gone
+    expect(src).not.toContain(`width: 150px`)
+    expect(src).toContain(`.precheck-detail { color: var(--tims-text-2); word-break: break-all; padding-left: 26px; }`)
+  })
+
+  it('P3: no-PK warn is a standalone alert card with table chips; fix button keeps its four-part gate', () => {
+    const src = viewSrc()
+    expect(src).toContain(`const noPKWarnItem = computed(() => precheckAttentionItems.value.find(it => it.item === 'no_pk_tables'))`)
+    expect(src).toContain(`class="precheck-nopk"`)
+    expect(src).toContain(`<el-tag v-for="t in noPKTables" :key="t" size="small" type="warning" effect="plain" class="nopk-chip">{{ t }}</el-tag>`)
+    // MS-11c pen5 gate survives verbatim (item/level conjuncts now structural via the card itself)
+    expect(src).toContain(`v-if="noPKTables.length && connCfg && !srcIsMySQL"`)
+    // no-PK warn leaves the group flow (ok variant stays folded in groups)
+    expect(src).toContain(`filter(it => !(it.item === 'no_pk_tables' && it.level !== 'ok'))`)
+  })
+
+  it('P4: resume block — position mono chip, DDL notice line, checkpoint file/time line', () => {
+    const src = viewSrc()
+    expect(src).toContain(`const resumeView = computed(() => {`)
+    expect(src).toContain(`rest.match(/(binlog\\.\\d+:\\d+|\\b[0-9A-F]{1,8}\\/[0-9A-F]{1,8}\\b)/)`)
+    expect(src).toContain(`<code v-if="resumeView.pos" class="resume-pos">{{ resumeView.pos }}</code>`)
+    expect(src).toContain(`<div v-if="resumeView.ddl" class="resume-ddl">⚠ {{ resumeView.ddl }}</div>`)
+    expect(src).toContain(`class="resume-cp"`)
+    expect(src).toContain(`.resume-pos { font-family: var(--tims-font-mono)`)
+  })
+
+  it('P5+P6: fold toggle above the group area; groups stack to one column under 900px', () => {
+    const src = viewSrc()
+    expect(src).toContain(`.precheck-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));`)
+    expect(src).toContain(`.precheck-groups { grid-template-columns: 1fr; }`)
   })
 })

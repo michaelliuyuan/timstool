@@ -257,35 +257,58 @@
         </template>
         <el-card class="detail-card" v-if="precheck">
           <h3>启动预检 <el-button size="small" style="margin-left: 8px;" @click="runPrecheck" :disabled="checking" :loading="checking">{{ checking ? '检查中…' : '重新检查' }}</el-button></h3>
-          <div v-for="it in precheckAttentionItems" :key="it.item" class="precheck-row" :class="it.level">
-            <span class="precheck-dot">{{ it.level === 'ok' ? '✓' : it.level === 'warn' ? '!' : '✗' }}</span>
-            <span class="precheck-label">{{ it.label }}</span>
-            <span class="precheck-detail">{{ it.detail }}</span>
-            <!-- REPLICA IDENTITY is a PG-only mechanism — the mysql no-PK precheck
-                 warn carries its own guidance (add a PK for row-accurate UPDATE/DELETE). -->
-            <!-- MS-11c pen5: connCfg-gated — the PG-only mechanism button must
-                 not appear in the pre-connCfg transient either. -->
-            <el-button v-if="it.item === 'no_pk_tables' && it.level === 'warn' && noPKTables.length && connCfg && !srcIsMySQL"
-              size="small" style="margin-left: auto; flex: none;"
-              @click="openNoPKFix">修复（REPLICA IDENTITY FULL）</el-button>
-          </div>
           <!-- MS-11c pen4 P2-④: a failed re-run must be visible, never silently
                keep the stale result dressed as fresh. -->
           <div v-if="precheckError" class="control-msg error" style="margin-bottom: 8px;">预检请求失败（{{ precheckError }}），显示的是上次结果，请重新检查</div>
-          <!-- MS-11c: ok items folded by default — only warn/fail need eyes. -->
+          <!-- MS-11l P5（=MS-11c ②语义保持）: ok items folded by default — only warn/fail
+               need eyes. Single GLOBAL toggle (showOkItems 单 ref), placed above the group
+               area; expanding reveals the ok rows inside each group. -->
           <div v-if="precheckOkItems.length" class="precheck-fold">
             <el-button link size="small" :aria-expanded="showOkItems" aria-controls="precheck-ok-list" @click="showOkItems = !showOkItems">{{ showOkItems ? '收起通过项' : `显示通过项（${precheckOkItems.length}）` }}</el-button>
-            <div v-if="showOkItems" id="precheck-ok-list">
-              <div v-for="it in precheckOkItems" :key="it.item" class="precheck-row ok">
-                <span class="precheck-dot">✓</span>
-                <span class="precheck-label">{{ it.label }}</span>
-                <span class="precheck-detail">{{ it.detail }}</span>
+          </div>
+          <!-- MS-11l P3: no-PK warn is a standalone alert card (chips for table names).
+               REPLICA IDENTITY is a PG-only mechanism — the mysql no-PK precheck warn
+               carries its own guidance (add a PK for row-accurate UPDATE/DELETE).
+               MS-11c pen5: connCfg-gated — the PG-only mechanism button must not appear
+               in the pre-connCfg transient either (四重条件零动，随警示行保留). -->
+          <div v-if="noPKWarnItem" class="precheck-nopk">
+            <div class="nopk-head">
+              <span class="precheck-dot warn">!</span>
+              <span class="nopk-title">无主键表预警</span>
+              <el-button v-if="noPKTables.length && connCfg && !srcIsMySQL"
+                size="small" style="margin-left: auto; flex: none;"
+                @click="openNoPKFix">修复（REPLICA IDENTITY FULL）</el-button>
+            </div>
+            <div class="nopk-detail">{{ noPKWarnItem.detail }}</div>
+            <div v-if="noPKTables.length" class="nopk-chips">
+              <el-tag v-for="t in noPKTables" :key="t" size="small" type="warning" effect="plain" class="nopk-chip">{{ t }}</el-tag>
+            </div>
+          </div>
+          <!-- MS-11l P1: three semantic group cards; P2: two-line entries
+               (dot+label main row, detail indented sub-row); ok rows render only
+               when the global fold is expanded (P5). -->
+          <div class="precheck-groups" id="precheck-ok-list">
+            <div v-for="g in precheckGroups" :key="g.key" class="precheck-group">
+              <div class="precheck-group-title">{{ g.title }}</div>
+              <div v-for="it in g.items" :key="it.item" v-show="it.level !== 'ok' || showOkItems" class="precheck-row" :class="it.level">
+                <div class="precheck-main">
+                  <span class="precheck-dot">{{ it.level === 'ok' ? '✓' : it.level === 'warn' ? '!' : '✗' }}</span>
+                  <span class="precheck-label">{{ it.label }}</span>
+                </div>
+                <div class="precheck-detail">{{ it.detail }}</div>
               </div>
             </div>
           </div>
+          <!-- MS-11l P4: resume block-ified — position as monospace chip, DDL note
+               on its own warning line, checkpoint file/time on a separate line. -->
           <div class="resume-box">
-            <strong>断点/起点：</strong>{{ precheck.conclusion }}
-            <span v-if="precheck.checkpoint.exists"> · checkpoint 文件 {{ precheck.checkpoint.file }}（更新于 {{ precheck.checkpoint.updated_at ? new Date(precheck.checkpoint.updated_at).toLocaleString() : '-' }}）</span>
+            <div class="resume-main">
+              <strong>断点/起点：</strong>
+              <code v-if="resumeView.pos" class="resume-pos">{{ resumeView.pos }}</code>
+              <span>{{ resumeView.text }}</span>
+            </div>
+            <div v-if="resumeView.ddl" class="resume-ddl">⚠ {{ resumeView.ddl }}</div>
+            <span v-if="precheck.checkpoint.exists" class="resume-cp">checkpoint 文件 <code class="resume-file">{{ precheck.checkpoint.file }}</code> · 更新于 {{ precheck.checkpoint.updated_at ? new Date(precheck.checkpoint.updated_at).toLocaleString() : '-' }}</span>
           </div>
           <div class="control-actions" style="margin-top: 8px;" v-if="precheck.checkpoint.exists && !isActive">
             <el-button type="danger" plain size="small" @click="resetCheckpoint">重置断点（危险）</el-button>
@@ -406,6 +429,52 @@ const precheckAttentionItems = computed(() => (precheck.value?.items || []).filt
 const precheckOkItems = computed(() => (precheck.value?.items || []).filter(it => it.level === 'ok'))
 const precheckHasFail = computed(() => (precheck.value?.items || []).some(it => it.level === 'fail'))
 const showOkItems = ref(false)
+
+// ---- MS-11l: precheck panel re-layout (P1-P6) — display layer only. ----
+// P1: semantic groups. Keys cover BOTH dialects' item ids (MySQL: log_bin/
+// binlog_format/binlog_row_image/repl_privs/master_status; PG: wal_level/
+// repl_role/slot); unknown future item ids fall into the 其他 tail group so
+// nothing ever silently disappears.
+const PRECHECK_GROUP_DEFS = [
+  { key: 'conn', title: '连通性', items: ['source_conn', 'target_conn'] },
+  { key: 'repl', title: '复制配置', items: ['log_bin', 'binlog_format', 'binlog_row_image', 'repl_privs', 'wal_level', 'repl_role', 'slot'] },
+  { key: 'base', title: '基线与位点', items: ['base_migration', 'master_status'] },
+]
+const precheckGroups = computed(() => {
+  // no-PK warn leaves the group flow — it renders as the standalone P3 card.
+  const items = (precheck.value?.items || []).filter(it => !(it.item === 'no_pk_tables' && it.level !== 'ok'))
+  const known = new Set<string>(PRECHECK_GROUP_DEFS.flatMap(g => g.items))
+  const groups = PRECHECK_GROUP_DEFS.map(g => ({ key: g.key, title: g.title, items: items.filter(it => g.items.includes(it.item)) }))
+    .filter(g => g.items.length > 0)
+  const rest = items.filter(it => !known.has(it.item))
+  if (rest.length) groups.push({ key: 'other', title: '其他检查项', items: rest })
+  return groups
+})
+// P3: the no-PK warn item extracted for the standalone alert card (ok variant
+// stays in the group flow, folded like any other ok item).
+const noPKWarnItem = computed(() => precheckAttentionItems.value.find(it => it.item === 'no_pk_tables'))
+// P4: resume line split — DDL notice becomes its own warning line, the resume
+// position (mysql file:pos / PG LSN) becomes a monospace chip. Pure display
+// parsing of the backend conclusion string; no API change.
+const resumeView = computed(() => {
+  const c = precheck.value?.conclusion || ''
+  let ddl = ''
+  let rest = c
+  const di = c.indexOf('DDL')
+  if (di >= 0) {
+    let start = c.lastIndexOf('；', di)
+    start = start < 0 ? 0 : start + 1
+    ddl = c.slice(start).trim()
+    rest = c.slice(0, start).replace(/[；;]\s*$/, '').trim()
+  }
+  let pos = ''
+  const pm = rest.match(/(binlog\.\d+:\d+|\b[0-9A-F]{1,8}\/[0-9A-F]{1,8}\b)/)
+  if (pm) {
+    pos = pm[1]
+    rest = rest.replace(pos, '').replace('位点  ', '位点 ').replace(/\s{2,}/g, ' ').trim()
+  }
+  return { ddl, pos, text: rest }
+})
 
 // MS-11c ②: a failing precheck auto-activates the precheck tab (warn-only
 // never steals focus — operator judgement stays on the overview).
@@ -1065,17 +1134,41 @@ code { background: #f0f0f0; padding: 2px 8px; border-radius: 4px; font-size: var
   .conn-flow { transform: rotate(90deg); padding: 2px 0; }
 }
 
-/* A2 precheck panel */
+/* A2 precheck panel — MS-11l P1-P6 re-layout */
 .precheck-fold { margin-top: 4px; border-bottom: 1px dashed #f0f0f0; }
-.precheck-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 0; font-size: var(--tims-font-sm); border-bottom: 1px dashed #f0f0f0; } /* P1 巡检修复 #7 字号归一 */
+/* P1: semantic group cards; P6: auto-fit columns stack to one column ≤900px */
+.precheck-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; margin-top: 10px; align-items: start; }
+.precheck-group { border: 1px solid var(--el-border-color-lighter, #ebeef5); border-radius: var(--tims-radius-s); padding: 8px 12px 2px; background: var(--el-bg-color, #fff); }
+.precheck-group-title { font-size: 12px; font-weight: 700; color: var(--tims-text-2); letter-spacing: 0.5px; margin-bottom: 2px; }
+/* P2: two-line entry — dot+label main row, detail as indented sub-row (the old
+   fixed 150px label no longer squeezes long details on the same line) */
+.precheck-row { display: flex; flex-direction: column; gap: 2px; padding: 6px 0; font-size: var(--tims-font-sm); border-bottom: 1px dashed #f0f0f0; } /* P1 巡检修复 #7 字号归一 */
+.precheck-row:last-child { border-bottom: none; }
+.precheck-main { display: flex; align-items: center; gap: 8px; }
 .precheck-dot { width: 18px; height: 18px; border-radius: 50%; color: #fff; font-size: 12px; display: inline-flex; align-items: center; justify-content: center; flex: none; align-self: center; }
 .precheck-row.ok .precheck-dot { background: #52c41a; }
-.precheck-row.warn .precheck-dot { background: #faad14; }
+.precheck-row.warn .precheck-dot, .precheck-nopk .precheck-dot.warn { background: #faad14; }
 .precheck-row.fail .precheck-dot { background: #f5222d; }
-.precheck-label { font-weight: 600; color: var(--tims-text); flex: none; width: 150px; } /* P1 巡检修复 #7 灰阶统一 */
-.precheck-detail { color: var(--tims-text-2); word-break: break-all; } /* P1 巡检修复 #7 灰阶统一 */
+.precheck-label { font-weight: 600; color: var(--tims-text); flex: none; } /* P1 巡检修复 #7 灰阶统一；MS-11l P2 解除 150px 定宽 */
+.precheck-detail { color: var(--tims-text-2); word-break: break-all; padding-left: 26px; } /* P1 巡检修复 #7 灰阶统一；P2 副行缩进至 dot+label 下方 */
+/* P3: no-PK warn standalone alert card — yellow tone + table-name chips */
+.precheck-nopk { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; padding: 10px 12px; background: #fff7e6; border: 1px solid #ffd591; border-radius: var(--tims-radius-s); }
+.nopk-head { display: flex; align-items: center; gap: 8px; }
+.nopk-title { font-weight: 700; color: var(--tims-tag-warning-text); }
+.nopk-detail { font-size: var(--tims-font-sm); color: var(--tims-text-2); padding-left: 26px; }
+.nopk-chips { display: flex; flex-wrap: wrap; gap: 6px; padding-left: 26px; }
+/* P4: resume block — position chip (mono), DDL notice line, checkpoint line */
 /* P1 巡检修复 #7 圆角/字号 + #9：#389e0d(3.37:1) → AA 绿 */
-.resume-box { margin-top: 12px; padding: 10px 12px; background: #f6ffed; border: 1px solid #b7eb8f; border-radius: var(--tims-radius-s); font-size: var(--tims-font-sm); color: var(--tims-ok-text); }
+.resume-box { margin-top: 12px; padding: 10px 12px; background: #f6ffed; border: 1px solid #b7eb8f; border-radius: var(--tims-radius-s); font-size: var(--tims-font-sm); color: var(--tims-ok-text); display: flex; flex-direction: column; gap: 4px; }
+.resume-main { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.resume-pos { font-family: var(--tims-font-mono); font-size: 12px; background: var(--el-bg-color, #fff); border: 1px solid #b7eb8f; border-radius: 4px; padding: 0 6px; color: var(--tims-text); }
+.resume-ddl { font-size: var(--tims-font-sm); color: var(--tims-tag-warning-text); }
+.resume-cp { font-size: 12px; color: var(--tims-text-2); }
+.resume-file { font-family: var(--tims-font-mono); font-size: 12px; }
+@media (max-width: 900px) {
+  .precheck-groups { grid-template-columns: 1fr; }
+  .precheck-detail, .nopk-detail, .nopk-chips { padding-left: 0; }
+}
 
 /* A3 slot card */
 /* P1 巡检修复 #9：tag 文字换 AA 深色（#389e0d/#d48806 不足 4.5:1）；胶囊圆角保留 */
