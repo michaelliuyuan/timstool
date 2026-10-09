@@ -66,3 +66,33 @@ describe('MS-11i pen1: responsive tables + empty/action unification', () => {
     expect(s).toContain('type="primary" @click="nextStep"')
   })
 })
+
+describe('MS-11i pen2: incremental dialog dual-column conn card', () => {
+  it('source/target pickers sit in the dual-column card with center arrow', () => {
+    const s = src('IncrementalView.vue')
+    expect(s).toContain('class="inc-conn-grid"')
+    expect(s).toContain('class="inc-conn-arrow">→')
+    expect(s).toContain('class="inc-conn-badge is-src">源数据库')
+    expect(s).toContain('class="inc-conn-badge is-dst">目标数据库（TiDB）')
+    // The three flat section dividers are gone (replaced by panels).
+    expect(s).not.toContain('<el-divider content-position="left">源数据库')
+    expect(s).not.toContain('<el-divider content-position="left">目标数据库（TiDB）')
+    expect(s).not.toContain('<el-divider content-position="left">同步配置')
+  })
+
+  it('functional red line: every form binding byte-identical', () => {
+    const s = src('IncrementalView.vue')
+    expect(s).toContain(`v-model="form.source_ref" :types="['postgres', 'mysql']"`)
+    expect(s).toContain(`v-model="form.target_ref" :types="['tidb']"`)
+    expect(s).toContain(`v-model="form.conflict_strategy"`)
+    expect(s).toContain(`v-model="form.batch_size" :min="1" :max="100000" :step="500"`)
+    expect(s).toContain(`v-model="form.parallelism" :min="1" :max="16" :step="1"`)
+    expect(s).toContain(`v-model="form.strict_mode"`)
+  })
+
+  it('dual-column stacks at narrow widths (responsive)', () => {
+    const s = src('IncrementalView.vue')
+    expect(s).toContain('@media (max-width: 768px)')
+    expect(s).toContain('.inc-conn-grid { grid-template-columns: 1fr; }')
+  })
+})

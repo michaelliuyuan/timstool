@@ -873,16 +873,32 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
         <el-form-item label="任务名称">
           <el-input v-model="form.name" placeholder="例如：订单表水位补齐" style="width: 360px;" />
         </el-form-item>
-        <el-divider content-position="left">源数据库</el-divider>
-        <el-form-item label="源数据源">
-          <DataSourcePicker v-model="form.source_ref" :types="['postgres', 'mysql']" />
-        </el-form-item>
-        <el-divider content-position="left">目标数据库（TiDB）</el-divider>
-        <el-form-item label="目标数据源">
-          <DataSourcePicker v-model="form.target_ref" :types="['tidb']" />
-        </el-form-item>
-        <el-divider content-position="left">同步配置</el-divider>
-        <el-form-item label="冲突策略">
+
+        <!-- MS-11i pen2: dual-column source/target conn card (MS-11h conn-cards
+             pattern) — visual restructure only, every binding untouched. -->
+        <div class="inc-panel">
+          <div class="inc-panel-head">连接</div>
+          <div class="inc-conn-grid">
+            <div class="inc-conn-side">
+              <div class="inc-conn-badge is-src">源数据库</div>
+              <el-form-item label="源数据源">
+                <DataSourcePicker v-model="form.source_ref" :types="['postgres', 'mysql']" />
+              </el-form-item>
+            </div>
+            <div class="inc-conn-mid"><span class="inc-conn-arrow">→</span></div>
+            <div class="inc-conn-side">
+              <div class="inc-conn-badge is-dst">目标数据库（TiDB）</div>
+              <el-form-item label="目标数据源">
+                <DataSourcePicker v-model="form.target_ref" :types="['tidb']" />
+              </el-form-item>
+            </div>
+          </div>
+        </div>
+
+        <!-- 同步参数：冲突策略全宽 + 数值项双栏紧凑 -->
+        <div class="inc-panel">
+          <div class="inc-panel-head">同步参数</div>
+          <el-form-item label="冲突策略">
           <div>
             <el-radio-group v-model="form.conflict_strategy">
               <el-radio value="replace">REPLACE INTO（默认，幂等）</el-radio>
@@ -894,19 +910,27 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
             </div>
           </div>
         </el-form-item>
-        <el-form-item label="批大小">
-          <el-input-number v-model="form.batch_size" :min="1" :max="100000" :step="500" controls-position="right" />
-        </el-form-item>
-        <el-form-item label="并行度">
-          <el-input-number v-model="form.parallelism" :min="1" :max="16" :step="1" controls-position="right" />
-          <span style="margin-left: 12px; font-size: var(--tims-font-sm); color: var(--tims-text-2);">多张表并行同步的并发数（1-16，默认 4）</span>
-        </el-form-item>
-        <el-form-item label="严格模式">
-          <el-switch v-model="form.strict_mode" />
-          <span style="margin-left: 12px; font-size: var(--tims-font-sm); color: var(--tims-text-2);">使用 &gt; 代替 ≥（跳过边界重读，但同秒迟到行可能丢失）</span>
-        </el-form-item>
+          <el-row :gutter="24">
+            <el-col :span="12">
+              <el-form-item label="批大小">
+                <el-input-number v-model="form.batch_size" :min="1" :max="100000" :step="500" controls-position="right" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="并行度">
+                <el-input-number v-model="form.parallelism" :min="1" :max="16" :step="1" controls-position="right" />
+                <span style="margin-left: 12px; font-size: var(--tims-font-sm); color: var(--tims-text-2);">多张表并行同步的并发数（1-16，默认 4）</span>
+              </el-form-item>
+            </el-col>
+          </el-row>
+          <el-form-item label="严格模式">
+            <el-switch v-model="form.strict_mode" />
+            <span style="margin-left: 12px; font-size: var(--tims-font-sm); color: var(--tims-text-2);">使用 &gt; 代替 ≥（跳过边界重读，但同秒迟到行可能丢失）</span>
+          </el-form-item>
+        </div>
 
-        <el-form-item label="表与水位列">
+        <div class="inc-panel">
+          <div class="inc-panel-head">表与水位列</div>
           <div style="width: 100%;">
             <div style="margin-bottom: 8px;">
               <el-switch v-model="batchMode" active-text="批量配置（多表共用同一水位列）" inactive-text="逐表配置" />
@@ -1025,7 +1049,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
               选择源数据源后自动加载表清单与列信息；清单加载失败时仍可手输表名兜底。
             </el-alert>
           </div>
-        </el-form-item>
+        </div>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
@@ -1098,6 +1122,56 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
 </template>
 
 <style scoped>
+/* MS-11i pen2: dual-column conn card + section panels (MS-11h conn-cards
+   pattern) — visual only, zero binding/validation changes. */
+.inc-panel {
+  border: 1px solid var(--tims-border);
+  border-radius: var(--tims-radius);
+  background: var(--tims-card);
+  padding: 12px 16px 0;
+  margin-bottom: 16px;
+}
+.inc-panel-head {
+  font-weight: 600;
+  font-size: var(--tims-font-sm);
+  color: var(--tims-text-2);
+  letter-spacing: 0.4px;
+  margin-bottom: 10px;
+}
+.inc-conn-grid {
+  display: grid;
+  grid-template-columns: 1fr 32px 1fr;
+  align-items: stretch;
+}
+.inc-conn-mid { display: flex; align-items: center; justify-content: center; }
+.inc-conn-arrow {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--tims-teal-soft);
+  color: var(--tims-tag-success-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 13px;
+}
+.inc-conn-badge {
+  font-size: var(--tims-font-sm);
+  font-weight: 600;
+  margin-bottom: 4px;
+  padding-left: 8px;
+  border-left: 3px solid var(--tims-border);
+}
+.inc-conn-badge.is-src { color: var(--tims-tag-success-text); border-left-color: var(--tims-teal); }
+.inc-conn-badge.is-dst { color: var(--tims-tag-warning-text); border-left-color: var(--tims-amber); }
+
+@media (max-width: 768px) {
+  .inc-conn-grid { grid-template-columns: 1fr; }
+  .inc-conn-mid { padding: 2px 0; }
+  .inc-conn-arrow { transform: rotate(90deg); }
+}
+
 /* FEAT-INC-LOGS: 同步日志抽屉 */
 .log-toolbar {
   display: flex;
