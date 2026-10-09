@@ -40,7 +40,11 @@ describe('MS-11i pen1: responsive tables + empty/action unification', () => {
     const s = src('HistoryView.vue')
     expect(s).toContain('<div v-if="tasks.length > 0" class="tims-table-scroll">')
     expect(s).toContain('label="行数" width="140" class-name="hide-sm"')
-    expect(s).toContain('label="创建时间" width="180" class-name="hide-sm"')
+    // MS-11i pen3: relative time columns (full timestamp on tooltip hover).
+    expect(s).toContain('label="创建时间" width="120" class-name="hide-sm"')
+    expect(s).toContain('label="结束时间" width="120"')
+    expect(s).toContain('function fmtRelative(')
+    expect(s).toContain('function fmtFull(')
     // Unified with CompareView: link buttons, not bordered/plain pairs.
     expect(s).toContain('size="small" link type="primary"')
     expect(s).toContain('size="small" link type="danger"')
@@ -94,5 +98,24 @@ describe('MS-11i pen2: incremental dialog dual-column conn card', () => {
     const s = src('IncrementalView.vue')
     expect(s).toContain('@media (max-width: 768px)')
     expect(s).toContain('.inc-conn-grid { grid-template-columns: 1fr; }')
+  })
+})
+
+describe('MS-11i pen3: datasources card grid + history relative time', () => {
+  it('datasource list renders as a responsive card grid, table gone', () => {
+    const s = src('DataSourcesView.vue')
+    expect(s).toContain('class="ds-grid"')
+    expect(s).toContain('grid-template-columns: repeat(auto-fill, minmax(300px, 1fr))')
+    expect(s).toContain('class="ds-card"')
+    expect(s).not.toContain('<el-table v-else :data="sorted"')
+    // Same handlers ride the card actions.
+    expect(s).toContain('@click="testDS(d)"')
+    expect(s).toContain('@command="(command: string) => onRowCommand(command, d)"')
+  })
+
+  it('create/edit stays dialog-based (te-survey claim already satisfied)', () => {
+    const s = src('DataSourcesView.vue')
+    expect(s).toContain(`:title="editing ? '编辑数据源' : '新建数据源'"`)
+    expect(s).toContain('@click="save"')
   })
 })

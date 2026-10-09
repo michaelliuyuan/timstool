@@ -187,52 +187,44 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
 
       <el-empty v-if="sorted.length === 0" description="还没有数据源；新建后，迁移向导 / 数据比对 / 兼容评估 / DDL 导出 / CDC 可直接引用" />
 
-      <el-table v-else :data="sorted" style="width: 100%">
-        <el-table-column prop="name" label="名称" min-width="140" />
-        <el-table-column label="类型" width="110">
-          <template #default="{ row }">
-            <el-tag :type="row.type === 'tidb' ? 'warning' : row.type === 'mysql' ? 'info' : 'success'" effect="plain" size="small">
-              {{ typeLabels[row.type] || row.type }}
+      <!-- MS-11i pen3: card grid replaces the flat table (te survey #0) —
+           same fields, same handlers (test/edit/remove), responsive columns. -->
+      <div v-else class="ds-grid">
+        <div v-for="d in sorted" :key="d.id" class="ds-card">
+          <div class="ds-card-head">
+            <el-tag :type="d.type === 'tidb' ? 'warning' : d.type === 'mysql' ? 'info' : 'success'" effect="plain" size="small">
+              {{ typeLabels[d.type] || d.type }}
             </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="连接" min-width="220">
-          <template #default="{ row }">
-            <span class="ds-mono">
-              {{ row.fields?.host || '-' }}<template v-if="row.fields?.port">:{{ row.fields.port }}</template><template v-if="row.fields?.database">/{{ row.fields.database }}</template>
-            </span>
-            <el-tag v-if="row.has_password" size="small" type="success" effect="plain" style="margin-left: 8px;">已存密码</el-tag>
-            <el-tag v-else size="small" type="info" effect="plain" style="margin-left: 8px;">无密码</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="最近测试" width="200">
-          <template #default="{ row }">
-            <template v-if="row.last_tested">
-              <el-tag :type="row.last_test_ok ? 'success' : 'danger'" size="small" effect="plain">
-                {{ row.last_test_ok ? '通过' : '失败' }}
+            <span class="ds-card-name" :title="d.name">{{ d.name }}</span>
+          </div>
+          <div class="ds-card-conn ds-mono">
+            {{ d.fields?.host || '-' }}<template v-if="d.fields?.port">:{{ d.fields.port }}</template><template v-if="d.fields?.database">/{{ d.fields.database }}</template>
+          </div>
+          <div class="ds-card-meta">
+            <el-tag v-if="d.has_password" size="small" type="success" effect="plain">已存密码</el-tag>
+            <el-tag v-else size="small" type="info" effect="plain">无密码</el-tag>
+            <template v-if="d.last_tested">
+              <el-tag :type="d.last_test_ok ? 'success' : 'danger'" size="small" effect="plain">
+                {{ d.last_test_ok ? '通过' : '失败' }}
               </el-tag>
-              <span class="ds-mono ds-dim">{{ fmtTime(row.last_tested) }}</span>
+              <span class="ds-dim ds-mono" :title="fmtTime(d.last_tested)">{{ fmtTime(d.last_tested) }}</span>
             </template>
             <span v-else class="ds-dim">未测试</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="操作" width="180" align="right">
-          <template #default="{ row }">
-            <div class="row-actions">
-              <el-button size="small" :loading="testingId === row.id" @click="testDS(row)">测试连接</el-button>
-              <el-dropdown trigger="click" @command="(c: string) => onRowCommand(c, row)">
-                <el-button size="small" link>更多<el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
-                <template #dropdown>
-                  <el-dropdown-menu>
-                    <el-dropdown-item command="edit">编辑</el-dropdown-item>
-                    <el-dropdown-item command="remove" divided class="row-del">删除</el-dropdown-item>
-                  </el-dropdown-menu>
-                </template>
-              </el-dropdown>
-            </div>
-          </template>
-        </el-table-column>
-      </el-table>
+          </div>
+          <div class="ds-card-actions">
+            <el-button size="small" :loading="testingId === d.id" @click="testDS(d)">测试连接</el-button>
+            <el-dropdown trigger="click" @command="(command: string) => onRowCommand(command, d)">
+              <el-button size="small" link>更多<el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="edit">编辑</el-dropdown-item>
+                  <el-dropdown-item command="remove" divided class="row-del">删除</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+          </div>
+        </div>
+      </div>
 
       <div v-for="(r, id) in testResults" :key="id" class="ds-test-result" :class="r.success ? 'ok' : 'bad'">
         {{ r.success ? (r.version || '连接成功') : r.message }}
@@ -307,5 +299,56 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
 .el-dropdown-menu__item.row-del:hover,
 .el-dropdown-menu__item.row-del:focus {
   color: var(--el-color-danger);
+}
+
+/* MS-11i pen3: responsive card grid */
+.ds-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 14px;
+}
+.ds-card {
+  border: 1px solid var(--tims-border, #e6e8f0);
+  border-radius: var(--tims-radius, 12px);
+  background: var(--tims-card, #fff);
+  box-shadow: var(--tims-shadow, none);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ds-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.ds-card-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ds-card-conn {
+  color: var(--tims-text, #2a3040);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ds-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-height: 24px;
+}
+.ds-card-meta .ds-dim { margin-left: 0; }
+.ds-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: auto;
+  padding-top: 6px;
+  border-top: 1px dashed var(--tims-border, #e6e8f0);
 }
 </style>

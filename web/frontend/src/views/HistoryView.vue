@@ -42,6 +42,28 @@ async function deleteTask(id: string) {
   }
 }
 
+// MS-11i pen3: relative time for the narrow history cells; the full timestamp
+// rides the el-tooltip (display-only, no data change).
+function fmtRelative(iso?: string): string {
+  if (!iso) return '-'
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return '-'
+  const min = Math.floor((Date.now() - d.getTime()) / 60000)
+  if (min < 1) return '刚刚'
+  if (min < 60) return `${min} 分钟前`
+  const hr = Math.floor(min / 60)
+  if (hr < 24) return `${hr} 小时前`
+  const day = Math.floor(hr / 24)
+  if (day < 30) return `${day} 天前`
+  return d.toLocaleDateString()
+}
+
+function fmtFull(iso?: string): string {
+  if (!iso) return '-'
+  const d = new Date(iso)
+  return isNaN(d.getTime()) ? '-' : d.toLocaleString()
+}
+
 onMounted(fetchHistory)
 </script>
 
@@ -65,11 +87,16 @@ onMounted(fetchHistory)
           <el-table-column label="行数" width="140" class-name="hide-sm">
             <template #default="{ row }">{{ row.rows_done?.toLocaleString() || 0 }}</template>
           </el-table-column>
-          <el-table-column label="创建时间" width="180" class-name="hide-sm">
-            <template #default="{ row }">{{ new Date(row.created_at).toLocaleString() }}</template>
+          <el-table-column label="创建时间" width="120" class-name="hide-sm">
+            <template #default="{ row }">
+              <el-tooltip :content="fmtFull(row.created_at)" placement="top"><span>{{ fmtRelative(row.created_at) }}</span></el-tooltip>
+            </template>
           </el-table-column>
-          <el-table-column label="结束时间" width="180">
-            <template #default="{ row }">{{ row.finished_at ? new Date(row.finished_at).toLocaleString() : '-' }}</template>
+          <el-table-column label="结束时间" width="120">
+            <template #default="{ row }">
+              <el-tooltip v-if="row.finished_at" :content="fmtFull(row.finished_at)" placement="top"><span>{{ fmtRelative(row.finished_at) }}</span></el-tooltip>
+              <span v-else>-</span>
+            </template>
           </el-table-column>
           <el-table-column label="操作" width="140">
             <template #default="{ row }">
