@@ -49,34 +49,37 @@ onMounted(fetchHistory)
   <div class="tims-page">
     <PageHeader title="迁移历史" />
     <el-card v-loading="loading">
-      <el-table :data="tasks" style="width: 100%;">
-        <el-table-column prop="name" label="任务名称" min-width="200" />
-        <el-table-column label="状态" width="120">
-          <template #default="{ row }">
-            <el-tag :type="(statusMap[row.status]?.type || 'info') as any">
-              {{ statusMap[row.status]?.label || row.status }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="表" width="100">
-          <template #default="{ row }">{{ row.tables_done }}/{{ row.tables_total }}</template>
-        </el-table-column>
-        <el-table-column label="行数" width="140">
-          <template #default="{ row }">{{ row.rows_done?.toLocaleString() || 0 }}</template>
-        </el-table-column>
-        <el-table-column label="创建时间" width="180">
-          <template #default="{ row }">{{ new Date(row.created_at).toLocaleString() }}</template>
-        </el-table-column>
-        <el-table-column label="结束时间" width="180">
-          <template #default="{ row }">{{ row.finished_at ? new Date(row.finished_at).toLocaleString() : '-' }}</template>
-        </el-table-column>
-        <el-table-column label="操作" width="180">
-          <template #default="{ row }">
-            <el-button size="small" @click="router.push(`/tasks/${row.id}`)">详情</el-button>
-            <el-button size="small" type="danger" plain @click="deleteTask(row.id)">删除</el-button>
-          </template>
-        </el-table-column>
-      </el-table>
+      <div v-if="tasks.length > 0" class="tims-table-scroll">
+        <el-table :data="tasks" style="width: 100%;">
+          <el-table-column prop="name" label="任务名称" min-width="200" />
+          <el-table-column label="状态" width="120">
+            <template #default="{ row }">
+              <el-tag :type="(statusMap[row.status]?.type || 'info') as any">
+                {{ statusMap[row.status]?.label || row.status }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="表" width="100">
+            <template #default="{ row }">{{ row.tables_done }}/{{ row.tables_total }}</template>
+          </el-table-column>
+          <el-table-column label="行数" width="140" class-name="hide-sm">
+            <template #default="{ row }">{{ row.rows_done?.toLocaleString() || 0 }}</template>
+          </el-table-column>
+          <el-table-column label="创建时间" width="180" class-name="hide-sm">
+            <template #default="{ row }">{{ new Date(row.created_at).toLocaleString() }}</template>
+          </el-table-column>
+          <el-table-column label="结束时间" width="180">
+            <template #default="{ row }">{{ row.finished_at ? new Date(row.finished_at).toLocaleString() : '-' }}</template>
+          </el-table-column>
+          <el-table-column label="操作" width="140">
+            <template #default="{ row }">
+              <!-- MS-11i pen1: link-style row actions, unified with CompareView 比对历史. -->
+              <el-button size="small" link type="primary" @click="router.push(`/tasks/${row.id}`)">详情</el-button>
+              <el-button size="small" link type="danger" :disabled="row.status === 'running'" @click="deleteTask(row.id)">删除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
       <el-empty v-if="!loading && tasks.length === 0" description="暂无历史记录" />
     </el-card>
   </div>

@@ -63,3 +63,37 @@ func TestDescribeUnknown(t *testing.T) {
 		t.Fatalf("Describe(unknown) err = %v, want unknown-source error", err)
 	}
 }
+
+// TestPostgresSSLModeOptionsLocalized (MS-11i pen1): the ConnectionForm renders
+// option LABELS verbatim, so PG sslmode labels must be Chinese UI wording while
+// VALUES stay the libpq enum literals (disable/require/verify-ca/verify-full).
+func TestPostgresSSLModeOptionsLocalized(t *testing.T) {
+	pg, err := source.Describe("postgres")
+	if err != nil {
+		t.Fatalf("Describe(postgres) err = %v", err)
+	}
+	var field *source.FieldSpec
+	for i := range pg.Fields {
+		if pg.Fields[i].Key == "sslmode" {
+			field = &pg.Fields[i]
+			break
+		}
+	}
+	if field == nil {
+		t.Fatal("postgres meta has no sslmode field")
+	}
+	want := []source.Option{
+		{Label: "禁用", Value: "disable"},
+		{Label: "要求加密", Value: "require"},
+		{Label: "验证 CA", Value: "verify-ca"},
+		{Label: "完全验证", Value: "verify-full"},
+	}
+	if len(field.Options) != len(want) {
+		t.Fatalf("sslmode options = %d, want %d", len(field.Options), len(want))
+	}
+	for i, o := range want {
+		if field.Options[i] != o {
+			t.Errorf("sslmode option[%d] = %+v, want %+v", i, field.Options[i], o)
+		}
+	}
+}

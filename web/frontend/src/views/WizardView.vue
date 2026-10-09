@@ -531,7 +531,9 @@ function prevStep() {
           <ConnectionForm v-if="currentMeta" :meta="currentMeta" :model="form.source" />
           </template>
           <el-form-item>
-            <el-button type="primary" :loading="testingSource" :disabled="!sourceRef && !currentMeta?.implemented" @click="testConnection('source')">
+            <!-- MS-11i pen1 (G4): 测试连接 is a secondary action — plain button;
+                 the step's single primary stays 下一步 (was two stacked primaries). -->
+            <el-button :loading="testingSource" :disabled="!sourceRef && !currentMeta?.implemented" @click="testConnection('source')">
               {{ sourceRef ? '测试数据源连接' : `测试 ${currentMeta?.displayName || 'PostgreSQL'} 连接` }}
             </el-button>
             <el-tag v-if="sourceTestResult" :type="sourceTestResult.success ? 'success' : 'danger'" style="margin-left: 12px;">
@@ -570,7 +572,7 @@ function prevStep() {
           </el-form-item>
           </template>
           <el-form-item>
-            <el-button type="primary" :loading="testingTarget" @click="testConnection('target')">
+            <el-button :loading="testingTarget" @click="testConnection('target')">
               {{ targetRef ? '测试数据源连接' : '测试 TiDB 连接' }}
             </el-button>
             <template v-if="targetTestResult">

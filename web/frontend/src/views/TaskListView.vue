@@ -62,34 +62,39 @@ onUnmounted(() => {
     </PageHeader>
 
     <el-card v-loading="loading">
-      <el-table :data="tasks" style="width: 100%;" @row-click="(row: Task) => goToTask(row.id)">
-        <el-table-column prop="name" label="任务名称" min-width="180" />
-        <el-table-column label="状态" width="120">
-          <template #default="{ row }">
-            <el-tag :type="(statusMap[row.status]?.type || 'info') as any">
-              {{ statusMap[row.status]?.label || row.status }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="阶段" width="120">
-          <template #default="{ row }">{{ row.phase || '-' }}</template>
-        </el-table-column>
-        <el-table-column label="进度" width="200">
-          <template #default="{ row }">
-            <el-progress :percentage="Math.round(row.progress * 100)" :stroke-width="14"
-              :status="row.status === 'completed' ? 'success' : row.status === 'failed' ? 'exception' : undefined" />
-          </template>
-        </el-table-column>
-        <el-table-column label="表进度" width="120">
-          <template #default="{ row }">{{ row.tables_done }}/{{ row.tables_total }}</template>
-        </el-table-column>
-        <el-table-column label="行数" width="140">
-          <template #default="{ row }">{{ row.rows_done?.toLocaleString() || 0 }}</template>
-        </el-table-column>
-        <el-table-column label="创建时间" width="180">
-          <template #default="{ row }">{{ new Date(row.created_at).toLocaleString() }}</template>
-        </el-table-column>
-      </el-table>
+      <!-- MS-11i pen1: table hidden entirely when empty — the el-empty below is
+           the single empty face (previously the built-in "暂无数据" row and the
+           el-empty + CTA stacked as two empty messages). -->
+      <div v-if="tasks.length > 0" class="tims-table-scroll">
+        <el-table :data="tasks" style="width: 100%;" @row-click="(row: Task) => goToTask(row.id)">
+          <el-table-column prop="name" label="任务名称" min-width="180" />
+          <el-table-column label="状态" width="120">
+            <template #default="{ row }">
+              <el-tag :type="(statusMap[row.status]?.type || 'info') as any">
+                {{ statusMap[row.status]?.label || row.status }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="阶段" width="120">
+            <template #default="{ row }">{{ row.phase || '-' }}</template>
+          </el-table-column>
+          <el-table-column label="进度" width="200">
+            <template #default="{ row }">
+              <el-progress :percentage="Math.round(row.progress * 100)" :stroke-width="14"
+                :status="row.status === 'completed' ? 'success' : row.status === 'failed' ? 'exception' : undefined" />
+            </template>
+          </el-table-column>
+          <el-table-column label="表进度" width="120" class-name="hide-sm">
+            <template #default="{ row }">{{ row.tables_done }}/{{ row.tables_total }}</template>
+          </el-table-column>
+          <el-table-column label="行数" width="140" class-name="hide-sm">
+            <template #default="{ row }">{{ row.rows_done?.toLocaleString() || 0 }}</template>
+          </el-table-column>
+          <el-table-column label="创建时间" width="180" class-name="hide-sm">
+            <template #default="{ row }">{{ new Date(row.created_at).toLocaleString() }}</template>
+          </el-table-column>
+        </el-table>
+      </div>
 
       <el-empty v-if="!loading && tasks.length === 0" description="暂无任务">
         <el-button type="primary" @click="router.push('/wizard')">创建第一个迁移任务</el-button>

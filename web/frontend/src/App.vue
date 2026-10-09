@@ -5,6 +5,11 @@ import { useRouter, useRoute } from 'vue-router'
 const router = useRouter()
 const route = useRoute()
 
+// Build-stamped app version (vite define from package.json — MS-11i pen1).
+// Bridge binding: template identifiers resolve lexically, so the global
+// __APP_VERSION__ must be pulled into setup scope to render.
+const appVersion = __APP_VERSION__
+
 // Optional modules: CDC is hidden unless /features reports it enabled (D3 #t53).
 const cdcEnabled = ref(false)
 
@@ -99,7 +104,7 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
             <i class="tims-heartbeat-dot"></i>
             <span class="tims-mono">{{ runningCount > 0 ? `${runningCount} 运行` : backendUp ? '空闲' : '离线' }}</span>
           </span>
-          <span class="tims-version tims-mono">V3.18</span>
+          <span class="tims-version tims-mono">V{{ appVersion }}</span>
         </div>
       </header>
       <main class="tims-workspace">

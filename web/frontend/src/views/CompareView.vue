@@ -906,7 +906,8 @@ onUnmounted(() => {
             <span class="tims-gauge-value tims-num">{{ activeReport.duration }}</span>
           </div>
         </div>
-        <el-table :data="activeReport.tables" max-height="400" size="small" style="margin-bottom: 12px;">
+        <div class="tims-table-scroll">
+          <el-table :data="activeReport.tables" max-height="400" size="small" style="margin-bottom: 12px;">
           <el-table-column prop="table_name" label="表名" min-width="140" />
           <el-table-column label="状态" width="90">
             <template #default="{ row }">
@@ -920,20 +921,22 @@ onUnmounted(() => {
               <span class="tims-num" :class="diffHeat(row.diff_rows)">{{ row.diff_rows }}</span>
             </template>
           </el-table-column>
-          <el-table-column prop="duration" label="耗时" width="90" />
+          <el-table-column prop="duration" label="耗时" width="90" class-name="hide-sm" />
           <el-table-column prop="error" label="错误/建议" min-width="200" show-overflow-tooltip />
-        </el-table>
+          </el-table>
+        </div>
       </template>
       <div v-else-if="activeTask.status === 'completed'" v-loading="loadingReport" style="min-height: 80px;"></div>
     </el-card>
 
     <el-card shadow="never">
       <template #header><span style="font-weight: bold;">比对历史</span></template>
-      <el-table :data="tasks" size="small">
-        <el-table-column prop="id" label="ID" width="90" />
-        <el-table-column prop="name" label="名称" min-width="160" />
-        <el-table-column label="模式" width="90">
-          <template #default="{ row }">
+      <div class="tims-table-scroll">
+        <el-table :data="tasks" size="small">
+          <el-table-column prop="id" label="ID" width="90" class-name="hide-sm" />
+          <el-table-column prop="name" label="名称" min-width="160" />
+          <el-table-column label="模式" width="90">
+            <template #default="{ row }">
             <span>{{ row.mode }}</span>
             <el-tag v-if="row.watermark" size="small" type="warning" style="margin-left: 4px;">水位</el-tag>
           </template>
@@ -943,10 +946,10 @@ onUnmounted(() => {
             <el-tag :type="statusTag(row.status)" size="small">{{ statusText(row.status) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="表进度" width="120">
+        <el-table-column label="表进度" width="120" class-name="hide-sm">
           <template #default="{ row }">{{ row.tables_done }} / {{ row.tables_total || '?' }}</template>
         </el-table-column>
-        <el-table-column label="创建时间" width="170">
+        <el-table-column label="创建时间" width="170" class-name="hide-sm">
           <template #default="{ row }">{{ new Date(row.created_at).toLocaleString() }}</template>
         </el-table-column>
         <el-table-column label="操作" width="140">
@@ -955,7 +958,8 @@ onUnmounted(() => {
             <el-button size="small" link type="danger" :disabled="row.status === 'running'" @click="removeTask(row)">删除</el-button>
           </template>
         </el-table-column>
-      </el-table>
+        </el-table>
+      </div>
     </el-card>
   </div>
 </template>

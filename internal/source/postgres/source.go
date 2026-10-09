@@ -50,10 +50,10 @@ var postgresMeta = source.SourceMeta{
 		{Key: "schema", Label: "Schema", Type: "text", Default: "public", Group: "source"},
 		{Key: "sslmode", Label: "SSL模式", Type: "select", Default: "disable", Group: "source",
 			Options: []source.Option{
-				{Label: "disable", Value: "disable"},
-				{Label: "require", Value: "require"},
-				{Label: "verify-ca", Value: "verify-ca"},
-				{Label: "verify-full", Value: "verify-full"},
+				{Label: "禁用", Value: "disable"},
+				{Label: "要求加密", Value: "require"},
+				{Label: "验证 CA", Value: "verify-ca"},
+				{Label: "完全验证", Value: "verify-full"},
 			}},
 	},
 }

@@ -231,6 +231,23 @@ body {
   margin: 0 auto;
 }
 
+/* --- Responsive table utilities (MS-11i pen1, single source) ---
+   Wrap every data table in .tims-table-scroll: guards against the page-level
+   horizontal squeeze at narrow viewports (el-table's own scrollbar only
+   engages when its container constrains width). Columns the page marks
+   class-name="hide-sm" are pruned at <=900px instead of wrapping. Pages
+   must NOT copy these rules locally. */
+.tims-table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+@media (max-width: 900px) {
+  .tims-table-scroll .hide-sm {
+    display: none;
+  }
+}
+
 /* Phase status dot (timeline, replaces emoji markers) */
 .phase-dot {
   width: 10px;
