@@ -110,6 +110,27 @@ func (s *Server) prepareCDCChain(cfg *config.Config) (lsn string, reusedSlot boo
 	return lsn, reused, nil
 }
 
+// chainSourceKey renders the chain identity of a source: kind + conn host.
+// The CDC chain is instance-scoped (a PG replication slot and a MySQL binlog
+// stream both belong to the instance, not to one database), so database is
+// deliberately NOT part of the key.
+func chainSourceKey(sc config.SourceConfig) string {
+	return fmt.Sprintf("%s@%s:%d", sc.SourceType(), sc.Host, sc.Port)
+}
+
+// cdcChainSourceMismatch reports whether the CDC config.yaml source differs
+// from this task's source (MS-11m guard: kind + conn host identity). An
+// unreadable CDC config keeps the legacy behavior — the seed path surfaces
+// its own error there.
+func (s *Server) cdcChainSourceMismatch(cfg *config.Config) (mismatch bool, cur, task string) {
+	cdcCfg, err := s.cdcCfgSnapshot()
+	if err != nil {
+		return false, "", ""
+	}
+	cur, task = chainSourceKey(cdcCfg.Source), chainSourceKey(cfg.Source)
+	return cur != task, cur, task
+}
+
 // startCDCChainAfterSuccess auto-starts the CDC supervisor after a successful
 // chained migration. Failure is loud (task log ERROR + broadcast) but does not
 // flip the completed task to failed — the slot retains WAL, the operator can
@@ -121,14 +142,33 @@ func (s *Server) prepareCDCChain(cfg *config.Config) (lsn string, reusedSlot boo
 // either PG semantics for the requested LSN (hint vs max(requested,
 // confirmed_flush)), seeding makes the consistent point the effective start.
 // An existing checkpoint (≥ our LSN by construction) is never clobbered.
+//
+// MS-11m: CDC is a system-wide single chain (one config.yaml cdc source, one
+// supervisor, one checkpoint file) while this hook is per-task. Before the
+// running-check/skip and before any seed/Start, the configured CDC source is
+// compared against THIS task's source: a foreign chain (e.g. MySQL→TiDB
+// running while this task is PG→TiDB) must neither swallow the chaining
+// intent silently nor let the seed/Start cross-pollinate the other chain's
+// checkpoint. WARN, do nothing, tell the operator.
 func (s *Server) startCDCChainAfterSuccess(taskID string, cfg *config.Config) {
 	msg := ""
 	ok := true
+	warn := false
 	switch {
 	case s.cdcSupervisor == nil:
 		ok = false
 		msg = "CDC 自动衔接失败：本服务未接入 CDC 控制（supervisor 未接线），请手动启动 CDC（slot 已保留 WAL，无数据丢失）"
 	default:
+		if mm, cur, task := s.cdcChainSourceMismatch(cfg); mm {
+			ok = false
+			warn = true
+			keep := "slot 已保留 WAL，无数据丢失"
+			if sourceIsMySQL(cfg.Source) {
+				keep = "binlog 天然保留，无数据丢失"
+			}
+			msg = fmt.Sprintf("CDC 链源不一致，未自动衔接：CDC 配置的链源=%s，本任务源=%s（%s）。请停用现役链或将 CDC 配置切换为本任务源后手动启动", cur, task, keep)
+			break
+		}
 		if st := s.cdcSupervisor.Status(); st.State == StateRunning || st.State == StateStarting || st.State == StateAdopted {
 			msg = "CDC 已在运行，跳过自动衔接（现有 checkpoint/slot 点位优先）"
 			break
@@ -162,11 +202,13 @@ func (s *Server) startCDCChainAfterSuccess(taskID string, cfg *config.Config) {
 			}
 		}
 	}
-	if ok {
-		s.logCollector.Append(taskID, "INFO", "CDC chain: "+msg, "")
-	} else {
-		s.logCollector.Append(taskID, "ERROR", "CDC chain: "+msg, "")
+	level := "INFO"
+	if warn {
+		level = "WARN"
+	} else if !ok {
+		level = "ERROR"
 	}
+	s.logCollector.Append(taskID, level, "CDC chain: "+msg, "")
 	s.BroadcastProgress(taskID, map[string]interface{}{
 		"phase":   "cdc_chain",
 		"message": msg,
@@ -203,7 +245,19 @@ func (s *Server) seedChainCheckpoint(taskID string, cfg *config.Config) error {
 	}
 	mgr := cdc.NewCheckpointManager(path)
 	if existing, lErr := mgr.Load(); lErr == nil && existing != nil {
-		trusted := existing.SlotName == "" || existing.SlotName == chainSlotName(cfg)
+		if existing.SlotName == "" {
+			// MS-11m: a slotless checkpoint is the MySQL (binlog file:pos)
+			// form. A PG chain LSN must neither overwrite it — cross-source
+			// position pollution of the system-wide checkpoint file — nor be
+			// compared against its unrelated file:pos space. Keep the file
+			// untouched: the PG child discards cross-source shapes at load
+			// (LoadForSource) and falls back to slot semantics, so replay
+			// stays loss-less while the operator reconciles the configs.
+			s.logCollector.Append(taskID, "WARN",
+				"CDC chain: 现有 checkpoint 为 MySQL 形态（无 slot 名），本任务为 PG 链：为防跨源位点污染未预置链点位（文件保持原值；PG 子进程将按 slot 点位起步，无数据丢失）", "")
+			return nil
+		}
+		trusted := existing.SlotName == chainSlotName(cfg)
 		if trusted && existing.LSN >= lsn {
 			// Same-slot checkpoint already at or past the chain point (a prior
 			// CDC run advanced beyond it): keep the newer position, never rewind.
