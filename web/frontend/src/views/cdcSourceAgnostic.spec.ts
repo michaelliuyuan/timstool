@@ -18,17 +18,21 @@ describe('CDCView source surface (MS-11 pen 4)', () => {
     expect(src).not.toContain(`源端（PG 数据源）`)
   })
 
-  it('connection edit section label is source-generic', () => {
+  it('connection card title + type badge are source-generic (MS-11h dual-column)', () => {
     const src = viewSrc()
-    expect(src).toContain(`源端数据库（PostgreSQL / MySQL）`)
+    expect(src).toContain(`<span class="conn-side-title">源端数据库</span>`)
+    expect(src).toContain(`{{ srcIsMySQL ? 'MySQL · binlog' : 'PostgreSQL' }}`)
+    expect(src).not.toContain(`源端数据库（PostgreSQL / MySQL）`)
     expect(src).not.toContain(`源端（PostgreSQL）`)
   })
 
-  it('CDC params row forks by source: mysql shows binlog wording, slot/pub stays PG-only', () => {
+  it('CDC params chip forks by source: mysql shows binlog wording, slot/pub stays PG-only', () => {
     const src = viewSrc()
-    // MS-11a: mysql branch shows the binlog wording; PG branch keeps the
-    // original slot/pub segment byte-identical.
-    expect(src).toContain(`<template v-if="srcIsMySQL"> · binlog 采集（file:pos 位点续传）</template><template v-else-if="connCfg.cdc.slot_name"> · slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }}</template>`)
+    // MS-11h: the params row became chips; the fork lives in the 位点续传
+    // chip. MS-11a semantics unchanged: mysql branch shows the binlog
+    // wording; PG branch keeps the slot/pub segment (the leading " · "
+    // separators went away with the chip cell).
+    expect(src).toContain(`<template v-if="srcIsMySQL">binlog 采集（file:pos 位点续传）</template><template v-else-if="connCfg.cdc.slot_name">slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }}</template>`)
   })
 
   it('REPLICA IDENTITY no-PK assist is hidden for mysql sources (PG-only mechanism)', () => {
@@ -53,7 +57,7 @@ describe('CDCView source-aware copy (MS-11a pens 1+2)', () => {
 
   it('A2 mysql chain shows binlog wording, never slot/pub', () => {
     const src = viewSrc()
-    expect(src).toContain(`<template v-if="srcIsMySQL"> · binlog 采集（file:pos 位点续传）</template>`)
+    expect(src).toContain(`<template v-if="srcIsMySQL">binlog 采集（file:pos 位点续传）</template>`)
     // The slot/pub segment is gated behind the PG (v-else-if) branch only.
     expect(src).not.toContain(`<template v-if="connCfg.cdc.slot_name">`)
   })
@@ -91,7 +95,7 @@ describe('CDCView source-aware copy (MS-11a pens 1+2)', () => {
 
   it('PG identity 1/4: slot/pub segment keeps the original literal in the PG branch', () => {
     const src = viewSrc()
-    expect(src).toContain(`<template v-else-if="connCfg.cdc.slot_name"> · slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }}</template>`)
+    expect(src).toContain(`<template v-else-if="connCfg.cdc.slot_name">slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }}</template>`)
   })
 
   it('PG identity 2/4: startup hint PG side is the original wording', () => {

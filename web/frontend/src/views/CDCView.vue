@@ -175,31 +175,56 @@
         <!-- S1-UI-06: which-one-to-use card (moved into the config tab, MS-11c) -->
         <SyncCompareCard v-if="connCfg" current="cdc" :cdc-source-req="srcIsMySQL ? 'binlog（ROW 格式 + REPLICATION 权限）' : undefined" />
 
-        <!-- Connection card (A1): the live config.yaml the CDC child uses -->
+        <!-- Connection card (A1): the live config.yaml the CDC child uses.
+             MS-11h（seq188 需求/seq192 落地令）：源/目标双栏对照卡（流向感）+
+             CDC 参数标签行 + 操作区统一收纳；编辑态与展示态同构（原位变输入框）。
+             功能零变动红线：三动作与既有校验语义原样，仅布局呈现变化。 -->
         <el-card class="detail-card" v-if="connCfg">
           <h3>连接信息（CDC 实际使用）</h3>
           <div class="detail-row">
             <span class="detail-label">配置文件:</span>
             <code>{{ connCfg.cfg_file }}</code>
           </div>
-          <div class="detail-row">
-            <span class="detail-label">源端:</span>
-            <code>{{ connCfg.source.host }}:{{ connCfg.source.port }}/{{ connCfg.source.database }} · {{ connCfg.source.user }}<span v-if="!connCfg.has_password" style="color:#cf1322;">（未设密码）</span></code>
+
+          <div class="conn-cards">
+            <div class="conn-side">
+              <div class="conn-side-head">
+                <span class="conn-side-title">源端数据库</span>
+                <span class="conn-side-type">{{ srcIsMySQL ? 'MySQL · binlog' : 'PostgreSQL' }}</span>
+              </div>
+              <div class="conn-field"><span>主机</span><el-input v-if="editingConn" v-model="editForm.source.host" size="small" /><code v-else>{{ connCfg.source.host }}</code></div>
+              <div class="conn-field"><span>端口</span><el-input-number v-if="editingConn" v-model="editForm.source.port" :min="1" :max="65535" controls-position="right" size="small" class="conn-field-num" /><code v-else>{{ connCfg.source.port }}</code></div>
+              <div class="conn-field"><span>用户</span><el-input v-if="editingConn" v-model="editForm.source.user" size="small" /><code v-else>{{ connCfg.source.user }}</code></div>
+              <div class="conn-field"><span>密码</span><el-input v-if="editingConn" v-model="editForm.source.password" type="password" show-password placeholder="留空保持不变" size="small" /><code v-else :class="{ 'conn-nopwd': !connCfg.has_password }">{{ connCfg.has_password ? '●●●●●●' : '（未设密码）' }}</code></div>
+              <div class="conn-field"><span>数据库</span><el-input v-if="editingConn" v-model="editForm.source.database" size="small" /><code v-else>{{ connCfg.source.database }}</code></div>
+              <div class="conn-field" v-if="editingConn || connCfg.source.schema"><span>Schema</span><el-input v-if="editingConn" v-model="editForm.source.schema" size="small" /><code v-else>{{ connCfg.source.schema }}</code></div>
+            </div>
+            <div class="conn-flow" aria-hidden="true">→</div>
+            <div class="conn-side">
+              <div class="conn-side-head">
+                <span class="conn-side-title">目标端</span>
+                <span class="conn-side-type">TiDB</span>
+              </div>
+              <div class="conn-field"><span>主机</span><el-input v-if="editingConn" v-model="editForm.target.host" size="small" /><code v-else>{{ connCfg.target.host }}</code></div>
+              <div class="conn-field"><span>端口</span><el-input-number v-if="editingConn" v-model="editForm.target.port" :min="1" :max="65535" controls-position="right" size="small" class="conn-field-num" /><code v-else>{{ connCfg.target.port }}</code></div>
+              <div class="conn-field"><span>用户</span><el-input v-if="editingConn" v-model="editForm.target.user" size="small" /><code v-else>{{ connCfg.target.user }}</code></div>
+              <div class="conn-field"><span>密码</span><el-input v-if="editingConn" v-model="editForm.target.password" type="password" show-password placeholder="留空保持不变" size="small" /><code v-else>●●●●●●</code></div>
+              <div class="conn-field"><span>数据库</span><el-input v-if="editingConn" v-model="editForm.target.database" size="small" /><code v-else>{{ connCfg.target.database }}</code></div>
+            </div>
           </div>
-          <div class="detail-row">
-            <span class="detail-label">目标端:</span>
-            <code>{{ connCfg.target.host }}:{{ connCfg.target.port }}/{{ connCfg.target.database }} · {{ connCfg.target.user }}</code>
+
+          <div class="conn-params">
+            <div class="conn-param"><span class="conn-param-k">模式</span><code>{{ connCfg.cdc.mode }}</code></div>
+            <div class="conn-param"><span class="conn-param-k">位点续传</span><code><template v-if="srcIsMySQL">binlog 采集（file:pos 位点续传）</template><template v-else-if="connCfg.cdc.slot_name">slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }}</template></code></div>
+            <div class="conn-param"><span class="conn-param-k">并发</span><code>{{ connCfg.cdc.parallel }}</code></div>
+            <div class="conn-param"><span class="conn-param-k">冲突策略</span><code>{{ connCfg.cdc.conflict_strategy }}</code></div>
+            <div class="conn-param"><span class="conn-param-k">DDL</span><code>{{ connCfg.cdc.sync_ddl ? '同步' : '不同步' }}</code></div>
           </div>
-          <div class="detail-row">
-            <span class="detail-label">CDC 参数:</span>
-            <code>{{ connCfg.cdc.mode }}<template v-if="srcIsMySQL"> · binlog 采集（file:pos 位点续传）</template><template v-else-if="connCfg.cdc.slot_name"> · slot={{ connCfg.cdc.slot_name }} · pub={{ connCfg.cdc.publication }}</template> · parallel={{ connCfg.cdc.parallel }} · 冲突={{ connCfg.cdc.conflict_strategy }} · DDL={{ connCfg.cdc.sync_ddl ? '同步' : '不同步' }}</code>
-          </div>
-          <div class="control-actions" style="margin-top: 10px;">
-            <el-button v-if="!editingConn" @click="startEditConn">编辑连接</el-button>
-            <el-button @click="importConn" :disabled="busy || isActive || editingConn">从最近迁移任务导入</el-button>
-          </div>
-          <!-- F-02 D4: one-click import from saved datasources -->
-          <div class="control-actions ds-import" v-if="!editingConn">
+
+          <div class="conn-actions" v-if="!editingConn">
+            <el-button type="primary" @click="startEditConn">编辑连接</el-button>
+            <el-button @click="importConn" :disabled="busy || isActive">从最近迁移任务导入</el-button>
+            <el-divider direction="vertical" />
             <span class="ds-import-label">从数据源导入：</span>
             <el-select v-model="dsSourceRef" class="ds-import-select" placeholder="源端数据源" size="small">
               <el-option label="源端数据源" value="" />
@@ -214,30 +239,11 @@
               {{ importingDS ? '导入中…' : '导入' }}
             </el-button>
           </div>
-          <!-- Inline edit form (A1 manual edit) -->
-          <div v-if="editingConn" class="conn-edit">
-            <div class="conn-edit-section">源端数据库（PostgreSQL / MySQL）</div>
-            <div class="conn-grid">
-              <label>主机<el-input v-model="editForm.source.host" size="small" /></label>
-              <label>端口<el-input-number v-model="editForm.source.port" :min="1" :max="65535" controls-position="right" size="small" class="conn-grid-num" /></label>
-              <label>用户名<el-input v-model="editForm.source.user" size="small" /></label>
-              <label>密码<el-input v-model="editForm.source.password" type="password" show-password placeholder="留空保持不变" size="small" /></label>
-              <label>数据库<el-input v-model="editForm.source.database" size="small" /></label>
-              <label>Schema<el-input v-model="editForm.source.schema" size="small" /></label>
-            </div>
-            <div class="conn-edit-section">目标端（TiDB）</div>
-            <div class="conn-grid">
-              <label>主机<el-input v-model="editForm.target.host" size="small" /></label>
-              <label>端口<el-input-number v-model="editForm.target.port" :min="1" :max="65535" controls-position="right" size="small" class="conn-grid-num" /></label>
-              <label>用户名<el-input v-model="editForm.target.user" size="small" /></label>
-              <label>密码<el-input v-model="editForm.target.password" type="password" show-password placeholder="留空保持不变" size="small" /></label>
-              <label>数据库<el-input v-model="editForm.target.database" size="small" /></label>
-            </div>
-            <div class="control-actions" style="margin-top: 8px;">
-              <el-button type="success" @click="saveConn" :disabled="savingConn" :loading="savingConn">{{ savingConn ? '保存中…' : '保存' }}</el-button>
-              <el-button type="danger" plain @click="editingConn = false">取消</el-button>
-            </div>
-            <div v-if="connMsg" class="control-msg" :class="{ error: connError }">{{ connMsg }}</div>
+
+          <div class="conn-actions" v-if="editingConn">
+            <el-button type="success" @click="saveConn" :disabled="savingConn" :loading="savingConn">{{ savingConn ? '保存中…' : '保存' }}</el-button>
+            <el-button type="danger" plain @click="editingConn = false">取消</el-button>
+            <span v-if="connMsg" class="control-msg" :class="{ error: connError }">{{ connMsg }}</span>
           </div>
         </el-card>
       </el-tab-pane>
@@ -935,12 +941,8 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-/* F-02 datasource import row */
-.ds-import {
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
+/* F-02 datasource import row（MS-11h：并 conn-actions 行内，wrapper 类清除，
+   label/arrow/select 三子类保留） */
 .ds-import-label { font-size: var(--tims-font-xs); color: var(--tims-text-2, #909399); } /* P1 巡检修复 #7 字号归一 */
 .ds-import-arrow { color: var(--tims-text-2, #909399); }
 .ds-import-select { width: 180px; }
@@ -1042,12 +1044,26 @@ code { background: #f0f0f0; padding: 2px 8px; border-radius: 4px; font-size: var
 .disabled-card code { background: #f0f0f0; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
 .auto-refresh { font-size: 12px; color: var(--tims-text-2); } /* P1 巡检修复 #7 灰阶统一 */
 
-/* A1 connection edit form */
-.conn-edit { margin-top: 12px; padding: 12px; background: #fafafa; border-radius: 8px; }
-.conn-edit-section { font-size: var(--tims-font-sm); font-weight: 600; color: var(--tims-text); margin: 8px 0; } /* P1 巡检修复 #7 字号/灰阶 */
-.conn-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-.conn-grid label { display: flex; flex-direction: column; font-size: 12px; color: var(--tims-text-2); gap: 2px; } /* P1 巡检修复 #7 灰阶统一 */
-.conn-grid-num { width: 100%; }
+/* MS-11h（seq192 落地令）：源/目标双栏对照卡 + 参数标签行 + 操作区统一。
+   旧 conn-grid/conn-edit 编辑表单形态由双栏卡原位编辑取代（类清除）。 */
+.conn-cards { display: grid; grid-template-columns: 1fr 32px 1fr; gap: 0 12px; align-items: stretch; margin: 12px 0 4px; }
+.conn-side { border: 1px solid var(--el-border-color-light, #e4e7ed); border-radius: 8px; padding: 10px 14px 12px; background: var(--el-fill-color-extra-light, #fafbfc); }
+.conn-side-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px dashed var(--el-border-color-lighter, #ebeef5); }
+.conn-side-title { font-weight: 600; font-size: 13px; }
+.conn-side-type { font-size: var(--tims-font-xs, 12px); color: var(--tims-text-2, #909399); border: 1px solid var(--el-border-color-light, #e4e7ed); border-radius: 4px; padding: 0 6px; line-height: 18px; }
+.conn-field { display: grid; grid-template-columns: 56px 1fr; gap: 8px; align-items: center; padding: 3px 0; font-size: 12px; min-height: 28px; }
+.conn-field > span { color: var(--tims-text-2, #909399); }
+.conn-field-num { width: 100%; }
+.conn-nopwd { color: #cf1322; }
+.conn-flow { display: flex; align-items: center; justify-content: center; color: var(--tims-text-2, #909399); font-size: 18px; }
+.conn-params { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.conn-param { display: inline-flex; align-items: baseline; gap: 6px; border: 1px solid var(--el-border-color-light, #e4e7ed); border-radius: 6px; padding: 3px 10px; font-size: 12px; background: var(--el-bg-color, #fff); }
+.conn-param-k { color: var(--tims-text-2, #909399); }
+.conn-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--el-border-color-lighter, #ebeef5); }
+@media (max-width: 900px) {
+  .conn-cards { grid-template-columns: 1fr; }
+  .conn-flow { transform: rotate(90deg); padding: 2px 0; }
+}
 
 /* A2 precheck panel */
 .precheck-fold { margin-top: 4px; border-bottom: 1px dashed #f0f0f0; }

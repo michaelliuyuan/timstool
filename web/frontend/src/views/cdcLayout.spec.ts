@@ -202,3 +202,71 @@ describe('CDCView pen5 closure (merged-card flash + transient button)', () => {
     expect(src).toContain(`userLeftPrecheckTab = false`)
   })
 })
+
+// MS-11h（seq192 落地令）：连接与配置 tab 观感重构锚——源/目标双栏对照卡 +
+// CDC 参数标签行 + 操作区统一收纳 + 编辑态同构（功能零变动红线：三动作与
+// 既有校验语义原样，仅布局呈现变化）。
+describe('CDCView conn tab layout (MS-11h)', () => {
+  it('H1: source/target dual-column cards with a flow arrow replace the single-column long strings', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<div class="conn-cards">`)
+    expect(src).toContain(`.conn-cards { display: grid; grid-template-columns: 1fr 32px 1fr;`)
+    // two sides + the flow arrow between them
+    expect(src).toContain(`<span class="conn-side-title">源端数据库</span>`)
+    expect(src).toContain(`<span class="conn-side-title">目标端</span>`)
+    expect(src).toContain(`<span class="conn-side-type">TiDB</span>`)
+    expect(src).toContain(`<div class="conn-flow" aria-hidden="true">→</div>`)
+    // the old single-line long-string shapes are gone
+    expect(src).not.toContain(`<span class="detail-label">源端:</span>`)
+    expect(src).not.toContain(`<span class="detail-label">目标端:</span>`)
+    expect(src).not.toContain(`<span class="detail-label">CDC 参数:</span>`)
+    // password stays masked in display, red when unset (has_password semantics)
+    expect(src).toContain(`{{ connCfg.has_password ? '●●●●●●' : '（未设密码）' }}`)
+    expect(src).toContain(`'conn-nopwd': !connCfg.has_password`)
+  })
+
+  it('H2: CDC params render as labeled chips, five facets', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<div class="conn-params">`)
+    for (const k of ['模式', '位点续传', '并发', '冲突策略', 'DDL']) {
+      expect(src).toContain(`<span class="conn-param-k">${k}</span>`)
+    }
+    expect(src).toContain(`{{ connCfg.cdc.sync_ddl ? '同步' : '不同步' }}`)
+  })
+
+  it('H3: actions unified in one row — primary edit, task import, divider, inline ds-import', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<div class="conn-actions" v-if="!editingConn">`)
+    expect(src).toContain(`<el-button type="primary" @click="startEditConn">编辑连接</el-button>`)
+    expect(src).toContain(`@click="importConn" :disabled="busy || isActive"`)
+    expect(src).toContain(`<el-divider direction="vertical" />`)
+    expect(src).toContain(`@click="importFromDS"`)
+    // the old two stacked action rows are gone
+    expect(src).not.toContain(`class="control-actions ds-import"`)
+  })
+
+  it('H4: edit mode is in-place in the same dual-column cards (no separate conn-edit form)', () => {
+    const src = viewSrc()
+    // inputs swap into the same conn-field cells
+    expect(src).toContain(`<el-input v-if="editingConn" v-model="editForm.source.host" size="small" /><code v-else>{{ connCfg.source.host }}</code>`)
+    expect(src).toContain(`<el-input-number v-if="editingConn" v-model="editForm.target.port"`)
+    // keep-stored-password semantics preserved in-place
+    expect(src).toContain(`placeholder="留空保持不变"`)
+    // save/cancel row carries the message line
+    expect(src).toContain(`@click="saveConn" :disabled="savingConn"`)
+    expect(src).toContain(`@click="editingConn = false"`)
+    // the old separate form classes are gone (usage forms; the MS-11h CSS
+    // comment may name them historiographically)
+    expect(src).not.toContain(`class="conn-edit"`)
+    expect(src).not.toContain(`class="conn-edit-section"`)
+    expect(src).not.toContain(`class="conn-grid"`)
+    expect(src).not.toContain(`conn-grid-num`)
+  })
+
+  it('H5: responsive — dual columns stack under 900px and the arrow rotates', () => {
+    const src = viewSrc()
+    expect(src).toContain(`@media (max-width: 900px)`)
+    expect(src).toContain(`.conn-cards { grid-template-columns: 1fr; }`)
+    expect(src).toContain(`.conn-flow { transform: rotate(90deg); padding: 2px 0; }`)
+  })
+})
