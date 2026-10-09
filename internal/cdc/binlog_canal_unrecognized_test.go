@@ -98,9 +98,13 @@ func TestCanalpatchFormAnchors(t *testing.T) {
 	for _, anchor := range []string{
 		// delivery point 1: parse failure (upstream returned nil here)
 		`uh.OnUnrecognizedQuery(ev.Header, pos, e, "parse_error: "+err.Error())`,
-		// delivery point 2: parseable, zero table nodes overall
+		// delivery point 2: parseable, zero table nodes overall; MS-11j —
+		// all-txn-control events (BEGIN/COMMIT/...) stay silent (upstream
+		// parity), only object statements reach the gate.
 		`uh.OnUnrecognizedQuery(ev.Header, pos, e, "no_table_node")`,
-		`if len(stmts) > 0 && nodesTotal == 0 {`,
+		`if len(stmts) > 0 && nodesTotal == 0 && !allTxnControl {`,
+		// MS-11j A-layer classifier (must exist in vendored copy)
+		`func isTxnControlStmt(stmt ast.StmtNode) bool {`,
 		// interface-assertion delivery (opt-in; Dummy keeps upstream behavior)
 		`c.eventHandler.(UnrecognizedQueryHandler)`,
 		// upstream skip log kept (parity for non-implementing handlers)

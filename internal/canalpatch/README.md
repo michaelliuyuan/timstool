@@ -32,6 +32,14 @@ Diff vs upstream v1.11.0 (byte-identical except the lines below):
   interface assertion. Handlers not implementing the interface keep the
   exact upstream behavior; savePos / table-cache / OnDDL seven-type
   semantics are untouched.
+- `sync.go` (MS-11j): zero-node delivery skips events whose statements are
+  ALL transaction-control / session-admin (`isTxnControlStmt`: BeginStmt,
+  CommitStmt, RollbackStmt, SavepointStmt, ReleaseSavepointStmt, SetStmt,
+  UseStmt, FlushStmt, LockTablesStmt, UnlockTablesStmt) — upstream skips
+  them silently; delivering them halted CDC on the first source DML write
+  (`BEGIN [canal 未识别: no_table_node]`, te E2E U5 P0 2026-10-09). Pair
+  anchor: internal/canalpatch/txncontrol_test.go + the B-layer gate entry
+  whitelist in internal/cdc/binlog_canal.go (gateDDLQuery).
 
 ## Maintenance note
 

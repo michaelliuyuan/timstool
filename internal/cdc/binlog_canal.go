@@ -259,6 +259,18 @@ func (h *canalHandler) OnTableChanged(header *replication.EventHeader, schemaNam
 // scan, comment-stripped, admin-whitelisted; details in the comment block
 // above OnDDL).
 func (h *canalHandler) gateDDLQuery(schema, query string) error {
+	// timstool patch (MS-11j, 病灶 B): administrative/transaction-control
+	// statements never carry table-object references — plain-ignore on ALL
+	// paths. Previously the ddlAdminKind whitelist only ran inside the
+	// off-target scan (ddlMentionsTargetDB); on-target admin statements
+	// fell straight to the halt (te E2E U5: BEGIN at schema==target).
+	if ddlAdminKind.MatchString(ddlStripComments(query)) {
+		h.s.log.Info("binlog source: admin/txn-control query ignored at gate",
+			zap.String("schema", schema),
+			zap.String("target", h.s.cfg.Database),
+			zap.String("query", ddlQuerySummary(query)))
+		return nil
+	}
 	target := h.s.cfg.Database
 	if schema == "" || !strings.EqualFold(schema, target) {
 		if ddlMentionsTargetDB(query, target) {
@@ -318,6 +330,7 @@ func (h *canalHandler) OnUnrecognizedQuery(header *replication.EventHeader, next
 // (fail-open — adversarial red, seq38).
 var ddlAdminKind = regexp.MustCompile(`(?is)^[ \t\r\n]*(` +
 	`SET|USE|GRANT|REVOKE|FLUSH|RESET|KILL|SAVEPOINT|RELEASE|ROLLBACK|BEGIN|COMMIT|START|LOCK|UNLOCK` +
+	`|XA` + // MS-11j ②: XA has no AST type (parse_error face) — word-level B-layer catch
 	`|(CREATE|ALTER|DROP)[ \t\r\n]+(USER|ROLE|DATABASE|SCHEMA|LOGFILE[ \t\r\n]+GROUP|SERVER|TABLESPACE)` +
 	`)\b`)
 

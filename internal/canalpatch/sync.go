@@ -160,7 +160,11 @@ func (c *Canal) handleEvent(ev *replication.BinlogEvent) error {
 			savePos = true
 		}
 		nodesTotal := 0
+		allTxnControl := len(stmts) > 0
 		for _, stmt := range stmts {
+			if !isTxnControlStmt(stmt) {
+				allTxnControl = false
+			}
 			nodes := parseStmt(stmt)
 			nodesTotal += len(nodes)
 			for _, node := range nodes {
@@ -184,7 +188,12 @@ func (c *Canal) handleEvent(ev *replication.BinlogEvent) error {
 		// no handler and leaves not even a log line. Delivered to the same
 		// additive face; MySQL logs each DDL as its own Query event, so a
 		// per-event total (not per-stmt) is the correct granularity.
-		if len(stmts) > 0 && nodesTotal == 0 {
+		// timstool patch (MS-11j): transaction-control/session-admin
+		// statements are zero-table-node BY DESIGN (BEGIN opens every
+		// row-based DML transaction) — upstream skips them silently and
+		// they must NOT be delivered (P0 2026-10-09: first source write
+		// halted CDC with "BEGIN [canal 未识别: no_table_node]").
+		if len(stmts) > 0 && nodesTotal == 0 && !allTxnControl {
 			if uh, ok := c.eventHandler.(UnrecognizedQueryHandler); ok {
 				if uerr := uh.OnUnrecognizedQuery(ev.Header, pos, e, "no_table_node"); uerr != nil {
 					return errors.Trace(uerr)
@@ -213,6 +222,33 @@ func (c *Canal) handleEvent(ev *replication.BinlogEvent) error {
 type node struct {
 	db    string
 	table string
+}
+
+// timstool patch (MS-11j): transaction-control and session-admin
+// statements parse with zero table nodes BY DESIGN (BEGIN opens every
+// row-based DML transaction in the binlog). Upstream skips them silently;
+// the pen-1 zero-node delivery point must not route them to the host DDL
+// gate (P0 2026-10-09: first source write halted CDC with
+// "BEGIN [canal 未识别: no_table_node]").
+//
+// Rulings on the remaining zero-node AST types (leader seq278 ①, full
+// audit): session/read-only/utility shapes — PREPARE/EXECUTE/DEALLOCATE
+// (binlog logs the rewritten statement text, not the EXECUTE form),
+// DO/SHOW/HELP/BINLOG — join the whitelist; CallStmt stays DELIVERED
+// (procedure bodies are opaque and may carry DDL — fail-closed). XA has
+// no AST type (parse_error face) and is handled by the B-layer word
+// whitelist in internal/cdc (ddlAdminKind).
+func isTxnControlStmt(stmt ast.StmtNode) bool {
+	switch stmt.(type) {
+	case *ast.BeginStmt, *ast.CommitStmt, *ast.RollbackStmt,
+		*ast.SavepointStmt, *ast.ReleaseSavepointStmt,
+		*ast.SetStmt, *ast.UseStmt, *ast.FlushStmt,
+		*ast.LockTablesStmt, *ast.UnlockTablesStmt,
+		*ast.PrepareStmt, *ast.ExecuteStmt, *ast.DeallocateStmt,
+		*ast.DoStmt, *ast.ShowStmt, *ast.HelpStmt, *ast.BinlogStmt:
+		return true
+	}
+	return false
 }
 
 func parseStmt(stmt ast.StmtNode) (ns []*node) {
