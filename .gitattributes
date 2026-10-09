@@ -1,0 +1,19 @@
+# MS-11k: repo-wide LF pin (anchor reproducibility root-cure).
+# Git for Windows defaults autocrlf=true -> fresh clones check out CRLF,
+# which go:embed embeds raw (bundle pollution, same-size/different-hash
+# anchors — the 56DC6ABA incident). eol=lf forces LF working trees in ANY
+# clone form; starter set = embed-relevant faces (static/* wildcard embeds
+# html/js/css/svg; *.svg and the lightning stub gaps were found by the MS-11k
+# decisive-clone experiment; woff2 fonts are binary-auto-detected, never
+# converted; go.mod/go.sum proved build-output-neutral by experiment).
+*.go text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.svg text eol=lf
+# embedded as-is by //go:embed (internal/lightning/embed.go): must stay
+# byte-exact blob. CRLF smudge (+1B "\r") both drifts the build AND breaks
+# the "placeholder\n" sentinel (HasEmbedded false-positive). binary macro
+# = -text: no EOL conversion ever; safe if ever swapped for the real
+# lightning ELF binary.
+internal/lightning/tidb-lightning binary
