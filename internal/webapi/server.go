@@ -2026,16 +2026,16 @@ func (s *Server) buildTaskReport(task *store.Task) *reporter.Report {
 				TargetRows: tc.RowsDone,
 				Duration:   "",
 			}
-		if !tc.FinishedAt.IsZero() && !tc.StartedAt.IsZero() {
-			// MS-11o A2: legacy rows can carry FinishedAt before StartedAt
-			// (clock oddities) — clamp the display side to 0, mirroring
-			// taskElapsedSeconds, instead of rendering a negative duration.
-			d := tc.FinishedAt.Sub(tc.StartedAt)
-			if d < 0 {
-				d = 0
+			if !tc.FinishedAt.IsZero() && !tc.StartedAt.IsZero() {
+				// MS-11o A2: legacy rows can carry FinishedAt before StartedAt
+				// (clock oddities) — clamp the display side to 0, mirroring
+				// taskElapsedSeconds, instead of rendering a negative duration.
+				d := tc.FinishedAt.Sub(tc.StartedAt)
+				if d < 0 {
+					d = 0
+				}
+				tr.Duration = reporter.FormatDuration(d)
 			}
-			tr.Duration = reporter.FormatDuration(d)
-		}
 			switch tc.State {
 			case checkpoint.StateCompleted:
 				tr.Status = reporter.StatusPass
@@ -2242,16 +2242,16 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 				}
 				pi.Warn = rec.Warn
 				pi.Error = rec.Error
-			if !rec.StartedAt.IsZero() && !rec.FinishedAt.IsZero() {
-				// MS-11o A2: same negative-clamp as the report table face —
-				// a phase record with FinishedAt before StartedAt renders 0,
-				// never a negative duration.
-				d := rec.FinishedAt.Sub(rec.StartedAt)
-				if d < 0 {
-					d = 0
+				if !rec.StartedAt.IsZero() && !rec.FinishedAt.IsZero() {
+					// MS-11o A2: same negative-clamp as the report table face —
+					// a phase record with FinishedAt before StartedAt renders 0,
+					// never a negative duration.
+					d := rec.FinishedAt.Sub(rec.StartedAt)
+					if d < 0 {
+						d = 0
+					}
+					pi.Duration = d.Seconds()
 				}
-				pi.Duration = d.Seconds()
-			}
 			}
 		} else if task.Status == "completed" {
 			pi.Status = "completed"

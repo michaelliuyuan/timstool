@@ -373,30 +373,30 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context, pipelineCfg PipelineCon
 						nextIdx++
 					}
 				}
-		}); err != nil {
-			// Chain aborted mid-export (MS-11o A1): the sequentially
-			// pre-stamped Running table never reaches a terminal state on
-			// this path — without a terminal stamp it stays Running forever
-			// and the migration report renders it as skip, masking the
-			// failure. Stamp every still-Running table failed with the
-			// abort error (state check under the checkpoint lock so a table
-			// that legitimately completed before the break keeps its honest
-			// green). The stamp mirrors MarkTableFailed semantics.
-			if o.cpMgr != nil {
-				abortErr := fmt.Sprintf("export aborted: %v", err)
-				for _, t := range cir.Tables {
-					_ = o.cpMgr.UpdateTable(t.Name, func(tc *checkpoint.TableCheckpoint) {
-						if tc.State == checkpoint.StateRunning {
-							tc.State = checkpoint.StateFailed
-							tc.Error = abortErr
-							tc.FinishedAt = time.Now()
-						}
-					})
+			}); err != nil {
+				// Chain aborted mid-export (MS-11o A1): the sequentially
+				// pre-stamped Running table never reaches a terminal state on
+				// this path — without a terminal stamp it stays Running forever
+				// and the migration report renders it as skip, masking the
+				// failure. Stamp every still-Running table failed with the
+				// abort error (state check under the checkpoint lock so a table
+				// that legitimately completed before the break keeps its honest
+				// green). The stamp mirrors MarkTableFailed semantics.
+				if o.cpMgr != nil {
+					abortErr := fmt.Sprintf("export aborted: %v", err)
+					for _, t := range cir.Tables {
+						_ = o.cpMgr.UpdateTable(t.Name, func(tc *checkpoint.TableCheckpoint) {
+							if tc.State == checkpoint.StateRunning {
+								tc.State = checkpoint.StateFailed
+								tc.Error = abortErr
+								tc.FinishedAt = time.Now()
+							}
+						})
+					}
 				}
+				o.finishPhase("data", err, false)
+				return nil, fmt.Errorf("source-cir: load data: %w", err)
 			}
-			o.finishPhase("data", err, false)
-			return nil, fmt.Errorf("source-cir: load data: %w", err)
-		}
 		} else {
 			// Dumpling produced CSVs directly; run lightning import (CSVs already in
 			// tempDir). Report real per-table row counts from the dumped CSVs so the

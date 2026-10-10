@@ -310,8 +310,8 @@ func (r *Report) ToHTML() string {
 			if durStr == "" {
 				durStr = "—"
 			}
-		sb.WriteString(fmt.Sprintf(`<tr><td class="num">%d</td><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%d</td><td class="num">%d</td><td class="num">%s</td><td class="num">%s</td><td>%s</td></tr>`,
-			i+1, htmlEsc(t.TableName), htmlEsc(badgeClass), htmlEsc(statusCN(string(t.Status))), t.SourceRows, t.TargetRows, diffStr, htmlEsc(durStr), errStr))
+			sb.WriteString(fmt.Sprintf(`<tr><td class="num">%d</td><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%d</td><td class="num">%d</td><td class="num">%s</td><td class="num">%s</td><td>%s</td></tr>`,
+				i+1, htmlEsc(t.TableName), htmlEsc(badgeClass), htmlEsc(statusCN(string(t.Status))), t.SourceRows, t.TargetRows, diffStr, htmlEsc(durStr), errStr))
 		}
 		sb.WriteString(`</tbody></table></div>`)
 	}
