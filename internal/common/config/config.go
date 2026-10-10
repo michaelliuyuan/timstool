@@ -227,31 +227,31 @@ func (t TargetConfig) DSNPinnedUTC() string {
 }
 
 type MigrationConfig struct {
-	Parallel            int      `yaml:"parallel"`
-	BatchSize           int      `yaml:"batch_size"`
-	TempDir             string   `yaml:"temp_dir"`
-	Tables              []string `yaml:"tables"`
-	ExcludeTables       []string `yaml:"exclude_tables"`
-	UseLightning        bool     `yaml:"use_lightning"`
-	LightningPath       string   `yaml:"lightning_path" json:"lightning_path"` // explicit tidb-lightning binary; empty = auto-discover (PATH → embedded)
+	Parallel      int      `yaml:"parallel"`
+	BatchSize     int      `yaml:"batch_size"`
+	TempDir       string   `yaml:"temp_dir"`
+	Tables        []string `yaml:"tables"`
+	ExcludeTables []string `yaml:"exclude_tables"`
+	UseLightning  bool     `yaml:"use_lightning"`
+	LightningPath string   `yaml:"lightning_path" json:"lightning_path"` // explicit tidb-lightning binary; empty = auto-discover (PATH → embedded)
 	// UseDumpling (MS-11p): MySQL export-side fast-path switch. Off (default)
 	// = current behavior byte-identical (auto-discovery + stream fallback).
 	// On = explicit choice: an unresolvable path or a failed dump FAILS the
 	// task — never a silent swap to the stream path.
-	UseDumpling  bool   `yaml:"use_dumpling" json:"use_dumpling"`
-	DumplingPath string `yaml:"dumpling_path" json:"dumpling_path"` // explicit tidb-dumpling binary; empty = auto-discover (PATH → common locations)
-	OnError             string   `yaml:"on_error"`
-	CheckpointDir       string   `yaml:"checkpoint_dir"`
-	ReadTimeout         string   `yaml:"read_timeout"`
-	WriteTimeout        string   `yaml:"write_timeout"`
-	TargetPolicy        string   `yaml:"target_policy"` // insert, truncate, drop
-	LargeTableThreshold int64    `yaml:"large_table_threshold" json:"largeTableThreshold"`
-	ChunkSize           int64    `yaml:"chunk_size" json:"chunkSize"`
-	ChunkParallel       int      `yaml:"chunk_parallel" json:"chunkParallel"`
-	SkipPrecheck        bool     `yaml:"skip_precheck" json:"skipPrecheck"`
-	SkipSchema          bool     `yaml:"skip_schema" json:"skipSchema"`
-	SkipData            bool     `yaml:"skip_data" json:"skipData"`
-	SkipValidate        bool     `yaml:"skip_validate" json:"skipValidate"`
+	UseDumpling         bool   `yaml:"use_dumpling" json:"use_dumpling"`
+	DumplingPath        string `yaml:"dumpling_path" json:"dumpling_path"` // explicit tidb-dumpling binary; empty = auto-discover (PATH → common locations)
+	OnError             string `yaml:"on_error"`
+	CheckpointDir       string `yaml:"checkpoint_dir"`
+	ReadTimeout         string `yaml:"read_timeout"`
+	WriteTimeout        string `yaml:"write_timeout"`
+	TargetPolicy        string `yaml:"target_policy"` // insert, truncate, drop
+	LargeTableThreshold int64  `yaml:"large_table_threshold" json:"largeTableThreshold"`
+	ChunkSize           int64  `yaml:"chunk_size" json:"chunkSize"`
+	ChunkParallel       int    `yaml:"chunk_parallel" json:"chunkParallel"`
+	SkipPrecheck        bool   `yaml:"skip_precheck" json:"skipPrecheck"`
+	SkipSchema          bool   `yaml:"skip_schema" json:"skipSchema"`
+	SkipData            bool   `yaml:"skip_data" json:"skipData"`
+	SkipValidate        bool   `yaml:"skip_validate" json:"skipValidate"`
 
 	// CDCChain (Full+Incremental Chaining): when true, the task pre-creates the
 	// CDC publication + replication slot BEFORE the full migration starts (so
