@@ -234,6 +234,12 @@ type MigrationConfig struct {
 	ExcludeTables       []string `yaml:"exclude_tables"`
 	UseLightning        bool     `yaml:"use_lightning"`
 	LightningPath       string   `yaml:"lightning_path" json:"lightning_path"` // explicit tidb-lightning binary; empty = auto-discover (PATH → embedded)
+	// UseDumpling (MS-11p): MySQL export-side fast-path switch. Off (default)
+	// = current behavior byte-identical (auto-discovery + stream fallback).
+	// On = explicit choice: an unresolvable path or a failed dump FAILS the
+	// task — never a silent swap to the stream path.
+	UseDumpling  bool   `yaml:"use_dumpling" json:"use_dumpling"`
+	DumplingPath string `yaml:"dumpling_path" json:"dumpling_path"` // explicit tidb-dumpling binary; empty = auto-discover (PATH → common locations)
 	OnError             string   `yaml:"on_error"`
 	CheckpointDir       string   `yaml:"checkpoint_dir"`
 	ReadTimeout         string   `yaml:"read_timeout"`

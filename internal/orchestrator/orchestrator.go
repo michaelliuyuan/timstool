@@ -38,6 +38,7 @@ var (
 	cirRunLightning      = target.RunLightningImport
 	cirValidateMigration = target.ValidateMigration
 	cirFindDumpling      = dumpling.FindBinary
+	cirDumpDumpling      = dumpling.Dump
 	cirPrecheck          = cirPrecheckProbe
 )
 
@@ -329,11 +330,35 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context, pipelineCfg PipelineCon
 		}
 		defer os.RemoveAll(tempDir)
 
-		// Export mode: dumpling (fast-path, concurrent+snapshot) if binary available;
-		// otherwise stream (per-row CIR DataReader → CSV). Design §3.
+		// Export mode: dumpling (fast-path, concurrent+snapshot) if a binary
+		// resolves; otherwise stream (per-row CIR DataReader → CSV). Design
+		// §3. MS-11p: resolution now starts from the user's configured path
+		// (empty = discovery chain), and use_dumpling=true makes the choice
+		// EXPLICIT — an unresolvable path or a failed dump then FAILS the
+		// task instead of silently swapping to stream (failure semantics A).
+		// Switch off (default) keeps the original behavior byte-for-byte.
 		exportMode := "stream"
 		if srcType == "mysql" {
-			if bin := cirFindDumpling(""); bin != "" {
+			bin := cirFindDumpling(o.cfg.Migration.DumplingPath)
+			if o.cfg.Migration.UseDumpling {
+				// Explicit choice: resolution must land on the binary the
+				// user asked for. Empty = nothing resolvable anywhere; a
+				// non-empty result that differs from a configured path means
+				// the configured path was unusable and discovery substituted
+				// another binary — a typo must fail loudly, never silently
+				// run a different dumpling.
+				if bin == "" {
+					err := fmt.Errorf("source-cir: use_dumpling=true: tidb-dumpling 未找到（配置路径 %q 不可用，PATH/常见部署位自动发现失败）——显式选择不静默换路，任务失败", o.cfg.Migration.DumplingPath)
+					o.finishPhase("data", err, false)
+					return nil, err
+				}
+				if p := o.cfg.Migration.DumplingPath; p != "" && bin != p {
+					err := fmt.Errorf("source-cir: use_dumpling=true: 配置的 dumpling 路径 %q 不可用（自动发现解析到 %q）——拒绝静默替换，请修正路径后重试", p, bin)
+					o.finishPhase("data", err, false)
+					return nil, err
+				}
+			}
+			if bin != "" {
 				exportMode = "dumpling"
 				log.Info("source-cir: using dumpling export (fast-path)", zap.String("binary", bin))
 				// Dumpling exports CSV directly to tempDir; LoadData then imports via lightning.
@@ -341,8 +366,40 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context, pipelineCfg PipelineCon
 				for i, t := range cir.Tables {
 					tableNames[i] = o.cfg.Source.Database + "." + t.Name
 				}
-				if err := dumpling.Dump(ctx, dumpling.DumpFromConfig(o.cfg.Source, tempDir, bin, tableNames)); err != nil {
-					// Fall back to stream on dumpling failure.
+				// Pool ①② honest accounting: chained per-table start stamps
+				// (MS-11n stream-path chain shape) — table 0 starts now,
+				// table k starts when table k-1 reaches a terminal state in
+				// the accounting loop below, so the monolithic dump gains
+				// per-table StartedAt truth.
+				if o.cpMgr != nil && len(cir.Tables) > 0 {
+					o.cpMgr.GetOrCreateTable(cir.Tables[0].Name, 0)
+					_ = o.cpMgr.MarkTableRunning(cir.Tables[0].Name)
+				}
+				if err := cirDumpDumpling(ctx, dumpling.DumpFromConfig(o.cfg.Source, tempDir, bin, tableNames)); err != nil {
+					if o.cfg.Migration.UseDumpling {
+						// Semantics A: the explicit choice failed — stamp the
+						// still-Running table failed (A1 sweep shape) and
+						// fail the task. No stream fallback.
+						if o.cpMgr != nil {
+							abortErr := fmt.Sprintf("export aborted: dumpling export failed: %v", err)
+							for _, t := range cir.Tables {
+								_ = o.cpMgr.UpdateTable(t.Name, func(tc *checkpoint.TableCheckpoint) {
+									if tc.State == checkpoint.StateRunning {
+										tc.State = checkpoint.StateFailed
+										tc.Error = abortErr
+										tc.FinishedAt = time.Now()
+									}
+								})
+							}
+						}
+						err = fmt.Errorf("source-cir: dumpling export failed (use_dumpling=true, 不回退 stream): %w", err)
+						o.finishPhase("data", err, false)
+						return nil, err
+					}
+					// Fall back to stream on dumpling failure (switch-off
+					// default, unchanged). The stream chain re-stamps each
+					// table Running as it actually starts, so the pre-stamp
+					// above converges honestly.
 					log.Warn("source-cir: dumpling failed, falling back to stream", zap.Error(err))
 					exportMode = "stream"
 				}
@@ -398,24 +455,47 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context, pipelineCfg PipelineCon
 				return nil, fmt.Errorf("source-cir: load data: %w", err)
 			}
 		} else {
-			// Dumpling produced CSVs directly; run lightning import (CSVs already in
-			// tempDir). Report real per-table row counts from the dumped CSVs so the
-			// progress layer/UI shows the true figure — the stream path gets counts
-			// from exportTableCSV's callback, but dumpling writes files directly and
-			// bypasses it, so without this the UI reports "0 rows migrated" even
-			// though Lightning loaded everything. See #t83.
+			// Dumpling produced CSVs directly; run lightning import (CSVs already
+			// in tempDir). MS-11p pool ①②: per-table EVIDENCE accounting — a
+			// table only turns green if THIS dump actually wrote its CSV (the
+			// MS-11n lesion stamped every table completed unconditionally, so
+			// a partial dump masked itself green); a table with no CSV is
+			// stamped failed and keeps that state until a later dump really
+			// exports it. Row counts still come from the CSVs themselves so
+			// the UI shows true figures (see #t83).
 			bareTables := make([]string, len(cir.Tables))
 			for i, t := range cir.Tables {
 				bareTables[i] = t.Name
 			}
 			rowCounts := dumpling.CountExportedRows(tempDir, o.cfg.Source.Database, bareTables)
-			for _, t := range cir.Tables {
+			exported := dumpling.ExportedTables(tempDir, o.cfg.Source.Database, bareTables)
+			for i, t := range cir.Tables {
 				rows := rowCounts[t.Name]
 				if o.cpMgr != nil {
 					o.cpMgr.GetOrCreateTable(t.Name, rows)
-					_ = o.cpMgr.MarkTableCompleted(t.Name, rows)
+					if exported[t.Name] {
+						// Honest green: a previously failed table flips with
+						// a NEW stamp and its stale error cleared
+						// (checkpoint layer); an already completed table
+						// keeps its FIRST completion stamp (sticky guard).
+						_ = o.cpMgr.MarkTableCompleted(t.Name, rows)
+					} else {
+						// No CSV for this table = this dump never exported
+						// it — never a green stamp without evidence.
+						_ = o.cpMgr.MarkTableFailed(t.Name, "dumpling produced no CSV for this table (not exported by this dump)")
+					}
+					// Chain the next table's start stamp at this table's
+					// terminal state (MS-11n stream-path chain shape).
+					if i+1 < len(cir.Tables) {
+						o.cpMgr.GetOrCreateTable(cir.Tables[i+1].Name, 0)
+						_ = o.cpMgr.MarkTableRunning(cir.Tables[i+1].Name)
+					}
 				}
-				log.Info("source-cir: dumpling exported table", zap.String("table", t.Name), zap.Int64("rows", rows))
+				if exported[t.Name] {
+					log.Info("source-cir: dumpling exported table", zap.String("table", t.Name), zap.Int64("rows", rows))
+				} else {
+					log.Warn("source-cir: dumpling produced no CSV for table", zap.String("table", t.Name))
+				}
 			}
 			if o.cpMgr != nil {
 				_ = o.cpMgr.SetSubPhase("data", "data-import")

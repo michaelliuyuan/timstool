@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"go.uber.org/zap"
@@ -218,4 +219,86 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// versionTimeout bounds the `<path> --version` probe. Package-level so tests
+// can shrink it (the timeout shape needs to be anchored without waiting the
+// real 5s).
+var versionTimeout = 5 * time.Second
+
+// SetVersionTimeout overrides the --version probe timeout and returns a
+// restore func (test seam; production default stays 5s).
+func SetVersionTimeout(d time.Duration) func() {
+	prev := versionTimeout
+	versionTimeout = d
+	return func() { versionTimeout = prev }
+}
+
+// Version runs `<binary> --version` and returns the trimmed first output line
+// — live evidence that the path is truly executable (MS-11p: dumpling has no
+// embedded fallback, so a real version string is the only honest proof the
+// binary runs on THIS machine). A hung or wedged binary fails at the timeout
+// instead of hanging the wizard request.
+func Version(ctx context.Context, binary string) (string, error) {
+	c, cancel := context.WithTimeout(ctx, versionTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(c, binary, "--version")
+	cmd.Env = append(os.Environ(), "NO_COLOR=1", "TERM=dumb")
+	out, err := cmd.CombinedOutput()
+	line := strings.TrimSpace(string(out))
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = strings.TrimSpace(line[:i])
+	}
+	if c.Err() != nil {
+		return line, fmt.Errorf("--version timed out after %s: %w", versionTimeout, c.Err())
+	}
+	if err != nil {
+		return line, fmt.Errorf("--version failed: %w%s", err, tailHint(out))
+	}
+	if line == "" {
+		return "", fmt.Errorf("--version produced no output")
+	}
+	return line, nil
+}
+
+// tailHint renders a short output tail for error messages (bounded like
+// Dump's).
+func tailHint(out []byte) string {
+	s := strings.TrimSpace(string(out))
+	if len(s) > 400 {
+		s = s[len(s)-400:]
+	}
+	if s != "" {
+		return "\n--- output tail ---\n" + s
+	}
+	return ""
+}
+
+// ExportedTables reports which of tables have at least one dumped CSV in dir
+// (files named {database}.{table}.*.csv). Post-dump per-table evidence for
+// honest checkpoint accounting (MS-11p pool ①②): a table with no CSV was not
+// exported by THIS dump whatever the exit code implied, and must not be
+// stamped completed.
+func ExportedTables(dir, database string, tables []string) map[string]bool {
+	have := make(map[string]bool, len(tables))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return have
+	}
+	prefix := make(map[string]string, len(tables))
+	for _, t := range tables {
+		prefix[t] = database + "." + t + "."
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".csv") {
+			continue
+		}
+		for t, p := range prefix {
+			if strings.HasPrefix(e.Name(), p) {
+				have[t] = true
+				break
+			}
+		}
+	}
+	return have
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/common/logger"
 	"github.com/michaelliuyuan/timstool/internal/common/reporter"
 	"github.com/michaelliuyuan/timstool/internal/common/version"
+	"github.com/michaelliuyuan/timstool/internal/dumpling"
 	"github.com/michaelliuyuan/timstool/internal/lightning"
 	"github.com/michaelliuyuan/timstool/internal/orchestrator"
 	"github.com/michaelliuyuan/timstool/internal/source"
@@ -300,6 +301,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 				r.Post("/test", s.handleTestDataSource)
 			})
 			r.Post("/validate-lightning", s.handleValidateLightning)
+			r.Post("/validate-dumpling", s.handleValidateDumpling)
 			// Migration options persistence (迁移选项记忆): server-side single
 			// source of truth so the wizard can prefill last-used Lightning path /
 			// temp dir across sessions, browsers, and service restarts.
@@ -884,6 +886,8 @@ type MigrationOptsBody struct {
 	ExcludeTables     []string `json:"exclude_tables"`
 	UseLightning      bool     `json:"use_lightning"`
 	LightningPath     string   `json:"lightning_path"`
+	UseDumpling       bool     `json:"use_dumpling"`
+	DumplingPath      string   `json:"dumpling_path"`
 	SkipPrecheck      bool     `json:"skip_precheck"`
 	SkipSchema        bool     `json:"skip_schema"`
 	SkipData          bool     `json:"skip_data"`
@@ -955,6 +959,90 @@ func (s *Server) handleValidateLightning(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+// webapiFindDumpling / webapiDumplingVersion are the validate-dumpling
+// handler seams (MS-11p): unit anchors fake discovery and the version probe
+// without a real tidb-dumpling on the machine.
+var (
+	webapiFindDumpling    = dumpling.FindBinary
+	webapiDumplingVersion = dumpling.Version
+)
+
+// validateDumplingRequest is the body for POST /api/validate-dumpling.
+// Mirror of the Lightning path gate with the MS-11p enhancement: an empty
+// path probes auto-discovery (PATH → common locations), a non-empty path
+// must exist, be a regular file, and (on unix) carry the x-bit. Passing
+// that, the handler runs `<path> --version` (5s timeout) and returns the
+// REAL version string — dumpling has no embedded fallback, so the live
+// probe is the only honest evidence the binary executes on this machine.
+type validateDumplingRequest struct {
+	Path string `json:"path"`
+}
+
+type validateDumplingResponse struct {
+	Success      bool   `json:"success"`
+	Message      string `json:"message"`
+	ResolvedPath string `json:"resolved_path"`
+	Version      string `json:"version,omitempty"`
+}
+
+func (s *Server) handleValidateDumpling(w http.ResponseWriter, r *http.Request) {
+	var req validateDumplingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	path := strings.TrimSpace(req.Path)
+	if path == "" {
+		resolved := webapiFindDumpling("")
+		if resolved == "" {
+			s.writeJSON(w, http.StatusOK, validateDumplingResponse{
+				Success: false,
+				Message: "未配置 dumpling 路径，且自动发现失败：PATH 中无 tidb-dumpling/dumpling，常见部署位也无",
+			})
+			return
+		}
+		path = resolved
+	} else {
+		fi, err := os.Stat(path)
+		if err != nil {
+			s.writeJSON(w, http.StatusOK, validateDumplingResponse{Success: false, Message: fmt.Sprintf("路径不存在：%s", path)})
+			return
+		}
+		if fi.IsDir() {
+			s.writeJSON(w, http.StatusOK, validateDumplingResponse{Success: false, Message: "路径是目录，需要指向 tidb-dumpling 可执行文件"})
+			return
+		}
+		if runtime.GOOS != "windows" && fi.Mode()&0111 == 0 {
+			s.writeJSON(w, http.StatusOK, validateDumplingResponse{Success: false, Message: "文件存在但没有执行权限（需要 x 位，Linux 上 chmod +x）"})
+			return
+		}
+	}
+
+	// Live probe (探真): the version string is the evidence the binary
+	// truly runs — a broken ELF or wrong-arch download fails HERE, not
+	// mid-migration.
+	ver, err := webapiDumplingVersion(r.Context(), path)
+	if err != nil {
+		msg := fmt.Sprintf("tidb-dumpling 路径校验通过但 --version 探真失败：%v", err)
+		if ver != "" {
+			msg += fmt.Sprintf("（输出：%s）", ver)
+		}
+		s.writeJSON(w, http.StatusOK, validateDumplingResponse{Success: false, Message: msg, ResolvedPath: path})
+		return
+	}
+	auto := ""
+	if strings.TrimSpace(req.Path) == "" {
+		auto = "（自动发现）"
+	}
+	s.writeJSON(w, http.StatusOK, validateDumplingResponse{
+		Success:      true,
+		Message:      fmt.Sprintf("tidb-dumpling 验证通过%s：%s", auto, ver),
+		ResolvedPath: path,
+		Version:      ver,
+	})
+}
+
 // migrationOptionsBody is the persisted shape of the wizard's migration
 // options step (temp_dir / use_lightning / lightning_path, plus the
 // target-cluster-only extras pd_addr / status_port — host/port/user/
@@ -963,6 +1051,8 @@ type migrationOptionsBody struct {
 	TempDir       string `json:"temp_dir"`
 	UseLightning  bool   `json:"use_lightning"`
 	LightningPath string `json:"lightning_path"`
+	UseDumpling   bool   `json:"use_dumpling"`
+	DumplingPath  string `json:"dumpling_path"`
 	PDAddr        string `json:"pd_addr,omitempty"`
 	StatusPort    int    `json:"status_port,omitempty"`
 }
@@ -1016,6 +1106,7 @@ func (s *Server) handlePutMigrationOptions(w http.ResponseWriter, r *http.Reques
 	// whitespace-only temp_dir cannot slip past validation and be stored raw.
 	req.TempDir = strings.TrimSpace(req.TempDir)
 	req.LightningPath = strings.TrimSpace(req.LightningPath)
+	req.DumplingPath = strings.TrimSpace(req.DumplingPath)
 	// Empty pd_addr means "clear the remembered address"; status_port must be
 	// a valid port number (0 = not provided / skip probing).
 	// A1: strip an optional scheme prefix and trailing slash so the stored
@@ -1056,6 +1147,25 @@ func (s *Server) handlePutMigrationOptions(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	}
+	// MS-11p: same gate shape for the dumpling export-side path — an
+	// explicit path saved with the switch on must exist and be usable, so a
+	// broken path cannot be persisted into a task that would then fail at
+	// run time (semantics A: fail EARLY, at save time, with a 400).
+	if req.UseDumpling && req.DumplingPath != "" {
+		fi, err := os.Stat(req.DumplingPath)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("dumpling 路径不存在：%s", req.DumplingPath))
+			return
+		}
+		if fi.IsDir() {
+			s.writeError(w, http.StatusBadRequest, "dumpling 路径是目录，需要指向 tidb-dumpling 可执行文件")
+			return
+		}
+		if runtime.GOOS != "windows" && fi.Mode()&0111 == 0 {
+			s.writeError(w, http.StatusBadRequest, "dumpling 文件存在但没有执行权限（需要 x 位，Linux 上 chmod +x）")
+			return
+		}
+	}
 
 	// Merge with the previously saved options: only fields explicitly present
 	// in the request body are applied; absent fields keep their saved values.
@@ -1068,6 +1178,12 @@ func (s *Server) handlePutMigrationOptions(w http.ResponseWriter, r *http.Reques
 	}
 	if _, ok := presence["lightning_path"]; ok {
 		merged.LightningPath = req.LightningPath
+	}
+	if _, ok := presence["use_dumpling"]; ok {
+		merged.UseDumpling = req.UseDumpling
+	}
+	if _, ok := presence["dumpling_path"]; ok {
+		merged.DumplingPath = req.DumplingPath
 	}
 	if _, ok := presence["pd_addr"]; ok {
 		merged.PDAddr = req.PDAddr
@@ -1199,6 +1315,8 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 			ExcludeTables: req.Opts.ExcludeTables,
 			UseLightning:  req.Opts.UseLightning,
 			LightningPath: req.Opts.LightningPath,
+			UseDumpling:   req.Opts.UseDumpling,
+			DumplingPath:  req.Opts.DumplingPath,
 			TempDir:       req.Opts.TempDir,
 			CheckpointDir: fmt.Sprintf(".checkpoint/%s", task.ID),
 			OnError:       "abort",
@@ -2009,6 +2127,8 @@ func (s *Server) buildTaskReport(task *store.Task) *reporter.Report {
 	switch {
 	case cfg.Migration.CDCChain:
 		report.Mode = "全量+增量衔接（CDC chain）"
+	case cfg.Migration.UseDumpling:
+		report.Mode = "Dumpling 导出 + Lightning 离线导入"
 	case cfg.Migration.UseLightning:
 		report.Mode = "Lightning 离线导入"
 	default:

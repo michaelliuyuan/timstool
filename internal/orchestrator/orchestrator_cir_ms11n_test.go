@@ -118,11 +118,12 @@ func TestRunSourceCIRStreamStampsPerTableStart(t *testing.T) {
 	}
 }
 
-// TestRunSourceCIRDumplingLeavesStartEmptyNote: the dumpling branch has no
-// per-table start point (monolithic dump — dumpling.Dump is not seamed, so
-// this shape is anchored at the checkpoint layer instead: see
+// TestRunSourceCIRDumplingLeavesStartEmptyNote: HISTORICAL (MS-11n shape,
+// superseded by MS-11p): the dumpling branch originally had no per-table
+// start point (monolithic dump, only GetOrCreateTable+MarkTableCompleted, so
+// StartedAt stayed zero and the report showed an honest "—"). MS-11p pool ①②
+// replaced this with chained per-table Running pre-stamps + evidence-based
+// terminal stamps — see orchestrator_cir_ms11p_test.go. The checkpoint-layer
+// anchor for the zero-start shape stays valid:
 // TestMarkTableCompletedWithoutRunningLeavesStartEmpty in
-// internal/common/checkpoint/checkpoint_ms11n_test.go). The orchestrator's
-// dumpling loop deliberately calls only GetOrCreateTable+MarkTableCompleted,
-// so StartedAt stays zero and the report shows an honest "—" (reporter's
-// dash anchor).
+// internal/common/checkpoint/checkpoint_ms11n_test.go.
