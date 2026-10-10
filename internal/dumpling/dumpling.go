@@ -273,32 +273,3 @@ func tailHint(out []byte) string {
 	}
 	return ""
 }
-
-// ExportedTables reports which of tables have at least one dumped CSV in dir
-// (files named {database}.{table}.*.csv). Post-dump per-table evidence for
-// honest checkpoint accounting (MS-11p pool ①②): a table with no CSV was not
-// exported by THIS dump whatever the exit code implied, and must not be
-// stamped completed.
-func ExportedTables(dir, database string, tables []string) map[string]bool {
-	have := make(map[string]bool, len(tables))
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return have
-	}
-	prefix := make(map[string]string, len(tables))
-	for _, t := range tables {
-		prefix[t] = database + "." + t + "."
-	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".csv") {
-			continue
-		}
-		for t, p := range prefix {
-			if strings.HasPrefix(e.Name(), p) {
-				have[t] = true
-				break
-			}
-		}
-	}
-	return have
-}

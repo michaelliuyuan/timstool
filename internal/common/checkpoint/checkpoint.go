@@ -222,10 +222,6 @@ func (m *Manager) MarkTableCompleted(tableName string, rowsDone int64) error {
 		if tc.State != StateCompleted {
 			tc.State = StateCompleted
 			tc.FinishedAt = time.Now()
-			// A failed table that genuinely completes on a re-run flips
-			// green honestly — the stale failure note must not linger
-			// under the new green state (MS-11p 诚实翻绿).
-			tc.Error = ""
 		}
 		// Raise the denominator if more rows were actually exported than the
 		// registered estimate, so aggregated progress never exceeds 100%.

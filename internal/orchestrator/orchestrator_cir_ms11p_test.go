@@ -1,21 +1,18 @@
 package orchestrator
 
-// MS-11p anchors: the dumpling export fast-path is now user-controllable and
-// honest. (1) The configured path is wired into binary resolution. (2) With
-// use_dumpling=true (failure semantics A) an unresolvable path, a silently
-// substituted path, or a failed dump FAILS the task — never a silent swap to
-// stream. (3) With the switch off the original auto-discover + fallback
-// behavior is byte-identical. (4) Per-table accounting (pool ①②): chained
-// Running pre-stamps, evidence-based terminal stamps — a table with no CSV
-// from this dump is failed and stays failed, a genuinely re-exported table
-// flips green with a NEW stamp.
+// MS-11p anchors (task book v1.1): the dumpling export fast-path is
+// user-controllable and honest. (1) The configured path is wired into binary
+// resolution. (2) With use_dumpling=true (failure semantics A) an
+// unresolvable path, a silently substituted path, or a failed dump FAILS the
+// task — never a silent swap to stream. (3) With the switch off the original
+// auto-discover + fallback behavior is byte-identical. Per-table stamp
+// semantics stay STATUS QUO (pool ①② rides a later batch per the v1.1
+// ruling — the pre-stamp/evidence face built under v1.0 was reverted).
 
 import (
 	"context"
 	"database/sql"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -55,21 +52,10 @@ func (f *fakeCIRSource3Tables) ReadSchema(ctx context.Context, opts source.Filte
 	return &source.Schema{Catalog: "db", Tables: []source.Table{mk("ta"), mk("tb"), mk("tc")}}, nil
 }
 
-// fakeDump writes real CSV evidence into cfg.OutputDir for the named tables
-// (rows = 1/2/3 per table), so the evidence/row-count accounting runs its
-// real code path.
-func fakeDump(tables ...string) func(context.Context, dumpling.DumpConfig) error {
-	return func(ctx context.Context, cfg dumpling.DumpConfig) error {
-		rows := map[string]int{"ta": 1, "tb": 2, "tc": 3}
-		for _, name := range tables {
-			content := strings.Repeat("1\n", rows[name])
-			if err := os.WriteFile(filepath.Join(cfg.OutputDir, "db."+name+".000000000000.csv"), []byte(content), 0o644); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-}
+// fakeDumpOK is a successful dump seam (no CSV evidence needed: the
+// accounting loop runs its real CountExportedRows over the empty tempDir and
+// stamps the status-quo zero-row completions).
+func fakeDumpOK(ctx context.Context, cfg dumpling.DumpConfig) error { return nil }
 
 // ms11pOrch builds an orchestrator whose source reports ta/tb/tc and whose
 // seams are installed with the dump path forced to the fake binary.
@@ -94,7 +80,7 @@ func ms11pOrch(t *testing.T, dump func(context.Context, dumpling.DumpConfig) err
 
 	o := cirTestOrch()
 	o.cfg.Migration.UseDumpling = true
-	mgr, err := checkpoint.NewManager(filepath.Join(t.TempDir(), "checkpoint"))
+	mgr, err := checkpoint.NewManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +163,9 @@ func TestRunSourceCIRDumplingExplicitPathSubstitutionRefused(t *testing.T) {
 
 // TestRunSourceCIRDumplingExplicitDumpFailsTaskFailsNoFallback: semantics A
 // negative anchor — dump failure under the explicit switch fails the task
-// (stream cold) and stamps the running table failed with the abort error.
+// and the stream path stays cold. Status-quo stamp face: this branch never
+// pre-stamps tables Running, so the checkpoint simply carries no table rows
+// from it (task-level failure is the honest terminal state).
 func TestRunSourceCIRDumplingExplicitDumpFailsTaskFailsNoFallback(t *testing.T) {
 	o, c, mgr := ms11pOrch(t, func(ctx context.Context, cfg dumpling.DumpConfig) error {
 		return errors.New("dump boom")
@@ -189,16 +177,8 @@ func TestRunSourceCIRDumplingExplicitDumpFailsTaskFailsNoFallback(t *testing.T) 
 	if c.load != 0 || c.lightning != 0 {
 		t.Fatalf("seams fired: load=%d lightning=%d, want 0/0 (semantics A: no stream swap)", c.load, c.lightning)
 	}
-	ta, ok := mgr.GetTable("ta")
-	if !ok {
-		t.Fatal("ta missing from checkpoint")
-	}
-	if ta.State != checkpoint.StateFailed || !strings.Contains(ta.Error, "export aborted: dumpling export failed") {
-		t.Fatalf("ta = %s/%q, want failed with abort error", ta.State, ta.Error)
-	}
-	// The never-started successors keep their honest pending state.
-	if tb, _ := mgr.GetTable("tb"); tb.State != checkpoint.StatePending {
-		t.Fatalf("tb = %s, want pending (never started)", tb.State)
+	if ta, ok := mgr.GetTable("ta"); ok && ta.State == checkpoint.StateRunning {
+		t.Fatalf("ta stuck Running: %+v (this branch never pre-stamps)", ta)
 	}
 }
 
@@ -227,84 +207,28 @@ func TestRunSourceCIRDumplingSwitchOffFallsBackToStream(t *testing.T) {
 	}
 }
 
-// TestRunSourceCIRDumplingPerTableStampsChained: pool ① shape — every table
-// carries its own start/finish stamps, chained like the stream path
-// (successor start never precedes predecessor finish).
-func TestRunSourceCIRDumplingPerTableStampsChained(t *testing.T) {
-	o, c, mgr := ms11pOrch(t, fakeDump("ta", "tb", "tc"))
+// TestRunSourceCIRDumplingHappyPathStatusQuoStamps: the fast path still runs
+// end-to-end (dump → lightning) and the accounting loop keeps its STATUS-QUO
+// shape — per-table completions with zero StartedAt (the MS-11n honest "—"
+// face; pool ①② deliberately untouched per v1.1).
+func TestRunSourceCIRDumplingHappyPathStatusQuoStamps(t *testing.T) {
+	o, c, mgr := ms11pOrch(t, fakeDumpOK)
 	if _, err := o.runSourceCIR(context.Background(), PipelineConfig{}); err != nil {
 		t.Fatalf("runSourceCIR: %v", err)
 	}
 	if c.lightning != 1 {
 		t.Fatalf("lightning = %d, want 1 (dumpling fast-path)", c.lightning)
 	}
-	ta, _ := mgr.GetTable("ta")
-	tb, _ := mgr.GetTable("tb")
-	tc, _ := mgr.GetTable("tc")
-	for _, tc_ := range []*checkpoint.TableCheckpoint{ta, tb, tc} {
-		if tc_.State != checkpoint.StateCompleted {
-			t.Fatalf("%s state = %s, want completed", tc_.TableName, tc_.State)
+	for _, name := range []string{"ta", "tb", "tc"} {
+		tc, ok := mgr.GetTable(name)
+		if !ok {
+			t.Fatalf("%s missing from checkpoint", name)
 		}
-		if tc_.StartedAt.IsZero() || tc_.FinishedAt.IsZero() {
-			t.Fatalf("%s missing stamps: %v -> %v", tc_.TableName, tc_.StartedAt, tc_.FinishedAt)
+		if tc.State != checkpoint.StateCompleted {
+			t.Fatalf("%s state = %s, want completed (status-quo accounting)", name, tc.State)
 		}
-		if tc_.StartedAt.After(tc_.FinishedAt) {
-			t.Fatalf("%s duration inverted: %v -> %v", tc_.TableName, tc_.StartedAt, tc_.FinishedAt)
+		if !tc.StartedAt.IsZero() {
+			t.Fatalf("%s StartedAt = %v, want zero (status-quo: no pre-stamps, honest —)", name, tc.StartedAt)
 		}
-	}
-	// Chained order (monotonic ≥, never before — same tolerance as the
-	// stream-path MS-11n anchor).
-	if tb.StartedAt.Before(ta.FinishedAt) || tc.StartedAt.Before(tb.FinishedAt) {
-		t.Fatalf("chain broken: ta.fin=%v tb.start=%v tb.fin=%v tc.start=%v", ta.FinishedAt, tb.StartedAt, tb.FinishedAt, tc.StartedAt)
-	}
-	// Real row counts from the dumped CSVs.
-	if ta.RowsDone != 1 || tb.RowsDone != 2 || tc.RowsDone != 3 {
-		t.Fatalf("rows: ta=%d tb=%d tc=%d, want 1/2/3", ta.RowsDone, tb.RowsDone, tc.RowsDone)
-	}
-}
-
-// TestRunSourceCIRDumplingNoCSVEvidenceStaysFailed: pool ② shape — a table
-// whose CSV this dump never produced is stamped failed and stays failed;
-// NO unconditional all-green.
-func TestRunSourceCIRDumplingNoCSVEvidenceStaysFailed(t *testing.T) {
-	o, _, mgr := ms11pOrch(t, fakeDump("ta", "tc")) // tb deliberately skipped
-	if _, err := o.runSourceCIR(context.Background(), PipelineConfig{}); err != nil {
-		t.Fatalf("runSourceCIR: %v (missing CSV is table-level honesty, task proceeds)", err)
-	}
-	ta, _ := mgr.GetTable("ta")
-	tb, _ := mgr.GetTable("tb")
-	tc, _ := mgr.GetTable("tc")
-	if ta.State != checkpoint.StateCompleted || tc.State != checkpoint.StateCompleted {
-		t.Fatalf("exported tables: ta=%s tc=%s, want completed", ta.State, tc.State)
-	}
-	if tb.State != checkpoint.StateFailed || !strings.Contains(tb.Error, "no CSV") {
-		t.Fatalf("tb = %s/%q, want failed with evidence error", tb.State, tb.Error)
-	}
-}
-
-// TestRunSourceCIRDumplingHonestFlipWithNewStamp: pool ① re-run shape — a
-// previously failed table that THIS dump really exports flips green with a
-// NEW terminal stamp and its stale error cleared.
-func TestRunSourceCIRDumplingHonestFlipWithNewStamp(t *testing.T) {
-	o, _, mgr := ms11pOrch(t, fakeDump("ta", "tb", "tc"))
-	// Seed a prior-run failure for ta.
-	mgr.GetOrCreateTable("ta", 0)
-	_ = mgr.MarkTableRunning("ta")
-	_ = mgr.MarkTableFailed("ta", "prior run export aborted")
-	old, _ := mgr.GetTable("ta")
-	oldFin := old.FinishedAt
-
-	if _, err := o.runSourceCIR(context.Background(), PipelineConfig{}); err != nil {
-		t.Fatalf("runSourceCIR: %v", err)
-	}
-	ta, _ := mgr.GetTable("ta")
-	if ta.State != checkpoint.StateCompleted {
-		t.Fatalf("ta = %s, want honest green flip", ta.State)
-	}
-	if ta.Error != "" {
-		t.Fatalf("ta error = %q, want stale failure cleared", ta.Error)
-	}
-	if !ta.FinishedAt.After(oldFin) {
-		t.Fatalf("ta FinishedAt = %v, want NEW stamp after prior %v (新章异刻)", ta.FinishedAt, oldFin)
 	}
 }

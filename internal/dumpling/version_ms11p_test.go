@@ -91,23 +91,3 @@ func TestVersionProbeFailingBinary(t *testing.T) {
 		t.Fatal("nonzero exit must fail the probe")
 	}
 }
-
-// TestExportedTablesEvidence: only tables with a dumped CSV count as
-// exported — file-presence truth for the honest per-table stamps.
-func TestExportedTablesEvidence(t *testing.T) {
-	dir := t.TempDir()
-	for _, f := range []string{"db.ta.000000000000.csv", "db.tc.000000000001.csv", "db.tc.000000000002.csv", "notes.txt", "other.x.tsv"} {
-		if err := os.WriteFile(filepath.Join(dir, f), []byte("1\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	got := ExportedTables(dir, "db", []string{"ta", "tb", "tc"})
-	if !got["ta"] || got["tb"] || !got["tc"] {
-		t.Fatalf("exported = %v, want ta=true tb=false tc=true", got)
-	}
-	// Unreadable/missing dir = no evidence at all (never a false green).
-	empty := ExportedTables(filepath.Join(dir, "missing"), "db", []string{"ta"})
-	if len(empty) != 0 {
-		t.Fatalf("missing dir = %v, want empty", empty)
-	}
-}
