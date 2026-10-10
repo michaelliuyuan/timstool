@@ -963,7 +963,7 @@ func (s *Server) handleValidateLightning(w http.ResponseWriter, r *http.Request)
 	// fails HERE, not mid-migration.
 	ver, err := webapiLightningVersion(r.Context(), path)
 	if err != nil {
-		msg := fmt.Sprintf("tidb-lightning 路径校验通过但 --version 探真失败：%v", err)
+		msg := fmt.Sprintf("tidb-lightning 路径校验通过但 -V 探真失败：%v", err)
 		if ver != "" {
 			msg += fmt.Sprintf("（输出：%s）", ver)
 		}

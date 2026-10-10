@@ -1,6 +1,6 @@
 package lightning
 
-// MS-11q: the --version live probe (探真), mirroring dumpling.Version
+// MS-11q: the -V live probe (探真), mirroring dumpling.Version
 // per-package (symmetric, no shared package — scope discipline). Lightning
 // validation upgrades from "stat pass = green" to "stat pass + probe pass =
 // green": the embedded form is a placeholder stub that never yields a fake
@@ -16,12 +16,12 @@ import (
 	"time"
 )
 
-// versionTimeout bounds the `<path> --version` probe. Package-level so tests
+// versionTimeout bounds the `<path> -V` probe. Package-level so tests
 // can shrink it (the timeout shape needs to be anchored without waiting the
 // real 5s).
 var versionTimeout = 5 * time.Second
 
-// SetVersionTimeout overrides the --version probe timeout and returns a
+// SetVersionTimeout overrides the -V probe timeout and returns a
 // restore func (test seam; production default stays 5s).
 func SetVersionTimeout(d time.Duration) func() {
 	prev := versionTimeout
@@ -29,13 +29,13 @@ func SetVersionTimeout(d time.Duration) func() {
 	return func() { versionTimeout = prev }
 }
 
-// Version runs `<binary> --version` and returns the trimmed first output line
+// Version runs `<binary> -V` and returns the trimmed first output line
 // — live evidence that the path is truly executable. A hung or wedged binary
 // fails at the timeout instead of hanging the wizard request.
 func Version(ctx context.Context, binary string) (string, error) {
 	c, cancel := context.WithTimeout(ctx, versionTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(c, binary, "--version")
+	cmd := exec.CommandContext(c, binary, "-V")
 	cmd.Env = append(os.Environ(), "NO_COLOR=1", "TERM=dumb")
 	out, err := cmd.CombinedOutput()
 	line := strings.TrimSpace(string(out))
@@ -43,13 +43,13 @@ func Version(ctx context.Context, binary string) (string, error) {
 		line = strings.TrimSpace(line[:i])
 	}
 	if c.Err() != nil {
-		return line, fmt.Errorf("--version timed out after %s: %w", versionTimeout, c.Err())
+		return line, fmt.Errorf("-V timed out after %s: %w", versionTimeout, c.Err())
 	}
 	if err != nil {
-		return line, fmt.Errorf("--version failed: %w%s", err, tailHint(out))
+		return line, fmt.Errorf("-V failed: %w%s", err, tailHint(out))
 	}
 	if line == "" {
-		return "", fmt.Errorf("--version produced no output")
+		return "", fmt.Errorf("-V produced no output")
 	}
 	return line, nil
 }

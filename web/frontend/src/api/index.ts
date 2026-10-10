@@ -414,7 +414,7 @@ export const apiClient = {
 
   // Lightning path gate for the wizard (doc: 迁移选项页门禁). Empty path probes
   // auto-discovery server-side; non-empty must exist and (on Linux) be
-  // executable. MS-11q: PLUS the live --version probe — version carries the
+  // executable. MS-11q: PLUS the live -V probe — version carries the
   // real version string back (stat pass + probe pass = green).
   validateLightning: (path: string) =>
     api.post<{ success: boolean; message: string; resolved_path: string; version?: string }>('/validate-lightning', { path }),

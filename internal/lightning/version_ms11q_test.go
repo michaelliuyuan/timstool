@@ -1,6 +1,6 @@
 package lightning
 
-// MS-11q anchors: the --version live probe (探真) for tidb-lightning —
+// MS-11q anchors: the -V live probe (探真) for tidb-lightning —
 // validation upgrades from "stat pass = green" to "stat pass + probe pass =
 // green". The embedded form is a placeholder stub that never yields a fake
 // path, so a probe always runs against a real executable: a REAL version
@@ -48,7 +48,7 @@ func fakeLightningScript(t *testing.T, name string, slow bool) string {
 	return p
 }
 
-// TestVersionProbeReturnsRealString: a runnable binary's --version output
+// TestVersionProbeReturnsRealString: a runnable binary's -V output
 // comes back trimmed-first-line — live evidence, no embedded fallback.
 func TestVersionProbeReturnsRealString(t *testing.T) {
 	p := fakeLightningScript(t, "tidb-lightning", false)

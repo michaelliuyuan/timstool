@@ -1,6 +1,6 @@
 package webapi
 
-// MS-11q anchors: the validate-lightning handler upgraded with the --version
+// MS-11q anchors: the validate-lightning handler upgraded with the -V
 // live probe (mirror of the MS-11p dumpling face) — both branches (explicit
 // path + auto-discovery) must yield a REAL version string; probe failure /
 // timeout / silent binaries fail validation; the gate-reject shapes
@@ -62,7 +62,7 @@ func postValidateLightning(t *testing.T, h http.HandlerFunc, body string) valida
 
 // TestHandleValidateLightningFourShapesPlusLiveProbe: the legacy gate shapes
 // (missing / directory / no x-bit unchanged) plus the MS-11q enhancement — a
-// passing path must yield a REAL --version string, and an auto-discovery hit
+// passing path must yield a REAL -V string, and an auto-discovery hit
 // (empty path) is probed too.
 func TestHandleValidateLightningFourShapesPlusLiveProbe(t *testing.T) {
 	s, _ := newTestServer(t)

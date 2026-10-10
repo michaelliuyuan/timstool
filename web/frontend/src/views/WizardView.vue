@@ -95,7 +95,7 @@ const formRef = ref<FormInstance>()
 
 // Lightning path gate (迁移选项页门禁): must validate successfully (explicit
 // path OR auto-discovery probe) before the wizard may advance past step 3.
-// MS-11q: validation now carries the live --version probe string (探真).
+// MS-11q: validation now carries the live -V probe string (探真).
 const lightningValidated = ref(false)
 const lightningResolvedPath = ref('')
 const lightningVersion = ref('')
@@ -734,7 +734,7 @@ function prevStep() {
             </div>
             <div :style="{ color: lightningValidated ? 'var(--tims-tag-success-text)' : 'var(--tims-tag-warning-text)', fontSize: 'var(--tims-font-xs)', marginTop: '4px' }">
               <template v-if="lightningValidated">验证通过：{{ lightningResolvedPath }}（{{ lightningVersion }}）</template>
-              <template v-else>开启 Lightning 后必须点击「验证」且通过（远端将执行 --version 探真），才能进入下一步</template>
+              <template v-else>开启 Lightning 后必须点击「验证」且通过（远端将执行 -V 探真），才能进入下一步</template>
             </div>
           </el-form-item>
           <el-form-item v-if="effectiveSourceType === 'mysql'" label="使用 Dumpling 导出">

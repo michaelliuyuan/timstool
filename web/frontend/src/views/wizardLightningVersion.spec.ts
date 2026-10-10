@@ -1,5 +1,6 @@
 // MS-11q FE anchors: the Lightning validation face upgrades to the live
-// --version probe display (探真), mirroring the MS-11p dumpling face.
+// -V probe display (探真), mirroring the MS-11p dumpling face (whose real
+// binary contract keeps --version — see the dumpling red-line anchor below).
 // 断言形=spec 精确匹配（禁页面盲扫），沿 wizardDumpling 先例。
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -9,10 +10,14 @@ const viewSrc = () =>
   readFileSync(resolve(__dirname, 'WizardView.vue'), 'utf8')
 
 describe('WizardView lightning validation probe face (MS-11q)', () => {
-  it('validation face shows the live --version probe result (探真), mirroring dumpling', () => {
+  it('validation face shows the live -V probe result (探真), mirroring dumpling', () => {
     const src = viewSrc()
     expect(src).toContain('验证通过：{{ lightningResolvedPath }}（{{ lightningVersion }}）')
-    expect(src).toContain('--version 探真')
+    expect(src).toContain('开启 Lightning 后必须点击「验证」且通过（远端将执行 -V 探真），才能进入下一步')
+    // The dumpling hint keeps its real-binary contract (--version); if the
+    // lightning face ever drifts back to --version this count becomes 2.
+    const legacy = src.match(/远端将执行 --version 探真/g) || []
+    expect(legacy.length).toBe(1)
   })
 
   it('api type carries the optional version field for validate-lightning', () => {

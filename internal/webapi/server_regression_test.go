@@ -55,7 +55,7 @@ func postJSON(t *testing.T, h http.HandlerFunc, body string) *httptest.ResponseR
 // (Lightning 配置门禁): explicit path must exist, be a regular file, and on
 // unix carry the x-bit; an empty path falls back to auto-discovery (PATH →
 // embedded), failing only when nothing can be resolved. MS-11q: success
-// shapes upgraded to the --version probe face (stat pass + probe pass).
+// shapes upgraded to the -V probe face (stat pass + probe pass).
 func TestHandleValidateLightning(t *testing.T) {
 	s, _ := newTestServer(t)
 
