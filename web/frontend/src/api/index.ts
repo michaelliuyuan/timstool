@@ -234,6 +234,8 @@ export interface CreateTaskRequest {
     exclude_tables: string[]
     use_lightning: boolean
     lightning_path: string
+    use_dumpling: boolean
+    dumpling_path: string
     skip_precheck: boolean
     skip_schema: boolean
     skip_data: boolean
@@ -415,15 +417,21 @@ export const apiClient = {
   validateLightning: (path: string) =>
     api.post<{ success: boolean; message: string; resolved_path: string }>('/validate-lightning', { path }),
 
+  // MS-11p dumpling export gate (MySQL 源端导出快路). Same path shapes as
+  // lightning PLUS the live --version probe: version carries the real
+  // version string back (no embedded fallback).
+  validateDumpling: (path: string) =>
+    api.post<{ success: boolean; message: string; resolved_path: string; version?: string }>('/validate-dumpling', { path }),
+
   // Migration options persistence (server-side memory of temp_dir / lightning
   // settings + the Lightning-only target extras pd_addr / status_port).
   // GET prefill on entering the options/target steps, PUT on advancing or a
   // successful target connection test. pd_addr empty and status_port 0 mean
   // "not remembered" and never overwrite the form defaults.
   getMigrationOptions: () =>
-    api.get<{ temp_dir: string; use_lightning: boolean; lightning_path: string; pd_addr?: string; status_port?: number }>('/migration-options'),
+    api.get<{ temp_dir: string; use_lightning: boolean; lightning_path: string; use_dumpling: boolean; dumpling_path: string; pd_addr?: string; status_port?: number }>('/migration-options'),
 
-  saveMigrationOptions: (opts: { temp_dir: string; use_lightning: boolean; lightning_path: string; pd_addr?: string; status_port?: number }) =>
+  saveMigrationOptions: (opts: { temp_dir: string; use_lightning: boolean; lightning_path: string; use_dumpling: boolean; dumpling_path: string; pd_addr?: string; status_port?: number }) =>
     api.put<{ success: boolean }>('/migration-options', opts),
 
   createTask: (req: CreateTaskRequest) =>

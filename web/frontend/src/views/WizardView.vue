@@ -62,6 +62,8 @@ const form = reactive({
     exclude_tables: [] as string[],
     use_lightning: false,
     lightning_path: '',
+    use_dumpling: false,
+    dumpling_path: '',
     skip_precheck: false,
     skip_schema: false,
     skip_data: false,
@@ -123,6 +125,44 @@ function onLightningSwitchChanged(val: boolean) {
   lightningValidated.value = false
   lightningResolvedPath.value = ''
   if (!val) form.opts.lightning_path = ''
+}
+
+// MS-11p dumpling export gate (MySQL 源端导出快路): same gate shape as
+// lightning, plus the --version 探真 string in the result face.
+const dumplingValidated = ref(false)
+const dumplingResolvedPath = ref('')
+const dumplingVersion = ref('')
+const validatingDumpling = ref(false)
+
+async function validateDumpling() {
+  validatingDumpling.value = true
+  try {
+    const { data } = await apiClient.validateDumpling(form.opts.dumpling_path.trim())
+    dumplingValidated.value = data.success
+    dumplingResolvedPath.value = data.success ? data.resolved_path : ''
+    dumplingVersion.value = data.success ? (data.version || '') : ''
+    if (data.success) ElMessage.success(data.message)
+    else ElMessage.error(data.message)
+  } catch (e: any) {
+    dumplingValidated.value = false
+    dumplingResolvedPath.value = ''
+    dumplingVersion.value = ''
+    ElMessage.error(`Dumpling 路径验证失败: ${e.response?.data?.error || e.message}`)
+  } finally {
+    validatingDumpling.value = false
+  }
+}
+
+function onDumplingPathChanged() {
+  dumplingValidated.value = false
+  dumplingResolvedPath.value = ''
+  dumplingVersion.value = ''
+}
+function onDumplingSwitchChanged(val: boolean) {
+  dumplingValidated.value = false
+  dumplingResolvedPath.value = ''
+  dumplingVersion.value = ''
+  if (!val) form.opts.dumpling_path = ''
 }
 
 // F-02b: the localStorage connection memory (saved connections + "remember
@@ -342,6 +382,8 @@ async function submit() {
         exclude_tables: excludedTables.value,
         use_lightning: form.opts.use_lightning,
         lightning_path: form.opts.use_lightning ? (lightningResolvedPath.value || form.opts.lightning_path.trim()) : '',
+        use_dumpling: form.opts.use_dumpling && effectiveSourceType.value === 'mysql',
+        dumpling_path: form.opts.use_dumpling && effectiveSourceType.value === 'mysql' ? (dumplingResolvedPath.value || form.opts.dumpling_path.trim()) : '',
         skip_precheck: form.opts.skip_precheck,
         skip_schema: form.opts.skip_schema,
         skip_data: form.opts.skip_data,
@@ -386,6 +428,10 @@ async function loadMigrationOptions() {
       form.opts.use_lightning = true
       form.opts.lightning_path = data.lightning_path || ''
     }
+    if (data.use_dumpling) {
+      form.opts.use_dumpling = true
+      form.opts.dumpling_path = data.dumpling_path || ''
+    }
     // Lightning-only target extras: prefill here as well so the PUT issued
     // when leaving step 2 (目标库) carries the REMEMBERED option values
     // instead of form defaults — otherwise that save would clobber the
@@ -402,6 +448,8 @@ async function saveMigrationOptions() {
       temp_dir: form.opts.temp_dir.trim(),
       use_lightning: form.opts.use_lightning,
       lightning_path: form.opts.use_lightning ? form.opts.lightning_path.trim() : '',
+      use_dumpling: form.opts.use_dumpling && effectiveSourceType.value === 'mysql',
+      dumpling_path: form.opts.use_dumpling && effectiveSourceType.value === 'mysql' ? form.opts.dumpling_path.trim() : '',
       pd_addr: form.target.pd_addr.trim(),
       status_port: form.target.status_port,
     })
@@ -476,6 +524,13 @@ async function nextStep() {
   // path validation (explicit path or auto-discovery) before advancing.
   if (activeStep.value === 3 && form.opts.use_lightning && !lightningValidated.value) {
     ElMessage.error('已开启 Lightning：请先配置并验证 tidb-lightning 可执行文件路径（或留空点验证走自动发现），验证通过才能进入下一步')
+    return
+  }
+  // Dumpling gate (step 3, MS-11p): enabled dumpling export requires a
+  // successful validation (explicit path or auto-discovery + --version
+  // 探真) before advancing — mirror of the Lightning gate.
+  if (activeStep.value === 3 && form.opts.use_dumpling && effectiveSourceType.value === 'mysql' && !dumplingValidated.value) {
+    ElMessage.error('已开启 Dumpling 导出：请先配置并验证 tidb-dumpling 可执行文件路径（或留空点验证走自动发现 + --version 探真），验证通过才能进入下一步')
     return
   }
   if (activeStep.value === 3) {
@@ -676,6 +731,27 @@ function prevStep() {
               <template v-else>开启 Lightning 后必须点击「验证」且通过（远端 Linux 将校验执行权限），才能进入下一步</template>
             </div>
           </el-form-item>
+          <el-form-item v-if="effectiveSourceType === 'mysql'" label="使用 Dumpling 导出">
+            <el-switch v-model="form.opts.use_dumpling" @change="onDumplingSwitchChanged" />
+            <div style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-top: 4px;">
+              MySQL 源端专用：tidb-dumpling 并发分片 + 一致性快照导出（快路，吞吐高一个量级）。开启后导出即显式选择——路径不可用或导出失败任务直接失败，不静默回退慢路。
+            </div>
+          </el-form-item>
+          <el-form-item v-if="effectiveSourceType === 'mysql' && form.opts.use_dumpling" label="Dumpling 路径">
+            <div style="display: flex; gap: 8px; width: 100%;">
+              <el-input
+                v-model="form.opts.dumpling_path"
+                placeholder="tidb-dumpling 可执行文件路径，留空则自动发现（PATH/常见部署位）"
+                style="width: 350px;"
+                @input="onDumplingPathChanged"
+              />
+              <el-button :loading="validatingDumpling" @click="validateDumpling">验证</el-button>
+            </div>
+            <div :style="{ color: dumplingValidated ? 'var(--tims-tag-success-text)' : 'var(--tims-tag-warning-text)', fontSize: 'var(--tims-font-xs)', marginTop: '4px' }">
+              <template v-if="dumplingValidated">验证通过：{{ dumplingResolvedPath }}（{{ dumplingVersion }}）</template>
+              <template v-else>开启 Dumpling 后必须点击「验证」且通过（远端将执行 --version 探真），才能进入下一步</template>
+            </div>
+          </el-form-item>
           <el-form-item label="数据临时目录">
             <el-input v-model="form.opts.temp_dir" placeholder="/tmp/timstool" style="width: 350px;" />
             <div style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-top: 4px;">
@@ -770,6 +846,10 @@ function prevStep() {
             <el-descriptions-item label="使用 Lightning">{{ form.opts.use_lightning ? '是' : '否' }}</el-descriptions-item>
             <el-descriptions-item v-if="form.opts.use_lightning" label="Lightning 路径" :span="2">
               {{ lightningResolvedPath || form.opts.lightning_path || '自动发现' }}
+            </el-descriptions-item>
+            <el-descriptions-item label="使用 Dumpling">{{ form.opts.use_dumpling && effectiveSourceType === 'mysql' ? '是' : '否' }}</el-descriptions-item>
+            <el-descriptions-item v-if="form.opts.use_dumpling && effectiveSourceType === 'mysql'" label="Dumpling 路径" :span="2">
+              {{ dumplingResolvedPath || form.opts.dumpling_path || '自动发现' }}
             </el-descriptions-item>
             <el-descriptions-item label="数据临时目录">{{ form.opts.temp_dir }}</el-descriptions-item>
             <el-descriptions-item label="全量+增量衔接">
