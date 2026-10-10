@@ -913,7 +913,16 @@ type validateLightningResponse struct {
 	Success      bool   `json:"success"`
 	Message      string `json:"message"`
 	ResolvedPath string `json:"resolved_path"`
+	Version      string `json:"version,omitempty"`
 }
+
+// webapiFindLightning / webapiLightningVersion are the validate-lightning
+// handler seams (MS-11q): unit anchors fake discovery and the version probe
+// without a real tidb-lightning on the machine.
+var (
+	webapiFindLightning    = lightning.FindBinary
+	webapiLightningVersion = lightning.Version
+)
 
 func (s *Server) handleValidateLightning(w http.ResponseWriter, r *http.Request) {
 	var req validateLightningRequest
@@ -922,8 +931,9 @@ func (s *Server) handleValidateLightning(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if strings.TrimSpace(req.Path) == "" {
-		resolved := lightning.FindBinary(s.dataDir)
+	path := strings.TrimSpace(req.Path)
+	if path == "" {
+		resolved := webapiFindLightning(s.dataDir)
 		if resolved == "" {
 			s.writeJSON(w, http.StatusOK, validateLightningResponse{
 				Success: false,
@@ -931,31 +941,44 @@ func (s *Server) handleValidateLightning(w http.ResponseWriter, r *http.Request)
 			})
 			return
 		}
-		s.writeJSON(w, http.StatusOK, validateLightningResponse{
-			Success:      true,
-			Message:      fmt.Sprintf("未配置路径，将使用自动发现的 tidb-lightning：%s", resolved),
-			ResolvedPath: resolved,
-		})
-		return
+		path = resolved
+	} else {
+		fi, err := os.Stat(path)
+		if err != nil {
+			s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: fmt.Sprintf("路径不存在：%s", path)})
+			return
+		}
+		if fi.IsDir() {
+			s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: "路径是目录，需要指向 tidb-lightning 可执行文件"})
+			return
+		}
+		if runtime.GOOS != "windows" && fi.Mode()&0111 == 0 {
+			s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: "文件存在但没有执行权限（需要 x 位，Linux 上 chmod +x）"})
+			return
+		}
 	}
 
-	fi, err := os.Stat(req.Path)
+	// Live probe (探真, MS-11q — mirrors dumpling): the version string is the
+	// evidence the binary truly runs — a broken ELF or wrong-arch download
+	// fails HERE, not mid-migration.
+	ver, err := webapiLightningVersion(r.Context(), path)
 	if err != nil {
-		s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: fmt.Sprintf("路径不存在：%s", req.Path)})
+		msg := fmt.Sprintf("tidb-lightning 路径校验通过但 --version 探真失败：%v", err)
+		if ver != "" {
+			msg += fmt.Sprintf("（输出：%s）", ver)
+		}
+		s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: msg, ResolvedPath: path})
 		return
 	}
-	if fi.IsDir() {
-		s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: "路径是目录，需要指向 tidb-lightning 可执行文件"})
-		return
-	}
-	if runtime.GOOS != "windows" && fi.Mode()&0111 == 0 {
-		s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: "文件存在但没有执行权限（需要 x 位，Linux 上 chmod +x）"})
-		return
+	auto := ""
+	if strings.TrimSpace(req.Path) == "" {
+		auto = "（自动发现）"
 	}
 	s.writeJSON(w, http.StatusOK, validateLightningResponse{
 		Success:      true,
-		Message:      "tidb-lightning 路径验证通过",
-		ResolvedPath: req.Path,
+		Message:      fmt.Sprintf("tidb-lightning 验证通过%s：%s", auto, ver),
+		ResolvedPath: path,
+		Version:      ver,
 	})
 }
 

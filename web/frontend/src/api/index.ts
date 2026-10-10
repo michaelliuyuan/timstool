@@ -413,9 +413,11 @@ export const apiClient = {
     api.post<{ tables: { name: string; row_estimate: number }[]; count: number }>('/config/list-tables', { ...req, type: 'source' }),
 
   // Lightning path gate for the wizard (doc: 迁移选项页门禁). Empty path probes
-  // auto-discovery server-side; non-empty must exist and (on Linux) be executable.
+  // auto-discovery server-side; non-empty must exist and (on Linux) be
+  // executable. MS-11q: PLUS the live --version probe — version carries the
+  // real version string back (stat pass + probe pass = green).
   validateLightning: (path: string) =>
-    api.post<{ success: boolean; message: string; resolved_path: string }>('/validate-lightning', { path }),
+    api.post<{ success: boolean; message: string; resolved_path: string; version?: string }>('/validate-lightning', { path }),
 
   // MS-11p dumpling export gate (MySQL 源端导出快路). Same path shapes as
   // lightning PLUS the live --version probe: version carries the real

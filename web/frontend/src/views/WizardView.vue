@@ -95,8 +95,10 @@ const formRef = ref<FormInstance>()
 
 // Lightning path gate (迁移选项页门禁): must validate successfully (explicit
 // path OR auto-discovery probe) before the wizard may advance past step 3.
+// MS-11q: validation now carries the live --version probe string (探真).
 const lightningValidated = ref(false)
 const lightningResolvedPath = ref('')
+const lightningVersion = ref('')
 const validatingLightning = ref(false)
 
 async function validateLightning() {
@@ -105,11 +107,13 @@ async function validateLightning() {
     const { data } = await apiClient.validateLightning(form.opts.lightning_path.trim())
     lightningValidated.value = data.success
     lightningResolvedPath.value = data.success ? data.resolved_path : ''
+    lightningVersion.value = data.success ? (data.version || '') : ''
     if (data.success) ElMessage.success(data.message)
     else ElMessage.error(data.message)
   } catch (e: any) {
     lightningValidated.value = false
     lightningResolvedPath.value = ''
+    lightningVersion.value = ''
     ElMessage.error(`Lightning 路径验证失败: ${e.response?.data?.error || e.message}`)
   } finally {
     validatingLightning.value = false
@@ -120,10 +124,12 @@ async function validateLightning() {
 function onLightningPathChanged() {
   lightningValidated.value = false
   lightningResolvedPath.value = ''
+  lightningVersion.value = ''
 }
 function onLightningSwitchChanged(val: boolean) {
   lightningValidated.value = false
   lightningResolvedPath.value = ''
+  lightningVersion.value = ''
   if (!val) form.opts.lightning_path = ''
 }
 
@@ -727,8 +733,8 @@ function prevStep() {
               <el-button :loading="validatingLightning" @click="validateLightning">验证</el-button>
             </div>
             <div :style="{ color: lightningValidated ? 'var(--tims-tag-success-text)' : 'var(--tims-tag-warning-text)', fontSize: 'var(--tims-font-xs)', marginTop: '4px' }">
-              <template v-if="lightningValidated">验证通过：{{ lightningResolvedPath }}</template>
-              <template v-else>开启 Lightning 后必须点击「验证」且通过（远端 Linux 将校验执行权限），才能进入下一步</template>
+              <template v-if="lightningValidated">验证通过：{{ lightningResolvedPath }}（{{ lightningVersion }}）</template>
+              <template v-else>开启 Lightning 后必须点击「验证」且通过（远端将执行 --version 探真），才能进入下一步</template>
             </div>
           </el-form-item>
           <el-form-item v-if="effectiveSourceType === 'mysql'" label="使用 Dumpling 导出">

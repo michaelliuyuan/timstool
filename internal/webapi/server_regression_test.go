@@ -54,18 +54,17 @@ func postJSON(t *testing.T, h http.HandlerFunc, body string) *httptest.ResponseR
 // TestHandleValidateLightning covers the wizard's Lightning path gate
 // (Lightning 配置门禁): explicit path must exist, be a regular file, and on
 // unix carry the x-bit; an empty path falls back to auto-discovery (PATH →
-// embedded), failing only when nothing can be resolved.
+// embedded), failing only when nothing can be resolved. MS-11q: success
+// shapes upgraded to the --version probe face (stat pass + probe pass).
 func TestHandleValidateLightning(t *testing.T) {
 	s, _ := newTestServer(t)
 
 	dir := t.TempDir()
 
-	// Case 1: exists + executable (0755). On Windows the x-bit is not
-	// representable, so this also covers the existence-only branch.
-	exe := filepath.Join(dir, "tidb-lightning")
-	if err := os.WriteFile(exe, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// Case 1: exists + executable (0755) + probe passes. On Windows the
+	// x-bit is not representable, so this also covers the existence-only
+	// branch.
+	exe := fakeLightningScript(t, "tidb-lightning", false)
 	w := postJSON(t, s.handleValidateLightning, fmt.Sprintf(`{"path":%q}`, exe))
 	var resp validateLightningResponse
 	if w.Code != 200 || json.NewDecoder(w.Body).Decode(&resp) != nil {
@@ -99,16 +98,11 @@ func TestHandleValidateLightning(t *testing.T) {
 		}
 	}
 
-	// Case 5: empty path → auto-discovery. Put a real executable on PATH so
-	// FindBinary resolves it regardless of the build's embedded placeholder.
-	bindir := t.TempDir()
-	stub := filepath.Join(bindir, "tidb-lightning")
-	if runtime.GOOS == "windows" {
-		stub += ".exe" // exec.LookPath on Windows requires a PATHEXT extension
-	}
-	if err := os.WriteFile(stub, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// Case 5: empty path → auto-discovery. Put a real probe-passing
+	// executable on PATH so FindBinary resolves it regardless of the
+	// build's embedded placeholder.
+	stub := fakeLightningScript(t, "tidb-lightning", false)
+	bindir := filepath.Dir(stub)
 	t.Setenv("PATH", bindir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	w = postJSON(t, s.handleValidateLightning, `{"path":""}`)
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
