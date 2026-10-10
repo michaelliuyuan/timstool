@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/common/checkpoint"
 )
@@ -81,6 +82,11 @@ func TestTaskPhases_MachineIsSourceOfTruth(t *testing.T) {
 	_ = cpMgr.FinishPhase("precheck", nil, false)
 	_ = cpMgr.StartPhase("schema")
 	_ = cpMgr.SetSubPhase("schema", "schema-execute")
+	// MS-11o flaky hardening: guarantee a measurable StartedAt→FinishedAt
+	// gap so the Duration>0 assertion below can never flake on a host whose
+	// clock collapses back-to-back time.Now() calls to the same instant
+	// (observed as an occasional first-red-rerun-green in full-suite runs).
+	time.Sleep(20 * time.Millisecond)
 	_ = cpMgr.FinishPhase("schema", nil, true)
 	cpMgr.Flush()
 

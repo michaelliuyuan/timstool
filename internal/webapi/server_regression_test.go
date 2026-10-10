@@ -114,8 +114,13 @@ func TestHandleValidateLightning(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("case5 decode: %v", err)
 	}
-	if !resp.Success || resp.ResolvedPath == "" {
-		t.Errorf("case5: success=%v resolved=%q msg=%q (want auto-discovery hit)", resp.Success, resp.ResolvedPath, resp.Message)
+	// MS-11o flaky hardening: pin the resolution to OUR stub. A loose
+	// "resolved != ''" assertion lets an environment shadow (implicit CWD
+	// lookup on Windows, PATH-order drift) pass silently one run and fail
+	// the next — the observed first-red-rerun-green. Exact-match turns any
+	// shadow into a deterministic failure with the culprit path printed.
+	if !resp.Success || filepath.Clean(resp.ResolvedPath) != filepath.Clean(stub) {
+		t.Errorf("case5: success=%v resolved=%q msg=%q (want exactly our PATH stub %q)", resp.Success, resp.ResolvedPath, resp.Message, stub)
 	}
 }
 
