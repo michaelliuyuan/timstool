@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,9 +15,27 @@ import (
 
 // handleSources lists all registered sources' metadata for the Web selector +
 // schema-driven form (doc multi-source-web-form-design §6.1). Does not open any
-// connection, so stubs are described too.
+// connection, so stubs are described too. MS-01: the payload now carries the
+// function-level capability matrix (additive JSON — old consumers ignore it).
 func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"sources": source.DescribeAll()})
+}
+
+// requireCapability is the prepared backend 400 double-guard for MS-03..MS-07:
+// it reads the SINGLE truth — the registry's capability bit via source.Capable
+// — so each interface task can swap its frozen `type != "postgres"` guard for
+// a capability read in one line (ruling seq 82: baseline only-decrease). Not
+// wired yet on purpose; the frozen guards are the MS-01 baseline.
+func (s *Server) requireCapability(w http.ResponseWriter, kind string, c source.Capability, msg string) bool {
+	ok, err := source.Capable(kind, c)
+	if err != nil || !ok {
+		// Unknown kinds (e.g. a target-side "tidb" profile used as a source)
+		// and capability-off kinds get the same feature-level 400 — the
+		// message names the supported source, not the registry internals.
+		s.writeError(w, http.StatusBadRequest, msg)
+		return false
+	}
+	return true
 }
 
 // handleSourceConfigSchema returns the connection-form fields for a source type.
@@ -34,8 +53,9 @@ func (s *Server) handleSourceConfigSchema(w http.ResponseWriter, r *http.Request
 // testSourceRequest is the {source, fields} body for the multi-source connection
 // test (doc §6.2). source defaults to "postgres" when empty (backward compat).
 type testSourceRequest struct {
-	Source string         `json:"source"`
-	Fields map[string]any `json:"fields"`
+	Source    string         `json:"source"`
+	Fields    map[string]any `json:"fields"`
+	SourceRef string         `json:"source_ref"` // F-02: resolve fields server-side
 }
 
 // versioner is an optional Source capability: the server version string echoed
@@ -50,9 +70,14 @@ type versioner interface {
 // {success, message, version} result map; stubs get a friendly "not implemented"
 // without a real connection attempt.
 func (s *Server) testSource(ctx context.Context, srcType string, fields map[string]any) map[string]interface{} {
-	if srcType == "" {
-		srcType = "postgres"
+	// MS-01: legacy "" default unified into source.NormalizeKind (single
+	// truth for the "type missing = postgres" rule). c-fix ⚠️2: the error
+	// payload echoes the ORIGINAL kind, not the zeroed assignment target.
+	normalized, err := source.NormalizeKind(srcType)
+	if err != nil {
+		return map[string]interface{}{"source": srcType, "success": false, "message": err.Error()}
 	}
+	srcType = normalized
 	result := map[string]interface{}{"source": srcType}
 
 	meta, err := source.Describe(srcType)
@@ -81,7 +106,15 @@ func (s *Server) testSource(ctx context.Context, srcType string, fields map[stri
 		Options:  stringifyMap(fields),
 	}
 	if port := stringField(fields, "port"); port != "" {
-		fmt.Sscanf(port, "%d", &cfg.Port)
+		// Strict: strconv.Atoi rejects trailing garbage ("80x"), unlike
+		// fmt.Sscanf("%d") which silently stopped at the first non-digit.
+		n, err := strconv.Atoi(strings.TrimSpace(port))
+		if err != nil {
+			result["success"] = false
+			result["message"] = fmt.Sprintf("invalid port %q: must be an integer", port)
+			return result
+		}
+		cfg.Port = n
 	}
 
 	src, err := source.Open(srcType, cfg)
@@ -131,6 +164,21 @@ func (s *Server) handleTestConnectionMulti(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	// P2-5: honor the documented source_ref — resolve fields server-side
+	// (same semantics as /sources/tables).
+	if req.SourceRef != "" {
+		e, err := s.resolveDataSourceRef(req.SourceRef)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+			return
+		}
+		if e.Type == "tidb" {
+			s.writeError(w, http.StatusBadRequest, "source_ref: tidb 数据源不能用作源端")
+			return
+		}
+		req.Source = e.Type
+		req.Fields = e.Fields
+	}
 	s.writeJSON(w, http.StatusOK, s.testSource(r.Context(), req.Source, req.Fields))
 }
 
@@ -145,9 +193,29 @@ func (s *Server) handleSourceTables(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	// F-02: a source_ref overrides {source, fields} with the stored profile
+	// (server-side password resolution).
 	srcType := req.Source
-	if srcType == "" {
-		srcType = "postgres"
+	if req.SourceRef != "" {
+		e, err := s.resolveDataSourceRef(req.SourceRef)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+			return
+		}
+		if e.Type == "tidb" {
+			s.writeError(w, http.StatusBadRequest, "source_ref: tidb 数据源不能用作源端")
+			return
+		}
+		srcType = e.Type
+		req.Fields = e.Fields
+	}
+	// MS-01 c-fix ⚠️1: normalize AFTER the ref override — {source:<unknown>,
+	// source_ref:<valid>} succeeds exactly as it did pre-MS-01 (the ref's
+	// type wins), and unknown kinds still 404 on the no-ref path.
+	srcType, err := source.NormalizeKind(srcType)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, err.Error())
+		return
 	}
 	meta, err := source.Describe(srcType)
 	if err != nil {
@@ -169,7 +237,13 @@ func (s *Server) handleSourceTables(w http.ResponseWriter, r *http.Request) {
 		Options:  stringifyMap(req.Fields),
 	}
 	if port := stringField(req.Fields, "port"); port != "" {
-		fmt.Sscanf(port, "%d", &cfg.Port)
+		// Strict parse (rejects trailing garbage, unlike Sscanf).
+		n, err := strconv.Atoi(strings.TrimSpace(port))
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid port %q: must be an integer", port))
+			return
+		}
+		cfg.Port = n
 	}
 
 	src, err := source.Open(srcType, cfg)
@@ -221,9 +295,13 @@ func (s *Server) handleSourceMeta(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	srcType := req.Source
-	if srcType == "" {
-		srcType = "postgres"
+	// MS-01 pattern (ruling seq 82): the ""→postgres default and unknown-kind
+	// rejection both live in NormalizeKind — handlers must not branch on the
+	// raw type string (A3 frozen-baseline guard).
+	srcType, err := source.NormalizeKind(req.Source)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, err.Error())
+		return
 	}
 	meta, err := source.Describe(srcType)
 	if err != nil {

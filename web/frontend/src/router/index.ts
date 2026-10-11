@@ -13,7 +13,7 @@ const router = createRouter({
       component: () => import('../views/WizardView.vue'),
     },
     {
-      path: '/compare/new',
+      path: '/mongocompare/new',
       name: 'CompareCreate',
       component: () => import('../views/CompareCreateView.vue'),
     },
@@ -33,14 +33,38 @@ const router = createRouter({
       component: () => import('../views/HistoryView.vue'),
     },
     {
+      path: '/datasources',
+      name: 'DataSources',
+      component: () => import('../views/DataSourcesView.vue'),
+    },
+    {
+      path: '/compare',
+      name: 'Compare',
+      component: () => import('../views/CompareView.vue'),
+    },
+    {
       path: '/assess',
       name: 'Assess',
       component: () => import('../views/AssessView.vue'),
     },
     {
+      path: '/ddl-export',
+      name: 'DDLExport',
+      component: () => import('../views/DDLExportView.vue'),
+    },
+    {
+      path: '/incremental',
+      name: 'Incremental',
+      component: () => import('../views/IncrementalView.vue'),
+    },
+    {
       path: '/cdc',
       name: 'CDC',
       component: () => import('../views/CDCView.vue'),
+    },
+    {
+      path: '/:pathMatch(.*)*',
+      redirect: '/',
     },
   ],
 })

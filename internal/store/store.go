@@ -1,11 +1,13 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,10 +62,29 @@ func NewStore(dataDir string) (*Store, error) {
 
 	db.SetMaxOpenConns(1)
 
+	// F-06 item 3: bound the first-touch ping so a wedged sqlite file fails
+	// fast instead of hanging the server startup path.
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
+	}
+
+	// F-02 (P2-7): task configs contain plaintext passwords at rest — tighten
+	// the db file (and its WAL/SHM siblings) to owner-only. SQLite may not
+	// have created the WAL files yet, so chmod best-effort on what exists.
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !os.IsNotExist(err) {
+			db.Close()
+			return nil, fmt.Errorf("chmod %s: %w", p, err)
+		}
 	}
 	return s, nil
 }
@@ -87,6 +108,7 @@ func (s *Store) migrate() error {
 			rows_done INTEGER NOT NULL DEFAULT 0,
 			error TEXT NOT NULL DEFAULT '',
 			result_json TEXT NOT NULL DEFAULT '',
+			run_id INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			started_at DATETIME,
 			finished_at DATETIME,
@@ -95,7 +117,16 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 		CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at DESC);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	// Existing databases gain the run_id column (F-08-2 item 7). SQLite has
+	// no ADD COLUMN IF NOT EXISTS: ignore the duplicate-column error.
+	if _, aerr := s.db.Exec(`ALTER TABLE tasks ADD COLUMN run_id INTEGER NOT NULL DEFAULT 0`); aerr != nil &&
+		!strings.Contains(aerr.Error(), "duplicate column") {
+		return aerr
+	}
+	return nil
 }
 
 func (s *Store) CreateTask(task *Task) error {
@@ -179,6 +210,102 @@ func (s *Store) UpdateTaskProgress(id string, phase string, progress float64, ta
 	return err
 }
 
+// --- Run-conditioned writes (F-08-2 item 7, "Plan A") ---
+//
+// run_id is the ownership generation token (webapi runSeq). The start/resume
+// handlers stamp it via SetTaskRun BEFORE writing Running; every migration-run
+// write below succeeds only while the stored run_id still matches the writer's
+// generation. A superseded run (resume swapped ownership) sees affected==0 and
+// skips — closing the residual microsecond window between the in-memory
+// owns() re-check and the row hitting disk, at the only place it matters: the
+// database itself.
+
+// SetTaskRun stamps the ownership generation and the Running status in one
+// statement (the new run's writes become conditional on run_id from here on).
+func (s *Store) SetTaskRun(id string, runID uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	_, err := s.db.Exec(`UPDATE tasks SET status='running', run_id=?, started_at=?, updated_at=? WHERE id=?`,
+		int64(runID), now, now, id)
+	return err
+}
+
+// UpdateTaskStatusIfRun writes a terminal/status change only while runID is
+// still the stored generation. Returns false (nil error) when superseded.
+func (s *Store) UpdateTaskStatusIfRun(id string, status TaskStatus, runID uint64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	var q string
+	var args []interface{}
+	switch status {
+	case TaskStatusRunning:
+		q = `UPDATE tasks SET status=?, started_at=?, updated_at=? WHERE id=? AND run_id=?`
+		args = []interface{}{status, now, now, id, int64(runID)}
+	case TaskStatusCompleted, TaskStatusFailed, TaskStatusCancelled:
+		q = `UPDATE tasks SET status=?, finished_at=?, updated_at=? WHERE id=? AND run_id=?`
+		args = []interface{}{status, now, now, id, int64(runID)}
+	default:
+		q = `UPDATE tasks SET status=?, updated_at=? WHERE id=? AND run_id=?`
+		args = []interface{}{status, now, id, int64(runID)}
+	}
+	res, err := s.db.Exec(q, args...)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// SetTaskErrorIfRun marks the task failed (terminal) only while the writer's
+// generation still owns the row.
+func (s *Store) SetTaskErrorIfRun(id string, taskErr string, runID uint64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	res, err := s.db.Exec(`UPDATE tasks SET status='failed', error=?, finished_at=?, updated_at=? WHERE id=? AND run_id=?`,
+		taskErr, now, now, id, int64(runID))
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// SetTaskResultIfRun stores the run result only while owning the generation.
+func (s *Store) SetTaskResultIfRun(id string, result string, runID uint64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	res, err := s.db.Exec(`UPDATE tasks SET result_json=?, updated_at=? WHERE id=? AND run_id=?`,
+		result, time.Now(), id, int64(runID))
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// UpdateTaskProgressIfRun updates progress only while owning the generation.
+func (s *Store) UpdateTaskProgressIfRun(id string, phase string, progress float64, tablesDone, tablesTotal int, rowsDone, rowsTotal int64, runID uint64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	res, err := s.db.Exec(`
+		UPDATE tasks SET phase=?, progress=?, tables_done=?, tables_total=?,
+			rows_done=?, rows_total=?, updated_at=? WHERE id=? AND run_id=?`,
+		phase, progress, tablesDone, tablesTotal, rowsDone, rowsTotal, time.Now(), id, int64(runID))
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 func (s *Store) SetTaskError(id string, taskErr string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -187,6 +314,25 @@ func (s *Store) SetTaskError(id string, taskErr string) error {
 	_, err := s.db.Exec(`UPDATE tasks SET status='failed', error=?, finished_at=?, updated_at=? WHERE id=?`,
 		taskErr, now, now, id)
 	return err
+}
+
+// FailAllRunning marks every task still in "running" state as failed with
+// the given message. Called once at server startup (F-08-2 ride b): a task
+// left running can only mean the previous process died mid-run — no
+// goroutine will ever finish or cancel it, so the UI would be stuck on a
+// zombie running state forever. Returns the number of recovered tasks.
+func (s *Store) FailAllRunning(message string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	res, err := s.db.Exec(`UPDATE tasks SET status='failed', error=?, finished_at=?, updated_at=? WHERE status='running'`,
+		message, now, now)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 func (s *Store) ResetTaskForRerun(id string) error {
@@ -213,6 +359,17 @@ func (s *Store) SetTaskResult(id string, result interface{}) error {
 	return err
 }
 
+// UpdateTaskConfig persists an updated config JSON for a task (used by the
+// CDC chain to record the slot consistent-point LSN after task start).
+func (s *Store) UpdateTaskConfig(id string, configJSON string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`UPDATE tasks SET config_json=?, updated_at=? WHERE id=?`,
+		configJSON, time.Now(), id)
+	return err
+}
+
 func (s *Store) ListTasks(limit, offset int) ([]*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -224,7 +381,7 @@ func (s *Store) ListTasks(limit, offset int) ([]*Task, error) {
 	rows, err := s.db.Query(`
 		SELECT id, name, status, config_json, phase, progress, tables_total, tables_done,
 			rows_total, rows_done, error, result_json, created_at, started_at, finished_at, updated_at
-		FROM tasks ORDER BY created_at DESC LIMIT ? OFFSET ?`, limit, offset)
+		FROM tasks ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ? -- rowid = insert-order tiebreak (id is TEXT PK, dict order != creation order)`, limit, offset)
 	if err != nil {
 		return nil, err
 	}

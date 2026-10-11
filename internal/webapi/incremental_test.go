@@ -1,0 +1,1023 @@
+package webapi
+
+import (
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	httptest "net/http/httptest"
+	"os"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/source"
+)
+
+// F-04 anchors: watermark SQL construction, state-advance semantics, the
+// three conflict strategies, and API validation (D4 source restriction +
+// identifier allow-list).
+
+func TestIncSelectSQL(t *testing.T) {
+	got := incSourceDialect.BuildSelectSQL("public", "users", []string{"id", "update_time", "name"}, "update_time", false)
+	want := `SELECT "id", "update_time", "name" FROM "public"."users" WHERE "update_time" >= $1 ORDER BY "update_time" LIMIT $2`
+	if got != want {
+		t.Fatalf("non-strict select =\n%s\nwant\n%s", got, want)
+	}
+	// Strict mode (opt-in, may lose same-second late rows) must use ">".
+	got = incSourceDialect.BuildSelectSQL("public", "users", []string{"id"}, "wm", true)
+	if !strings.Contains(got, `"wm" > $1`) {
+		t.Fatalf("strict select missing > : %s", got)
+	}
+	// Identifiers containing quotes must be escaped, never inlined raw.
+	got = incSourceDialect.BuildSelectSQL(`s"x`, `t"y`, []string{`c"z`}, `w"m`, false)
+	if strings.Contains(got, `"s"x"`) || !strings.Contains(got, `"s""x"`) {
+		t.Fatalf("quote escaping failed: %s", got)
+	}
+	// The watermark value is ALWAYS a $1 parameter 鈥?no string interpolation
+	// of values anywhere in the scan.
+	if !strings.Contains(want, "$1") || strings.Count(want, "$1") != 1 {
+		t.Fatalf("watermark must be parameterized exactly once: %s", want)
+	}
+}
+
+func TestIncInsertSQLStrategies(t *testing.T) {
+	replace := incBuildInsertSQL("db", "users", []string{"id", "name"}, 2, "replace")
+	if !strings.HasPrefix(replace, "REPLACE INTO `db`.`users` (`id`, `name`) VALUES (?, ?), (?, ?)") {
+		t.Fatalf("replace SQL = %s", replace)
+	}
+	ignore := incBuildInsertSQL("db", "users", []string{"id"}, 1, "ignore")
+	if !strings.HasPrefix(ignore, "INSERT IGNORE INTO `db`.`users` (`id`) VALUES (?)") {
+		t.Fatalf("ignore SQL = %s", ignore)
+	}
+	plain := incBuildInsertSQL("db", "users", []string{"id"}, 1, "error")
+	if !strings.HasPrefix(plain, "INSERT INTO `db`.`users` (`id`) VALUES (?)") {
+		t.Fatalf("error-strategy SQL = %s", plain)
+	}
+}
+
+// P-INC-TZ anchor (MS-03 segment 2): the incremental write DSN must pin every
+// pooled connection's session to UTC (aligns with the validator read session
+// getTiDBConn -> SessionInit SET time_zone='+00:00'); TargetConfig.DSN()
+// itself must stay untouched so its other consumers are unaffected.
+func TestIncTargetDSNUTCTimezone(t *testing.T) {
+	tc := config.TargetConfig{Host: "h", Port: 4000, User: "root", Password: "p", Database: "db"}
+	got := incTargetDSN(tc)
+	if !strings.Contains(got, "time_zone=%27%2B00%3A00%27") {
+		t.Fatalf("incremental write DSN missing UTC session pin: %s", got)
+	}
+	if !strings.Contains(got, "charset=utf8mb4") {
+		t.Fatalf("incremental write DSN lost the charset param: %s", got)
+	}
+	plain := tc.DSN()
+	if strings.Contains(plain, "time_zone") {
+		t.Fatalf("TargetConfig.DSN() must not gain the session pin: %s", plain)
+	}
+}
+
+func TestIncAdvanceWatermark(t *testing.T) {
+	// Zero rows: never move the watermark (a MAX query would race ahead of
+	// in-flight writes).
+	if got := incAdvanceWatermark("2026-01-01", "2026-06-01", 0); got != "2026-01-01" {
+		t.Fatalf("zero rows must not advance: %s", got)
+	}
+	// Rows synced: the stream's MAX (last row of the ordered scan) wins.
+	if got := incAdvanceWatermark("2026-01-01", "2026-06-01", 42); got != "2026-06-01" {
+		t.Fatalf("rows synced must advance to stream max: %s", got)
+	}
+	// Boundary re-read: default >= semantics re-scan the boundary watermark
+	// every run 鈥?same-second late rows are picked up, at the cost of
+	// re-reading rows exactly at the watermark (anchored by the >= in the
+	// select test above).
+}
+
+func TestIncIdentifierAllowList(t *testing.T) {
+	for _, ok := range []string{"users", "t1", "_x", "A_b_9"} {
+		if !incIdentifierOK(ok) {
+			t.Errorf("identifier %q must be accepted", ok)
+		}
+	}
+	for _, bad := range []string{"users; DROP TABLE x", `a"b`, "a b", "1abc", "a-b", "", "a.b"} {
+		if incIdentifierOK(bad) {
+			t.Errorf("identifier %q must be rejected", bad)
+		}
+	}
+}
+
+func TestIncWatermarkTypeWhitelist(t *testing.T) {
+	for _, ok := range []string{"timestamp with time zone", "timestamp without time zone", "date", "integer", "bigint"} {
+		if !incWatermarkTypes[ok] {
+			t.Errorf("type %q must be whitelisted", ok)
+		}
+	}
+	for _, bad := range []string{"text", "numeric", "jsonb", "boolean", "uuid"} {
+		if incWatermarkTypes[bad] {
+			t.Errorf("type %q must NOT be whitelisted", bad)
+		}
+	}
+}
+
+// TestIncrementalJobAPIValidation covers the D4 source restriction, target
+// type check, identifier/strategy/batch validation, and the create/update/
+// delete lifecycle. No live DB needed: validation happens before any connect.
+func TestIncrementalJobAPIValidation(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	// One postgres source + one tidb target registered.
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "inc-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "inc-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+	// And a tidb "source" to prove the D4 rejection (target-only kind), plus
+	// a mysql source which MS-10a lifted INTO the watermark capability set.
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "inc-bad", "type": "tidb",
+		"fields": {"host": "10.0.0.8", "port": 4000, "user": "root", "password": "pw", "database": "db9"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tidbID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "inc-my", "type": "mysql",
+		"fields": {"host": "10.0.0.2", "port": 3306, "user": "u", "password": "pw", "database": "db3"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	mysqlID := dsBody(t, w)["id"].(string)
+
+	validBody := func(src, strategy, table, wmCol string) string {
+		return `{"name": "j1", "source_ref": "` + src + `", "target_ref": "` + tgtID +
+			`", "batch_size": 500, "conflict_strategy": "` + strategy +
+			`", "tables": [{"table": "` + table + `", "watermark_column": "` + wmCol + `", "initial_watermark": ""}]}`
+	}
+
+	// D4: watermark-incapable source rejected with 400 (capability-shaped).
+	w, req = doReq("POST", "/api/v1/incremental/jobs", validBody(tidbID, "replace", "users", "update_time"))
+	s.handleCreateIncrementalJob(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "不支持增量同步") {
+		t.Fatalf("tidb source must be rejected 400: %d %s", w.Code, w.Body.String())
+	}
+	// MS-10a: mysql source is watermark-capable — the create must be
+	// accepted (no live connect happens at create time).
+	w, req = doReq("POST", "/api/v1/incremental/jobs", `{"name": "jmy", "source_ref": "`+mysqlID+`", "target_ref": "`+tgtID+
+		`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time", "initial_watermark": ""}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("mysql source create must be 201 since MS-10a: %d %s", w.Code, w.Body.String())
+	}
+
+	// Bad conflict strategy / bad identifiers / bad batch size 鈫?400.
+	for _, body := range []string{
+		validBody(srcID, "truncate", "users", "update_time"),
+		validBody(srcID, "replace", "users; DROP TABLE x", "update_time"),
+		validBody(srcID, "replace", "users", "col-from-(select)"),
+	} {
+		w, req = doReq("POST", "/api/v1/incremental/jobs", body)
+		s.handleCreateIncrementalJob(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("invalid job accepted: %d %s (%s)", w.Code, w.Body.String(), body)
+		}
+	}
+	w, req = doReq("POST", "/api/v1/incremental/jobs",
+		`{"name": "j2", "source_ref": "`+srcID+`", "target_ref": "`+tgtID+`", "batch_size": 0, "conflict_strategy": "replace", "tables": []}`)
+	s.handleCreateIncrementalJob(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("empty tables / bad batch must be 400, got %d", w.Code)
+	}
+
+	// #t1: case-variant duplicates (ord_hdr vs ORD_HDR) are the same PG
+	// unquoted identifier — must be rejected 400 before any connect.
+	w, req = doReq("POST", "/api/v1/incremental/jobs",
+		`{"name": "j3", "source_ref": "`+srcID+`", "target_ref": "`+tgtID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [`+
+			`{"table": "ord_hdr", "watermark_column": "update_time", "initial_watermark": ""},`+
+			`{"table": "ORD_HDR", "watermark_column": "id", "initial_watermark": ""}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "duplicate table") {
+		t.Fatalf("case-variant duplicate table must be 400 duplicate table: %d %s", w.Code, w.Body.String())
+	}
+
+	// Happy path: create 鈫?list 鈫?update (config edit keeps state) 鈫?delete.
+	w, req = doReq("POST", "/api/v1/incremental/jobs", validBody(srcID, "replace", "users", "update_time"))
+	s.handleCreateIncrementalJob(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	id := dsBody(t, w)["id"].(string)
+
+	// Simulate runtime state, then update the config: the state must survive.
+	incMu.Lock()
+	list := s.loadIncrementalJobs()
+	for i := range list {
+		if list[i].ID == id {
+			list[i].States["users"] = &incTableState{LastWatermark: "2026-01-01", TotalRows: 7}
+		}
+	}
+	if err := s.saveIncrementalJobs(list); err != nil {
+		t.Fatal(err)
+	}
+	incMu.Unlock()
+
+	// D4 gate on UPDATE too (v2): PUT must not swap refs past the type checks.
+	w, req = doReq("PUT", "/api/v1/incremental/jobs/"+id, validBody(tidbID, "replace", "users", "update_time"))
+	req = withChiParam(req, "id", id)
+	s.handleUpdateIncrementalJob(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "不支持增量同步") {
+		t.Fatalf("PUT with tidb source must be rejected 400: %d %s", w.Code, w.Body.String())
+	}
+	w, req = doReq("PUT", "/api/v1/incremental/jobs/"+id, `{"name": "j1", "source_ref": "`+srcID+
+		`", "target_ref": "`+mysqlID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time"}]}`)
+	req = withChiParam(req, "id", id)
+	s.handleUpdateIncrementalJob(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "TiDB") {
+		t.Fatalf("PUT with mysql target must be rejected 400: %d %s", w.Code, w.Body.String())
+	}
+
+	w, req = doReq("PUT", "/api/v1/incremental/jobs/"+id, validBody(srcID, "ignore", "users", "other_col"))
+	req = withChiParam(req, "id", id)
+	s.handleUpdateIncrementalJob(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update: %d %s", w.Code, w.Body.String())
+	}
+	incMu.Lock()
+	list = s.loadIncrementalJobs()
+	incMu.Unlock()
+	var found *incJob
+	for i := range list {
+		if list[i].ID == id {
+			found = &list[i]
+		}
+	}
+	if found == nil {
+		t.Fatal("job vanished after update")
+	}
+	if st := found.States["users"]; st == nil || st.LastWatermark != "2026-01-01" || st.TotalRows != 7 {
+		t.Fatalf("config edit must not reset table state: %+v", found.States)
+	}
+
+	w, req = doReq("DELETE", "/api/v1/incremental/jobs/"+id, "")
+	req = withChiParam(req, "id", id)
+	s.handleDeleteIncrementalJob(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete: %d %s", w.Code, w.Body.String())
+	}
+	incMu.Lock()
+	list = s.loadIncrementalJobs()
+	incMu.Unlock()
+	for _, e := range list {
+		if e.ID == id {
+			t.Fatal("job still present after delete")
+		}
+	}
+}
+
+// #t1 batch column endpoint: validation happens before any connect, so the
+// no-DB error paths are fully exercisable without a live source.
+func TestIncrementalColumnsBatchValidation(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "cb-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "cb-bad", "type": "tidb",
+		"fields": {"host": "10.0.0.8", "port": 4000, "user": "root", "password": "pw", "database": "db9"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tidbID := dsBody(t, w)["id"].(string)
+
+	post := func(body string) *httptest.ResponseRecorder {
+		w, req := doReq("POST", "/api/v1/incremental/columns-batch", body)
+		s.handleIncrementalColumnsBatch(w, req)
+		return w
+	}
+
+	// Missing source_ref / empty tables → 400.
+	if w := post(`{"source_ref": "", "tables": ["users"]}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("missing source_ref must be 400: %d %s", w.Code, w.Body.String())
+	}
+	if w := post(`{"source_ref": "` + srcID + `", "tables": []}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("empty tables must be 400: %d %s", w.Code, w.Body.String())
+	}
+	// Watermark-incapable source → 400 with the capability-shaped D4 message
+	// (MS-10a: mysql is capable now; tidb is the target-only negative kind).
+	if w := post(`{"source_ref": "` + tidbID + `", "tables": ["users"]}`); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "不支持增量同步") {
+		t.Fatalf("tidb source must be rejected 400: %d %s", w.Code, w.Body.String())
+	}
+	// Injection-shaped / duplicate table names → 400 before any connect.
+	if w := post(`{"source_ref": "` + srcID + `", "tables": ["users; DROP TABLE x"]}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("bad identifier must be 400: %d %s", w.Code, w.Body.String())
+	}
+	if w := post(`{"source_ref": "` + srcID + `", "tables": ["users", "users"]}`); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "重复") {
+		t.Fatalf("duplicate table must be 400: %d %s", w.Code, w.Body.String())
+	}
+	// Cap: more than 200 tables → 400.
+	tooMany := make([]string, incColumnsBatchLimit+1)
+	for i := range tooMany {
+		tooMany[i] = "t" + strconv.Itoa(i)
+	}
+	b, _ := json.Marshal(map[string]any{"source_ref": srcID, "tables": tooMany})
+	if w := post(string(b)); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "上限") {
+		t.Fatalf("over-cap must be 400: %d %s", w.Code, w.Body.String())
+	}
+	// Valid shape but unreachable host: validation passed, connect fails → 502
+	// (proves the request reached the connection stage, not a validation 400).
+	if w := post(`{"source_ref": "` + srcID + `", "tables": ["users"]}`); w.Code != http.StatusBadGateway {
+		t.Fatalf("unreachable source must be 502, got %d %s", w.Code, w.Body.String())
+	}
+}
+
+// --- F-04 v2: same-value saturation (Blocker A) anchors ---
+
+// MS-04 D4 absorption anchors (ruling seq 271): the capability read must
+// keep the legacy guard's semantics - empty kind REJECTED explicitly
+// (NormalizeKind("") would default to postgres = semantic flip risk) and
+// unknown kinds resolve false (400 same-text path, never 500).
+func TestIncSourceWatermarkCapable(t *testing.T) {
+	if incSourceWatermarkCapable("") {
+		t.Fatal(`incSourceWatermarkCapable("") = true; empty kind must be rejected (legacy guard parity)`)
+	}
+	if incSourceWatermarkCapable("oracle") {
+		t.Fatal(`incSourceWatermarkCapable("oracle") = true; unknown kind must resolve false`)
+	}
+	if incSourceWatermarkCapable("tidb") {
+		t.Fatal(`incSourceWatermarkCapable("tidb") = true; target-only kind must stay watermark-incapable`)
+	}
+	// MS-10a: mysql flipped into the watermark capability set.
+	if !incSourceWatermarkCapable("mysql") {
+		t.Fatal(`incSourceWatermarkCapable("mysql") = false; watermark landed for MySQL in MS-10a`)
+	}
+	if !incSourceWatermarkCapable("postgres") {
+		t.Fatal(`incSourceWatermarkCapable("postgres") = false`)
+	}
+}
+
+// MS-06 generalized capability-read anchors (ruling seq 347): the TWO call
+// shapes differ on the EMPTY kind - C1 two-shape table:
+//   - :2333 assess shape feeds the RAW stored type: empty -> srcCapable
+//     rejects -> 400 (legacy guard parity, same as the watermark shape);
+//   - :1264 cdc_chain shape feeds cfg.Source.SourceType(), which NORMALIZES
+//     "" to postgres: empty -> CapCDC(postgres) = true -> ALLOWED (legacy
+//     empty-means-postgres allow behavior preserved).
+//
+// Ten states pinned: each capability (CapAssess/CapCDC) across
+// empty/unknown/mysql/tidb/postgres in BOTH shapes.
+func TestSrcCapable(t *testing.T) {
+	// Shape 1 (raw value in, e.g. e.Type): empty is rejected.
+	if srcCapable("", source.CapAssess) {
+		t.Fatal(`srcCapable("", CapAssess) = true; raw-shape empty must be rejected (C1)`)
+	}
+	if srcCapable("oracle", source.CapAssess) {
+		t.Fatal(`srcCapable("oracle", CapAssess) = true; unknown kind must resolve false`)
+	}
+	// MS-10b: assess flipped ON for mysql (information_schema scanner
+	// dialect); tidb stays target-only.
+	if srcCapable("tidb", source.CapAssess) {
+		t.Fatal(`srcCapable("tidb", CapAssess) = true; tidb is target-only`)
+	}
+	if !srcCapable("mysql", source.CapAssess) {
+		t.Fatal(`srcCapable("mysql", CapAssess) = false; want true since MS-10b`)
+	}
+	if !srcCapable("postgres", source.CapAssess) {
+		t.Fatal(`srcCapable("postgres", CapAssess) = false`)
+	}
+	if srcCapable("oracle", source.CapCDC) || srcCapable("tidb", source.CapCDC) {
+		t.Fatal("srcCapable(oracle/tidb, CapCDC) = true; CDC needs the real binlog/logical-replication engines")
+	}
+	// MS-11 pen 4: cdc flipped ON for mysql (binlog CDC, canal adapter).
+	if !srcCapable("mysql", source.CapCDC) {
+		t.Fatal(`srcCapable("mysql", CapCDC) = false; want true since MS-11`)
+	}
+	if !srcCapable("postgres", source.CapCDC) {
+		t.Fatal(`srcCapable("postgres", CapCDC) = false`)
+	}
+	// Shape 2 (normalized value in, e.g. cfg.Source.SourceType()): empty
+	// has ALREADY defaulted to postgres, so the cdc_chain path ALLOWS it.
+	if cfg := (config.SourceConfig{}); cfg.SourceType() != "postgres" {
+		t.Fatal(`SourceConfig{}.SourceType() != "postgres"; the cdc_chain shape depends on the built-in default`)
+	}
+	if !srcCapable((config.SourceConfig{}).SourceType(), source.CapCDC) {
+		t.Fatal("srcCapable(SourceType(), CapCDC) = false for an empty config; legacy empty-means-postgres allow behavior flipped (C1)")
+	}
+	// MS-07: the DDL export guard reads the RAW stored type (C1 shape 1 -
+	// empty is rejected), identical to the legacy `!= "postgres"` behavior.
+	if srcCapable("", source.CapDDLExport) {
+		t.Fatal(`srcCapable("", CapDDLExport) = true; raw-shape empty must be rejected (C1)`)
+	}
+	if srcCapable("oracle", source.CapDDLExport) {
+		t.Fatal(`srcCapable("oracle", CapDDLExport) = true; unknown kind must resolve false`)
+	}
+	// MS-10c: ddl_export flipped ON for mysql (SHOW CREATE exporter
+	// dialect); tidb stays target-only (the last PG-only flow is CDC).
+	if !srcCapable("mysql", source.CapDDLExport) {
+		t.Fatal(`srcCapable("mysql", CapDDLExport) = false; want true since MS-10c`)
+	}
+	if srcCapable("tidb", source.CapDDLExport) {
+		t.Fatal(`srcCapable("tidb", CapDDLExport) = true; tidb stays target-only`)
+	}
+	if !srcCapable("postgres", source.CapDDLExport) {
+		t.Fatal(`srcCapable("postgres", CapDDLExport) = false`)
+	}
+}
+
+// MS-04 logs-renderer quote-fragment anchor (ruling seq 269): the log
+// previews' identifier fragments must be BYTE-identical to the dialect's -
+// the renderers are same-source different call sites (overall SQL differs:
+// inline wm/limit for display vs $1/$2 parameters).
+func TestIncLogsRenderersQuoteFragments(t *testing.T) {
+	cols := []string{"id", `c"z`}
+	strict := false
+	sel := incRenderSelectSQL(incSourceDialect, `s"x`, `t"y`, cols, `w"m`, strict, "'2026-01-01'", 500)
+	drn := incRenderDrainSQL(incSourceDialect, `s"x`, `t"y`, cols, `w"m`, "'2026-01-01'")
+	jmp := incRenderNextWatermarkSQL(incSourceDialect, `s"x`, `t"y`, `w"m`, "'2026-01-01'")
+	d := incSourceDialect
+	qualifier := d.QuoteIdent(`s"x`) + "." + d.QuoteIdent(`t"y`)
+	for _, rendered := range []string{sel, drn, jmp} {
+		if !strings.Contains(rendered, qualifier) || !strings.Contains(rendered, d.QuoteIdent(`w"m`)) {
+			t.Fatalf("log renderer fragment missing (qualifier/wm) from rendered SQL:\n%s", rendered)
+		}
+	}
+	for _, rendered := range []string{sel, drn} { // column list only in select/drain
+		if !strings.Contains(rendered, d.QuoteIdent(`c"z`)) {
+			t.Fatalf("log renderer column fragment missing from rendered SQL:\n%s", rendered)
+		}
+	}
+}
+
+// MS-11b pen 6: the log renderers share incQuoteSQLLiteral with the MySQL
+// no-PK probe — the backslash injection shape must be inert on this consumer
+// too (raw \' would terminate the literal early under MySQL default escapes).
+func TestIncLogsRendererBackslashEscaping(t *testing.T) {
+	evil := `db\' OR 1=1 -- `
+	for _, rendered := range []string{
+		incRenderSelectSQL(incSourceDialect, "s", "t", []string{"id"}, "wm", false, evil, 10),
+		incRenderDrainSQL(incSourceDialect, "s", "t", []string{"id"}, "wm", evil),
+		incRenderNextWatermarkSQL(incSourceDialect, "s", "t", "wm", evil),
+	} {
+		if !strings.Contains(rendered, `'db\\'' OR 1=1 -- '`) {
+			t.Fatalf("backslash not doubled (literal breakable):\n%s", rendered)
+		}
+		if strings.Contains(rendered, "db\\'") {
+			t.Fatalf("raw backslash-quote pair survived:\n%s", rendered)
+		}
+	}
+}
+
+func TestIncDrainAndJumpSQL(t *testing.T) {
+	got := incSourceDialect.BuildDrainSQL("public", "users", []string{"id", "update_time"}, "update_time")
+	want := `SELECT "id", "update_time" FROM "public"."users" WHERE "update_time" = $1`
+	if got != want {
+		t.Fatalf("drain SQL =\n%s\nwant\n%s", got, want)
+	}
+	if strings.Contains(got, "LIMIT") {
+		t.Fatalf("drain scan must be unbounded (streamed): %s", got)
+	}
+	jump := incSourceDialect.BuildNextWatermarkSQL("public", "users", "update_time")
+	wantJump := `SELECT MIN("update_time") FROM "public"."users" WHERE "update_time" > $1`
+	if jump != wantJump {
+		t.Fatalf("jump SQL =\n%s\nwant\n%s", jump, wantJump)
+	}
+}
+
+func TestIncCursorStep(t *testing.T) {
+	// Empty batch: keep the cursor, done.
+	if wm, sat, done := incCursorStep("w0", "", 0, 100); wm != "w0" || sat || !done {
+		t.Fatalf("empty batch: %q %v %v", wm, sat, done)
+	}
+	// Partial batch: advance to stream max, done.
+	if wm, sat, done := incCursorStep("w0", "w5", 40, 100); wm != "w5" || sat || !done {
+		t.Fatalf("partial batch: %q %v %v", wm, sat, done)
+	}
+	// Full batch, max moved: advance, continue keyset.
+	if wm, sat, done := incCursorStep("w0", "w9", 100, 100); wm != "w9" || sat || done {
+		t.Fatalf("advancing full batch: %q %v %v", wm, sat, done)
+	}
+	// Full batch ENTIRELY at the entry watermark: saturation 鈥?the livelock
+	// case (same-second bulk INSERT) that MUST go to drain, not a retry.
+	if wm, sat, done := incCursorStep("w0", "w0", 100, 100); wm != "w0" || !sat || done {
+		t.Fatalf("saturation: %q %v %v", wm, sat, done)
+	}
+}
+
+func TestIncJumpAfterDrain(t *testing.T) {
+	if wm, done := incJumpAfterDrain(sql.NullString{Valid: false}); !done || wm != "" {
+		t.Fatalf("NULL next 鈬?done: %q %v", wm, done)
+	}
+	if wm, done := incJumpAfterDrain(sql.NullString{String: ""}); !done || wm != "" {
+		t.Fatalf("empty next 鈬?done: %q %v", wm, done)
+	}
+	if wm, done := incJumpAfterDrain(sql.NullString{String: "w7", Valid: true}); done || wm != "w7" {
+		t.Fatalf("value next 鈬?continue at w7: %q %v", wm, done)
+	}
+}
+
+// fakeWMTable models a source table as a sorted list of watermark values; the
+// fetch/min probes mirror the exact SQL semantics the engine issues.
+type fakeWMTable struct {
+	rows []string // sorted ascending
+}
+
+func (f *fakeWMTable) fetch(wm string, limit int, strict bool) []string {
+	op := func(v string) bool {
+		if strict {
+			return v > wm
+		}
+		return v >= wm
+	}
+	out := []string{}
+	for _, v := range f.rows {
+		if op(v) && len(out) < limit {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func (f *fakeWMTable) fetchEq(wm string) []string {
+	out := []string{}
+	for _, v := range f.rows {
+		if v == wm {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func (f *fakeWMTable) minAbove(wm string) sql.NullString {
+	for _, v := range f.rows {
+		if v > wm {
+			return sql.NullString{String: v, Valid: true}
+		}
+	}
+	return sql.NullString{}
+}
+
+// runLoopModel replays syncOneTable's cursor driver over a fake table using
+// the PRODUCTION decision helpers (incCursorStep / incJumpAfterDrain) 鈥?the
+// loop skeleton mirrors the engine's, so a livelock here means one there.
+func runLoopModel(t *testing.T, tbl *fakeWMTable, startWM string, batchSize int, strict bool) (written int, finalWM string) {
+	t.Helper()
+	const maxIters = 10000
+	// Mirrors the engine: an empty starting watermark derives the cursor from
+	// MIN(col) — strict jobs then get a >= first scan (adversarial ①, v2);
+	// a >= scan also follows every drain jump (the jumped-to value's rows are
+	// unconsumed — a strict > would skip them all).
+	minDerived := startWM == ""
+	geScan := minDerived
+	wm, lastWM, written := startWM, startWM, 0
+	for i := 0; ; i++ {
+		if i > maxIters {
+			t.Fatal("loop model livelocked (did not terminate)")
+		}
+		entryWM := wm
+		if entryWM == "" {
+			// MIN(col) probe on the fake table.
+			if len(tbl.rows) == 0 {
+				break
+			}
+			entryWM = tbl.rows[0]
+			wm = entryWM
+		}
+		batch := tbl.fetch(entryWM, batchSize, strict && !geScan)
+		if len(batch) == 0 {
+			break
+		}
+		written += len(batch)
+		lastWM = batch[len(batch)-1]
+		next, saturated, done := incCursorStep(entryWM, lastWM, len(batch), batchSize)
+		if saturated {
+			// Drain: rewrite ALL rows at this value in chunks, then jump.
+			// (REPLACE/IGNORE idempotent; the engine's error strategy would
+			// surface a duplicate-key here 鈥?deterministic, not a livelock.)
+			drain := tbl.fetchEq(lastWM)
+			written += len(drain)
+			jump, tableDone := incJumpAfterDrain(tbl.minAbove(lastWM))
+			if tableDone {
+				return written, lastWM
+			}
+			wm = jump
+			geScan = true
+			continue
+		}
+		geScan = false
+		wm = next
+		if done {
+			break
+		}
+	}
+	return written, lastWM
+}
+
+func TestIncLoopSameValue2xBatch(t *testing.T) {
+	// Same value with 2脳BatchSize rows, plus one later value: pre-fix this
+	// livelocked forever; now it completes, writes every row (via drain) and
+	// the watermark jumps past the saturated value.
+	rows := []string{}
+	for i := 0; i < 20; i++ {
+		rows = append(rows, "w1")
+	}
+	rows = append(rows, "w2", "w2")
+	tbl := &fakeWMTable{rows: rows}
+	written, wm := runLoopModel(t, tbl, "w0", 10, false)
+	if wm != "w2" {
+		t.Fatalf("watermark must jump to w2, got %q", wm)
+	}
+	// b1 (>=w0, 10×w1) + b2 (>=w1 re-reads the same 10 — the livelock batch,
+	// now detected as saturation) + drain rewrites all 20 at w1 + w2 tail.
+	if written != 10+10+20+2 {
+		t.Fatalf("written = %d, want 42 (two keyset batches + full drain + tail)", written)
+	}
+}
+
+func TestIncLoopWholeTableSameValue(t *testing.T) {
+	rows := []string{}
+	for i := 0; i < 35; i++ {
+		rows = append(rows, "w9")
+	}
+	written, wm := runLoopModel(t, &fakeWMTable{rows: rows}, "", 10, false)
+	if wm != "w9" || written != 10+35 {
+		t.Fatalf("whole-table same value: wm=%q written=%d (want w9, 45)", wm, written)
+	}
+}
+
+func TestIncLoopStrictMINBackfill(t *testing.T) {
+	// Strict mode + empty initial watermark: the MIN-derived first scan must
+	// be >= (all MIN rows arrive via the saturation drain), and the
+	// post-jump scan must also be >= (the w2 row is unconsumed — a strict >
+	// there would drop it entirely).
+	rows := []string{}
+	for i := 0; i < 25; i++ {
+		rows = append(rows, "w1")
+	}
+	rows = append(rows, "w2")
+	written, wm := runLoopModel(t, &fakeWMTable{rows: rows}, "", 10, true)
+	if wm != "w2" || written != 10+25+1 {
+		t.Fatalf("strict MIN backfill: wm=%q written=%d (want w2, 36 — zero rows lost)", wm, written)
+	}
+}
+
+func TestIncLoopSaturationAtLastValue(t *testing.T) {
+	// The saturated value is the table's maximum: drain finds no value above
+	// 鈬?table complete, watermark = the saturated value, no extra query loop.
+	rows := []string{}
+	for i := 0; i < 15; i++ {
+		rows = append(rows, "w1")
+	}
+	rows = append(rows, "w5")
+	for i := 0; i < 12; i++ {
+		rows = append(rows, "w7") // 12 > batchSize 鈬?saturation at max value
+	}
+	written, wm := runLoopModel(t, &fakeWMTable{rows: rows}, "w0", 10, false)
+	if wm != "w7" || written != 10+10+15+10+10+12 {
+		t.Fatalf("saturation at last value: wm=%q written=%d (want w7, 67)", wm, written)
+	}
+}
+
+func TestIncLoopMixedRegular(t *testing.T) {
+	// Ordinary mixed values, no saturation: identical outcome to the pre-fix
+	// engine (regression anchor 鈥?the fix must not change normal behavior).
+	tbl := &fakeWMTable{rows: []string{"w1", "w2", "w2", "w3", "w4", "w4", "w4"}}
+	written, wm := runLoopModel(t, tbl, "w0", 3, false)
+	// >= boundary re-reads make every value's first row appear twice; the
+	// final w4×3 exactly fills a batch ⇒ one drain. Same shape as pre-fix,
+	// minus the livelock.
+	if wm != "w4" || written != 3*4+3 {
+		t.Fatalf("mixed: wm=%q written=%d (want w4, 15)", wm, written)
+	}
+}
+
+func TestIncLoopStrictUnchanged(t *testing.T) {
+	// Strict mode (">") can never saturate: every fetched row is strictly
+	// above the cursor, so lastWM != entryWM by construction.
+	rows := []string{}
+	for i := 0; i < 25; i++ {
+		rows = append(rows, "w1")
+	}
+	rows = append(rows, "w2")
+	written, wm := runLoopModel(t, &fakeWMTable{rows: rows}, "w0", 10, true)
+	// Strict tradeoff (documented, opt-in): after advancing past "w1" the
+	// remaining same-value rows are skipped 鈥?10 (first batch) + "w2" only.
+	if wm != "w2" || written != 11 {
+		t.Fatalf("strict: wm=%q written=%d (want w2, 11)", wm, written)
+	}
+}
+
+// --- run async anchors (202 + incRunning + startup cleanup) ---
+
+// waitForIncRun polls the persisted jobs file until the job's newest history
+// record leaves the running state (or the deadline fires).
+func waitForIncRun(t *testing.T, s *Server, id string) incRunRecord {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		incMu.Lock()
+		list := s.loadIncrementalJobs()
+		incMu.Unlock()
+		for i := range list {
+			if list[i].ID == id && len(list[i].History) > 0 {
+				if list[i].History[0].Status != incRunStatusRunning {
+					return list[i].History[0]
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("run did not leave running state in time")
+	return incRunRecord{}
+}
+
+// Anchor 1: POST run returns 202 + run_id immediately; a job whose
+// source_ref no longer resolves (datasource deleted post-create) finishes in
+// the background with per-table errors and a completed terminal record; the
+// running flag is cleared afterwards.
+func TestIncRunAsyncAcceptedAndCompletes(t *testing.T) {
+	s, _ := newTestServer(t)
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "async-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "async-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+
+	w, req = doReq("POST", "/api/v1/incremental/jobs", `{"name": "aj", "source_ref": "`+srcID+
+		`", "target_ref": "`+tgtID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time"}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	id := dsBody(t, w)["id"].(string)
+
+	// Break the source ref after creation: the run must fail per-table, not hang.
+	w, req = doReq("DELETE", "/api/v1/datasources/"+srcID, "")
+	req = withChiParam(req, "id", srcID)
+	s.handleDeleteDataSource(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete datasource: %d %s", w.Code, w.Body.String())
+	}
+
+	w, req = doReq("POST", "/api/v1/incremental/jobs/"+id+"/run", "")
+	req = withChiParam(req, "id", id)
+	s.handleRunIncrementalJob(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("run must be 202: %d %s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil || resp["run_id"] == "" || resp["status"] != "running" {
+		t.Fatalf("202 body must carry run_id+running: %v %v", err, w.Body.String())
+	}
+	runID := resp["run_id"]
+
+	rec := waitForIncRun(t, s, id)
+	if rec.RunID != runID {
+		t.Fatalf("terminal record must keep the stub run_id: %+v", rec)
+	}
+	if rec.Status != incRunStatusCompleted {
+		t.Fatalf("terminal status must be completed: %+v", rec)
+	}
+	if len(rec.Tables) != 1 || rec.Tables[0].Error == "" {
+		t.Fatalf("per-table error must land for unresolved source_ref: %+v", rec.Tables)
+	}
+	incMu.Lock()
+	running := incRunning[id]
+	incMu.Unlock()
+	if running {
+		t.Fatal("incRunning must be cleared after run completion")
+	}
+}
+
+// Anchor 2: a job flagged running rejects a second run and a delete with 409.
+func TestIncRunSecondRunConflict(t *testing.T) {
+	s, _ := newTestServer(t)
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "c-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "c-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/incremental/jobs", `{"name": "cj", "source_ref": "`+srcID+
+		`", "target_ref": "`+tgtID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time"}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	id := dsBody(t, w)["id"].(string)
+
+	incMu.Lock()
+	incRunning[id] = true
+	incMu.Unlock()
+	w, req = doReq("POST", "/api/v1/incremental/jobs/"+id+"/run", "")
+	req = withChiParam(req, "id", id)
+	s.handleRunIncrementalJob(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("second run must be 409: %d %s", w.Code, w.Body.String())
+	}
+	w, req = doReq("DELETE", "/api/v1/incremental/jobs/"+id, "")
+	req = withChiParam(req, "id", id)
+	s.handleDeleteIncrementalJob(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("delete while running must be 409: %d %s", w.Code, w.Body.String())
+	}
+	incMu.Lock()
+	delete(incRunning, id)
+	incMu.Unlock()
+}
+
+// Anchor 3: running stubs persisted before a restart are rewritten as failed
+// at startup; States are untouched.
+func TestIncStartupCleanupRunningStubs(t *testing.T) {
+	s, _ := newTestServer(t)
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "cl-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "cl-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/incremental/jobs", `{"name": "clj", "source_ref": "`+srcID+
+		`", "target_ref": "`+tgtID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time"}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	id := dsBody(t, w)["id"].(string)
+
+	incMu.Lock()
+	list := s.loadIncrementalJobs()
+	for i := range list {
+		if list[i].ID == id {
+			list[i].States["users"] = &incTableState{LastWatermark: "2026-01-01", TotalRows: 3}
+			list[i].History = []incRunRecord{{RunID: "deadbeef", StartedAt: time.Now(), Status: incRunStatusRunning}}
+		}
+	}
+	if err := s.saveIncrementalJobs(list); err != nil {
+		t.Fatal(err)
+	}
+	incMu.Unlock()
+
+	s.markInterruptedIncrementalRuns()
+
+	incMu.Lock()
+	list = s.loadIncrementalJobs()
+	incMu.Unlock()
+	for _, e := range list {
+		if e.ID != id {
+			continue
+		}
+		if len(e.History) != 1 {
+			t.Fatalf("history must keep the stub: %+v", e.History)
+		}
+		if e.History[0].Status != incRunStatusFailed || e.History[0].Error == "" {
+			t.Fatalf("running stub must become failed with error: %+v", e.History[0])
+		}
+		if st := e.States["users"]; st == nil || st.LastWatermark != "2026-01-01" || st.TotalRows != 3 {
+			t.Fatalf("states must be untouched by cleanup: %+v", e.States)
+		}
+	}
+}
+
+// Anchor 4: a persisted "states":null job (old/hand-edited file) is normalized
+// to a non-nil map on load, and a background run over it completes without
+// panicking on the first States write.
+func TestIncLoadNullStatesNormalized(t *testing.T) {
+	s, _ := newTestServer(t)
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "ns-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "ns-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/incremental/jobs", `{"name": "nsj", "source_ref": "`+srcID+
+		`", "target_ref": "`+tgtID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time"}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	id := dsBody(t, w)["id"].(string)
+
+	// Force a literal "states": null back onto disk (States has no omitempty,
+	// so nil marshals as null), then re-load and require a non-nil map.
+	incMu.Lock()
+	list := s.loadIncrementalJobs()
+	for i := range list {
+		if list[i].ID == id {
+			list[i].States = nil
+		}
+	}
+	if err := s.saveIncrementalJobs(list); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(s.incrementalJobsFile())
+	if err != nil || !strings.Contains(string(raw), `"states": null`) {
+		t.Fatalf("fixture must carry literal states:null: %v %s", err, raw)
+	}
+	list = s.loadIncrementalJobs()
+	incMu.Unlock()
+	for i := range list {
+		if list[i].ID == id && list[i].States == nil {
+			t.Fatal("loadIncrementalJobs must normalize states:null to a non-nil map")
+		}
+	}
+
+	// The run engine must survive the first States write on such a job. Break
+	// the source ref first so the run fails per-table quickly (no live DB in
+	// unit tests) instead of blocking on a connection attempt.
+	w, req = doReq("DELETE", "/api/v1/datasources/"+srcID, "")
+	req = withChiParam(req, "id", srcID)
+	s.handleDeleteDataSource(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete datasource: %d %s", w.Code, w.Body.String())
+	}
+	w, req = doReq("POST", "/api/v1/incremental/jobs/"+id+"/run", "")
+	req = withChiParam(req, "id", id)
+	s.handleRunIncrementalJob(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("run must be 202: %d %s", w.Code, w.Body.String())
+	}
+	rec := waitForIncRun(t, s, id)
+	if rec.Status != incRunStatusCompleted {
+		t.Fatalf("run over states:null job must complete: %+v", rec)
+	}
+}
+
+// Anchor 5: the panic-finalize helper rewrites a running stub to failed with a
+// generic error, clears the running flag and leaves States untouched.
+func TestIncFinalizeFailedAfterPanic(t *testing.T) {
+	s, _ := newTestServer(t)
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name": "pf-src", "type": "postgres",
+		"fields": {"host": "10.0.0.1", "port": 5432, "user": "pg", "password": "pw", "database": "db"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	srcID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name": "pf-tgt", "type": "tidb",
+		"fields": {"host": "10.0.0.9", "port": 4000, "user": "root", "password": "pw", "database": "db2"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	tgtID := dsBody(t, w)["id"].(string)
+	w, req = doReq("POST", "/api/v1/incremental/jobs", `{"name": "pfj", "source_ref": "`+srcID+
+		`", "target_ref": "`+tgtID+`", "batch_size": 500, "conflict_strategy": "replace", "tables": [{"table": "users", "watermark_column": "update_time"}]}`)
+	s.handleCreateIncrementalJob(w, req)
+	id := dsBody(t, w)["id"].(string)
+
+	incMu.Lock()
+	list := s.loadIncrementalJobs()
+	for i := range list {
+		if list[i].ID == id {
+			list[i].States["users"] = &incTableState{LastWatermark: "2026-02-02", TotalRows: 7}
+			list[i].History = []incRunRecord{{RunID: "panica11", StartedAt: time.Now(), Status: incRunStatusRunning}}
+		}
+	}
+	if err := s.saveIncrementalJobs(list); err != nil {
+		t.Fatal(err)
+	}
+	incRunning[id] = true
+	incMu.Unlock()
+
+	s.finalizeIncRunFailed(id, "panica11")
+
+	incMu.Lock()
+	running := incRunning[id]
+	list = s.loadIncrementalJobs()
+	incMu.Unlock()
+	if running {
+		t.Fatal("finalizeIncRunFailed must clear incRunning")
+	}
+	for _, e := range list {
+		if e.ID != id {
+			continue
+		}
+		if len(e.History) != 1 || e.History[0].Status != incRunStatusFailed || e.History[0].Error == "" {
+			t.Fatalf("stub must be rewritten to failed with an error: %+v", e.History)
+		}
+		if e.History[0].RunID != "panica11" {
+			t.Fatalf("finalize must keep the run_id: %+v", e.History[0])
+		}
+		if st := e.States["users"]; st == nil || st.LastWatermark != "2026-02-02" || st.TotalRows != 7 {
+			t.Fatalf("states must be untouched by panic finalize: %+v", e.States)
+		}
+	}
+}

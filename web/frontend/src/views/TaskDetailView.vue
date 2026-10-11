@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import apiClient from '../api'
 import type { Task, TaskLogEntry, PhaseInfo } from '../api'
 import { isCompareTask, parseCompareResult } from '../api'
@@ -13,6 +13,12 @@ const task = ref<Task | null>(null)
 const loading = ref(true)
 const ws = ref<WebSocket | null>(null)
 const wsProgress = ref<any>(null)
+// Server-computed elapsed seconds (last WS progress message) + local
+// receive-time, so the display ticks every second without re-differencing
+// the (possibly skewed) browser clock against server-written started_at.
+const serverElapsed = ref<number | null>(null)
+const serverElapsedAt = ref(0)
+const nowTick = ref(Date.now())
 
 // Compare tasks (M4): type-aware degradation — migration stats/phases/report
 // are meaningless for compare; a compare-specific result card renders instead.
@@ -65,6 +71,31 @@ const phaseMap: Record<string, string> = {
 
 const phases = ['precheck', 'schema', 'data', 'validate']
 
+// Phase status → tag type/label, covering the P1 state machine values
+// (pending/running/completed/failed/skipped) plus the warn overlay.
+function phaseStatusMeta(status: string, warn?: boolean): { type: string; label: string } {
+  if (status === 'completed') {
+    return warn ? { type: 'warning', label: '带警告完成' } : { type: 'success', label: '已完成' }
+  }
+  switch (status) {
+    case 'running': return { type: '', label: '进行中' }
+    case 'failed': return { type: 'danger', label: '失败' }
+    case 'skipped': return { type: 'info', label: '已跳过' }
+    default: return { type: 'info', label: '等待中' }
+  }
+}
+
+// Phase duration formatter: 12s / 1m03s / 2h05m.
+function fmtPhaseDuration(sec?: number): string {
+  if (!sec || sec <= 0) return ''
+  const h = Math.floor(sec / 3600)
+  const m = Math.floor((sec % 3600) / 60)
+  const s = Math.floor(sec % 60)
+  if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`
+  if (m > 0) return `${m}m${String(s).padStart(2, '0')}s`
+  return `${s}s`
+}
+
 const statusInfo = computed(() => {
   if (!task.value) return { type: 'info', label: '-' }
   return statusMap[task.value.status] || { type: 'info', label: task.value.status }
@@ -75,22 +106,46 @@ const progressPercent = computed(() => {
   return Math.round(task.value.progress * 100)
 })
 
+const importSubText = computed(() => {
+  const p = wsProgress.value
+  if (!p || !task.value || task.value.phase !== 'data') return ''
+  const imported = p.imported_tables
+  if (typeof imported !== 'number' || imported <= 0) return ''
+  const total = p.tables_total ?? task.value.tables_total
+  return `数据导入中（${imported}/${total} 表）`
+})
+
+const elapsedSeconds = computed(() => {
+  if (!task.value?.started_at) return null
+  // Finished: exact server-written interval (clock-skew free).
+  if (task.value.finished_at) {
+    const d = Math.floor((new Date(task.value.finished_at).getTime() - new Date(task.value.started_at).getTime()) / 1000)
+    return Math.max(0, d)
+  }
+  // Running: server-computed base + locally advanced seconds.
+  if (serverElapsed.value !== null) {
+    return Math.max(0, serverElapsed.value + Math.floor((nowTick.value - serverElapsedAt.value) / 1000))
+  }
+  // Fallback (no WS yet): browser clock, clamped non-negative.
+  const d = Math.floor((nowTick.value - new Date(task.value.started_at).getTime()) / 1000)
+  return Math.max(0, d)
+})
+
 const elapsed = computed(() => {
-  if (!task.value?.started_at) return '-'
-  const end = task.value.finished_at ? new Date(task.value.finished_at) : new Date()
-  const start = new Date(task.value.started_at)
-  const diff = Math.floor((end.getTime() - start.getTime()) / 1000)
-  const h = Math.floor(diff / 3600)
-  const m = Math.floor((diff % 3600) / 60)
-  const s = diff % 60
-  return `${h}h ${m}m ${s}s`
+  const s = elapsedSeconds.value
+  if (s === null) return '-'
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  return `${h}h ${m}m ${sec}s`
 })
 
 const rowsPerSec = computed(() => {
   if (!task.value?.started_at || !task.value?.rows_done) return 0
-  const end = task.value.finished_at ? new Date(task.value.finished_at) : new Date()
-  const start = new Date(task.value.started_at)
-  const secs = (end.getTime() - start.getTime()) / 1000
+  let secs = elapsedSeconds.value
+  if (secs === null) {
+    secs = Math.max(0, Math.floor((nowTick.value - new Date(task.value.started_at).getTime()) / 1000))
+  }
   if (secs <= 0) return 0
   return Math.round(task.value.rows_done / secs)
 })
@@ -158,12 +213,17 @@ function connectWS() {
       const data = JSON.parse(event.data)
       if (data.task_id === taskId && task.value) {
         wsProgress.value = data
+        if (typeof data.elapsed_seconds === 'number') {
+          serverElapsed.value = Math.max(0, data.elapsed_seconds)
+          serverElapsedAt.value = Date.now()
+        }
         if (data.phase) task.value.phase = data.phase
         if (data.progress !== undefined) task.value.progress = data.progress
         if (data.tables_done !== undefined) task.value.tables_done = data.tables_done
         if (data.tables_total !== undefined) task.value.tables_total = data.tables_total
         if (data.rows_done !== undefined) task.value.rows_done = data.rows_done
         if (data.rows_total !== undefined) task.value.rows_total = data.rows_total
+        if (data.imported_tables !== undefined) task.value.imported_tables = data.imported_tables
         if (data.status) task.value.status = data.status
         // compare heartbeat: completed collection checkpoints so far
         if (data.buckets_done !== undefined) bucketsDone.value = data.buckets_done
@@ -173,6 +233,7 @@ function connectWS() {
 }
 
 let pollTimer: any = null
+let tickTimer: any = null
 
 onMounted(() => {
   fetchTask()
@@ -181,12 +242,15 @@ onMounted(() => {
     fetchTask()
     fetchPhases()
   }, 5000)
+  // 1s heartbeat so elapsed (server base + local advance) renders smoothly.
+  tickTimer = setInterval(() => { nowTick.value = Date.now() }, 1000)
   loadLogs()
   fetchPhases()
 })
 
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer)
+  if (tickTimer) clearInterval(tickTimer)
   if (ws.value) ws.value.close()
   if (logWs.value) logWs.value.close()
 })
@@ -216,6 +280,9 @@ async function restartCompare(resume: boolean) {
 
 async function cancelTask() {
   try {
+    await ElMessageBox.confirm('确认取消该迁移任务？进行中的同步将中断。', '确认', { type: 'warning' })
+  } catch { return }
+  try {
     await apiClient.cancelTask(taskId)
     ElMessage.success('任务已取消')
     await fetchTask()
@@ -226,6 +293,9 @@ async function cancelTask() {
 
 async function deleteTask() {
   try {
+    await ElMessageBox.confirm('确认删除该任务？删除后不可恢复。', '确认', { type: 'warning' })
+  } catch { return }
+  try {
     await apiClient.deleteTask(taskId)
     ElMessage.success('任务已删除')
     router.push('/tasks')
@@ -235,14 +305,18 @@ async function deleteTask() {
 }
 
 async function downloadReport() {
-  const { data } = await apiClient.getTaskReport(taskId, 'html')
-  const blob = new Blob([data], { type: 'text/html' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `report-${taskId}.html`
-  a.click()
-  URL.revokeObjectURL(url)
+  try {
+    const { data } = await apiClient.getTaskReport(taskId, 'html')
+    const blob = new Blob([data], { type: 'text/html' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `report-${taskId}.html`
+    a.click()
+    URL.revokeObjectURL(url)
+  } catch (e: any) {
+    ElMessage.error(`报告下载失败: ${e.response?.data?.error || e.message}`)
+  }
 }
 
 async function loadLogs() {
@@ -303,7 +377,7 @@ function logLevelClass(level: string): string {
 </script>
 
 <template>
-  <div v-loading="loading" style="max-width: 1000px; margin: 0 auto;">
+  <div v-loading="loading" class="tims-page">
     <el-page-header @back="router.push('/tasks')" style="margin-bottom: 20px;">
       <template #content>
         <span>{{ task?.name || '任务详情' }}</span>
@@ -324,7 +398,7 @@ function logLevelClass(level: string): string {
             </el-col>
             <el-col :span="4">
               <el-statistic title="行数" :value="task.rows_done.toLocaleString()" />
-              <div style="font-size: 12px; color: #999;">/ {{ task.rows_total.toLocaleString() }}</div>
+              <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2);">/ {{ task.rows_total.toLocaleString() }}</div>
             </el-col>
             <el-col :span="4">
               <el-statistic title="吞吐量" :value="rowsPerSec.toLocaleString()" suffix="rows/s" />
@@ -338,6 +412,7 @@ function logLevelClass(level: string): string {
           </el-row>
           <el-progress :percentage="progressPercent" :stroke-width="20" style="margin-top: 16px;"
             :status="task.status === 'completed' ? 'success' : task.status === 'failed' ? 'exception' : undefined" />
+          <div v-if="importSubText" style="margin-top: 6px; font-size: var(--tims-font-sm); color: var(--tims-text-2);">{{ importSubText }}</div>
         </template>
         <template v-else>
           <el-row :gutter="20">
@@ -429,23 +504,26 @@ function logLevelClass(level: string): string {
                 v-for="phase in phaseData"
                 :key="phase.name"
                 :type="phase.status === 'completed' ? 'success' : phase.status === 'running' ? 'primary' : phase.status === 'failed' ? 'danger' : 'info'"
-                :hollow="phase.status === 'pending'"
+                :hollow="phase.status === 'pending' || phase.status === 'skipped'"
                 :timestamp="phase.sub_label ? `${phase.label}（${phase.sub_label}）` : phase.label"
                 placement="top"
               >
                 <div style="display: flex; align-items: center; gap: 8px;">
-                  <span>{{ phase.status === 'completed' ? '✅' : phase.status === 'running' ? '⏳' : phase.status === 'failed' ? '❌' : '⬜' }}</span>
-                  <el-tag :type="phase.status === 'completed' ? 'success' : phase.status === 'running' ? '' : phase.status === 'failed' ? 'danger' : 'info'" size="small">
-                    {{ phase.status === 'completed' ? '已完成' : phase.status === 'running' ? '进行中' : phase.status === 'failed' ? '失败' : '等待中' }}
+                  <span :class="['phase-dot', `phase-dot--${phase.status}`]" aria-hidden="true"></span>
+                  <el-tag :type="phaseStatusMeta(phase.status, phase.warn).type" size="small">
+                    {{ phaseStatusMeta(phase.status, phase.warn).label }}
                   </el-tag>
+                  <span v-if="fmtPhaseDuration(phase.duration)" style="color: var(--tims-text-2); font-size: var(--tims-font-sm);">{{ fmtPhaseDuration(phase.duration) }}</span>
+                  <el-tooltip v-if="phase.error" :content="phase.error" placement="top">
+                    <el-icon style="color: var(--el-color-danger);"><Warning /></el-icon>
+                  </el-tooltip>
                 </div>
-                <div v-if="phase.table_count > 0 && phase.name === 'data'" style="margin-top: 8px; color: #606266; font-size: 13px;">
-                  表: {{ phase.tables_done }}/{{ phase.table_count }} · 行: {{ phase.rows_done.toLocaleString() }}/{{ phase.rows_total.toLocaleString() }}
-                  <el-progress :percentage="phase.rows_total > 0 ? Math.round(phase.rows_done / phase.rows_total * 100) : 0" :stroke-width="6" style="margin-top: 4px;" />
+                <div v-if="phase.table_count > 0 && phase.name === 'data'" style="margin-top: 8px; color: #606266; font-size: var(--tims-font-sm);">
+                  <template v-if="phase.sub_label === '数据导入'">数据导入 · 已导入表: {{ phase.imported_tables }}/{{ phase.table_count }}</template>
+                  <template v-else>表: {{ phase.tables_done }}/{{ phase.table_count }} · 行: {{ phase.rows_done.toLocaleString() }}/{{ phase.rows_total.toLocaleString() }}</template>
                 </div>
-                <div v-else-if="phase.table_count > 0 && phase.name === 'schema'" style="margin-top: 8px; color: #606266; font-size: 13px;">
+                <div v-else-if="phase.table_count > 0 && phase.name === 'schema'" style="margin-top: 8px; color: #606266; font-size: var(--tims-font-sm);">
                   表: {{ phase.tables_done }}/{{ phase.table_count }}
-                  <el-progress :percentage="phase.table_count > 0 ? Math.round(phase.tables_done / phase.table_count * 100) : 0" :stroke-width="6" style="margin-top: 4px;" />
                 </div>
                 <div v-if="phaseLogs[phase.name]?.length" style="margin-top: 8px;">
                   <el-tag size="small" type="info" style="cursor: pointer;" @click="logPhaseFilter = phase.name; logDrawerVisible = true">
@@ -462,8 +540,11 @@ function logLevelClass(level: string): string {
             :label="phase.label"
             :name="phase.name"
           >
-            <div v-if="phase.status === 'pending'" style="color: #909399; text-align: center; padding: 30px;">
+            <div v-if="phase.status === 'pending'" style="color: var(--tims-text-2); text-align: center; padding: 30px;">
               该阶段尚未开始
+            </div>
+            <div v-else-if="phase.status === 'skipped'" style="color: var(--tims-text-2); text-align: center; padding: 30px;">
+              该阶段已跳过
             </div>
             <template v-else>
               <div v-if="phase.table_count > 0 && phase.name === 'data'" style="margin-bottom: 16px;">
@@ -504,7 +585,7 @@ function logLevelClass(level: string): string {
                   </el-table-column>
                 </el-table>
               </div>
-              <div v-if="phase.logs?.length === 0 && phaseLogs[phase.name]?.length === 0" style="color: #909399; text-align: center; padding: 20px;">
+              <div v-if="phase.logs?.length === 0 && phaseLogs[phase.name]?.length === 0" style="color: var(--tims-text-2); text-align: center; padding: 20px;">
                 暂无日志
               </div>
               <div v-else-if="phase.logs?.length" class="phase-log-container">
@@ -536,9 +617,9 @@ function logLevelClass(level: string): string {
         <template #header>任务信息</template>
         <el-descriptions :column="2" border>
           <el-descriptions-item label="任务 ID">{{ task.id }}</el-descriptions-item>
-          <el-descriptions-item label="创建时间">{{ task.created_at }}</el-descriptions-item>
-          <el-descriptions-item label="开始时间">{{ task.started_at || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="结束时间">{{ task.finished_at || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="创建时间">{{ new Date(task.created_at).toLocaleString() }}</el-descriptions-item>
+          <el-descriptions-item label="开始时间">{{ task.started_at ? new Date(task.started_at).toLocaleString() : '-' }}</el-descriptions-item>
+          <el-descriptions-item label="结束时间">{{ task.finished_at ? new Date(task.finished_at).toLocaleString() : '-' }}</el-descriptions-item>
         </el-descriptions>
       </el-card>
     </template>
@@ -556,7 +637,7 @@ function logLevelClass(level: string): string {
         </el-select>
       </div>
       <div ref="logContainer" v-loading="logsLoading" class="log-container">
-        <div v-if="filteredLogs.length === 0 && !logsLoading" style="color: #999; text-align: center; padding: 40px;">
+        <div v-if="filteredLogs.length === 0 && !logsLoading" style="color: var(--tims-text-2); text-align: center; padding: 40px;">
           暂无日志
         </div>
         <div v-for="(log, idx) in filteredLogs" :key="idx" class="log-line" :class="logLevelClass(log.level)">
@@ -572,58 +653,62 @@ function logLevelClass(level: string): string {
 
 <style scoped>
 .log-container {
-  background: #1e1e1e;
-  color: #d4d4d4;
-  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-  font-size: 13px;
-  line-height: 1.6;
-  padding: 12px;
-  border-radius: 6px;
+  background: var(--tims-ink);
+  border: 1px solid var(--tims-border-ink);
+  color: var(--tims-text-inv);
+  font-family: var(--tims-font-mono);
+  font-size: var(--tims-font-xs);
+  line-height: 1.7;
+  padding: 14px 16px;
+  border-radius: var(--tims-radius);
   height: calc(100vh - 240px);
   overflow-y: auto;
 }
 
 .phase-log-container {
-  background: #1e1e1e;
-  color: #d4d4d4;
-  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-  font-size: 13px;
-  line-height: 1.6;
-  padding: 12px;
-  border-radius: 6px;
+  background: var(--tims-ink);
+  border: 1px solid var(--tims-border-ink);
+  color: var(--tims-text-inv);
+  font-family: var(--tims-font-mono);
+  font-size: var(--tims-font-xs);
+  line-height: 1.7;
+  padding: 14px 16px;
+  border-radius: var(--tims-radius);
   max-height: 400px;
   overflow-y: auto;
 }
 
 .log-line {
   padding: 2px 0;
-  border-bottom: 1px solid rgba(255,255,255,0.05);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .log-time {
-  color: #6a9955;
+  color: var(--tims-text-inv-2);
   margin-right: 8px;
 }
 
 .log-level {
-  font-weight: bold;
+  font-weight: 500;
   margin-right: 8px;
 }
 
 .log-msg {
-  color: #d4d4d4;
+  color: var(--tims-text-inv);
 }
 
 .log-caller {
-  color: #608b4e;
+  color: var(--tims-text-inv-2);
   margin-left: 8px;
-  font-size: 12px;
+  font-size: var(--tims-font-xs);
 }
 
-.log-info .log-level { color: #4ec9b0; }
-.log-warn .log-level { color: #dcdcaa; }
-.log-error .log-level { color: #f44747; }
-.log-debug .log-level { color: #608b4e; }
-.log-error { background: rgba(244, 71, 71, 0.1); }
-.log-warn { background: rgba(220, 220, 170, 0.08); }
+.log-info .log-level { color: #4fb5b5; } /* #t2 深底日志面板用浅青（深青在暗底不达标） */
+.log-warn .log-level { color: var(--tims-amber); }
+.log-error .log-level { color: #ee6a6a; } /* #t2 深底用浅红（品牌加深后 #cc3030 在暗底不足） */
+.log-debug .log-level { color: #7fb069; }
+.log-error { background: rgba(225, 60, 60, 0.10); }
+.log-warn { background: rgba(217, 126, 0, 0.08); }
 </style>

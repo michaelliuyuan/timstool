@@ -22,9 +22,23 @@ type CDCStatusResponse struct {
 	UptimeSeconds float64 `json:"uptime_seconds,omitempty"`
 	FatalError    string  `json:"fatal_error,omitempty"`
 
+	// Stats is the apply-side counter face (F-09 visibility on the HTTP
+	// API): applied/failed/skipped/ddl_skipped/last_skip_reason etc., read
+	// from the same status file the dashboard uses. Nil when no status file.
+	Stats *cdc.CDCStatusStats `json:"stats,omitempty"`
+
 	// Control is the supervisor's lifecycle view (CONTROL channel, #t55):
 	// state/pid/restarts/uptime/adopted. Omitted when CDC control isn't wired.
 	Control *CDCControlStatus `json:"control,omitempty"`
+
+	// Watchdog is the P1 revive-guard face: revives / last revive time and
+	// trigger state. Omitted when the watchdog isn't wired.
+	Watchdog *CDCWatchdogStatus `json:"watchdog,omitempty"`
+
+	// Alarms is the anomaly-stop ring (MS-11f 笔① c): CDC stopped without a
+	// covering audit stop — each entry is one transition edge. Omitted when
+	// no alarm has fired in this web process.
+	Alarms []CDCAlarm `json:"alarms,omitempty"`
 }
 
 // cdcStatusView is the web's computed view of the CDC process, read from the
@@ -98,10 +112,49 @@ func (s *Server) cdcStatus() cdcStatusView {
 	return s.cdcProvider.StatusView()
 }
 
+// reconcileStatusFace (MS-11g 笔② 🟢2, ruling seq148): reconciles the
+// file-derived read face with the supervisor's control truth so operators
+// never see contradictory transitional states. Response-shaping ONLY —
+// cdcStatus()/ComputeLiveness/the anomaly checker are untouched (their
+// semantics are red-line faces from MS-11f).
+//
+//   - halted is NEVER overridden (the fatal-error red line keeps its face)
+//   - a stopped chain whose status file lingers (dead pid ⇒ stale wording
+//     "may have crashed") reads not_running instead
+//   - a LIVE file under a stopped control (someone started `timstool cdc`
+//     by hand after a web stop) keeps the file truth — adoption respect
+//   - a starting/running control whose file still carries the previous
+//     incarnation (old pid, or no first write yet) shows the control pid
+//     and a "starting" state until the child's first status write
+//     converges (the FE's inStartup card already renders this window)
+func reconcileStatusFace(v cdcStatusView, ctrl *CDCControlStatus) cdcStatusView {
+	if ctrl == nil || v.State == string(cdc.LivenessHalted) {
+		return v
+	}
+	switch ctrl.State {
+	case StateStopped:
+		if v.State == string(cdc.LivenessRunning) && v.Running {
+			return v // outside-supervisor live chain: the file is the truth
+		}
+		return cdcStatusView{State: string(cdc.LivenessNotRunning)}
+	case StateStarting, StateRunning:
+		if v.PID > 0 && v.PID != ctrl.PID {
+			return cdcStatusView{State: "starting", PID: ctrl.PID}
+		}
+		if v.State == string(cdc.LivenessNotRunning) {
+			// first-status-write window (missing/blank file, PID 0)
+			return cdcStatusView{State: "starting", PID: ctrl.PID}
+		}
+	}
+	return v
+}
+
 func cdcMessage(v cdcStatusView) string {
 	switch v.State {
 	case string(cdc.LivenessRunning):
 		return "CDC running (LSN: " + v.LSN + ")"
+	case "starting":
+		return "CDC 正在启动（等待子进程首次状态上报收敛）"
 	case string(cdc.LivenessHalted):
 		if v.FatalError != "" {
 			return "CDC halted: " + v.FatalError
@@ -128,6 +181,14 @@ func (s *Server) handleCDCStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v := s.cdcStatus()
+	var ctrl *CDCControlStatus
+	if s.cdcSupervisor != nil {
+		cs := s.cdcSupervisor.Status()
+		ctrl = &cs
+		// MS-11g 笔② 🟢2: shape the read face with the control truth
+		// (stale flash after stops / old-pid flash after starts).
+		v = reconcileStatusFace(v, ctrl)
+	}
 	resp := CDCStatusResponse{
 		Available:     true,
 		Enabled:       true,
@@ -140,10 +201,15 @@ func (s *Server) handleCDCStatus(w http.ResponseWriter, r *http.Request) {
 		PID:           v.PID,
 		UptimeSeconds: v.UptimeSeconds,
 		FatalError:    v.FatalError,
+		Stats:         v.Stats,
 	}
-	if s.cdcSupervisor != nil {
-		cs := s.cdcSupervisor.Status()
-		resp.Control = &cs
+	resp.Control = ctrl
+	if s.cdcWatchdog != nil {
+		ws := s.cdcWatchdog.Status()
+		resp.Watchdog = &ws
+	}
+	if alarms := s.cdcAlarms(); len(alarms) > 0 {
+		resp.Alarms = alarms
 	}
 	s.writeJSON(w, http.StatusOK, resp)
 }
@@ -151,6 +217,41 @@ func (s *Server) handleCDCStatus(w http.ResponseWriter, r *http.Request) {
 // handleCDCStart starts the CDC child via the supervisor (CONTROL channel, #t55).
 // Idempotent. Returns 409 + guidance when cdc.enable is false (does not bypass #t50).
 func (s *Server) handleCDCStart(w http.ResponseWriter, r *http.Request) {
+	// MS-11e E1: config errors (400) precede conflicts (409). With
+	// cdc.enable=false AND a live dual-increment conflict, the operator
+	// previously saw the mutex 409 first — but enable=false is a config
+	// problem and its remediation is the actionable one. Mirrors the
+	// supervisor's own cfg (the runtime truth for this gate); an unwired
+	// server keeps the 409 "not wired" below.
+	if s.cdcSupervisor != nil && !s.cdcSupervisor.cfg.Enable {
+		s.writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"ok": false, "state": "disabled",
+			"message": "cdc.enable 为 false（配置错误）：请先在 config.yaml 开启 cdc.enable 后重试。",
+		})
+		return
+	}
+	// MS-11b pen 2: MySQL server_id pre-start gate. The child validates this
+	// too (config v1 rules), but without a gate here the supervisor would
+	// spawn-and-crash-loop a doomed child (te 🟡②, production seq1016).
+	// MS-11e E2: the read is a LOCKED snapshot (cdcCfgSnapshot takes
+	// cdcCfgMu) — PUT /cdc/config rewrites this same file under that mutex,
+	// so an unlocked read here was a TOCTOU stale-cfg hazard. The gate runs
+	// before the mutex 409 and the supervisor wiring check so it is
+	// testable and fails fast even on a half-wired server.
+	if cfg, err := s.cdcCfgSnapshot(); err == nil && cfg.Source.SourceType() == "mysql" && cfg.CDC.ServerID == 0 {
+		s.writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"ok": false, "message": "MySQL CDC 需要 cdc.server_id（1-2^32-1 内唯一整数）：在 config.yaml 设置后重试，例如 server_id: 910808。",
+		})
+		return
+	}
+	// MS-11 pen 3, ruling #3: MySQL dual-increment mutex — refuse starting
+	// the binlog CDC child while a polling run is live on the same source.
+	if s.blockCDCStartForIncremental() {
+		s.writeJSON(w, http.StatusConflict, map[string]interface{}{
+			"ok": false, "message": dualIncrementMsg,
+		})
+		return
+	}
 	if s.cdcSupervisor == nil {
 		s.writeJSON(w, http.StatusConflict, map[string]interface{}{
 			"ok": false, "state": "disabled", "message": "CDC control is not wired on this server.",
@@ -159,6 +260,8 @@ func (s *Server) handleCDCStart(w http.ResponseWriter, r *http.Request) {
 	}
 	st, err := s.cdcSupervisor.Start(r.Context())
 	if errors.Is(err, ErrCDCDisabled) {
+		// Backstop: normally unreachable (the E1 pre-gate fired first), kept
+		// for the race where config.yaml flips between gate and spawn.
 		s.writeJSON(w, http.StatusConflict, map[string]interface{}{
 			"ok": false, "state": "disabled", "message": "CDC module disabled. Set cdc.enable: true first.",
 		})
@@ -171,6 +274,9 @@ func (s *Server) handleCDCStart(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok": true, "state": string(st.State), "pid": st.PID, "message": "CDC started",
 	})
+	if s.cdcWatchdog != nil {
+		s.cdcWatchdog.NotifyStarted()
+	}
 }
 
 // handleCDCStop gracefully stops the CDC child (CONTROL channel, #t55). Idempotent.
@@ -180,6 +286,12 @@ func (s *Server) handleCDCStop(w http.ResponseWriter, r *http.Request) {
 			"ok": true, "state": "stopped", "message": "CDC control is not wired on this server.",
 		})
 		return
+	}
+	// L2-1 (adversarial): clear desired BEFORE stopping so a concurrent
+	// watchdog tick cannot revive mid-Stop (double guard: revive() also
+	// re-checks desired before spawning).
+	if s.cdcWatchdog != nil {
+		s.cdcWatchdog.NotifyStopped()
 	}
 	st := s.cdcSupervisor.Stop(r.Context())
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -202,15 +314,21 @@ func (s *Server) handleCDCStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCDCCheckpoint handles GET /api/v1/cdc/checkpoint.
+// MS-11d pen 3: the endpoint reads the DISK truth (loadCheckpointInfo, same
+// source as /cdc/slot and the precheck resume box) instead of the status.json
+// embedded copy — one truth, no split-brain between the child's last status
+// write and the file on disk.
 func (s *Server) handleCDCCheckpoint(w http.ResponseWriter, r *http.Request) {
 	if !s.cdcEnabled {
 		s.writeJSON(w, http.StatusOK, struct{}{})
 		return
 	}
-	v := s.cdcStatus()
-	if v.Checkpoint == nil {
-		s.writeJSON(w, http.StatusOK, struct{}{})
+	cdcCfgMu.Lock()
+	cfg, err := s.loadCDCConfig()
+	cdcCfgMu.Unlock()
+	if err != nil {
+		s.writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusOK, v.Checkpoint)
+	s.writeJSON(w, http.StatusOK, loadCheckpointInfo(cfg))
 }

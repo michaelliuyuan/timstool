@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,10 +63,76 @@ func (c *CheckpointManager) Load() (*Checkpoint, error) {
 	c.dirty = false
 
 	c.log.Info("cdc checkpoint loaded",
-		zap.String("lsn", cp.LSN.String()),
+		zap.String("position", cp.Position()),
 		zap.Time("timestamp", cp.Timestamp),
 	)
 	return &cp, nil
+}
+
+// pgLSNShape pins the PG checkpoint position form (MS-11d): upper-case hex
+// hi/lo separated by a slash, e.g. 0/1A2B3C4.
+var pgLSNShape = regexp.MustCompile(`^[0-9A-F]+/[0-9A-F]+$`)
+
+// Source kinds accepted by LoadForSource.
+const (
+	SourceKindPostgres = "postgres"
+	SourceKindMySQL    = "mysql"
+)
+
+// checkpointMatchesSource reports whether the loaded checkpoint belongs to
+// the configured source kind: PG = bare LSN in hi/lo hex form; MySQL = a
+// binlog file:pos pair (File non-empty with a rotation suffix, Pos > 0).
+func checkpointMatchesSource(cp *Checkpoint, kind string) bool {
+	if cp == nil {
+		return false
+	}
+	switch kind {
+	case SourceKindMySQL:
+		return cp.Binlog != nil && binlogPositionShapeOK(cp.Binlog)
+	case SourceKindPostgres:
+		return cp.Binlog == nil && cp.LSN > 0 && pgLSNShape.MatchString(cp.LSN.String())
+	}
+	return false
+}
+
+// binlogPositionShapeOK: the file name carries a numeric rotation suffix
+// ("binlog.000005") and the position is positive.
+func binlogPositionShapeOK(bp *BinlogPosition) bool {
+	if bp == nil || bp.File == "" || bp.Pos <= 0 {
+		return false
+	}
+	dot := strings.LastIndex(bp.File, ".")
+	if dot <= 0 || dot == len(bp.File)-1 {
+		return false
+	}
+	suffix := bp.File[dot+1:]
+	_, err := strconv.Atoi(suffix)
+	return err == nil
+}
+
+// LoadForSource loads the checkpoint but REFUSES one written by the other
+// source kind (MS-11d root fix): a MySQL chain must never resume from a PG
+// LSN and vice versa — the positions are not comparable. On mismatch the
+// stale file is discarded (removed) and a nil checkpoint returned so the
+// runner starts from the current position; the discard is logged, never
+// fatal (a cross-source switch legitimately has no resumable position).
+func (c *CheckpointManager) LoadForSource(kind string) (*Checkpoint, error) {
+	cp, err := c.Load()
+	if err != nil || cp == nil {
+		return cp, err
+	}
+	if checkpointMatchesSource(cp, kind) {
+		return cp, nil
+	}
+	c.log.Info("cdc checkpoint: 旧源 checkpoint 已弃用（source type changed），从当前位点起步",
+		zap.String("position", cp.Position()),
+		zap.String("source_kind", kind),
+	)
+	if rmErr := os.Remove(c.filePath); rmErr != nil && !os.IsNotExist(rmErr) {
+		return nil, fmt.Errorf("cdc checkpoint: discard stale file: %w", rmErr)
+	}
+	c.Reset()
+	return nil, nil
 }
 
 // Save writes the current checkpoint to disk.
@@ -85,7 +154,7 @@ func (c *CheckpointManager) Save() error {
 
 	c.dirty = false
 	c.log.Debug("cdc checkpoint saved",
-		zap.String("lsn", cp.LSN.String()),
+		zap.String("position", cp.Position()),
 	)
 	return nil
 }
@@ -97,6 +166,10 @@ func (c *CheckpointManager) Update(lsn pglogrepl.LSN) {
 	defer c.mu.Unlock()
 
 	c.checkpoint.LSN = lsn
+	// Exactly-one invariant (models.go: dual-source shape): a PG checkpoint
+	// never carries a binlog pair, so a re-seeded chain point cannot leave a
+	// stale MySQL field behind (which LoadForSource would read as cross-source).
+	c.checkpoint.Binlog = nil
 	c.checkpoint.Timestamp = time.Now()
 	c.dirty = true
 }
@@ -108,11 +181,46 @@ func (c *CheckpointManager) GetLSN() pglogrepl.LSN {
 	return c.checkpoint.LSN
 }
 
+// UpdateBinlog records a new MySQL binlog position (MS-11 pen 1, dual-source
+// shape; the PG Update(lsn) path is untouched). Call after a successfully
+// applied batch; Save() persists.
+func (c *CheckpointManager) UpdateBinlog(bp BinlogPosition) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.checkpoint.Binlog = &bp
+	// Exactly-one invariant (models.go: dual-source shape): a MySQL checkpoint
+	// never carries a PG LSN, so LoadForSource cannot misread a mixed shape.
+	c.checkpoint.LSN = 0
+	c.checkpoint.Timestamp = time.Now()
+	c.dirty = true
+}
+
+// GetBinlog returns a copy of the current MySQL binlog position, nil when the
+// checkpoint is a PG one (or fresh).
+func (c *CheckpointManager) GetBinlog() *BinlogPosition {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.checkpoint.Binlog == nil {
+		return nil
+	}
+	bp := *c.checkpoint.Binlog
+	return &bp
+}
+
 // GetCheckpoint returns a copy of the current checkpoint.
 func (c *CheckpointManager) GetCheckpoint() Checkpoint {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.checkpoint
+}
+
+// Position renders the source-neutral checkpoint marker (PG LSN text /
+// MySQL binlog file:pos) — MS-11 pen 1.
+func (c *CheckpointManager) Position() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.checkpoint.Position()
 }
 
 // IsDirty returns true if there are unpersisted LSN updates.

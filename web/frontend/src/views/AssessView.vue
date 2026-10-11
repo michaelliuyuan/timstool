@@ -1,6 +1,14 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
+import apiClient from '../api'
+import PageHeader from '../components/PageHeader.vue'
+import DataSourcePicker from '../components/DataSourcePicker.vue'
+import { useDataSources } from '../composables/useDataSources'
+
+// F-02: the connection is either a saved datasource (postgres, server-side
+// credentials) or the legacy inline form. The localStorage memory is retired
+// (passwords must not live in the browser).
 
 interface Finding {
   dimension: string
@@ -20,6 +28,10 @@ interface DimResult {
   total: number
   score: number
   findings: Finding[]
+  // MS-10b2 item 3: false = the source has no objects of this kind
+  // (MySQL: sequences/custom types/...) — the dimension is N/A, not a
+  // fake 100. Absent (legacy payloads) = applicable.
+  applicable?: boolean
 }
 
 interface AssessReport {
@@ -37,10 +49,22 @@ const ddlDialogVisible = ref(false)
 const ddlDialogTitle = ref('')
 const ddlDialogContent = ref('')
 
-const STORAGE_KEY = 'pg2tidb-assess-source'
+const sourceRef = ref('')
+const { load: loadDataSources, get: getDataSource } = useDataSources()
+// 刘源 seq768 调整：副标题不列举类型（picker 自承载类型集）；报告面的
+// 源库标签随所选源动态（V3.18.4 比对报告 srcLabel 先例同款）。
+const effectiveSourceType = computed(() =>
+  sourceRef.value ? (getDataSource(sourceRef.value)?.type || 'postgres') : 'postgres')
+const srcLabelShort = computed(() => (effectiveSourceType.value === 'mysql' ? 'MySQL' : 'PG'))
+// P1-1: one-shot migration — the retired localStorage key historically stored
+// the inline sourceForm including a plaintext password; drop it so the value
+// can never be read back.
+onMounted(() => {
+  localStorage.removeItem('pg2tidb-assess-source')
+  loadDataSources()
+})
 
-const savedSource = localStorage.getItem(STORAGE_KEY)
-const sourceForm = ref(savedSource ? JSON.parse(savedSource) : {
+const sourceForm = ref({
   host: '',
   port: 5432,
   user: 'postgres',
@@ -49,22 +73,37 @@ const sourceForm = ref(savedSource ? JSON.parse(savedSource) : {
   schema: 'public'
 })
 
-function saveSourceConfig() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(sourceForm.value))
-  ElMessage.success('数据源配置已保存')
-}
+const testingSource = ref(false)
+const sourceTestResult = ref<{ success: boolean; message: string; version?: string } | null>(null)
 
-function clearSourceConfig() {
-  localStorage.removeItem(STORAGE_KEY)
-  sourceForm.value = { host: '', port: 5432, user: 'postgres', password: '', database: '', schema: 'public' }
-  ElMessage.info('已清除保存的配置')
+// 测试连接（S1-UI-04）：ref 模式服务端解析（/test-connection source_ref），
+// 手动模式走 {source, fields}，与向导/比对页体验一致。
+async function testSourceConn() {
+  testingSource.value = true
+  sourceTestResult.value = null
+  try {
+    // S1-UI-08: unified apiClient — axios rejects non-2xx so the ok check is
+    // implicit and the payload can never be mis-parsed as JSON.
+    const { data } = sourceRef.value
+      ? await apiClient.testSourceConnectionRef(sourceRef.value)
+      : await apiClient.testSourceConnection('postgres', { ...sourceForm.value })
+    sourceTestResult.value = data
+    if (data.success) ElMessage.success('连接成功')
+    else ElMessage.error(`连接失败: ${data.message}`)
+  } catch (e: any) {
+    const msg = e.response?.data?.error || e.message
+    sourceTestResult.value = { success: false, message: msg }
+    ElMessage.error(`连接测试失败: ${msg}`)
+  } finally {
+    testingSource.value = false
+  }
 }
 
 const levelEmoji: Record<string, string> = {
-  compatible: '✅',
-  convertible: '⚠️',
-  manual_needed: '🟡',
-  incompatible: '❌'
+  compatible: '●',
+  convertible: '▲',
+  manual_needed: '◆',
+  incompatible: '✕'
 }
 
 const levelName: Record<string, string> = {
@@ -117,8 +156,8 @@ function badgeClass(level: string): string {
 }
 
 async function runAssess() {
-  if (!sourceForm.value.host || !sourceForm.value.database) {
-    ElMessage.warning('请填写主机和数据库名')
+  if (!sourceRef.value && (!sourceForm.value.host || !sourceForm.value.database)) {
+    ElMessage.warning('请选择数据源或填写主机和数据库名')
     return
   }
   loading.value = true
@@ -126,35 +165,31 @@ async function runAssess() {
   htmlReportUrl.value = ''
 
   try {
-    const resp = await fetch('/api/v1/assess', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(sourceForm.value)
-    })
-    if (!resp.ok) {
-      const err = await resp.json()
-      throw new Error(err.error || `HTTP ${resp.status}`)
-    }
-    report.value = await resp.json()
+    const body = sourceRef.value
+      ? { source_ref: sourceRef.value }
+      : { ...sourceForm.value }
+    // S1-UI-08: apiClient with extended timeout — assess scans the whole
+    // database server-side and must not hit the global 30s cutoff.
+    const { data } = await apiClient.assess(body)
+    report.value = data
     ElMessage.success('评估完成')
   } catch (e: any) {
-    ElMessage.error(e.message || '评估失败')
+    ElMessage.error(e.response?.data?.error || e.message || '评估失败')
   } finally {
     loading.value = false
   }
 }
 
 async function downloadHTML() {
-  if (!sourceForm.value.host) return
+  if (!sourceRef.value && !sourceForm.value.host) return
   loading.value = true
+
   try {
-    const resp = await fetch('/api/v1/assess', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...sourceForm.value, format: 'html' })
-    })
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-    const html = await resp.text()
+    const body = sourceRef.value
+      ? { source_ref: sourceRef.value, format: 'html' }
+      : { ...sourceForm.value, format: 'html' }
+    const { data } = await apiClient.assess(body, 'html')
+    const html = String(data)
     const blob = new Blob([html], { type: 'text/html' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -163,7 +198,7 @@ async function downloadHTML() {
     a.click()
     URL.revokeObjectURL(url)
   } catch (e: any) {
-    ElMessage.error(e.message || '下载失败')
+    ElMessage.error(e.response?.data?.error || e.message || '下载失败')
   } finally {
     loading.value = false
   }
@@ -173,7 +208,7 @@ function showDDL(finding: Finding) {
   ddlDialogTitle.value = finding.object_name + ' — DDL'
   const parts: string[] = []
   if (finding.ddl) {
-    parts.push('-- PG DDL')
+    parts.push(`-- ${srcLabelShort.value} DDL`)
     parts.push(finding.ddl)
   }
   if (finding.tidb_ddl) {
@@ -192,37 +227,73 @@ function copyDDL() {
 </script>
 
 <template>
-  <div style="max-width: 1100px; margin: 0 auto;">
+  <div class="tims-page">
+    <PageHeader title="兼容评估" subtitle="扫描源数据库 → TiDB 迁移兼容性风险" />
     <!-- Connection Form -->
     <el-card shadow="never" style="margin-bottom: 20px;">
       <template #header>
-        <span style="font-weight: 600;">🔗 数据源配置</span>
+        <span style="font-weight: 600;">数据源配置</span>
       </template>
-      <el-form :model="sourceForm" label-width="80px" size="default" inline>
-        <el-form-item label="主机">
-          <el-input v-model="sourceForm.host" placeholder="PG 主机地址" style="width: 160px;" />
+      <el-form :model="sourceForm" label-width="120px" size="default">
+        <el-form-item label="数据源">
+          <DataSourcePicker v-model="sourceRef" :types="['postgres', 'mysql']" />
         </el-form-item>
-        <el-form-item label="端口">
-          <el-input-number v-model="sourceForm.port" :min="1" :max="65535" style="width: 120px;" />
-        </el-form-item>
-        <el-form-item label="用户">
-          <el-input v-model="sourceForm.user" style="width: 120px;" />
-        </el-form-item>
-        <el-form-item label="密码">
-          <el-input v-model="sourceForm.password" type="password" show-password style="width: 140px;" />
-        </el-form-item>
-        <el-form-item label="数据库">
-          <el-input v-model="sourceForm.database" placeholder="数据库名" style="width: 140px;" />
-        </el-form-item>
-        <el-form-item label="Schema">
-          <el-input v-model="sourceForm.schema" style="width: 100px;" />
-        </el-form-item>
+        <!-- v1: the legacy inline form stays PG-only (MS-10-FE scope) — a
+             MySQL source must come in as a datasource reference above. -->
+        <template v-if="!sourceRef">
+          <el-divider content-position="left">源数据库</el-divider>
+          <el-form-item>
+            <div style="font-size: var(--tims-font-sm); color: var(--el-text-color-secondary); line-height: 1.6;">
+              手工连接仅支持 PostgreSQL；MySQL 源请使用上方数据源引用。
+            </div>
+          </el-form-item>
+          <el-row :gutter="24">
+            <el-col :span="12">
+              <el-form-item label="主机">
+                <el-input v-model="sourceForm.host" placeholder="PG 主机地址" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="端口">
+                <el-input-number v-model="sourceForm.port" :min="1" :max="65535" style="width: 100%;" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="用户">
+                <el-input v-model="sourceForm.user" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="密码">
+                <el-input v-model="sourceForm.password" type="password" show-password />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="数据库">
+                <el-input v-model="sourceForm.database" placeholder="数据库名" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="12">
+              <el-form-item label="Schema">
+                <el-input v-model="sourceForm.schema" />
+              </el-form-item>
+            </el-col>
+          </el-row>
+        </template>
         <el-form-item>
-          <el-button type="primary" @click="runAssess" :loading="loading">
-            {{ loading ? '评估中...' : '🔍 开始评估' }}
+          <el-button @click="testSourceConn" :loading="testingSource" :disabled="!sourceRef && !sourceForm.host">
+            测试连接
           </el-button>
-          <el-button @click="saveSourceConfig">💾 保存配置</el-button>
-          <el-button @click="clearSourceConfig" text type="info">清除</el-button>
+          <el-tag
+            v-if="sourceTestResult"
+            :type="sourceTestResult.success ? 'success' : 'danger'"
+            style="margin-left: 12px;"
+          >
+            {{ sourceTestResult.success ? (sourceTestResult.version ? `连接成功（${sourceTestResult.version}）` : '连接成功') : sourceTestResult.message }}
+          </el-tag>
+          <el-button type="primary" style="margin-left: 12px;" @click="runAssess" :loading="loading">
+            {{ loading ? '评估中...' : '开始评估' }}
+          </el-button>
         </el-form-item>
       </el-form>
     </el-card>
@@ -250,11 +321,12 @@ function copyDDL() {
       <el-row :gutter="16" style="margin-bottom: 20px;">
         <el-col :span="6" v-for="(key, idx) in ['compatible', 'convertible', 'manual_needed', 'incompatible']" :key="key">
           <el-card shadow="never" :body-style="{ textAlign: 'center', padding: '20px' }">
-            <div :style="{ fontSize: '32px', fontWeight: 700, color: ['#52c41a','#faad14','#fa8c16','#f5222d'][idx] }">
+            <!-- #t2 P1(adversarial ⚠️-1)：原 #52c41a/#faad14/#fa8c16/#f5222d 白底 2.27/1.90/2.38/4.08 连大字 3:1 都不达标，换 AA 档（映射=fixer 提案 seq 23 + positive 数值背书 seq 24） -->
+            <div :style="{ fontSize: '32px', fontWeight: 700, color: ['var(--tims-tag-success-text)', 'var(--tims-tag-warning-text)', 'var(--tims-tag-manual-text)', 'var(--tims-tag-danger-text)'][idx] }">
               {{ report.summary[key] || 0 }}
             </div>
-            <div style="font-size: 13px; color: #666; margin-top: 4px;">
-              {{ ['✅ 兼容', '⚠️ 可转换', '🟡 需手动', '❌ 不兼容'][idx] }}
+            <div style="font-size: var(--tims-font-sm); color: var(--tims-text-2); margin-top: 4px;">
+              {{ ['兼容', '可转换', '需手动', '不兼容'][idx] }}
             </div>
           </el-card>
         </el-col>
@@ -263,7 +335,7 @@ function copyDDL() {
       <!-- Dimension Scores -->
       <el-card shadow="never" style="margin-bottom: 20px;">
         <template #header>
-          <span style="font-weight: 600;">📊 维度评分</span>
+            <span style="font-weight: 600;">维度评分</span>
         </template>
         <el-table :data="report.dimension_results" stripe size="default">
           <el-table-column label="维度" width="140">
@@ -272,18 +344,26 @@ function copyDDL() {
           <el-table-column prop="total" label="对象数" width="100" align="center" />
           <el-table-column label="得分" width="220">
             <template #default="{ row }">
+              <!-- MS-10b2 item 3: N/A dimension renders a gray
+                   not-applicable note, never a fake-100 progress bar. -->
+              <span v-if="row.applicable === false" style="color: #9AA3AF;">N/A 不适用</span>
+              <!-- #t2 ⚠️-1 填充色族同步 AA -->
               <el-progress
+                v-else
                 :percentage="Math.round(row.score)"
-                :color="row.score >= 90 ? '#52c41a' : row.score >= 70 ? '#faad14' : row.score >= 40 ? '#fa8c16' : '#f5222d'"
+                :color="row.score >= 90 ? '#0b7a7a' : row.score >= 70 ? '#9a5700' : row.score >= 40 ? '#7a4300' : '#c02f2f'"
                 :stroke-width="10"
               />
             </template>
           </el-table-column>
           <el-table-column label="兼容性" width="120">
             <template #default="{ row }">
-              {{ levelEmoji[
-                row.score >= 90 ? 'compatible' : row.score >= 70 ? 'convertible' : row.score >= 40 ? 'manual_needed' : 'incompatible'
-              ] }}
+              <span v-if="row.applicable === false" style="color: #9AA3AF;">—</span>
+              <template v-else>
+                {{ levelEmoji[
+                  row.score >= 90 ? 'compatible' : row.score >= 70 ? 'convertible' : row.score >= 40 ? 'manual_needed' : 'incompatible'
+                ] }}
+              </template>
             </template>
           </el-table-column>
         </el-table>
@@ -293,8 +373,8 @@ function copyDDL() {
       <el-card shadow="never" v-if="problems.length > 0">
         <template #header>
           <div style="display: flex; justify-content: space-between; align-items: center;">
-            <span style="font-weight: 600;">⚠️ 需要处理的项目（{{ problems.length }} 项）</span>
-            <el-button size="small" @click="downloadHTML" :loading="loading">📥 下载 HTML 报告</el-button>
+            <span style="font-weight: 600;">需要处理的项目（{{ problems.length }} 项）</span>
+            <el-button size="small" @click="downloadHTML" :loading="loading">下载 HTML 报告</el-button>
           </div>
         </template>
         <el-table :data="problems" stripe size="small" max-height="500">
@@ -308,7 +388,7 @@ function copyDDL() {
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="pg_detail" label="PG" width="140" show-overflow-tooltip />
+          <el-table-column prop="pg_detail" :label="srcLabelShort" width="140" show-overflow-tooltip />
           <el-table-column prop="tidb_detail" label="TiDB" width="120" show-overflow-tooltip />
           <el-table-column prop="suggestion" label="建议" min-width="250" show-overflow-tooltip />
           <el-table-column label="DDL" width="80" align="center">
@@ -325,7 +405,7 @@ function copyDDL() {
     <el-dialog v-model="ddlDialogVisible" :title="ddlDialogTitle" width="700px">
       <el-input type="textarea" :model-value="ddlDialogContent" :rows="18" readonly style="font-family: monospace;" />
       <template #footer>
-        <el-button @click="copyDDL">📋 复制</el-button>
+        <el-button @click="copyDDL">复制</el-button>
         <el-button @click="ddlDialogVisible = false">关闭</el-button>
       </template>
     </el-dialog>

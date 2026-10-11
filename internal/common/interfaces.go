@@ -26,6 +26,7 @@ type SchemaOpts struct {
 	DryRun        bool
 	OutputFile    string
 	Schemas       []string
+	Tables        []string // include list for PROGRESS registration only; empty ⇒ all (DDL build/execute range is unchanged)
 	ExcludeTables []string
 }
 
@@ -40,11 +41,11 @@ type DataOpts struct {
 }
 
 type DataResult struct {
-	TotalRows    int64
-	TotalTables  int
-	TotalBytes   int64
-	Duration     string
-	ExportPath   string
+	TotalRows   int64
+	TotalTables int
+	TotalBytes  int64
+	Duration    string
+	ExportPath  string
 }
 
 type ValidateOpts struct {

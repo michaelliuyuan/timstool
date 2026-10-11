@@ -1,0 +1,323 @@
+// MS-11c 布局锚：CDC 页面三分 Tab 重构 + Hero 状态条 + 合并卡 + 预检折叠/
+// 徽标 + 位点推进小图。断言形=源文本精确匹配（禁页面盲扫）；srcIsMySQL
+// 文案分派与 MS-11a 竞态三面闭环的恒等面由 cdcSourceAgnostic.spec.ts 守护，
+// 本文件只锚新增结构面。
+import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
+const viewSrc = () =>
+  readFileSync(resolve(__dirname, 'CDCView.vue'), 'utf8')
+
+describe('CDCView layout (MS-11c pens 1+2)', () => {
+  it('A hero bar inlines start/stop/refresh and carries the four-state skin', () => {
+    const src = viewSrc()
+    expect(src).toContain(`class="status-card hero" :class="cardState"`)
+    // start keeps the precheck disable semantics + tooltip (tab wording)
+    expect(src).toContain(`:disabled="busy || isActive || !precheckPassed"`)
+    expect(src).toContain(`请先在「启动预检」Tab 重新检查`)
+    expect(src).toContain(`@click="confirmStopCDC">停止 CDC</el-button>`)
+    expect(src).toContain(`<el-button @click="refresh">刷新</el-button>`)
+    // hero summary strip: lag/throughput/uptime
+    expect(src).toContain(`<span>延迟 {{ stats.lag_seconds?.toFixed(1) || '0' }}s</span>`)
+    expect(src).toContain(`<span>运行 {{ formatUptime(stats.uptime_seconds) }}</span>`)
+  })
+
+  it('B stats grid sits right under the hero (pipeline strip stays above it)', () => {
+    const src = viewSrc()
+    const heroIdx = src.indexOf('status-card hero')
+    const statsIdx = src.indexOf('class="stats-grid"')
+    const stripIdx = src.indexOf('<DataPipelineStrip')
+    expect(stripIdx).toBeLessThan(heroIdx)
+    expect(heroIdx).toBeLessThan(statsIdx)
+  })
+
+  it('C three tabs: overview default, connection+config, precheck', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<el-tabs v-model="activeTab" class="cdc-tabs">`)
+    expect(src).toContain(`ref<'overview' | 'conn' | 'precheck'>('overview')`)
+    expect(src).toContain(`<el-tab-pane label="概览" name="overview">`)
+    expect(src).toContain(`<el-tab-pane label="连接与配置" name="conn">`)
+    expect(src).toContain(`<el-tab-pane name="precheck">`)
+  })
+
+  it('C merged position card unifies checkpoint/config/slot with dedup guards', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<h3>位点 / 复制槽 / 进程</h3>`)
+    expect(src).toContain(`hasPositionInfo`)
+    // dedup: the slotView checkpoint row hides when it equals the live checkpoint
+    expect(src).toContain(`(!checkpoint || slotView.checkpoint.lsn !== checkpoint.lsn)`)
+    // no duplicate 运行时长 row (stats-grid 运行时间 owns that datum)
+    expect(src).not.toContain(`运行时长:</span>`)
+  })
+
+  it('C SyncCompareCard lives in the connection tab, still behind connCfg', () => {
+    const src = viewSrc()
+    const tabIdx = src.indexOf(`label="连接与配置"`)
+    const cmpIdx = src.indexOf(`<SyncCompareCard v-if="connCfg" current="cdc"`)
+    expect(tabIdx).toBeGreaterThan(-1)
+    expect(cmpIdx).toBeGreaterThan(tabIdx)
+  })
+
+  it('pen2+MS-11l P5: ok items folded by default — single global toggle, ok rows gated inside groups', () => {
+    const src = viewSrc()
+    // single global fold ref + toggle wording (MS-11c semantics preserved)
+    expect(src).toContain(`showOkItems = !showOkItems`)
+    expect(src).toContain(`显示通过项（${'${precheckOkItems.length}'}）`)
+    // ok rows now live INSIDE group cards, hidden unless the fold is expanded
+    expect(src).toContain(`v-show="it.level !== 'ok' || showOkItems"`)
+    // attention/ok split computeds still define the fold semantics
+    expect(src).toContain(`const precheckAttentionItems = computed(() => (precheck.value?.items || []).filter(it => it.level !== 'ok'))`)
+    expect(src).toContain(`const precheckOkItems = computed(() => (precheck.value?.items || []).filter(it => it.level === 'ok'))`)
+  })
+
+  it('pen2: precheck tab badge + fail auto-activate (warn-only never steals focus)', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<span v-if="precheck && !precheckPassed" class="tab-dot"`)
+    expect(src).toContain(`watch(precheck, p => {`)
+    expect(src).toContain(`activeTab.value = 'precheck'`)
+  })
+
+  it('pen2: 位点推进 sparkline parses PG LSN and MySQL file:pos, skips junk', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<SparkLine v-if="positionHistory.length > 1" :data="positionHistory" :height="34" />`)
+    expect(src).toContain(`h * 0x100000000 + l`)
+    expect(src).toContain(`* 1e9 + pos`)
+    expect(src).toContain(`if (v === null) return`)
+    expect(src).toContain(`pushPosition(statusRes?.lsn || cpRes?.lsn)`)
+  })
+})
+
+describe('CDCView pen4 fixes (adversarial P2/P3 closure)', () => {
+  it('P2-⑤: hero meta is neutral until connCfg arrives — no forked-word first-frame flash', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<div class="status-meta" v-if="connCfg">`)
+    expect(src).toContain(`<div class="status-meta" v-else>连接配置加载中…</div>`)
+    // the forked literals still live INSIDE the connCfg-gated block
+    const gateIdx = src.indexOf(`<div class="status-meta" v-if="connCfg">`)
+    const forkIdx = src.indexOf(`{{ srcIsMySQL ? '同步位点' : 'LSN' }}: {{ status.lsn }}`)
+    expect(forkIdx).toBeGreaterThan(gateIdx)
+  })
+
+  it('P2-①: fail auto-activate fires only on the no-fail→fail transition and never after the operator leaves', () => {
+    const src = viewSrc()
+    expect(src).toContain(`if (!precheckFailActive && !userLeftPrecheckTab) {`)
+    expect(src).toContain(`precheckFailActive = true`)
+    expect(src).toContain(`watch(activeTab, t => {`)
+    // fail-clear resets the episode so a NEW fail may activate again
+    expect(src).toContain(`precheckFailActive = false`)
+    expect(src).toContain(`userLeftPrecheckTab = false`)
+  })
+
+  it('P2-② + P3-d: tab dot and ok-fold are accessible', () => {
+    const src = viewSrc()
+    expect(src).toContain(`class="tab-dot" :class="precheckHasFail ? 'fail' : 'warn'" role="status"`)
+    expect(src).toContain(`:aria-expanded="showOkItems" aria-controls="precheck-ok-list"`)
+    expect(src).toContain(`id="precheck-ok-list"`)
+  })
+
+  it('P2-④: runPrecheck failure is visible — stale result labeled, never dressed as fresh', () => {
+    const src = viewSrc()
+    expect(src).toContain(`precheckError.value = e?.response?.data?.error || e?.message || '网络错误'`)
+    expect(src).toContain(`显示的是上次结果，请重新检查`)
+    // success clears the banner
+    expect(src).toContain(`precheckError.value = ''`)
+  })
+
+  it('P3-a/P3-b: parsePosition gates finite/non-negative and reads the post-dot rotation index only', () => {
+    const src = viewSrc()
+    expect(src).toContain(`lsn.slice(0, idx).split('.').pop()`)
+    expect(src).toContain(`!Number.isFinite(n) || n < 0`)
+  })
+
+  it('MS-11e G: >2^53 positions are gated by Number.isSafeInteger — never silently lossy', () => {
+    const src = viewSrc()
+    // positive: the safe path still funnels through accept (sparkline keeps
+    // advancing for ordinary PG LSN / mysql file:pos coordinates)
+    expect(src).toContain(`positionHistory.value.push(v)`)
+    // negative: unsafe integers set the risk flag and return null — the
+    // sample is skipped, never plotted at a silently-rounded value
+    expect(src).toContain(`if (!Number.isSafeInteger(n)) {`)
+    expect(src).toContain(`positionPrecisionRisk.value = true`)
+    // and the risk surfaces in the UI (sampling paused, raw string shown)
+    expect(src).toContain(`v-if="positionPrecisionRisk"`)
+    expect(src).toContain(`推进小图暂停采样`)
+  })
+
+  // MS-11e pen7: two drift fixes on the G gate — the banner said "paused"
+  // but outlived the pause, and the latest-position readout froze at the
+  // last safe value when a sample was skipped.
+  it('MS-11e pen7 G: risk flag clears on a safe sample; latest readout advances past skipped samples', () => {
+    const src = viewSrc()
+    // a SAFE sample resets the banner (accept returns n and clears the flag)
+    expect(src).toContain(`positionPrecisionRisk.value = false`)
+    // pushPosition advances the latest readout BEFORE the null early-return,
+    // so an unsafe sample no longer freezes positionLatest
+    const pIdx = src.indexOf('function pushPosition(')
+    expect(pIdx).toBeGreaterThan(-1)
+    const body = src.slice(pIdx, src.indexOf('}', src.indexOf('if (v === null) return', pIdx)))
+    const latestIdx = body.indexOf('if (lsn) positionLatest.value = lsn')
+    const nullIdx = body.indexOf('if (v === null) return')
+    expect(latestIdx).toBeGreaterThan(-1)
+    expect(nullIdx).toBeGreaterThan(latestIdx)
+    // banner wording de-absolutized (no "displayed as the raw string" claim)
+    expect(src).not.toContain(`无精度损失）`)
+  })
+})
+
+describe('CDCView pen5 closure (merged-card flash + transient button)', () => {
+  it('pen5: merged-card forked 位点 label gates on connCfg — no "LSN:" flash on mysql chains', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<div class="detail-row" v-if="connCfg && checkpoint && checkpoint.lsn">`)
+    const gateIdx = src.indexOf(`<div class="detail-row" v-if="connCfg && checkpoint && checkpoint.lsn">`)
+    const forkIdx = src.indexOf(`{{ srcIsMySQL ? '同步位点:' : 'LSN:' }}`)
+    expect(forkIdx).toBeGreaterThan(gateIdx)
+  })
+
+  it('pen5: no-PK assist button stays hidden in the pre-connCfg transient', () => {
+    const src = viewSrc()
+    expect(src).toContain(`noPKTables.length && connCfg && !srcIsMySQL`)
+  })
+
+  it('pen5: fail predicates pinned — auto-activate and badge ride level === "fail", never warn', () => {
+    const src = viewSrc()
+    expect(src).toContain(`.some(it => it.level === 'fail')`)
+    expect(src).toContain(`const precheckHasFail = computed(() => (precheck.value?.items || []).some(it => it.level === 'fail'))`)
+  })
+
+  // MS-11e F: the pen2/pen5 anchors pinned the watch CALL and the computed
+  // full form, but the watch's own hasFail predicate line was only covered
+  // by the loose `.some(...)` substring — a regression that drops the null-p
+  // guard, the empty-items guard, or flips warn to count as fail would pass.
+  // Full-shape pin (MS-11d pen5 double-pins untouched: computed form above
+  // and the loose substring both stay byte-identical).
+  it('MS-11e F: watch hasFail predicate pinned full-shape — null p / empty items / warn never counts', () => {
+    const src = viewSrc()
+    expect(src).toContain(`const hasFail = !!(p && (p.items || []).some(it => it.level === 'fail'))`)
+    // predicate must be === 'fail', never a !== 'ok' shape (warn ≠ fail)
+    const wIdx = src.indexOf('const hasFail =')
+    expect(wIdx).toBeGreaterThan(-1)
+    const seg = src.slice(wIdx, src.indexOf('})', wIdx))
+    expect(seg).not.toContain(`!== 'ok'`)
+    // the no-fail branch resets BOTH episode flags (re-arm on a new fail)
+    expect(src).toContain(`precheckFailActive = false`)
+    expect(src).toContain(`userLeftPrecheckTab = false`)
+  })
+})
+
+// MS-11h（seq192 落地令）：连接与配置 tab 观感重构锚——源/目标双栏对照卡 +
+// CDC 参数标签行 + 操作区统一收纳 + 编辑态同构（功能零变动红线：三动作与
+// 既有校验语义原样，仅布局呈现变化）。
+describe('CDCView conn tab layout (MS-11h)', () => {
+  it('H1: source/target dual-column cards with a flow arrow replace the single-column long strings', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<div class="conn-cards">`)
+    expect(src).toContain(`.conn-cards { display: grid; grid-template-columns: 1fr 32px 1fr;`)
+    // two sides + the flow arrow between them
+    expect(src).toContain(`<span class="conn-side-title">源端数据库</span>`)
+    expect(src).toContain(`<span class="conn-side-title">目标端</span>`)
+    expect(src).toContain(`<span class="conn-side-type">TiDB</span>`)
+    expect(src).toContain(`<div class="conn-flow" aria-hidden="true">→</div>`)
+    // the old single-line long-string shapes are gone
+    expect(src).not.toContain(`<span class="detail-label">源端:</span>`)
+    expect(src).not.toContain(`<span class="detail-label">目标端:</span>`)
+    expect(src).not.toContain(`<span class="detail-label">CDC 参数:</span>`)
+    // password stays masked in display, red when unset (has_password semantics)
+    expect(src).toContain(`{{ connCfg.has_password ? '●●●●●●' : '（未设密码）' }}`)
+    expect(src).toContain(`'conn-nopwd': !connCfg.has_password`)
+  })
+
+  it('H2: CDC params render as labeled chips, five facets', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<div class="conn-params">`)
+    for (const k of ['模式', '位点续传', '并发', '冲突策略', 'DDL']) {
+      expect(src).toContain(`<span class="conn-param-k">${k}</span>`)
+    }
+    expect(src).toContain(`{{ connCfg.cdc.sync_ddl ? '同步' : '不同步' }}`)
+  })
+
+  it('H3: actions unified in one row — primary edit, task import, divider, inline ds-import', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<div class="conn-actions" v-if="!editingConn">`)
+    expect(src).toContain(`<el-button type="primary" @click="startEditConn">编辑连接</el-button>`)
+    expect(src).toContain(`@click="importConn" :disabled="busy || isActive"`)
+    expect(src).toContain(`<el-divider direction="vertical" />`)
+    expect(src).toContain(`@click="importFromDS"`)
+    // the old two stacked action rows are gone
+    expect(src).not.toContain(`class="control-actions ds-import"`)
+  })
+
+  it('H4: edit mode is in-place in the same dual-column cards (no separate conn-edit form)', () => {
+    const src = viewSrc()
+    // inputs swap into the same conn-field cells
+    expect(src).toContain(`<el-input v-if="editingConn" v-model="editForm.source.host" size="small" /><code v-else>{{ connCfg.source.host }}</code>`)
+    expect(src).toContain(`<el-input-number v-if="editingConn" v-model="editForm.target.port"`)
+    // keep-stored-password semantics preserved in-place
+    expect(src).toContain(`placeholder="留空保持不变"`)
+    // save/cancel row carries the message line
+    expect(src).toContain(`@click="saveConn" :disabled="savingConn"`)
+    expect(src).toContain(`@click="editingConn = false"`)
+    // the old separate form classes are gone (usage forms; the MS-11h CSS
+    // comment may name them historiographically)
+    expect(src).not.toContain(`class="conn-edit"`)
+    expect(src).not.toContain(`class="conn-edit-section"`)
+    expect(src).not.toContain(`class="conn-grid"`)
+    expect(src).not.toContain(`conn-grid-num`)
+  })
+
+  it('H5: responsive — dual columns stack under 900px and the arrow rotates', () => {
+    const src = viewSrc()
+    expect(src).toContain(`@media (max-width: 900px)`)
+    expect(src).toContain(`.conn-cards { grid-template-columns: 1fr; }`)
+    expect(src).toContain(`.conn-flow { transform: rotate(90deg); padding: 2px 0; }`)
+  })
+})
+
+describe('CDCView MS-11l precheck re-layout (P1-P6)', () => {
+  it('P1: three semantic group cards + unknown-item fallback tail group', () => {
+    const src = viewSrc()
+    expect(src).toContain(`const PRECHECK_GROUP_DEFS = [`)
+    expect(src).toContain(`{ key: 'conn', title: '连通性', items: ['source_conn', 'target_conn'] }`)
+    expect(src).toContain(`{ key: 'repl', title: '复制配置', items: ['log_bin', 'binlog_format', 'binlog_row_image', 'repl_privs', 'wal_level', 'repl_role', 'slot'] }`)
+    expect(src).toContain(`{ key: 'base', title: '基线与位点', items: ['base_migration', 'master_status'] }`)
+    // drift safety: future backend item ids land in 其他, never silently dropped
+    expect(src).toContain(`groups.push({ key: 'other', title: '其他检查项', items: rest })`)
+    expect(src).toContain(`v-for="g in precheckGroups"`)
+    expect(src).toContain(`v-for="it in g.items"`)
+  })
+
+  it('P2: two-line entries — dot+label main row, detail as indented sub-row', () => {
+    const src = viewSrc()
+    expect(src).toContain(`<div class="precheck-main">`)
+    // the old fixed-width label that squeezed details on the same line is gone
+    expect(src).not.toContain(`width: 150px`)
+    expect(src).toContain(`.precheck-detail { color: var(--tims-text-2); word-break: break-all; padding-left: 26px; }`)
+  })
+
+  it('P3: no-PK warn is a standalone alert card with table chips; fix button keeps its four-part gate', () => {
+    const src = viewSrc()
+    expect(src).toContain(`const noPKWarnItem = computed(() => precheckAttentionItems.value.find(it => it.item === 'no_pk_tables'))`)
+    expect(src).toContain(`class="precheck-nopk"`)
+    expect(src).toContain(`<el-tag v-for="t in noPKTables" :key="t" size="small" type="warning" effect="plain" class="nopk-chip">{{ t }}</el-tag>`)
+    // MS-11c pen5 gate survives verbatim (item/level conjuncts now structural via the card itself)
+    expect(src).toContain(`v-if="noPKTables.length && connCfg && !srcIsMySQL"`)
+    // no-PK warn leaves the group flow (ok variant stays folded in groups)
+    expect(src).toContain(`filter(it => !(it.item === 'no_pk_tables' && it.level !== 'ok'))`)
+  })
+
+  it('P4: resume block — position mono chip, DDL notice line, checkpoint file/time line', () => {
+    const src = viewSrc()
+    expect(src).toContain(`const resumeView = computed(() => {`)
+    expect(src).toContain(`rest.match(/(binlog\\.\\d+:\\d+|\\b[0-9A-F]{1,8}\\/[0-9A-F]{1,8}\\b)/)`)
+    expect(src).toContain(`<code v-if="resumeView.pos" class="resume-pos">{{ resumeView.pos }}</code>`)
+    expect(src).toContain(`<div v-if="resumeView.ddl" class="resume-ddl">⚠ {{ resumeView.ddl }}</div>`)
+    expect(src).toContain(`class="resume-cp"`)
+    expect(src).toContain(`.resume-pos { font-family: var(--tims-font-mono)`)
+  })
+
+  it('P5+P6: fold toggle above the group area; groups stack to one column under 900px', () => {
+    const src = viewSrc()
+    expect(src).toContain(`.precheck-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));`)
+    expect(src).toContain(`.precheck-groups { grid-template-columns: 1fr; }`)
+  })
+})

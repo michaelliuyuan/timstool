@@ -20,6 +20,13 @@ function fieldsOf(group: string): FieldSpec[] {
   return props.meta.fields.filter(f => f.group === group)
 }
 
+// P1 对比度巡检修复：required 字段的默认校验消息是英文（"source.host is
+// required"）。仅中文化消息文案（请填写<label>），校验逻辑（required + blur
+// 触发）保持不变。
+function rulesFor(f: FieldSpec) {
+  return f.required ? [{ required: true, message: `请填写${f.label}`, trigger: 'blur' }] : []
+}
+
 const groups = ['common', 'source']
 </script>
 
@@ -36,7 +43,9 @@ const groups = ['common', 'source']
       v-for="f in fieldsOf(g)"
       :key="f.key"
       :label="f.label"
+      :prop="`source.${f.key}`"
       :required="f.required"
+      :rules="rulesFor(f)"
     >
       <el-input
         v-if="f.type === 'text'"

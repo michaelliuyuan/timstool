@@ -6,18 +6,60 @@ import (
 	"io"
 	"os"
 	"sort"
+
+	"github.com/michaelliuyuan/timstool/internal/source"
 )
 
 // ReportGenerator creates assessment reports in various formats.
 type ReportGenerator struct {
-	report *AssessmentReport
+	report  *AssessmentReport
+	srcMeta source.SourceMeta
+	srcKind string
 }
 
 // NewReportGenerator creates a report generator from assessment results.
-func NewReportGenerator(dims []DimensionResult) *ReportGenerator {
-	rg := &ReportGenerator{}
-	rg.report = buildReport(dims)
-	return rg
+// srcType drives the source-database labels rendered in the reports; it is
+// resolved through the source registry (A3 single truth: callers must not
+// branch on the raw type string). "" normalizes to the PG legacy wording so
+// inline/legacy call sites stay byte-identical; an unknown kind falls back to
+// PG rather than failing report rendering.
+func NewReportGenerator(dims []DimensionResult, srcType string) *ReportGenerator {
+	kind, err := source.NormalizeKind(srcType)
+	if err != nil {
+		kind = "postgres"
+	}
+	meta, err := source.Describe(kind)
+	if err != nil {
+		meta = source.SourceMeta{DisplayName: "PostgreSQL", ShortName: "PG"}
+	}
+	return &ReportGenerator{report: buildReport(dims), srcMeta: meta, srcKind: kind}
+}
+
+// CaliberLine renders the item-4 assessment-caliber annotation: an
+// explicit source-kind line for non-PG sources (the scoring caliber is
+// always "TiDB target compatibility"). PG keeps the legacy layout with
+// no extra line (report-face parity anchor).
+func (rg *ReportGenerator) CaliberLine() string {
+	if rg.srcKind == "mysql" {
+		return fmt.Sprintf("源端类型：%s（口径：TiDB 目标兼容性）", rg.SourceLabel())
+	}
+	return ""
+}
+
+// SourceLabel returns the full source label used in report titles.
+func (rg *ReportGenerator) SourceLabel() string {
+	if rg.srcMeta.DisplayName != "" {
+		return rg.srcMeta.DisplayName
+	}
+	return "PostgreSQL"
+}
+
+// SourceLabelShort returns the short source label used in table headers.
+func (rg *ReportGenerator) SourceLabelShort() string {
+	if rg.srcMeta.ShortName != "" {
+		return rg.srcMeta.ShortName
+	}
+	return "PG"
 }
 
 func buildReport(dims []DimensionResult) *AssessmentReport {
@@ -26,9 +68,16 @@ func buildReport(dims []DimensionResult) *AssessmentReport {
 		Summary:          make(map[string]int),
 	}
 
+	// MS-10b2 item 3: N/A dimensions stay out of the weighted aggregate
+	// (numerator AND denominator). With every dimension applicable the
+	// weights sum to 1.0, so the division is a no-op for legacy payloads
+	// (PG parity).
 	var totalScore float64
 	var totalWeight float64
 	for _, dim := range dims {
+		if !dim.IsApplicable() {
+			continue
+		}
 		weight := DimensionWeights[dim.Dimension]
 		totalScore += weight * dim.Score
 		totalWeight += weight
@@ -38,7 +87,7 @@ func buildReport(dims []DimensionResult) *AssessmentReport {
 		}
 	}
 	if totalWeight > 0 {
-		r.Score = totalScore
+		r.Score = totalScore / totalWeight
 	}
 	r.Level = OverallLevel(r.Score)
 
@@ -56,9 +105,13 @@ func (rg *ReportGenerator) PrintTerminal(w io.Writer) {
 
 	fmt.Fprintf(w, "\n")
 	fmt.Fprintf(w, "╔══════════════════════════════════════════════════════════════╗\n")
-	fmt.Fprintf(w, "║         PostgreSQL → TiDB 兼容性评估报告                    ║\n")
+	fmt.Fprintf(w, "║         %s → TiDB 兼容性评估报告                    ║\n", rg.SourceLabel())
 	fmt.Fprintf(w, "╚══════════════════════════════════════════════════════════════╝\n")
 	fmt.Fprintf(w, "\n")
+	if caliber := rg.CaliberLine(); caliber != "" {
+		fmt.Fprintf(w, "  %s\n", caliber)
+		fmt.Fprintf(w, "\n")
+	}
 
 	// Overall score
 	emoji := LevelEmoji[r.Level]
@@ -78,8 +131,15 @@ func (rg *ReportGenerator) PrintTerminal(w io.Writer) {
 	fmt.Fprintf(w, "  │ 评估维度       │  得分  │ 说明                           │\n")
 	fmt.Fprintf(w, "  ├────────────────┼────────┼────────────────────────────────┤\n")
 	for _, dim := range r.DimensionResults {
-		emoji := LevelEmoji[OverallLevel(dim.Score)]
 		name := dimNameCN(dim.Dimension)
+		if !dim.IsApplicable() {
+			// MS-10b2 item 3: empty source object set renders N/A, not
+			// a fake 100.
+			fmt.Fprintf(w, "  │ %-12s   │ ➖ %-5s │ %-30s │\n",
+				name, "N/A", "不适用（源端无此类对象）")
+			continue
+		}
+		emoji := LevelEmoji[OverallLevel(dim.Score)]
 		fmt.Fprintf(w, "  │ %-12s   │ %s %-5s │ %-30s │\n",
 			name, emoji, FormatScore(dim.Score),
 			fmt.Sprintf("共 %d 项", dim.Total))

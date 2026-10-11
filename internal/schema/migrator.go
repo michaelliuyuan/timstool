@@ -18,12 +18,57 @@ import (
 	"go.uber.org/zap"
 )
 
+// ProgressReporter surfaces per-table schema progress to the checkpoint
+// layer (schema-phase tables_total/tables_done in the UI). Implemented by
+// checkpoint.Manager; the schema marks live in TableCheckpoint.SchemaState,
+// fully separate from the data-resume State cursor.
+type ProgressReporter interface {
+	RegisterSchemaTables(names []string) error
+	MarkSchemaTableCompleted(name string) error
+	MarkSchemaTableFailed(name string, errStr string) error
+	// SetSubPhase surfaces the current schema sub-step (schema-build /
+	// schema-execute) so the UI can label progress precisely.
+	SetSubPhase(phase, sub string) error
+}
+
 type Migrator struct {
 	cfg config.Config
+	rpt ProgressReporter
 }
 
 func NewMigrator(cfg config.Config) *Migrator {
 	return &Migrator{cfg: cfg}
+}
+
+// SetProgressReporter wires the optional schema progress sink. Nil (default)
+// disables reporting — CLI/dry-run runs work unchanged.
+func (m *Migrator) SetProgressReporter(r ProgressReporter) {
+	m.rpt = r
+}
+
+// progressRegistrationNames picks the checkpoint-registration subset of the
+// collected tables: empty include list ⇒ all collected tables; non-empty ⇒
+// the intersection. tables comes back from CollectTables already
+// exclude-filtered, matching the data side's exclude semantics (①b).
+func progressRegistrationNames(tables []TableInfo, include []string) []string {
+	if len(include) == 0 {
+		names := make([]string, len(tables))
+		for i, t := range tables {
+			names[i] = t.Name
+		}
+		return names
+	}
+	set := make(map[string]struct{}, len(include))
+	for _, t := range include {
+		set[t] = struct{}{}
+	}
+	var names []string
+	for _, t := range tables {
+		if _, ok := set[t.Name]; ok {
+			names = append(names, t.Name)
+		}
+	}
+	return names
 }
 
 func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
@@ -52,6 +97,22 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 		return cerrors.Wrap(cerrors.ErrSchemaFetch, "collect tables", err)
 	}
 	logger.Info("collected tables", zap.Int("count", len(tables)))
+
+	// Register tables up front so the UI's schema tables_total is correct
+	// from the start (0/N), then mark each as its DDL is built. The
+	// registration set aligns with the DATA migration set (①b): a table
+	// that data will never process (whitelisted out or excluded) must not
+	// be pre-registered, or tables_done would never reach tables_total.
+	// DDL build/execute range above is unchanged; build-loop marks for
+	// unregistered tables are no-ops (UpdateTable errors on missing).
+	if m.rpt != nil && len(tables) > 0 {
+		names := progressRegistrationNames(tables, opts.Tables)
+		if len(names) > 0 {
+			if err := m.rpt.RegisterSchemaTables(names); err != nil {
+				logger.Warn("schema progress: register tables failed", zap.Error(err))
+			}
+		}
+	}
 
 	views, err := collector.CollectViews(ctx, schema)
 	if err != nil {
@@ -103,7 +164,15 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 			"SET FOREIGN_KEY_CHECKS = 0")
 	}
 
+	// Sub-phase label: DDL build (per-table marks below only cover the
+	// "already exists" skip and build-failure cases; success marks moved
+	// to executeDDL so tables_done reflects REAL execution).
+	if m.rpt != nil {
+		_ = m.rpt.SetSubPhase("schema", "schema-build")
+	}
+
 	var deferredFKs []string
+	strippedBefore := 0
 
 	for _, table := range schemaInfo.Tables {
 		policy := m.cfg.Migration.TargetPolicy
@@ -116,6 +185,9 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 				Status:     reporter.StatusSkip,
 				SourceRows: int64(len(table.Columns)),
 			})
+			if m.rpt != nil {
+				_ = m.rpt.MarkSchemaTableCompleted(table.Name)
+			}
 			continue
 		}
 
@@ -137,9 +209,35 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 				Status:    reporter.StatusFail,
 				Error:     err.Error(),
 			})
+			if m.rpt != nil {
+				_ = m.rpt.MarkSchemaTableFailed(table.Name, err.Error())
+			}
 			continue
 		}
 		logger.Info(fmt.Sprintf("built table DDL: %s", table.Name))
+
+		// BUG-0930: surface stripped TEXT/BLOB/JSON-family defaults for
+		// this table — per-column warning + one visible report row.
+		if stripped := builder.strippedDefaults[strippedBefore:]; len(stripped) > 0 {
+			var notes []string
+			for _, sd := range stripped {
+				if sd.NotNull {
+					logger.Warn("schema DDL: stripped literal DEFAULT on TEXT/BLOB/JSON column (NOT NULL — post-migration INSERTs omitting this column WILL FAIL)",
+						zap.String("table", sd.Table), zap.String("column", sd.Column), zap.String("default", sd.Default))
+					notes = append(notes, fmt.Sprintf("%s=%s [NOT NULL: INSERT without this column will fail]", sd.Column, sd.Default))
+				} else {
+					logger.Warn("schema DDL: stripped literal DEFAULT on TEXT/BLOB/JSON column",
+						zap.String("table", sd.Table), zap.String("column", sd.Column), zap.String("default", sd.Default))
+					notes = append(notes, fmt.Sprintf("%s=%s", sd.Column, sd.Default))
+				}
+			}
+			rpt.AddTableReport(reporter.TableReport{
+				TableName:  table.Name,
+				Status:     reporter.StatusWarn,
+				Suggestion: "TiDB 1101: stripped literal DEFAULT on TEXT/BLOB/JSON column(s): " + strings.Join(notes, "; "),
+			})
+			strippedBefore = len(builder.strippedDefaults)
+		}
 
 		for _, idx := range table.Indexes {
 			if idx.IsPrimary {
@@ -157,10 +255,12 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 		}
 
 		rpt.AddTableReport(reporter.TableReport{
-			TableName: table.Name,
-			Status:    reporter.StatusPass,
+			TableName:  table.Name,
+			Status:     reporter.StatusPass,
 			SourceRows: int64(len(table.Columns)),
 		})
+		// P0: no completed mark here — the table's DDL has only been
+		// BUILT. executeDDL marks completion per statement attribution.
 	}
 
 	if len(deferredFKs) > 0 {
@@ -201,7 +301,10 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 
 	if !opts.DryRun && opts.OutputFile == "" {
 		zap.L().Info("executing DDL on TiDB", zap.Int("statements", len(builder.Statements())))
-		if err := m.executeDDL(ctx, sql); err != nil {
+		if m.rpt != nil {
+			_ = m.rpt.SetSubPhase("schema", "schema-execute")
+		}
+		if err := m.executeDDL(ctx, builder.Statements()); err != nil {
 			zap.L().Error("DDL execution failed, full SQL", zap.String("ddl", truncate(sql, 5000)))
 			return cerrors.Wrap(cerrors.ErrSchemaApply, "execute DDL", err)
 		}
@@ -223,14 +326,25 @@ func (m *Migrator) Run(ctx context.Context, opts common.SchemaOpts) error {
 	return nil
 }
 
-func (m *Migrator) executeDDL(ctx context.Context, ddl string) error {
+// ddlExec is the execution seam used by runDDL (tests substitute a fake;
+// production passes *sql.DB).
+type ddlExec interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
+
+// executeDDL runs each pre-built statement individually. Statements arrive
+// as a slice (not a joined blob) so semicolons inside view bodies, DEFAULT
+// literals or comments can never split a statement in half (F-05).
+func (m *Migrator) executeDDL(ctx context.Context, statements []string) error {
 	tidbDB, err := sql.Open("mysql", m.cfg.Target.DSN())
 	if err != nil {
 		return fmt.Errorf("connect to TiDB: %w", err)
 	}
 	defer tidbDB.Close()
+	return m.runDDL(ctx, tidbDB, statements)
+}
 
-	statements := strings.Split(ddl, ";")
+func (m *Migrator) runDDL(ctx context.Context, tidbDB ddlExec, statements []string) error {
 	executed := 0
 	failed := 0
 	for _, stmt := range statements {
@@ -257,6 +371,9 @@ func (m *Migrator) executeDDL(ctx context.Context, ddl string) error {
 		if objectName != "" {
 			label = fmt.Sprintf("%s %s", action, objectName)
 		}
+		// P0: attribute the statement to a registered table so the UI's
+		// schema tables_done climbs with REAL execution, not DDL build.
+		table := attributeStatementToTable(action, stmt)
 
 		var lastErr error
 		maxRetries := 3
@@ -281,6 +398,9 @@ func (m *Migrator) executeDDL(ctx context.Context, ddl string) error {
 				failed++
 				zap.L().Error(fmt.Sprintf("DDL failed: %s (after %d attempts)", label, maxRetries), zap.Error(err))
 				zap.L().Error(fmt.Sprintf("Failed DDL: %s", truncate(stmt, 500)))
+				if m.rpt != nil && table != "" {
+					_ = m.rpt.MarkSchemaTableFailed(table, err.Error())
+				}
 				if m.cfg.Migration.OnError != "skip" {
 					return fmt.Errorf("execute DDL: %w", err)
 				}
@@ -293,10 +413,34 @@ func (m *Migrator) executeDDL(ctx context.Context, ddl string) error {
 		if lastErr != nil {
 			_ = lastErr
 		}
+		// Duplicate-skips (lastErr==nil via the break above) count as
+		// success; failed statements already marked failed above.
+		if m.rpt != nil && table != "" && lastErr == nil {
+			_ = m.rpt.MarkSchemaTableCompleted(table)
+		}
 		executed++
 	}
 	zap.L().Info(fmt.Sprintf("DDL execution completed: %d executed, %d failed", executed, failed))
 	return nil
+}
+
+// attributeStatementToTable maps a DDL statement to the registered table
+// whose schema progress it advances. CREATE/ALTER/DROP TABLE name the table
+// directly; CREATE [UNIQUE] INDEX names the INDEX, so the table comes from
+// the ON clause. SET / comments / unattributable statements return "".
+func attributeStatementToTable(action, stmt string) string {
+	switch action {
+	case "CREATE TABLE", "ALTER TABLE", "DROP TABLE":
+		return extractObjectName(stmt)
+	case "CREATE INDEX", "CREATE UNIQUE INDEX":
+		m := regexp.MustCompile(`(?i)\bON\s+` + "`" + `?([^\s(` + "`" + `]+)`)
+		if match := m.FindStringSubmatch(stmt); len(match) >= 2 {
+			return match[1]
+		}
+		return ""
+	default:
+		return ""
+	}
 }
 
 func extractDDLAction(stmt string) string {
@@ -324,7 +468,7 @@ func extractObjectName(stmt string) string {
 	if strings.HasPrefix(upper, "SET ") || strings.HasPrefix(upper, "--") {
 		return ""
 	}
-	m := regexp.MustCompile("(?i)^(?:DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?|CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?|ALTER\\s+TABLE\\s+|CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+)`?([^`\\s(]+)")
+	m := regexp.MustCompile("(?i)^(?:DROP\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?|CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?|ALTER\\s+TABLE\\s+|CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?)`?([^`\\s(]+)")
 	match := m.FindStringSubmatch(stmt)
 	if len(match) >= 2 {
 		return match[1]

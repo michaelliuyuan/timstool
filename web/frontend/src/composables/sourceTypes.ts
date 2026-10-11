@@ -11,6 +11,13 @@ export interface Capabilities {
   schema: boolean
   data: boolean
   cdc: boolean
+  // MS-01 function-level bits (additive JSON from /sources). Optional so old
+  // payloads / specs keep compiling; the capable() helper resolves missing
+  // bits through the legacy default (type missing = postgres = all true).
+  compare?: boolean
+  watermark?: boolean
+  assess?: boolean
+  ddl_export?: boolean
 }
 
 export interface FieldSpec {

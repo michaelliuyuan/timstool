@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/common/logger"
 	"github.com/michaelliuyuan/timstool/internal/store"
 	"github.com/michaelliuyuan/timstool/internal/webapi"
 	"github.com/spf13/cobra"
@@ -49,6 +50,17 @@ Default URL: http://localhost:8080`,
 			return fmt.Errorf("load config: %w", err)
 		}
 
+		// MS-11f 笔③ (te seq102 另核): initialize the GLOBAL zap logger —
+		// without this zap.L() is the package no-op and every ERROR line
+		// (audit-write failures, anomaly alarms, supervisor faults) vanishes.
+		// Same convention as the other long-running commands (precheck/data).
+		logLevel, _ := cmd.Flags().GetString("log-level")
+		logFormat, _ := cmd.Flags().GetString("log-format")
+		if err := logger.InitWithOutput(logLevel, logFormat, cfg.Logging.Output); err != nil {
+			return fmt.Errorf("init logger: %w", err)
+		}
+		defer logger.Sync()
+
 		// CDC status file (READ channel) — resolved before NewServer so the
 		// supervisor (#t55) can spawn the CDC child with the matching
 		// --status-file, and so a CDC/web cwd mismatch is VISIBLE.
@@ -66,6 +78,11 @@ Default URL: http://localhost:8080`,
 		cdcSup := webapi.NewCDCSupervisor(cfg.CDC, bin, cfgFile, statusFile, zap.L())
 		srv := webapi.NewServer(s, webHost, webPort, dataDir, StaticFS, cdcSup, statusFile, time.Duration(cdcStaleSec)*time.Second)
 		srv.SetCDCStatusProvider(webapi.NewFileCDCStatusProvider(statusFile, time.Duration(cdcStaleSec)*time.Second))
+		srv.SetCDCConfigFile(cfgFile)
+		// MS-11f 笔①: destructive-endpoint gate token — startup SNAPSHOT of
+		// config security.token (runtime config edits never affect the live
+		// gate; rotating the token requires a web restart by design).
+		srv.SetSecurityToken(cfg.Security.Token)
 		fmt.Fprintf(os.Stderr, "timstool web UI: http://%s:%d\n", webHost, webPort)
 		return srv.Start()
 	},

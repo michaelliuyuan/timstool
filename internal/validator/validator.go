@@ -11,10 +11,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/michaelliuyuan/timstool/internal/common"
 	"github.com/michaelliuyuan/timstool/internal/common/config"
@@ -25,28 +26,206 @@ import (
 
 type Validator struct {
 	cfg config.Config
+
+	// Standalone-comparison overrides (webapi compare tasks). Zero values
+	// fall back to cfg so Run() behavior is unchanged for orchestrator/CLI.
+	pgDSNOverride    string
+	tidbDSNOverride  string
+	schemaOverride   string
+	compareOverride  *config.CompareConfig
+	parallelOverride int
+
+	// onTableDone is an optional per-table progress callback (tables done so
+	// far, total tables, latest table report). Called from worker goroutines;
+	// implementations must be safe for concurrent use.
+	onTableDone func(done, total int, tr reporter.TableReport)
+
+	// MS-03 dialect injection: source-side and target-side specifics live
+	// behind CompareDialect/TargetDialect (pure relocation; see
+	// docs/MS03-DIALECT-MAP.md). Defaults preserve the pre-MS-03 behavior.
+	srcDialect CompareDialect
+	tgtDialect TargetDialect
 }
 
+// NewValidator assembles the validator with dialects dispatched on the
+// NORMALIZED source type (MS-08): mysql gets the MySQL source dialect +
+// go-sql-driver DSN/driver; everything else (including the empty default,
+// which SourceType() normalizes to postgres) keeps the legacy PG assembly
+// byte-identically. Unknown types are unreachable behind the webapi
+// capability guard (srcCapable) and fall to the PG shape here.
 func NewValidator(cfg config.Config) *Validator {
-	return &Validator{cfg: cfg}
+	v := &Validator{cfg: cfg, tgtDialect: tidbDialect{}}
+	if cfg.Source.SourceType() == "mysql" {
+		v.srcDialect = mysqlDialect{}
+	} else {
+		v.srcDialect = postgresDialect{}
+	}
+	return v
+}
+
+// srcLabel returns the user-facing source label for mismatch report
+// formatting, dispatched on the assembled source dialect ("PG" for the
+// legacy postgres assembly, "MySQL" for the mysql one) so reports stop
+// hard-coding PG when comparing a MySQL source.
+func (v *Validator) srcLabel() string {
+	if _, ok := v.srcDialect.(mysqlDialect); ok {
+		return "MySQL"
+	}
+	return "PG"
+}
+
+// srcDriverName returns the database/sql driver for the source side,
+// dispatched on the assembled dialect (pgx for PG, mysql for MySQL/TiDB
+// wire).
+func (v *Validator) srcDriverName() string {
+	if _, ok := v.srcDialect.(mysqlDialect); ok {
+		return "mysql"
+	}
+	return "pgx"
+}
+
+// sourceDSN returns the source DSN to connect to (override first). F-13
+// hardening: the fallback dispatches on the source type (DSNByType) so a
+// future non-PG reuse of Run() gets the driver-shaped, UTC-pinned DSN; for
+// postgres it is byte-identical to the legacy DSN().
+func (v *Validator) sourceDSN() string {
+	if v.pgDSNOverride != "" {
+		return v.pgDSNOverride
+	}
+	return v.cfg.Source.DSNByType()
+}
+
+// targetDSN returns the TiDB DSN to connect to (override first).
+func (v *Validator) targetDSN() string {
+	if v.tidbDSNOverride != "" {
+		return v.tidbDSNOverride
+	}
+	return v.cfg.Target.DSN()
+}
+
+// sourceSchema returns the source schema name (override first, may be "").
+// MS-08: a MySQL source has no PG-style schema (schema == database), so an
+// empty schema defaults to the connection database instead of "public".
+func (v *Validator) sourceSchema() string {
+	if v.schemaOverride != "" {
+		return v.schemaOverride
+	}
+	if v.cfg.Source.Schema != "" {
+		return v.cfg.Source.Schema
+	}
+	if _, ok := v.srcDialect.(mysqlDialect); ok {
+		return v.cfg.Source.Database
+	}
+	return v.cfg.Source.Schema
+}
+
+// compareCfg returns the effective compare configuration (override first).
+func (v *Validator) compareCfg() config.CompareConfig {
+	if v.compareOverride != nil {
+		return *v.compareOverride
+	}
+	return v.cfg.Compare
+}
+
+// parallelism returns the effective table-level parallelism (override first).
+func (v *Validator) parallelism() int {
+	if v.parallelOverride > 0 {
+		return v.parallelOverride
+	}
+	return v.cfg.Migration.Parallel
+}
+
+// MaxConcBudget is the hard cap for the unified concurrency budget. Both DB
+// pools are capped at 8 open conns, so a budget above 8 could re-create the
+// pool-exhaustion deadlock (#t4 root cause).
+const MaxConcBudget = 8
+
+// ResolveConcurrency maps the unified budget plus the two legacy knobs onto
+// one effective value (#t4): an explicit concurrency wins; otherwise the
+// larger of the legacy table-level parallel and chunk-level parallel is
+// adopted; the result is clamped into [1, MaxConcBudget] with a default of 4.
+// Exported so webapi folds deprecated request knobs into the same value.
+func ResolveConcurrency(concurrency, legacyParallel, legacyChunkParallel int) int {
+	c := concurrency
+	if c <= 0 {
+		c = legacyParallel
+		if legacyChunkParallel > c {
+			c = legacyChunkParallel
+		}
+	}
+	if c <= 0 {
+		c = 4
+	}
+	if c > MaxConcBudget {
+		c = MaxConcBudget
+	}
+	return c
+}
+
+// concurrency returns the effective unified concurrency budget for Run.
+func (v *Validator) concurrency() int {
+	cc := v.compareCfg()
+	return ResolveConcurrency(cc.Concurrency, v.parallelism(), cc.ChecksumParallel)
+}
+
+// concSem is the single-layer global work-unit semaphore (#t4). Every DB
+// connection acquisition (dedicated TiDB conns and pool-backed queries)
+// happens while holding a slot, and no goroutine waits on the sem while
+// holding a connection — the invariant that structurally rules out the
+// old pool-vs-WaitGroup deadlock.
+type concSem chan struct{}
+
+// acquire blocks until a slot is free or ctx is done. Holding the returned
+// release func's result is required: acquire MUST be followed by release.
+func (s concSem) acquire(ctx context.Context) (func(), error) {
+	select {
+	case s <- struct{}{}:
+		return func() { <-s }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// OnTableDone registers a per-table progress callback used by Run (and thus
+// RunWithDSNs). Safe to call before starting a run.
+func (v *Validator) OnTableDone(fn func(done, total int, tr reporter.TableReport)) {
+	v.onTableDone = fn
+}
+
+// RunWithDSNs runs a standalone comparison against explicit DSNs instead of
+// the validator's config file. pgDSN/tidbDSN are used verbatim; schema,
+// compare and parallel override the corresponding config values when non-zero
+// (schema non-empty). Behavior is otherwise identical to Run.
+func (v *Validator) RunWithDSNs(ctx context.Context, pgDSN, tidbDSN, schema string, compare config.CompareConfig, parallel int, opts common.ValidateOpts) (*reporter.Report, error) {
+	clone := *v
+	clone.pgDSNOverride = pgDSN
+	clone.tidbDSNOverride = tidbDSN
+	if schema != "" {
+		clone.schemaOverride = schema
+	}
+	clone.compareOverride = &compare
+	if parallel > 0 {
+		clone.parallelOverride = parallel
+	}
+	return clone.Run(ctx, opts)
 }
 
 // getTiDBConn gets a dedicated connection from the TiDB connection pool and
-// sets the session timezone to UTC. This ensures TIMESTAMP values are returned
-// in UTC, matching PostgreSQL's timestamptz output.
-func getTiDBConn(ctx context.Context, tidbDB *sql.DB) (*sql.Conn, error) {
+// initializes the session (timezone to UTC) via the target dialect - this
+// ensures TIMESTAMP values are returned in UTC, matching PostgreSQL's
+// timestamptz output. P-INC-TZ touchpoint: session setup relocated
+// byte-identically (ruling seq 204-2); the fix lands in segment 2 only.
+func (v *Validator) getTiDBConn(ctx context.Context, tidbDB *sql.DB) (*sql.Conn, error) {
 	conn, err := tidbDB.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get TiDB connection: %w", err)
 	}
-	_, err = conn.ExecContext(ctx, "SET time_zone = '+00:00'")
-	if err != nil {
+	if err := v.tgtDialect.SessionInit(ctx, conn); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("set TiDB timezone: %w", err)
+		return nil, err
 	}
 	return conn, nil
 }
-
 func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporter.Report, error) {
 	logger := zap.L()
 	logger.Info("starting data validation", zap.String("level", opts.Level), zap.String("mode", opts.Mode))
@@ -54,7 +233,7 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 	// Resolve effective mode: CLI flag > config default
 	mode := opts.Mode
 	if mode == "" {
-		mode = v.cfg.Compare.CompareMode
+		mode = v.compareCfg().CompareMode
 	}
 	if mode == "" {
 		mode = "sample"
@@ -62,13 +241,21 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 
 	rpt := reporter.NewReport("data-validation")
 
-	pgDB, err := sql.Open("pgx", v.cfg.Source.DSN())
+	// #t3: while a watermark filter is active the PG session runs in UTC so
+	// timestamptz literals compare symmetrically with the TiDB UTC session.
+	pgDSN := v.sourceDSN()
+	wm := v.wmFilter()
+	if wm != nil {
+		pgDSN = v.srcDialect.AdjustDSN(pgDSN)
+	}
+
+	pgDB, err := sql.Open(v.srcDriverName(), pgDSN)
 	if err != nil {
 		return nil, cerrors.Wrap(cerrors.ErrSourceConnect, "connect to PostgreSQL", err)
 	}
 	defer pgDB.Close()
 
-	tidbDB, err := sql.Open("mysql", v.cfg.Target.DSN())
+	tidbDB, err := sql.Open("mysql", v.targetDSN())
 	if err != nil {
 		return nil, cerrors.Wrap(cerrors.ErrTargetConnect, "connect to TiDB", err)
 	}
@@ -84,46 +271,53 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 		return nil, cerrors.Wrap(cerrors.ErrValidateRowCount, "get table list", err)
 	}
 
-	parallel := v.cfg.Migration.Parallel
-	if parallel <= 0 {
-		parallel = 4
-	}
+	// #t4: single unified concurrency budget. Table goroutines no longer
+	// hold a semaphore slot (and a TiDB conn) for the whole table: quick and
+	// sample validations are one work unit each; checksum mode acquires a
+	// slot for the count phase and one slot per chunk, so a table worker
+	// never waits on the sem while holding a connection.
+	budget := v.concurrency()
+	logger.Info("validation concurrency budget",
+		zap.Int("budget", budget), zap.Int("tables", len(tables)))
 
 	var mu sync.Mutex
-	sem := make(chan struct{}, parallel)
+	sem := make(concSem, budget)
 	var wg sync.WaitGroup
+	var tablesDone int32
 
 	for _, table := range tables {
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(tableName string) {
 			defer wg.Done()
-			defer func() { <-sem }()
-
-			// Get a dedicated TiDB connection with UTC timezone for this goroutine.
-			// This ensures all queries on this connection return TIMESTAMP values
-			// in UTC, matching PostgreSQL's timestamptz output.
-			tidbConn, connErr := getTiDBConn(ctx, tidbDB)
-			if connErr != nil {
-				mu.Lock()
-				rpt.AddTableReport(reporter.TableReport{
-					TableName: tableName,
-					Status:    reporter.StatusFail,
-					Error:     fmt.Sprintf("get TiDB connection: %v", connErr),
-				})
-				mu.Unlock()
-				return
-			}
-			defer tidbConn.Close()
 
 			var tr reporter.TableReport
 			switch mode {
-			case "quick":
-				tr = v.validateRowCount(ctx, pgDB, tidbConn, tableName)
-			case "sample":
-				tr = v.validateSampling(ctx, pgDB, tidbConn, tidbDB, tableName, opts.SampleRatio)
+			case "quick", "sample":
+				tr = v.runTableUnit(ctx, pgDB, tidbDB, sem, tableName, wm, mode, opts.SampleRatio)
 			case "checksum":
-				tr = v.validateChecksum(ctx, pgDB, tidbConn, tableName)
+				// Watermark column precheck first (1 slot, pool-backed PG
+				// query inside the slot), then the chunked comparison which
+				// manages its own per-unit slots (count = 1 unit, each
+				// chunk = 1 unit) — no slot held across waits.
+				if wm != nil {
+					release, aerr := sem.acquire(ctx)
+					if aerr != nil {
+						tr = reporter.TableReport{TableName: tableName, Status: reporter.StatusFail,
+							Error: fmt.Sprintf("cancelled before start: %v", aerr)}
+						break
+					}
+					werr := v.srcDialect.ValidateWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), tableName, wm)
+					release()
+					if werr != nil {
+						tr = reporter.TableReport{
+							TableName: tableName,
+							Status:    reporter.StatusFail,
+							Error:     werr.Error(),
+						}
+						break
+					}
+				}
+				tr = v.validateChecksumChunked(ctx, pgDB, tidbDB, tableName, sem)
 			default:
 				tr = reporter.TableReport{
 					TableName: tableName,
@@ -132,9 +326,27 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 				}
 			}
 
+			// #t3: stamp the watermark scope on every table report
+			// (SourceRows/TargetRows are already the filtered counts —
+			// validateRowCount runs first in every mode).
+			if wm != nil {
+				note := fmt.Sprintf("水位过滤 %s %s %s（源 %d 行/目标 %d 行）",
+					wm.Column, wmOp(wm), wm.Value, tr.SourceRows, tr.TargetRows)
+				if tr.Suggestion == "" {
+					tr.Suggestion = note
+				} else {
+					tr.Suggestion = note + "；" + tr.Suggestion
+				}
+			}
+
 			mu.Lock()
 			rpt.AddTableReport(tr)
 			mu.Unlock()
+
+			if v.onTableDone != nil {
+				done := int(atomic.AddInt32(&tablesDone, 1))
+				v.onTableDone(done, len(tables), tr)
+			}
 
 			logger.Info("table validation result",
 				zap.String("table", tableName),
@@ -170,17 +382,77 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 	return rpt, nil
 }
 
+// runTableUnit runs ONE budget work unit for quick/sample modes (#t4): the
+// slot is acquired first, the dedicated UTC TiDB conn + the optional
+// watermark precheck (pool-backed PG query) + the validation body all happen
+// inside the slot, then conn and slot are released. Watermark predicate
+// construction itself is untouched (#t3 paths preserved verbatim).
+func (v *Validator) runTableUnit(ctx context.Context, pgDB, tidbDB *sql.DB, sem concSem,
+	table string, wm *config.WatermarkFilter, mode string, sampleRatio float64) reporter.TableReport {
+	// 1 table validation = 1 work unit: the dedicated UTC TiDB conn lives
+	// entirely inside the budget slot.
+	release, aerr := sem.acquire(ctx)
+	if aerr != nil {
+		return reporter.TableReport{TableName: table, Status: reporter.StatusFail,
+			Error: fmt.Sprintf("cancelled before start: %v", aerr)}
+	}
+	tidbConn, connErr := v.getTiDBConn(ctx, tidbDB)
+	if connErr != nil {
+		release()
+		return reporter.TableReport{TableName: table, Status: reporter.StatusFail,
+			Error: fmt.Sprintf("get TiDB connection: %v", connErr)}
+	}
+	var tr reporter.TableReport
+	if mode == "quick" {
+		tr = v.validateTableUnit(ctx, pgDB, tidbConn, table, wm, func(c *sql.Conn) reporter.TableReport {
+			return v.validateRowCount(ctx, pgDB, c, table)
+		})
+	} else {
+		tr = v.validateTableUnit(ctx, pgDB, tidbConn, table, wm, func(c *sql.Conn) reporter.TableReport {
+			return v.validateSampling(ctx, pgDB, c, tidbDB, table, sampleRatio)
+		})
+	}
+	tidbConn.Close()
+	release()
+	return tr
+}
+
+// validateTableUnit runs one single-slot work unit for quick/sample modes:
+// the optional watermark column precheck (pool-backed PG query) plus the mode
+// body, all while the caller holds a budget slot and the dedicated TiDB conn.
+func (v *Validator) validateTableUnit(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string,
+	wm *config.WatermarkFilter, fn func(*sql.Conn) reporter.TableReport) reporter.TableReport {
+	if wm != nil {
+		if werr := v.srcDialect.ValidateWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), table, wm); werr != nil {
+			return reporter.TableReport{
+				TableName: table,
+				Status:    reporter.StatusFail,
+				Error:     werr.Error(),
+			}
+		}
+	}
+	return fn(tidbConn)
+}
+
 func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string) reporter.TableReport {
 	tr := reporter.TableReport{TableName: table, Status: reporter.StatusPass}
 
-	schema := v.cfg.Source.Schema
+	schema := v.sourceSchema()
 	if schema == "" {
 		schema = "public"
 	}
 
 	var sourceCount int64
-	err := pgDB.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", quotePG(schema), quotePG(table))).Scan(&sourceCount)
+	var err error
+	wm := v.wmFilter()
+	if wm != nil {
+		err = pgDB.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s WHERE %s",
+				v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wm.Value).Scan(&sourceCount)
+	} else {
+		err = pgDB.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table))).Scan(&sourceCount)
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("source count: %v", err)
@@ -188,8 +460,14 @@ func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn
 	}
 
 	var targetCount int64
-	err = tidbConn.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteMySQL(table))).Scan(&targetCount)
+	if wm != nil {
+		err = tidbConn.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s",
+				v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wm.Value).Scan(&targetCount)
+	} else {
+		err = tidbConn.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT COUNT(*) FROM %s", v.tgtDialect.QuoteIdent(table))).Scan(&targetCount)
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("target count: %v", err)
@@ -208,9 +486,22 @@ func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn
 	return tr
 }
 
+// sampleOffset picks a random OFFSET for the sampling window. F-12 defense:
+// when sampleSize >= rows (ratio > 1 against a table smaller than the window,
+// or a 1-row table) the naive span rows-sampleSize+1 goes <= 0 and
+// rand.Int63n panics on the negative argument — take the whole table from
+// offset 0 instead.
+func sampleOffset(rows int64, sampleSize int) int64 {
+	if rows <= 0 || int64(sampleSize) >= rows {
+		return 0
+	}
+	return rand.Int63n(rows - int64(sampleSize) + 1)
+}
 func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, tidbDB *sql.DB, table string, ratio float64) reporter.TableReport {
 	tr := v.validateRowCount(ctx, pgDB, tidbConn, table)
-	if tr.Status == reporter.StatusFail && tr.DiffRows != 0 {
+	// Same fallthrough guard as checksum.go: a COUNT error (DiffRows==0,
+	// Status=Fail) must not reach the SourceRows==0 PASS branch (F-05).
+	if tr.Status == reporter.StatusFail {
 		return tr
 	}
 
@@ -219,13 +510,13 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		return tr
 	}
 
-	schema := v.cfg.Source.Schema
+	schema := v.sourceSchema()
 	if schema == "" {
 		schema = "public"
 	}
 
 	// Detect table structure: does it have a primary key or unique index?
-	keyInfo, err := v.detectTableKey(ctx, pgDB, schema, table)
+	keyInfo, err := v.srcDialect.DetectTableKey(ctx, pgDB, schema, table)
 	if err != nil {
 		logger := zap.L()
 		logger.Warn("failed to detect table key, assuming no PK", zap.String("table", table), zap.Error(err))
@@ -235,14 +526,14 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 
 	// For no-PK tables, decide which strategy to use
 	if needsNoPKStrategy {
-		strategy := v.cfg.Compare.NoPKStrategy
+		strategy := v.compareCfg().NoPKStrategy
 		if strategy == "" {
 			strategy = "auto"
 		}
 
 		// Auto-select strategy based on table size
 		if strategy == "auto" {
-			threshold := v.cfg.Compare.NoPKTableThreshold
+			threshold := v.compareCfg().NoPKTableThreshold
 			if threshold <= 0 {
 				threshold = 1000000
 			}
@@ -273,11 +564,19 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		sampleSize = 1000
 	}
 
-	offset := rand.Int63n(tr.SourceRows - int64(sampleSize) + 1)
+	offset := sampleOffset(tr.SourceRows, sampleSize)
 
-	pgQuery := fmt.Sprintf("SELECT * FROM %s.%s ORDER BY 1 LIMIT %d OFFSET %d",
-		quotePG(schema), quotePG(table), sampleSize, offset)
-	pgRows, err := pgDB.QueryContext(ctx, pgQuery)
+	wm := v.wmFilter()
+	var pgRows *sql.Rows
+	if wm != nil {
+		pgQuery := fmt.Sprintf("SELECT * FROM %s.%s WHERE %s ORDER BY 1 LIMIT %d OFFSET %d",
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm), sampleSize, offset)
+		pgRows, err = pgDB.QueryContext(ctx, pgQuery, wm.Value)
+	} else {
+		pgQuery := fmt.Sprintf("SELECT * FROM %s.%s ORDER BY 1 LIMIT %d OFFSET %d",
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), sampleSize, offset)
+		pgRows, err = pgDB.QueryContext(ctx, pgQuery)
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("sample source: %v", err)
@@ -288,7 +587,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 	pgCols, _ := pgRows.ColumnTypes()
 	if pgCols == nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = "failed to get PG column types"
+		tr.Error = "failed to get source column types"
 		return tr
 	}
 
@@ -300,7 +599,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 	for i, c := range pgCols {
 		dt := strings.ToLower(c.DatabaseTypeName())
 		if isApproximateFloatType(dt) ||
-				strings.Contains(dt, "json") {
+			strings.Contains(dt, "json") {
 			skipCols[i] = true
 		}
 		if dt == "character" || dt == "char" || dt == "bpchar" || dt == "character varying" || dt == "varchar" || dt == "text" {
@@ -318,7 +617,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 	for pgRows.Next() {
 		if err := pgRows.Scan(pgPtrs...); err != nil {
 			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("scan PG row: %v", err)
+			tr.Error = fmt.Sprintf("scan %s row: %v", v.srcLabel(), err)
 			return tr
 		}
 		row := make([]string, len(pgCols))
@@ -328,7 +627,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		pgData = append(pgData, row)
 	}
 
-// The Go code below should be inserted at the right indentation level.
+	// The Go code below should be inserted at the right indentation level.
 	// Determine key columns for matching.
 	// If the table has a PK (single or composite), use ALL PK columns as the key.
 	var keyColIndices []int
@@ -390,11 +689,12 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 	if len(keyColIndices) > 0 {
 		isCompositePK := len(keyColIndices) > 1
 		var tidbQuery string
+		var tidbArgs []interface{}
 
 		if isCompositePK {
 			var colNames []string
 			for _, idx := range keyColIndices {
-				colNames = append(colNames, quoteMySQL(pgCols[idx].Name()))
+				colNames = append(colNames, v.tgtDialect.QuoteIdent(pgCols[idx].Name()))
 			}
 			seen := make(map[string]bool)
 			var tupleParts []string
@@ -416,7 +716,11 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 				return tr
 			}
 			tidbQuery = fmt.Sprintf("SELECT * FROM %s WHERE (%s) IN (%s)",
-				quoteMySQL(table), strings.Join(colNames, ","), strings.Join(tupleParts, ","))
+				v.tgtDialect.QuoteIdent(table), strings.Join(colNames, ","), strings.Join(tupleParts, ","))
+			if wm != nil {
+				tidbQuery += fmt.Sprintf(" AND %s", v.tgtDialect.WmPredicateFragment(wm))
+				tidbArgs = []interface{}{wm.Value}
+			}
 		} else {
 			keyColName := pgCols[keyColIndices[0]].Name()
 			var whereParts []string
@@ -435,10 +739,19 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 				return tr
 			}
 			tidbQuery = fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s)",
-				quoteMySQL(table), quoteMySQL(keyColName), strings.Join(whereParts, ","))
+				v.tgtDialect.QuoteIdent(table), v.tgtDialect.QuoteIdent(keyColName), strings.Join(whereParts, ","))
+			if wm != nil {
+				tidbQuery += fmt.Sprintf(" AND %s", v.tgtDialect.WmPredicateFragment(wm))
+				tidbArgs = []interface{}{wm.Value}
+			}
 		}
 
-		tidbRows, err := tidbConn.QueryContext(ctx, tidbQuery)
+		var tidbRows *sql.Rows
+		if len(tidbArgs) > 0 {
+			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery, tidbArgs...)
+		} else {
+			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery)
+		}
 		if err != nil {
 			tr.Status = reporter.StatusFail
 			tr.Error = fmt.Sprintf("sample target: %v", err)
@@ -606,10 +919,10 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 				diag := ""
 				if mismatchCount <= 3 {
 					if pgIdx, ok := pgKeyToIdx[key]; ok {
-						diag = diagnoseRowDiff(pgData[pgIdx], tidbRow, pgHashCols, tidbHashCols, trimColNames, pgCols, tidbCols)
+						diag = diagnoseRowDiff(v.srcLabel(), pgData[pgIdx], tidbRow, pgHashCols, tidbHashCols, trimColNames, pgCols, tidbCols)
 					}
 				}
-				mismatchDetails = append(mismatchDetails, fmt.Sprintf("hash=%s not found in PG (key=%s)%s", truncate(h, 16), truncate(key, 40), diag))
+				mismatchDetails = append(mismatchDetails, fmt.Sprintf("hash=%s not found in %s (key=%s)%s", truncate(h, 16), v.srcLabel(), truncate(key, 40), diag))
 				continue
 			}
 			// Remove first matching entry
@@ -624,16 +937,23 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		for _, entries := range pgHashMap {
 			for _, e := range entries {
 				mismatchCount++
-				mismatchDetails = append(mismatchDetails, fmt.Sprintf("hash=%s in PG but not found in TiDB (key=%s)", truncate(e.hash, 16), truncate(e.key, 40)))
+				mismatchDetails = append(mismatchDetails, fmt.Sprintf("hash=%s in %s but not found in TiDB (key=%s)", truncate(e.hash, 16), v.srcLabel(), truncate(e.key, 40)))
 			}
 		}
 
 	} else {
 		// Fallback for NULL first column: use positional comparison
 		// (less reliable but necessary when key column is NULL)
-		tidbQuery := fmt.Sprintf("SELECT * FROM %s LIMIT %d OFFSET %d",
-			quoteMySQL(table), sampleSize, offset)
-		tidbRows, err := tidbConn.QueryContext(ctx, tidbQuery)
+		var tidbRows *sql.Rows
+		if wm != nil {
+			tidbQuery := fmt.Sprintf("SELECT * FROM %s WHERE %s LIMIT %d OFFSET %d",
+				v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm), sampleSize, offset)
+			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery, wm.Value)
+		} else {
+			tidbQuery := fmt.Sprintf("SELECT * FROM %s LIMIT %d OFFSET %d",
+				v.tgtDialect.QuoteIdent(table), sampleSize, offset)
+			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery)
+		}
 		if err != nil {
 			tr.Status = reporter.StatusFail
 			tr.Error = fmt.Sprintf("sample target: %v", err)
@@ -669,7 +989,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 					if pgVal != tidbVal {
 						mismatchCount++
 						colName := tidbCols[colIdx].Name()
-						mismatchDetails = append(mismatchDetails, fmt.Sprintf("row %d col %q: PG=%q TiDB=%q", rowIdx+int(offset)+1, colName, truncate(pgVal, 80), truncate(tidbVal, 80)))
+						mismatchDetails = append(mismatchDetails, fmt.Sprintf("row %d col %q: %s=%q TiDB=%q", rowIdx+int(offset)+1, colName, v.srcLabel(), truncate(pgVal, 80), truncate(tidbVal, 80)))
 						break
 					}
 				}
@@ -701,11 +1021,17 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, ratio float64, tr reporter.TableReport, schema string) reporter.TableReport {
 	logger := zap.L()
 
-	// Hash group is an exact strategy — query the full PG table, not a sample.
+	// Hash group is an exact strategy 鈥?query the full PG table, not a sample.
 	// Sampling would cause mismatches because TiDB is also queried in full.
-	pgQuery := fmt.Sprintf("SELECT * FROM %s.%s",
-		quotePG(schema), quotePG(table))
-	pgRows, err := pgDB.QueryContext(ctx, pgQuery)
+	var pgRows *sql.Rows
+	var err error
+	if wm := v.wmFilter(); wm != nil {
+		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wm.Value)
+	} else {
+		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table)))
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("sample source (no-PK): %v", err)
@@ -716,7 +1042,7 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 	pgCols, _ := pgRows.ColumnTypes()
 	if pgCols == nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = "failed to get PG column types"
+		tr.Error = "failed to get source column types"
 		return tr
 	}
 
@@ -740,7 +1066,7 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 	for pgRows.Next() {
 		if err := pgRows.Scan(pgPtrs...); err != nil {
 			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("scan PG row: %v", err)
+			tr.Error = fmt.Sprintf("scan %s row: %v", v.srcLabel(), err)
 			return tr
 		}
 		row := make([]string, len(pgCols))
@@ -759,11 +1085,18 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 
 // validateNoPKWithAggregate wraps full-table PG query + aggregate hash validation.
 func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, tr reporter.TableReport, schema string) reporter.TableReport {
-	pgQuery := fmt.Sprintf("SELECT * FROM %s.%s", quotePG(schema), quotePG(table))
-	pgRows, err := pgDB.QueryContext(ctx, pgQuery)
+	var pgRows *sql.Rows
+	var err error
+	if wm := v.wmFilter(); wm != nil {
+		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wm.Value)
+	} else {
+		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table)))
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("aggregate hash: query PG: %v", err)
+		tr.Error = fmt.Sprintf("aggregate hash: query %s: %v", v.srcLabel(), err)
 		return tr
 	}
 	defer pgRows.Close()
@@ -771,7 +1104,7 @@ func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB,
 	pgCols, _ := pgRows.ColumnTypes()
 	if pgCols == nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = "aggregate hash: failed to get PG column types"
+		tr.Error = "aggregate hash: failed to get source column types"
 		return tr
 	}
 
@@ -793,7 +1126,7 @@ func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB,
 	for pgRows.Next() {
 		if err := pgRows.Scan(pgPtrs...); err != nil {
 			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("aggregate hash: scan PG row: %v", err)
+			tr.Error = fmt.Sprintf("aggregate hash: scan %s row: %v", v.srcLabel(), err)
 			return tr
 		}
 		row := make([]string, len(pgCols))
@@ -808,11 +1141,18 @@ func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB,
 
 // validateNoPKWithBucket wraps full-table PG query + bucket validation.
 func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, tr reporter.TableReport, schema string) reporter.TableReport {
-	pgQuery := fmt.Sprintf("SELECT * FROM %s.%s", quotePG(schema), quotePG(table))
-	pgRows, err := pgDB.QueryContext(ctx, pgQuery)
+	var pgRows *sql.Rows
+	var err error
+	if wm := v.wmFilter(); wm != nil {
+		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wm.Value)
+	} else {
+		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table)))
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("bucket compare: query PG: %v", err)
+		tr.Error = fmt.Sprintf("bucket compare: query %s: %v", v.srcLabel(), err)
 		return tr
 	}
 	defer pgRows.Close()
@@ -820,7 +1160,7 @@ func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, ti
 	pgCols, _ := pgRows.ColumnTypes()
 	if pgCols == nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = "bucket compare: failed to get PG column types"
+		tr.Error = "bucket compare: failed to get source column types"
 		return tr
 	}
 
@@ -842,7 +1182,7 @@ func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, ti
 	for pgRows.Next() {
 		if err := pgRows.Scan(pgPtrs...); err != nil {
 			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("bucket compare: scan PG row: %v", err)
+			tr.Error = fmt.Sprintf("bucket compare: scan %s row: %v", v.srcLabel(), err)
 			return tr
 		}
 		row := make([]string, len(pgCols))
@@ -855,85 +1195,15 @@ func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, ti
 	return v.validateBucketCompare(ctx, pgDB, tidbConn, table, tr, pgCols, pgData, skipCols)
 }
 
-func (v *Validator) validateChecksum(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string) reporter.TableReport {
-	tr := v.validateRowCount(ctx, pgDB, tidbConn, table)
-	if tr.Status == reporter.StatusFail && tr.DiffRows != 0 {
-		return tr
-	}
-
-	schema := v.cfg.Source.Schema
-	if schema == "" {
-		schema = "public"
-	}
-
-	var pgChecksum sql.NullString
-	err := pgDB.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT md5(string_agg(t::text, ',' ORDER BY id)) FROM (SELECT * FROM %s.%s ORDER BY 1) t",
-			quotePG(schema), quotePG(table))).Scan(&pgChecksum)
-	if err != nil {
-		tr.Status = reporter.StatusWarn
-		tr.Error = fmt.Sprintf("checksum source: %v", err)
-		return tr
-	}
-
-	var tidbChecksum sql.NullString
-	err = tidbConn.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT MD5(GROUP_CONCAT(t ORDER BY id SEPARATOR ',')) FROM (SELECT * FROM %s ORDER BY 1) t",
-			quoteMySQL(table))).Scan(&tidbChecksum)
-	if err != nil {
-		tr.Status = reporter.StatusWarn
-		tr.Error = fmt.Sprintf("checksum target: %v", err)
-		return tr
-	}
-
-	if pgChecksum.String != tidbChecksum.String {
-		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("checksum mismatch: pg=%s tidb=%s", pgChecksum.String, tidbChecksum.String)
-	}
-
-	return tr
-}
-
 func (v *Validator) getTables(ctx context.Context, pgDB *sql.DB, include []string) ([]string, error) {
 	if len(include) > 0 {
 		return include, nil
 	}
 
-	schema := v.cfg.Source.Schema
-	if schema == "" {
-		schema = "public"
-	}
-
-	query := `
-		SELECT table_name
-		FROM information_schema.tables
-		WHERE table_schema = $1 AND table_type = 'BASE TABLE'
-		ORDER BY table_name
-	`
-	rows, err := pgDB.QueryContext(ctx, query, schema)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var tables []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		tables = append(tables, name)
-	}
-	return tables, nil
+	return v.srcDialect.ListTables(ctx, pgDB, schemaOrDefault(v.sourceSchema()))
 }
 
-func quotePG(name string) string {
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
-}
-
-func quoteMySQL(name string) string {
-	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
-}
+// MS-03: quotePG/quoteMySQL relocated verbatim into the dialect implementations QuoteIdent methods.
 
 func normalizeValue(val interface{}) string {
 	if val == nil {
@@ -953,6 +1223,13 @@ func normalizeValue(val interface{}) string {
 		return normalizeString(strconv.FormatFloat(float64(v), 'f', -1, 32))
 	case int64:
 		return normalizeString(strconv.FormatInt(v, 10))
+	case uint64:
+		// MS-08 MySQL source seam (dialect.go:22): UNSIGNED BIGINT may scan
+		// as uint64 on the MySQL driver (text protocol yields []byte, the
+		// binary/interpolated paths can yield uint64). PG never returns
+		// uint64, so this case is unreachable-and-inert for PG sources -
+		// extending the single shared implementation, not a per-dialect fork.
+		return normalizeString(strconv.FormatUint(v, 10))
 	case int:
 		return normalizeString(strconv.Itoa(v))
 	case []byte:
@@ -1003,7 +1280,7 @@ func normalizeTimestampString(s string) string {
 }
 
 func normalizeString(s string) string {
-	// Normalize line endings: \r\n → \n, then standalone \r → \n.
+	// Normalize line endings: \r\n 鈫?\n, then standalone \r 鈫?\n.
 	// MySQL/TiDB may strip or normalize carriage returns differently than PG.
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
@@ -1053,7 +1330,7 @@ func pgArrayToJSON(s string) string {
 		} else if elem == "f" {
 			parts = append(parts, "false")
 		} else if len(elem) >= 2 && elem[0] == '"' && elem[len(elem)-1] == '"' {
-			// Already quoted in PG syntax — unescape PG "" → JSON \"
+			// Already quoted in PG syntax 鈥?unescape PG "" 鈫?JSON \"
 			unquoted := elem[1 : len(elem)-1]
 			unquoted = strings.ReplaceAll(unquoted, `""`, `"`)
 			b, _ := json.Marshal(unquoted)
@@ -1163,9 +1440,12 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-// diagnoseRowDiff compares a PG row and TiDB row column-by-column and returns
-// a diagnostic string listing the first few column differences with precise diff location.
+// diagnoseRowDiff compares a source row and TiDB row column-by-column and
+// returns a diagnostic string listing the first few column differences with
+// precise diff location. srcLabel is the user-facing source label ("PG" or
+// "MySQL") so the type tags match the actual source kind.
 func diagnoseRowDiff(
+	srcLabel string,
 	pgRow []string, tidbRow []string,
 	pgHashCols []colMapping, tidbHashCols []tidbColMapping,
 	trimColNames map[string]bool,
@@ -1216,12 +1496,16 @@ func diagnoseRowDiff(
 
 			// Show hex of bytes starting from diff position
 			pgHex := fmt.Sprintf("%x", []byte(pgVal[diffPos:]))
-			if len(pgHex) > 80 { pgHex = pgHex[:80] + "..." }
+			if len(pgHex) > 80 {
+				pgHex = pgHex[:80] + "..."
+			}
 			tidbHex := fmt.Sprintf("%x", []byte(tidbVal[diffPos:]))
-			if len(tidbHex) > 80 { tidbHex = tidbHex[:80] + "..." }
+			if len(tidbHex) > 80 {
+				tidbHex = tidbHex[:80] + "..."
+			}
 
-			diffs = append(diffs, fmt.Sprintf("%s PG(%s)[len=%d] TiDB(%s)[len=%d] diff@byte%d pg_hex_after=%s tidb_hex_after=%s",
-				pgHC.name, pgType, len(pgVal), tidbType, len(tidbVal), diffPos,
+			diffs = append(diffs, fmt.Sprintf("%s %s(%s)[len=%d] TiDB(%s)[len=%d] diff@byte%d src_hex_after=%s tidb_hex_after=%s",
+				pgHC.name, srcLabel, pgType, len(pgVal), tidbType, len(tidbVal), diffPos,
 				pgHex, tidbHex))
 		}
 	}
@@ -1230,4 +1514,3 @@ func diagnoseRowDiff(
 	}
 	return " diff=[" + strings.Join(diffs, "; ") + "]"
 }
-

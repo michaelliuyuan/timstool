@@ -103,9 +103,9 @@ func TestNormalizeStringVal(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"10.50", "10.5"},
 		{"10.00", "10"},
-		{"abc   ", "abc"},     // CHAR trailing padding trimmed
-		{"10.500  ", "10.5"},  // trailing trim + decimal strip together
-		{"  10.5", "  10.5"},  // leading whitespace NOT trimmed (by design)
+		{"abc   ", "abc"},    // CHAR trailing padding trimmed
+		{"10.500  ", "10.5"}, // trailing trim + decimal strip together
+		{"  10.5", "  10.5"}, // leading whitespace NOT trimmed (by design)
 		{"text", "text"},
 	}
 	for _, c := range cases {

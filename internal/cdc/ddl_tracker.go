@@ -25,7 +25,7 @@ type DDLTracker struct {
 
 // DDLEntry records a captured DDL statement.
 type DDLEntry struct {
-	ID         int64  `json:"id"` // timstool_ddl_log.id (DDL checkpoint cursor, #t59)
+	ID         int64  `json:"id"` // pg2tidb_ddl_log.id (DDL checkpoint cursor, #t59)
 	LSN        string `json:"lsn"`
 	Schema     string `json:"schema"`
 	ObjectName string `json:"object_name"`
@@ -65,7 +65,7 @@ func (t *DDLTracker) SetLogger(log *zap.Logger) {
 func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 	// Create the event trigger function
 	_, err := t.db.ExecContext(ctx, `
-		CREATE OR REPLACE FUNCTION timstool_ddl_capture()
+		CREATE OR REPLACE FUNCTION pg2tidb_ddl_capture()
 		RETURNS event_trigger
 		LANGUAGE plpgsql AS $$
 		DECLARE
@@ -73,10 +73,15 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 		BEGIN
 			FOR r IN SELECT * FROM pg_event_trigger_ddl_commands()
 			LOOP
-				INSERT INTO timstool_ddl_log (ddl_time, schema_name, object_name,
-					object_type, ddl_command, txid)
+				-- Never log the tool's own bookkeeping DDL (pg2tidb_* objects):
+				-- self-referential rows replay to TiDB and fail (P1 incident).
+				IF position('pg2tidb_' in r.object_identity) > 0 THEN
+					CONTINUE;
+				END IF;
+				INSERT INTO pg2tidb_ddl_log (ddl_time, schema_name, object_name,
+					object_type, ddl_command, txid, status)
 				VALUES (now(), r.schema_name, r.object_identity,
-					r.object_type, current_query(), txid_current());
+					r.object_type, current_query(), txid_current(), 'applied');
 			END LOOP;
 		END;
 		$$;
@@ -85,29 +90,29 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 		return fmt.Errorf("create event trigger function: %w", err)
 	}
 
-	// Create the DDL log table
-	_, err = t.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS timstool_ddl_log (
-			id SERIAL PRIMARY KEY,
-			ddl_time TIMESTAMPTZ DEFAULT now(),
-			schema_name TEXT,
-			object_name TEXT,
-			object_type TEXT,
-			ddl_command TEXT,
-			txid BIGINT,
-			lsn_txid BIGINT
-		);
-	`)
+	// Create the DDL log table. Both this CREATE and the migration ALTER
+	// below are captured by our own event trigger and replayed to TiDB, so
+	// their text must be PG/TiDB dual-legal: no DEFAULT on TEXT columns
+	// (TiDB err 1101). `status TEXT` is bare; capture INSERTs write
+	// 'applied' explicitly (P1 production incident, 2026-09-27).
+	_, err = t.db.ExecContext(ctx, ddlLogCreateSQL)
 	if err != nil {
 		return fmt.Errorf("create ddl log table: %w", err)
 	}
 
+	// F-09 group 1: skip bookkeeping columns for pre-existing tables
+	// (ADD COLUMN IF NOT EXISTS keeps old libraries compatible).
+	_, err = t.db.ExecContext(ctx, ddlLogMigrateSQL)
+	if err != nil {
+		return fmt.Errorf("migrate ddl log table: %w", err)
+	}
+
 	// Create the event trigger (ddl_command_end captures CREATE/ALTER).
 	_, err = t.db.ExecContext(ctx, `
-		DROP EVENT TRIGGER IF EXISTS timstool_ddl_trigger;
-		CREATE EVENT TRIGGER timstool_ddl_trigger
+		DROP EVENT TRIGGER IF EXISTS pg2tidb_ddl_trigger;
+		CREATE EVENT TRIGGER pg2tidb_ddl_trigger
 		ON ddl_command_end
-		EXECUTE FUNCTION timstool_ddl_capture();
+		EXECUTE FUNCTION pg2tidb_ddl_capture();
 	`)
 	if err != nil {
 		return fmt.Errorf("create event trigger: %w", err)
@@ -121,7 +126,7 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 	// sequences/indexes/constraints — are not logged; the table DROP cascades
 	// on the target). shouldApplyDDL routes DROP TABLE → table → apply.
 	_, err = t.db.ExecContext(ctx, `
-		CREATE OR REPLACE FUNCTION timstool_ddl_drop_capture()
+		CREATE OR REPLACE FUNCTION pg2tidb_ddl_drop_capture()
 		RETURNS event_trigger
 		LANGUAGE plpgsql AS $$
 		DECLARE
@@ -129,12 +134,12 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 		BEGIN
 			FOR r IN SELECT * FROM pg_event_trigger_dropped_objects()
 			LOOP
-				IF r.object_type = 'table' THEN
-					INSERT INTO timstool_ddl_log (ddl_time, schema_name, object_name,
-						object_type, ddl_command, txid)
+				IF r.object_type = 'table' AND position('pg2tidb_' in r.object_name) = 0 THEN
+					INSERT INTO pg2tidb_ddl_log (ddl_time, schema_name, object_name,
+						object_type, ddl_command, txid, status)
 					VALUES (now(), r.schema_name, r.object_name, r.object_type,
 						'DROP TABLE ' || quote_ident(r.object_name),
-						txid_current());
+						txid_current(), 'applied');
 				END IF;
 			END LOOP;
 		END;
@@ -144,10 +149,10 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 		return fmt.Errorf("create ddl drop capture function: %w", err)
 	}
 	_, err = t.db.ExecContext(ctx, `
-		DROP EVENT TRIGGER IF EXISTS timstool_ddl_drop_trigger;
-		CREATE EVENT TRIGGER timstool_ddl_drop_trigger
+		DROP EVENT TRIGGER IF EXISTS pg2tidb_ddl_drop_trigger;
+		CREATE EVENT TRIGGER pg2tidb_ddl_drop_trigger
 		ON sql_drop
-		EXECUTE FUNCTION timstool_ddl_drop_capture();
+		EXECUTE FUNCTION pg2tidb_ddl_drop_capture();
 	`)
 	if err != nil {
 		return fmt.Errorf("create sql_drop event trigger: %w", err)
@@ -159,30 +164,80 @@ func (t *DDLTracker) SetupEventTrigger(ctx context.Context) error {
 
 // TeardownEventTrigger removes the event triggers and capture functions.
 func (t *DDLTracker) TeardownEventTrigger(ctx context.Context) error {
-	_, err := t.db.ExecContext(ctx, `DROP EVENT TRIGGER IF EXISTS timstool_ddl_trigger;`)
+	_, err := t.db.ExecContext(ctx, `DROP EVENT TRIGGER IF EXISTS pg2tidb_ddl_trigger;`)
 	if err != nil {
 		t.log.Warn("drop event trigger", zap.Error(err))
 	}
-	_, err = t.db.ExecContext(ctx, `DROP EVENT TRIGGER IF EXISTS timstool_ddl_drop_trigger;`)
+	_, err = t.db.ExecContext(ctx, `DROP EVENT TRIGGER IF EXISTS pg2tidb_ddl_drop_trigger;`)
 	if err != nil {
 		t.log.Warn("drop sql_drop event trigger", zap.Error(err))
 	}
-	_, err = t.db.ExecContext(ctx, `DROP FUNCTION IF EXISTS timstool_ddl_capture();`)
+	_, err = t.db.ExecContext(ctx, `DROP FUNCTION IF EXISTS pg2tidb_ddl_capture();`)
 	if err != nil {
 		t.log.Warn("drop event trigger function", zap.Error(err))
 	}
-	_, err = t.db.ExecContext(ctx, `DROP FUNCTION IF EXISTS timstool_ddl_drop_capture();`)
+	_, err = t.db.ExecContext(ctx, `DROP FUNCTION IF EXISTS pg2tidb_ddl_drop_capture();`)
 	if err != nil {
 		t.log.Warn("drop sql_drop event trigger function", zap.Error(err))
 	}
 	return nil
 }
 
+// toolBookkeepingPrefix namespaces every PG object the tool creates for its
+// own machinery (ddl log table, event triggers, capture functions).
+const toolBookkeepingPrefix = "pg2tidb_"
+
+// ddlLogCreateSQL / ddlLogMigrateSQL create/migrate the PG-side DDL log.
+// Both statements are captured by the tool's own event trigger and replayed
+// to TiDB, so they must be PG/TiDB dual-legal: no DEFAULT on TEXT columns
+// (TiDB err 1101, non-degradable → halt loop). Capture INSERTs write the
+// status value explicitly instead of relying on a column default.
+// (P1 production incident, 2026-09-27; anchored by TestDDLLogSQLDualLegal.)
+const ddlLogCreateSQL = `
+	CREATE TABLE IF NOT EXISTS pg2tidb_ddl_log (
+		id SERIAL PRIMARY KEY,
+		ddl_time TIMESTAMPTZ DEFAULT now(),
+		schema_name TEXT,
+		object_name TEXT,
+		object_type TEXT,
+		ddl_command TEXT,
+		txid BIGINT,
+		lsn_txid BIGINT,
+		status TEXT,
+		skip_reason TEXT,
+		skipped_at TIMESTAMPTZ
+	);
+`
+
+const ddlLogMigrateSQL = `
+	ALTER TABLE pg2tidb_ddl_log
+		ADD COLUMN IF NOT EXISTS status TEXT,
+		ADD COLUMN IF NOT EXISTS skip_reason TEXT,
+		ADD COLUMN IF NOT EXISTS skipped_at TIMESTAMPTZ;
+`
+
+// isToolBookkeepingObject reports whether a captured DDL entry targets one of
+// the tool's own PG objects. PG's object_identity is schema-qualified and may
+// be quoted ("public.pg2tidb_ddl_log", "\"odd\".pg2tidb_ddl_log"), so the
+// check unquotes and matches the trailing name segment against the pg2tidb_
+// prefix. Such entries are skipped (with cursor advance) by shouldApplyDDL —
+// they never replicate to the target. This also neutralizes rows logged by
+// the OLD trigger (pre-fix), whose stored ddl_command text still carries the
+// TiDB-illegal `TEXT NOT NULL DEFAULT` shape: replaying them would hit the
+// non-degradable 1101 and halt the runner (P1 production incident).
+func isToolBookkeepingObject(objectName string) bool {
+	s := strings.ToLower(strings.TrimSpace(objectName))
+	if i := strings.LastIndexByte(s, '.'); i >= 0 {
+		s = s[i+1:]
+	}
+	return strings.HasPrefix(strings.Trim(s, `"`), toolBookkeepingPrefix)
+}
+
 // FetchNewDDL queries the DDL log for entries since the last checkpoint.
 func (t *DDLTracker) FetchNewDDL(ctx context.Context, sinceID int64) ([]DDLEntry, error) {
 	rows, err := t.db.QueryContext(ctx, `
 		SELECT id, ddl_time, schema_name, object_name, object_type, ddl_command
-		FROM timstool_ddl_log
+		FROM pg2tidb_ddl_log
 		WHERE id > $1
 		ORDER BY id ASC
 	`, sinceID)
@@ -194,18 +249,30 @@ func (t *DDLTracker) FetchNewDDL(ctx context.Context, sinceID int64) ([]DDLEntry
 	var entries []DDLEntry
 	for rows.Next() {
 		var id int64
+		var schema sql.NullString // schema_name is nullable: NULL → "" (H, MS-11e)
 		var e DDLEntry
-		if err := rows.Scan(&id, &e.LSN, &e.Schema, &e.ObjectName,
+		if err := rows.Scan(&id, &e.LSN, &schema, &e.ObjectName,
 			&e.ObjectType, &e.DDL); err != nil {
 			return nil, fmt.Errorf("scan ddl entry: %w", err)
 		}
 		e.ID = id
 		e.LSN = fmt.Sprintf("ddl_%d", id)
+		e.Schema = schema.String
 
-		// Transform DDL for TiDB
+		// Transform DDL for TiDB. MS-11e pen7 (H P3): a filtered-out row is
+		// dropped silently — with a whitelist configured, NULL-schema rows
+		// (whose key degrades to a bare table name) can never match a
+		// schema-qualified entry, so the drop was invisible outside
+		// pg2tidb_ddl_log itself. One info line makes it auditable.
 		if t.filter.Allow(e.Schema, e.ObjectName) {
 			e.TiDBDDL = t.transform.Transform(e.DDL, e.ObjectType)
 			entries = append(entries, e)
+		} else {
+			t.log.Info("ddl tracker: DDL row filtered out (not in table filter)",
+				zap.Int64("id", id),
+				zap.String("schema", e.Schema),
+				zap.String("object", e.ObjectName),
+				zap.Bool("null_schema", !schema.Valid))
 		}
 	}
 
@@ -217,6 +284,26 @@ func (t *DDLTracker) FetchNewDDL(ctx context.Context, sinceID int64) ([]DDLEntry
 	t.mu.Unlock()
 
 	return entries, nil
+}
+
+// MarkSkipped records a degradable DDL skip (F-09 group 1) on the log row so
+// the divergence is queryable and manually compensable: fix the target by
+// hand, replay the DDL, then set the row back to 'applied'. reason carries
+// the object-type classification (e.g. "[ddl/table]") for compensation
+// prioritization. Best-effort: a failure is logged, never fatal.
+func (t *DDLTracker) MarkSkipped(ctx context.Context, id int64, reason string) {
+	_, err := t.db.ExecContext(ctx, `
+		UPDATE pg2tidb_ddl_log SET status='skipped', skip_reason=$1, skipped_at=now()
+		WHERE id=$2
+	`, reason, id)
+	if err != nil {
+		// ERROR, not Warn: on failure the row stays at its default
+		// 'applied' — a FALSE applied record. The in-memory counter and
+		// log line keep this skip visible, but the queryable compensation
+		// row is MISSING and an operator must reconcile by DDL id/time.
+		t.log.Error("ddl tracker: mark skipped FAILED - compensation row is MISSING (row falsely reads applied); reconcile manually",
+			zap.Int64("id", id), zap.Error(err))
+	}
 }
 
 // RecentDDL returns the last N DDL entries.
@@ -238,6 +325,13 @@ func (t *DDLTracker) RecentDDL(n int) []DDLEntry {
 // index → created with the table). A standalone CREATE INDEX (its own
 // statement, object_type=index) IS applied. #t61.
 func shouldApplyDDL(e DDLEntry) bool {
+	// The tool's own bookkeeping DDL never replicates (P1 incident: the
+	// migration ALTER replayed to TiDB hit 1101 and halt-looped the runner).
+	// Skipping here (rather than dropping in FetchNewDDL) still advances the
+	// ddl_log.id cursor, so pre-fix stored rows unblock the chain.
+	if isToolBookkeepingObject(e.ObjectName) {
+		return false
+	}
 	ot := strings.ToUpper(e.ObjectType)
 	if ot == "SEQUENCE" {
 		return false // PG sequence → TiDB AUTO_INCREMENT; never replicate

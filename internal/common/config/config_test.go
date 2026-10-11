@@ -1,10 +1,48 @@
 package config
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
+
+// F-06 item 4 anchor: passwords/users full of DSN-breaking specials must
+// round-trip through both DSN builders without derailing the parsers.
+func TestDSNEscapingSpecialChars(t *testing.T) {
+	const user = "u@ser" // NOTE: ':' in a MySQL username is unrepresentable (driver parses user:pass at the first ':')
+	const pass = "p@ss:w/rd?+% #&=()"
+
+	// PG: parse the URL back and extract userinfo.
+	pg := SourceConfig{Host: "db", Port: 5432, User: user, Password: pass, Database: "d", SSLMode: "disable"}.DSN()
+	u, err := url.Parse(pg)
+	if err != nil {
+		t.Fatalf("PG DSN no longer parses: %v (%q)", err, pg)
+	}
+	if u.User.Username() != user {
+		t.Errorf("PG user round-trip: got %q want %q (dsn=%s)", u.User.Username(), user, pg)
+	}
+	if got, ok := u.User.Password(); !ok || got != pass {
+		t.Errorf("PG password round-trip: got %q want %q (dsn=%s)", got, pass, pg)
+	}
+
+	// MySQL/TiDB: parse with the driver itself.
+	my := TargetConfig{Host: "db", Port: 4000, User: user, Password: pass, Database: "d"}.DSN()
+	mc, err := mysql.ParseDSN(my)
+	if err != nil {
+		t.Fatalf("MySQL DSN no longer parses: %v (%q)", err, my)
+	}
+	if mc.User != user || mc.Passwd != pass {
+		t.Errorf("MySQL round-trip: got %q/%q want %q/%q (dsn=%s)", mc.User, mc.Passwd, user, pass, my)
+	}
+	if mc.Timeout != ConnectTimeoutSec*time.Second {
+		t.Errorf("MySQL connect timeout: got %v want %vs", mc.Timeout, ConnectTimeoutSec)
+	}
+}
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
@@ -20,15 +58,15 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Web.Enable != false {
 		t.Error("web should be disabled by default")
 	}
-	if cfg.CDC.Enable != false {
-		t.Error("cdc should be disabled by default")
+	if cfg.CDC.Enable != true {
+		t.Error("cdc should be enabled by default (49e073b: enable CDC incremental sync by default)")
 	}
 }
 
 func TestCDCConfigDefault(t *testing.T) {
 	cdc := DefaultConfig().CDC
-	if cdc.Enable {
-		t.Error("cdc.enable should default to false")
+	if !cdc.Enable {
+		t.Error("cdc.enable should default to true (49e073b)")
 	}
 	if cdc.Mode != "full_incr" {
 		t.Errorf("cdc.mode default = %q, want full_incr", cdc.Mode)
@@ -180,8 +218,8 @@ cdc:
 	}
 }
 
-// Backward compatibility: a config file with NO cdc section must load with the
-// CDC module disabled (defaults), and must validate.
+// Backward compatibility: a config file with NO cdc section loads with the
+// DEFAULT CDC settings (enable=true since 49e073b) and must validate.
 func TestCDCConfigLoadNoSectionBackwardCompat(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
@@ -201,8 +239,8 @@ target:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.CDC.Enable {
-		t.Error("missing cdc section should load as disabled")
+	if !cfg.CDC.Enable {
+		t.Error("missing cdc section should load with the default (enabled, 49e073b)")
 	}
 	if cfg.CDC.Mode != "full_incr" {
 		t.Errorf("missing cdc section should default mode to full_incr, got %q", cfg.CDC.Mode)
@@ -319,7 +357,7 @@ func TestSourceDSN(t *testing.T) {
 		Database: "testdb",
 		SSLMode:  "disable",
 	}
-	expected := "postgresql://postgres:pass@localhost:5432/testdb?sslmode=disable"
+	expected := "postgresql://postgres:pass@localhost:5432/testdb?connect_timeout=10&sslmode=disable"
 	if dsn := cfg.DSN(); dsn != expected {
 		t.Errorf("expected %s, got %s", expected, dsn)
 	}
@@ -333,7 +371,7 @@ func TestTargetDSN(t *testing.T) {
 		Password: "",
 		Database: "testdb",
 	}
-	expected := "root:@tcp(127.0.0.1:4000)/testdb?charset=utf8mb4&parseTime=true&timeout=30s&readTimeout=300s&writeTimeout=300s"
+	expected := "root@tcp(127.0.0.1:4000)/testdb?parseTime=true&readTimeout=5m0s&timeout=10s&writeTimeout=5m0s&charset=utf8mb4"
 	if dsn := cfg.DSN(); dsn != expected {
 		t.Errorf("expected %s, got %s", expected, dsn)
 	}
@@ -379,5 +417,21 @@ func TestWebConfigValidation(t *testing.T) {
 	cfg.Web.Port = 99999
 	if err := cfg.Validate(); err == nil {
 		t.Error("invalid web port should fail validation")
+	}
+}
+
+// TestSourceDSNByType_MySQLSessionTimeZonePinned pins MS-08d: the mysql DSN
+// must carry time_zone='+00:00' (URL-encoded %27%2B00%3A00%27 by FormatDSN,
+// same shape as incremental.go incTargetDSN) so the session clock is UTC and
+// DATETIME scans land as UTC time.Time; the PG shape stays param-free.
+func TestSourceDSNByType_MySQLSessionTimeZonePinned(t *testing.T) {
+	sc := SourceConfig{Type: "mysql", Host: "h", Port: 3306, User: "u", Password: "p", Database: "d"}
+	got := sc.DSNByType()
+	if !strings.Contains(got, "time_zone=%27%2B00%3A00%27") {
+		t.Fatalf("mysql DSNByType missing pinned UTC session time_zone: %s", got)
+	}
+	pg := SourceConfig{Type: "postgres", Host: "h", Port: 5432, User: "u", Password: "p", Database: "d"}
+	if plain := pg.DSNByType(); strings.Contains(plain, "time_zone") {
+		t.Fatalf("PG DSN must not carry a mysql time_zone param: %s", plain)
 	}
 }

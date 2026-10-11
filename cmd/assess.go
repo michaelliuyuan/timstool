@@ -15,8 +15,8 @@ import (
 )
 
 var (
-	assessFormat  string
-	assessOutput  string
+	assessFormat string
+	assessOutput string
 )
 
 var assessCmd = &cobra.Command{
@@ -82,7 +82,7 @@ Output formats:
 		dims := assessor.Assess(result)
 
 		// Phase 3: Generate report
-		rg := assess.NewReportGenerator(dims)
+		rg := assess.NewReportGenerator(dims, "postgres")
 		report := rg.Report()
 
 		zap.L().Info("assessment completed",

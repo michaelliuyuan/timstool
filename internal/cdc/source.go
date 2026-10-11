@@ -11,18 +11,19 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"go.uber.org/zap"
 )
 
 // Source connects to a PostgreSQL database and streams logical replication
 // changes via the pgoutput plugin.
 type Source struct {
-	cfg    SourceConfig
-	log    *zap.Logger
-	db     *sql.DB // regular connection for setup (create slot/pub)
+	cfg SourceConfig
+	log *zap.Logger
+	db  *sql.DB // regular connection for setup (create slot/pub)
 
 	mu        sync.Mutex
-	conn      *pgconn.PgConn // dedicated replication connection
+	conn      *pgconn.PgConn       // dedicated replication connection
 	relations map[uint32]*Relation // relation OID → schema info
 	running   bool
 	stopCh    chan struct{}
@@ -35,19 +36,19 @@ type Source struct {
 
 // Relation holds table metadata learned from the replication stream.
 type Relation struct {
-	OID       uint32
-	Schema    string
-	Name      string
-	Columns   []RelationColumn
+	OID     uint32
+	Schema  string
+	Name    string
+	Columns []RelationColumn
 }
 
 // RelationColumn is a single column in a replicated table.
 type RelationColumn struct {
-	Name      string
-	TypeOID   uint32
-	TypeName  string
-	IsKey     bool
-	Ordinal   int
+	Name     string
+	TypeOID  uint32
+	TypeName string
+	IsKey    bool
+	Ordinal  int
 }
 
 // NewSource creates a new CDC Source.
@@ -80,26 +81,14 @@ func (s *Source) SetLogger(log *zap.Logger) {
 // dsn returns a PostgreSQL connection string without specifying a database
 // (used for the replication connection which connects to the specific DB).
 func (s *Source) dsn() string {
-	sslmode := s.cfg.SSLMode
-	if sslmode == "" {
-		sslmode = "disable"
-	}
-	return fmt.Sprintf(
-		"postgresql://%s:%s@%s:%d/%s?sslmode=%s&replication=database",
-		s.cfg.User, s.cfg.Password, s.cfg.Host, s.cfg.Port, s.cfg.Database, sslmode,
-	)
+	return config.BuildPGDSN(s.cfg.Host, s.cfg.Port, s.cfg.User, s.cfg.Password,
+		s.cfg.Database, s.cfg.SSLMode, map[string]string{"replication": "database"})
 }
 
 // regularDSN returns a normal connection string for setup queries.
 func (s *Source) regularDSN() string {
-	sslmode := s.cfg.SSLMode
-	if sslmode == "" {
-		sslmode = "disable"
-	}
-	return fmt.Sprintf(
-		"postgresql://%s:%s@%s:%d/%s?sslmode=%s",
-		s.cfg.User, s.cfg.Password, s.cfg.Host, s.cfg.Port, s.cfg.Database, sslmode,
-	)
+	return config.BuildPGDSN(s.cfg.Host, s.cfg.Port, s.cfg.User, s.cfg.Password,
+		s.cfg.Database, s.cfg.SSLMode, nil)
 }
 
 // Setup creates the replication slot and publication if they don't exist.
@@ -352,11 +341,11 @@ func (s *Source) parseLogicalMsg(relations map[uint32]*Relation, xld pglogrepl.X
 		}
 		for i, col := range v.Columns {
 			rel.Columns = append(rel.Columns, RelationColumn{
-				Name:    col.Name,
-				TypeOID: col.DataType,
+				Name:     col.Name,
+				TypeOID:  col.DataType,
 				TypeName: fmt.Sprintf("oid_%d", col.DataType),
-				IsKey:   col.Flags == 1,
-				Ordinal: i,
+				IsKey:    col.Flags == 1,
+				Ordinal:  i,
 			})
 		}
 		relations[v.RelationID] = rel
@@ -453,7 +442,7 @@ func (s *Source) parseLogicalMsg(relations map[uint32]*Relation, xld pglogrepl.X
 //     DELETE) carries ONLY the PK columns, in relation column order.
 //
 // isKeyTuple selects between the two mappings. NULL columns ('n') map to a nil
-// value so the transformer renders NULL (not ''). Every column carries the
+// value so the transformer renders NULL (not ”). Every column carries the
 // relation's IsKey flag so the transformer can build a PK-only WHERE without
 // relying on old/new image presence. See #t48 Bug#5.
 func decodeTupleColumns(rel *Relation, tuple *pglogrepl.TupleData, isKeyTuple bool) []ColumnValue {

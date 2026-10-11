@@ -276,31 +276,39 @@ func (s *CDCSupervisor) supervise(stopCh chan struct{}) {
 			s.finish()
 			return
 		}
+		// pen3 root fix (ruling seq109 #1): a failed respawn is a HARD error
+		// (bad binary / bad config), not a transient crash — the old
+		// `continue` was a dead path (s.proc is nil, the loop-top guard
+		// returned without a terminal state and without closing done, so
+		// Stop() hung forever on <-done). Fall to the FAILED terminal state,
+		// cap or no cap.
 		proc2, err := s.factory()
-		if err != nil {
-			if s.restarts >= maxRestarts {
-				s.state = StateFailed
-				s.mu.Unlock()
-				s.finish()
-				return
-			}
-			s.mu.Unlock()
-			continue
+		if err == nil {
+			err = proc2.Start()
 		}
-		if err := proc2.Start(); err != nil {
-			if s.restarts >= maxRestarts {
-				s.state = StateFailed
-				s.mu.Unlock()
-				s.finish()
-				return
-			}
+		if err != nil {
 			s.mu.Unlock()
-			continue
+			s.failRespawn(err)
+			return
 		}
 		s.proc = proc2
 		s.pid = proc2.PID()
 		s.state = StateRunning
 		s.mu.Unlock()
+	}
+}
+
+// failRespawn moves the supervisor to the FAILED terminal state after a
+// respawn could not be spawned/started: clears the pid, closes done exactly
+// once (unblocks Stop) and leaves an ERROR line on the supervisor logger.
+func (s *CDCSupervisor) failRespawn(err error) {
+	s.mu.Lock()
+	s.state = StateFailed
+	s.pid = 0
+	s.mu.Unlock()
+	s.finish()
+	if s.log != nil {
+		s.log.Error("cdc supervisor: respawn failed; state=failed", zap.Error(err))
 	}
 }
 
@@ -405,4 +413,26 @@ func (s *CDCSupervisor) Adopt(statusPath string, stale time.Duration, alive func
 	s.pid = st.PID
 	s.state = StateAdopted
 	s.startedAt = time.Now()
+}
+
+// abandonAdopted drops a dead adopted child so a subsequent Start can spawn a
+// fresh one (P1 watchdog: adopted children have no supervise loop, so their
+// death otherwise leaves the supervisor stuck in adopted forever). The alive
+// probe is injected (the package default is a no-op true on Windows).
+func (s *CDCSupervisor) abandonAdopted(alive func(int) bool) {
+	if alive == nil {
+		alive = pidAlive
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != StateAdopted {
+		return
+	}
+	if s.pid > 0 && alive(s.pid) {
+		return // still alive — keep the adoption
+	}
+	s.adopted = false
+	s.pid = 0
+	s.state = StateStopped
+	s.startedAt = time.Time{}
 }

@@ -11,14 +11,30 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"net/url"
 	"strings"
+	"time"
 
+	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/source"
 
 	// MySQL driver for *sql.DB.
 	_ "github.com/go-sql-driver/mysql"
 )
+
+// SystemDatabases is the shared MySQL system-schema set (MS-10b2 item 8,
+// ruling seq843-⑧): every consumer that must exclude server system schemas
+// (ddlexport SHOW DATABASES walk, assess system-schema guard, …) reads this
+// single exported copy instead of re-declaring a private mirror. Lowercase
+// keys; callers compare via strings.ToLower (TiDB/Windows builds report
+// INFORMATION_SCHEMA etc. in upper/mixed case).
+var SystemDatabases = map[string]bool{
+	"mysql":              true,
+	"information_schema": true,
+	"performance_schema": true,
+	"sys":                true,
+	// TiDB (MySQL-compatible surface) reports its own system schemas.
+	"metrics_schema": true,
+}
 
 func init() {
 	source.Register("mysql", func(cfg source.SourceConfig) (source.Source, error) {
@@ -32,11 +48,18 @@ func init() {
 // doc §5/§7). MySQL has no PG-style schema (schema==database), which is why a
 // pg→mysql switch must drop the schema/sslmode keys.
 var mysqlMeta = source.SourceMeta{
-	Name:         "mysql",
-	DisplayName:  "MySQL",
-	Implemented:  true,
-	DefaultPort:  3306,
-	Capabilities: source.Capabilities{Schema: true, Data: true, CDC: false},
+	Name:        "mysql",
+	DisplayName: "MySQL",
+	ShortName:   "MySQL",
+	Implemented: true,
+	DefaultPort: 3306,
+	// MS-01: assess flipped on by MS-10b (assess scanner dialect);
+	// ddl_export flipped on by MS-10c (SHOW CREATE exporter dialect);
+	// compare flipped on by MS-08 (the compare validator speaks the MySQL
+	// wire); watermark (suggest + incremental) flipped on by MS-10a
+	// (mysqlWatermarkDialect); cdc flipped on by MS-11 (binlog CDC via the
+	// canal adapter, v1 DML-only + file:pos — DDL is a loud error state).
+	Capabilities: source.Capabilities{Schema: true, Data: true, CDC: true, Compare: true, Watermark: true, Assess: true, DDLExport: true},
 	Fields: []source.FieldSpec{
 		{Key: "host", Label: "主机地址", Type: "text", Required: true, Default: "localhost", Placeholder: "localhost", Group: "common"},
 		{Key: "port", Label: "端口", Type: "number", Required: true, Default: 3306, Group: "common"},
@@ -116,15 +139,19 @@ func (s *Source) IncrementalCapture() (source.IncrementalCapture, error) {
 }
 
 // dsn builds a MySQL DSN from the source config.
+//
+// B-F02-9: the go-sql-driver DSN is NOT URL syntax — user and password are
+// taken literally, so url.QueryEscape must not be applied (a password like
+// "TiDB@2026" was sent as "TiDB%402026" and failed auth with 1045). The
+// driver splits on the last '@' before the network part, so literal '@' and
+// ':' in credentials are safe.
 func dsn(c source.SourceConfig) string {
 	charset := c.Options["charset"]
 	if charset == "" {
 		charset = "utf8mb4"
 	}
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=true&loc=Local",
-		url.QueryEscape(c.User), url.QueryEscape(c.Password),
-		c.Host, c.Port, c.Database, charset)
-	return dsn
+	return config.BuildMySQLDSN(c.Host, c.Port, c.User, c.Password, c.Database,
+		map[string]string{"charset": charset}, time.Local)
 }
 
 // --- Dialect ---
@@ -156,6 +183,11 @@ func (mysqlDialect) LimitOffsetSQL(limit, offset int64) string {
 // --- TypeMapper (3d: stub passthrough for now; full mapping in step 3d) ---
 
 type mysqlTypeMapper struct{}
+
+// NewTypeMapper exposes the MySQL→TiDB type mapping for non-orchestrator
+// consumers (MS-10b2 item 2: the assess checker grades MySQL native types
+// via the same single mapping truth the migration pipeline uses).
+func NewTypeMapper() source.TypeMapper { return mysqlTypeMapper{} }
 
 func (mysqlTypeMapper) MapType(srcType string, precision, scale int) source.TiDBType {
 	// Full type mapping is implemented in step 3d.
@@ -258,6 +290,9 @@ func mapMySQLType(srcType string, precision, scale int) string {
 	case "DATE":
 		return "DATE"
 	case "TIME":
+		if precision > 0 {
+			return fmt.Sprintf("TIME(%d)", precision)
+		}
 		return "TIME"
 	case "DATETIME":
 		if precision > 0 {

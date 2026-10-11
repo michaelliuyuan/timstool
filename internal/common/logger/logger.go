@@ -9,27 +9,37 @@ import (
 )
 
 var (
-	extraMu   sync.Mutex
-	extraCore zapcore.Core
-	baseLevel zapcore.Level
-	baseCore  zapcore.Core
+	extraMu    sync.Mutex
+	extraCores []zapcore.Core
+	baseLevel  zapcore.Level
+	baseCore   zapcore.Core
 )
 
+// RegisterExtraCore adds a task-scoped logging core. Multiple cores may be
+// registered concurrently (one per running migration task); each must be
+// removed by passing the identical core value to UnregisterExtraCore.
 func RegisterExtraCore(core zapcore.Core) {
+	if core == nil {
+		return
+	}
 	extraMu.Lock()
 	defer extraMu.Unlock()
-	if extraCore == nil {
-		extraCore = core
-	} else {
-		extraCore = zapcore.NewTee(extraCore, core)
-	}
+	extraCores = append(extraCores, core)
 	rebuildLogger()
 }
 
-func UnregisterExtraCore() {
+// UnregisterExtraCore removes exactly the given previously-registered core.
+// A single task finishing no longer tears down the cores of concurrently
+// running tasks (the old single-slot behavior did exactly that).
+func UnregisterExtraCore(core zapcore.Core) {
 	extraMu.Lock()
 	defer extraMu.Unlock()
-	extraCore = nil
+	for i, c := range extraCores {
+		if c == core {
+			extraCores = append(extraCores[:i], extraCores[i+1:]...)
+			break
+		}
+	}
 	rebuildLogger()
 }
 
@@ -39,9 +49,7 @@ func rebuildLogger() {
 	}
 	var cores []zapcore.Core
 	cores = append(cores, baseCore)
-	if extraCore != nil {
-		cores = append(cores, extraCore)
-	}
+	cores = append(cores, extraCores...)
 	core := zapcore.NewTee(cores...)
 	logger := zap.New(core, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
 	zap.ReplaceGlobals(logger)

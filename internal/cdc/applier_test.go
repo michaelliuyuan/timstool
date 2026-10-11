@@ -2,6 +2,8 @@ package cdc
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -69,7 +71,7 @@ func TestIsFatalError(t *testing.T) {
 		fatal  bool
 	}{
 		{"Error 1064: You have an error in your SQL syntax", true},
-		{"Error 1146: Table 'test.users' doesn't exist", false}, // schema error now (#t59): retried then halted via StructuralError, not fatal-no-retry
+		{"Error 1146: Table 'test.users' doesn't exist", false}, // schema error (#t59): long retry, then F-09 degradable skip (visible, chain continues)
 		{"Error 1054: Unknown column 'foo' in 'field list'", true},
 		{"syntax error near 'SELECT'", true},
 		{"access denied for user 'root'", true},
@@ -125,8 +127,11 @@ func TestApplyEvent_SkipsInternalTable(t *testing.T) {
 		Table:   "pg2tidb_ddl_log",
 		Columns: []ColumnValue{{Name: "id", Value: "1", Type: "oid_23"}},
 	})
-	if err != nil {
-		t.Fatalf("internal-table DML must be skipped (nil err), got: %v", err)
+	// The skip must surface as skippedError so the worker counts it ONLY as
+	// skipped (never applied — received = applied+skipped+failed, F-09).
+	var sk *skippedError
+	if !errors.As(err, &sk) {
+		t.Fatalf("internal-table DML must return skippedError, got: %v", err)
 	}
 	if got := a.stats.EventsSkipped; got != 1 {
 		t.Errorf("EventsSkipped = %d, want 1 (internal table skipped)", got)
@@ -212,4 +217,31 @@ func TestApplierStats_Snapshot(t *testing.T) {
 	if snap.EventsApplied != 95 {
 		t.Errorf("EventsApplied = %d", snap.EventsApplied)
 	}
+}
+
+// TestApplierStats_ConcurrentSnapshotRace: concurrent Snapshot() reads while
+// writers mutate the stats must be race-free (run with -race). Snapshot must
+// return a lock-free DTO, never a copy of the mutex-guarded ApplierStats.
+func TestApplierStats_ConcurrentSnapshotRace(t *testing.T) {
+	s := &ApplierStats{}
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		for i := 0; i < 10000; i++ {
+			s.mu.Lock()
+			s.EventsReceived++
+			s.EventsApplied++
+			s.BatchesFlushed++
+			s.LastLSN = fmt.Sprintf("LSN/%d", i)
+			s.LastError = ""
+			s.mu.Unlock()
+		}
+	}()
+
+	for i := 0; i < 10000; i++ {
+		snap := s.Snapshot()
+		_ = snap.EventsReceived + snap.EventsApplied + snap.BatchesFlushed
+	}
+	<-done
 }

@@ -4,23 +4,23 @@ import "fmt"
 
 // Compatibility levels for findings.
 const (
-	LevelCompatible    = "compatible"     // ✅ Direct support
-	LevelConvertible   = "convertible"    // ⚠️ Auto-mapped
-	LevelManualNeeded  = "manual_needed"  // 🟡 Needs manual intervention
-	LevelIncompatible  = "incompatible"   // ❌ Not supported
+	LevelCompatible   = "compatible"    // ✅ Direct support
+	LevelConvertible  = "convertible"   // ⚠️ Auto-mapped
+	LevelManualNeeded = "manual_needed" // 🟡 Needs manual intervention
+	LevelIncompatible = "incompatible"  // ❌ Not supported
 )
 
 // Assessment dimensions with weights.
 const (
-	DimDataType  = "data_type"  // 25%
-	DimStructure = "structure"  // 20%
-	DimIndex     = "index"      // 15%
-	DimView      = "view"       // 10%
-	DimFunction  = "function"   // 10%
-	DimTrigger   = "trigger"    // 5%
+	DimDataType   = "data_type"   // 25%
+	DimStructure  = "structure"   // 20%
+	DimIndex      = "index"       // 15%
+	DimView       = "view"        // 10%
+	DimFunction   = "function"    // 10%
+	DimTrigger    = "trigger"     // 5%
 	DimCustomType = "custom_type" // 5%
-	DimExtension = "extension"   // 5%
-	DimSequence  = "sequence"    // 5%
+	DimExtension  = "extension"   // 5%
+	DimSequence   = "sequence"    // 5%
 )
 
 // DimensionWeights maps each dimension to its weight in the overall score.
@@ -54,15 +54,15 @@ var LevelEmoji = map[string]string{
 
 // ScanResult holds all scanned schema objects from PostgreSQL.
 type ScanResult struct {
-	Tables    []TableInfo
-	Columns   []ColumnInfo
-	Indexes   []IndexInfo
-	Views     []ViewInfo
-	Functions []FunctionInfo
-	Triggers  []TriggerInfo
-	Enums     []EnumInfo
+	Tables     []TableInfo
+	Columns    []ColumnInfo
+	Indexes    []IndexInfo
+	Views      []ViewInfo
+	Functions  []FunctionInfo
+	Triggers   []TriggerInfo
+	Enums      []EnumInfo
 	Extensions []ExtensionInfo
-	Sequences []SequenceInfo
+	Sequences  []SequenceInfo
 }
 
 // TableInfo represents a PG table.
@@ -73,30 +73,31 @@ type TableInfo struct {
 
 // ColumnInfo represents a PG column with its type info.
 type ColumnInfo struct {
-	TableSchema    string
-	TableName      string
-	ColumnName     string
-	DataType       string // PG data type name
-	MaxLength      int    // character_maximum_length
-	NumericPrec    int    // numeric_precision
-	NumericScale   int    // numeric_scale
-	IsNullable     bool
-	ColumnDefault  string
-	IsPrimary      bool
+	TableSchema     string
+	TableName       string
+	ColumnName      string
+	DataType        string // PG data type name
+	MaxLength       int    // character_maximum_length
+	NumericPrec     int    // numeric_precision
+	NumericScale    int    // numeric_scale
+	IsNullable      bool
+	ColumnDefault   string
+	IsPrimary       bool
 	OrdinalPosition int
+	IsAutoIncr      bool // MySQL EXTRA auto_increment (MS-10b2 item 7; PG never sets it)
 }
 
 // IndexInfo represents a PG index.
 type IndexInfo struct {
-	TableName  string
-	Name       string
-	IndexType  string // btree, hash, gin, gist, brin, spgist
-	IsUnique   bool
-	IsPrimary  bool
-	Definition string
-	IsPartial  bool // has WHERE clause
-	IsExpression bool // uses expression
-	DDL        string // Full CREATE INDEX DDL
+	TableName    string
+	Name         string
+	IndexType    string // btree, hash, gin, gist, brin, spgist
+	IsUnique     bool
+	IsPrimary    bool
+	Definition   string
+	IsPartial    bool   // has WHERE clause
+	IsExpression bool   // uses expression
+	DDL          string // Full CREATE INDEX DDL
 }
 
 // ViewInfo represents a PG view.
@@ -120,35 +121,35 @@ type FunctionInfo struct {
 
 // TriggerInfo represents a PG trigger.
 type TriggerInfo struct {
-	TableName     string
-	Name          string
-	EventType     string // INSERT, UPDATE, DELETE, TRUNCATE
-	Timing        string // BEFORE, AFTER, INSTEAD OF
-	Statement     string
-	DDL           string // Full CREATE TRIGGER DDL
+	TableName string
+	Name      string
+	EventType string // INSERT, UPDATE, DELETE, TRUNCATE
+	Timing    string // BEFORE, AFTER, INSTEAD OF
+	Statement string
+	DDL       string // Full CREATE TRIGGER DDL
 }
 
 // EnumInfo represents a PG enum type.
 type EnumInfo struct {
-	Schema  string
-	Name    string
-	Values  []string
-	DDL     string // Full CREATE TYPE AS ENUM DDL
+	Schema string
+	Name   string
+	Values []string
+	DDL    string // Full CREATE TYPE AS ENUM DDL
 }
 
 // ExtensionInfo represents a PG extension.
 type ExtensionInfo struct {
-	Name    string
-	Version string
+	Name      string
+	Version   string
 	Installed bool
-	DDL      string // Full CREATE EXTENSION DDL
+	DDL       string // Full CREATE EXTENSION DDL
 }
 
 // SequenceInfo represents a PG sequence.
 type SequenceInfo struct {
-	Schema    string
-	Name      string
-	DataType  string
+	Schema     string
+	Name       string
+	DataType   string
 	StartValue int64
 	Increment  int64
 	MaxValue   int64
@@ -158,46 +159,77 @@ type SequenceInfo struct {
 
 // Finding represents a single compatibility assessment result.
 type Finding struct {
-	Dimension   string `json:"dimension"`
-	ObjectType  string `json:"object_type"`
-	ObjectName  string `json:"object_name"`
-	Level       string `json:"level"`
-	PGDetail    string `json:"pg_detail"`
-	TiDBDetail  string `json:"tidb_detail"`
-	Suggestion  string `json:"suggestion"`
-	AutoFix     bool   `json:"auto_fix"`
-	DDL         string `json:"ddl,omitempty"`         // Original DDL from PG
-	TiDBDDL     string `json:"tidb_ddl,omitempty"`    // Suggested TiDB-compatible DDL
+	Dimension  string `json:"dimension"`
+	ObjectType string `json:"object_type"`
+	ObjectName string `json:"object_name"`
+	Level      string `json:"level"`
+	PGDetail   string `json:"pg_detail"`
+	TiDBDetail string `json:"tidb_detail"`
+	Suggestion string `json:"suggestion"`
+	AutoFix    bool   `json:"auto_fix"`
+	DDL        string `json:"ddl,omitempty"`      // Original DDL from PG
+	TiDBDDL    string `json:"tidb_ddl,omitempty"` // Suggested TiDB-compatible DDL
 }
 
 // DimensionResult holds the assessment results for one dimension.
 type DimensionResult struct {
-	Dimension string   `json:"dimension"`
-	Total     int      `json:"total"`
-	Score     float64  `json:"score"`
+	Dimension string    `json:"dimension"`
+	Total     int       `json:"total"`
+	Score     float64   `json:"score"`
 	Findings  []Finding `json:"findings"`
+	// Applicable is the MS-10b2 item-3 N/A tri-state: nil means the
+	// dimension is applicable (legacy shape — the field is omitted from
+	// JSON so populated-dimension payloads stay byte-identical, the PG
+	// parity anchor); an explicit false marks a dimension whose source
+	// object set is empty (MySQL: sequences/custom types/extensions) —
+	// it must render N/A and stay out of the weighted aggregate.
+	Applicable *bool `json:"applicable,omitempty"`
+}
+
+// IsApplicable reports whether the dimension enters scoring/rendering;
+// nil (legacy) counts as applicable. Value receiver so map-indexed
+// DimensionResult values can be queried directly.
+func (d DimensionResult) IsApplicable() bool {
+	return d.Applicable == nil || *d.Applicable
+}
+
+// MarkNotApplicable flags the dimension N/A and zeroes its score.
+func (d *DimensionResult) MarkNotApplicable() {
+	v := false
+	d.Applicable = &v
+	d.Score = 0
 }
 
 // AssessmentReport is the top-level report.
 type AssessmentReport struct {
-	Score            float64            `json:"score"`
-	Level            string             `json:"level"`
-	DimensionResults []DimensionResult  `json:"dimension_results"`
-	AllFindings      []Finding          `json:"all_findings"`
-	Summary          map[string]int     `json:"summary"`
+	Score            float64           `json:"score"`
+	Level            string            `json:"level"`
+	DimensionResults []DimensionResult `json:"dimension_results"`
+	AllFindings      []Finding         `json:"all_findings"`
+	Summary          map[string]int    `json:"summary"`
 }
 
-// Score calculates the overall score from dimension results.
+// Score calculates the overall score from dimension results. N/A
+// dimensions (MS-10b2 item 3) are excluded from both numerator and
+// denominator; with every dimension applicable the weights already sum
+// to 1.0 so the legacy value is unchanged (PG parity).
 func (r *AssessmentReport) Score_() float64 {
 	if len(r.DimensionResults) == 0 {
 		return 0
 	}
-	var total float64
+	var total, weightSum float64
 	for _, dr := range r.DimensionResults {
+		if !dr.IsApplicable() {
+			continue
+		}
 		weight := DimensionWeights[dr.Dimension]
 		total += weight * dr.Score
+		weightSum += weight
 	}
-	return total
+	if weightSum > 0 {
+		return total / weightSum
+	}
+	return 0
 }
 
 // OverallLevel returns the compatibility level based on score.

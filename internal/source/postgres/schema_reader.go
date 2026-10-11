@@ -65,10 +65,15 @@ func (r schemaReader) ReadSchema(ctx context.Context, opts source.Filter) (*sour
 
 		indexes := make([]source.Index, 0, len(t.Indexes))
 		for _, idx := range t.Indexes {
+			parts := make([]source.IndexPart, 0, len(idx.Columns))
+			for _, c := range idx.Columns {
+				// PG collector yields plain column-name key parts only.
+				parts = append(parts, source.IndexPart{Value: c})
+			}
 			indexes = append(indexes, source.Index{
-				Name:    idx.IndexName,
-				Columns: idx.Columns,
-				Unique:  idx.IsUnique,
+				Name:   idx.IndexName,
+				Parts:  parts,
+				Unique: idx.IsUnique,
 			})
 		}
 

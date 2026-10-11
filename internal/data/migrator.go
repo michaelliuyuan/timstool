@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,10 +33,17 @@ import (
 var chunkFileIndexRegexp = regexp.MustCompile(`^(.+)\.(\d+)$`)
 
 type Migrator struct {
-	cfg       config.Config
-	pgDB      *sql.DB
-	cpMgr     *checkpoint.Manager
-	display   *progress.Display
+	cfg     config.Config
+	pgDB    *sql.DB
+	cpMgr   *checkpoint.Manager
+	display *progress.Display
+	// preRegistered guards one-time upfront table registration so progress
+	// denominators are stable from the start of the export loop.
+	preRegistered bool
+	// estimates caches the row estimates from the first preRegisterTables
+	// call so later entry points (importViaSQL, lightning fallback) reuse
+	// them instead of nil.
+	estimates map[string]int64
 }
 
 func NewMigrator(cfg config.Config) *Migrator {
@@ -72,6 +80,7 @@ func (m *Migrator) Run(ctx context.Context, opts common.DataOpts) (*common.DataR
 		return nil, cerrors.Wrap(cerrors.ErrCheckpointLoad, "init checkpoint", err)
 	}
 	m.cpMgr.SetPhase("data-export")
+	_ = m.cpMgr.SetSubPhase("data", "data-export")
 
 	if err := os.MkdirAll(opts.TempDir, 0755); err != nil {
 		return nil, cerrors.Wrap(cerrors.ErrDataExport, "create temp dir", err)
@@ -83,6 +92,11 @@ func (m *Migrator) Run(ctx context.Context, opts common.DataOpts) (*common.DataR
 	}
 
 	logger.Info("migrating tables", zap.Int("count", len(tables)))
+
+	// Register every selected table upfront (with zero-scan row estimates) so
+	// the progress denominators are full-size from the first poll instead of
+	// growing as the export loop walks the table list.
+	estimates := m.preRegisterTables(ctx, tables)
 
 	var totalRows atomic.Int64
 	var totalBytes atomic.Int64
@@ -110,8 +124,11 @@ func (m *Migrator) Run(ctx context.Context, opts common.DataOpts) (*common.DataR
 
 			rowCount, err := m.getRowCount(ctx, table)
 			if err != nil {
-				logger.Warn("failed to get row count", zap.String("table", table), zap.Error(err))
-				rowCount = 0
+				logger.Warn("failed to get row count, keeping estimate", zap.String("table", table), zap.Error(err))
+				rowCount = estimates[table]
+			} else {
+				// Converge the denominator to the exact count; never below RowsDone.
+				m.setExactRowsTotal(table, rowCount)
 			}
 
 			m.cpMgr.GetOrCreateTable(table, rowCount)
@@ -174,18 +191,37 @@ func (m *Migrator) Run(ctx context.Context, opts common.DataOpts) (*common.DataR
 			return nil, firstErr
 		}
 
+		// Record the mode BEFORE the phase flip so the poller never sees
+		// phase=data-import with an empty/stale mode (importViaSQL /
+		// importViaLightning re-set it on their own entry as a fallback
+		// override). Paired with SetImportedTables(0) below.
+		m.cpMgr.SetImportMode(checkpoint.ImportModeLightning)
+		m.cpMgr.SetImportedTables(0)
 		m.cpMgr.SetPhase("data-import")
+		_ = m.cpMgr.SetSubPhase("data", "data-import")
 		m.cpMgr.Flush()
 
 		if err := m.importViaLightning(ctx, opts, tables); err != nil {
 			logger.Warn("LOAD DATA import failed, falling back to streaming INSERT", zap.Error(err))
+			m.cpMgr.SetImportedTables(0)
 			if err := m.importViaSQL(ctx, opts); err != nil {
 				return nil, cerrors.Wrap(cerrors.ErrDataImport, "sql import", err)
 			}
 		} else {
+			m.cpMgr.SetImportedTables(len(tables))
 			for _, table := range tables {
-				tc := m.cpMgr.GetOrCreateTable(table, 0)
-				m.cpMgr.MarkTableCompleted(table, tc.RowsTotal)
+				m.cpMgr.GetOrCreateTable(table, 0)
+				// Pure row-count convergence (double insurance with the
+				// sticky guard in MarkTableCompleted): a completed table
+				// settles RowsDone to its denominator, but State and
+				// timestamps are never re-stamped here — the export
+				// phase's first-completion FinishedAt survives the
+				// Lightning-end refresh, so per-table durations stay real.
+				_ = m.cpMgr.UpdateTable(table, func(tc *checkpoint.TableCheckpoint) {
+					if tc.State == checkpoint.StateCompleted {
+						tc.RowsDone = tc.RowsTotal
+					}
+				})
 			}
 			m.cpMgr.Flush()
 			logger.Info("[DEBUG] Lightning completed, checkpoint flushed",
@@ -244,6 +280,9 @@ func (m *Migrator) getTables(ctx context.Context, include, exclude []string) ([]
 			tables = append(tables, name)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list tables: %w", err)
+	}
 	return tables, nil
 }
 
@@ -256,6 +295,168 @@ func (m *Migrator) getRowCount(ctx context.Context, table string) (int64, error)
 	err := m.pgDB.QueryRowContext(ctx,
 		fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", quotePG(schema), quotePG(table))).Scan(&count)
 	return count, err
+}
+
+// pgQuoteLiteral quotes s as a PostgreSQL string literal (single quotes).
+// quotePG is NOT suitable here: it emits double quotes, which PostgreSQL
+// parses as an identifier reference, making schema/table comparisons in
+// catalog queries fail with "column does not exist" and silently disabling
+// the estimate query.
+func pgQuoteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// setExactRowsTotal overwrites the estimated RowsTotal with the exact COUNT
+// taken at dispatch time. The denominator never drops below RowsDone and is
+// only lowered while no rows have been exported yet, so live progress can
+// never jump backwards past what has already been done.
+func (m *Migrator) setExactRowsTotal(table string, exact int64) {
+	if err := m.cpMgr.UpdateTable(table, func(tc *checkpoint.TableCheckpoint) {
+		if exact < tc.RowsDone {
+			exact = tc.RowsDone
+		}
+		tc.RowsTotal = exact
+	}); err != nil {
+		zap.L().Warn("failed to set exact row total",
+			zap.String("table", table), zap.Error(err))
+	}
+}
+
+// estimateRowCounts returns a zero-scan row-count estimate per table using
+// planner statistics (pg_class.reltuples) and live-tuple counters
+// (pg_stat_all_tables.n_live_tup), taking the larger of the two. Partitioned
+// parents (relkind='p', whose reltuples is empty) fall back to a recursive
+// pg_inherits sum over leaf partitions. Failure of any query is non-fatal:
+// missing tables simply get estimate 0 and rely on the exact COUNT at
+// dispatch time.
+func (m *Migrator) estimateRowCounts(ctx context.Context, tables []string) map[string]int64 {
+	estimates := make(map[string]int64, len(tables))
+	schema := m.cfg.Source.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	logger := zap.L()
+
+	literals := make([]string, 0, len(tables))
+	for _, t := range tables {
+		literals = append(literals, pgQuoteLiteral(t))
+	}
+	query := fmt.Sprintf(`
+		SELECT c.relname, c.relkind,
+		       GREATEST(COALESCE(c.reltuples, 0)::bigint, COALESCE(s.n_live_tup, 0)) AS est_rows
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid
+		WHERE n.nspname = %s AND c.relname IN (%s) AND c.relkind IN ('r', 'p')`,
+		pgQuoteLiteral(schema), strings.Join(literals, ", "))
+
+	rows, err := m.pgDB.QueryContext(ctx, query)
+	if err != nil {
+		logger.Warn("row estimate query failed, falling back to dispatch-time counts", zap.Error(err))
+		return estimates
+	}
+	defer rows.Close()
+
+	var partitionParents []string
+	for rows.Next() {
+		var name, relkind string
+		var est int64
+		if err := rows.Scan(&name, &relkind, &est); err != nil {
+			logger.Warn("row estimate scan failed", zap.Error(err))
+			continue
+		}
+		if est < 0 {
+			est = 0
+		}
+		estimates[name] = est
+		// Only partitioned parents need the recursive fallback; plain empty
+		// or never-analyzed tables keep estimate 0 and converge at dispatch.
+		if relkind == "p" {
+			partitionParents = append(partitionParents, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		logger.Warn("row estimate iteration failed", zap.Error(err))
+	}
+
+	// Partitioned parents carry no reltuples; sum their leaf partitions.
+	for _, table := range partitionParents {
+		if est := m.estimatePartitionRows(ctx, schema, table); est > 0 {
+			estimates[table] = est
+		}
+	}
+
+	total := int64(0)
+	for _, t := range tables {
+		total += estimates[t]
+	}
+	logger.Info("estimated source row counts",
+		zap.Int("tables", len(tables)), zap.Int64("estimated_rows", total))
+
+	return estimates
+}
+
+// estimatePartitionRows sums planner/live-tuple estimates over the leaf
+// partitions (relkind='r') of a (possibly partitioned) table via a recursive
+// pg_inherits walk. Returns 0 on failure.
+func (m *Migrator) estimatePartitionRows(ctx context.Context, schema, table string) int64 {
+	query := fmt.Sprintf(`
+		WITH RECURSIVE tree AS (
+			SELECT c.oid FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = %s AND c.relname = %s
+			UNION ALL
+			SELECT cl.oid FROM pg_class cl
+			JOIN pg_inherits i ON i.inhrelid = cl.oid
+			JOIN tree t ON i.inhparent = t.oid
+		)
+		SELECT COALESCE(SUM(GREATEST(COALESCE(c.reltuples, 0), COALESCE(s.n_live_tup, 0))), 0)
+		FROM tree x
+		JOIN pg_class c ON c.oid = x.oid
+		LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid
+		WHERE c.relkind = 'r'`,
+		pgQuoteLiteral(schema), pgQuoteLiteral(table))
+
+	var sum int64
+	if err := m.pgDB.QueryRowContext(ctx, query).Scan(&sum); err != nil {
+		zap.L().Warn("partition row estimate failed",
+			zap.String("table", table), zap.Error(err))
+		return 0
+	}
+	return sum
+}
+
+// preRegisterTables registers all selected tables in the checkpoint with
+// estimated row counts before the export/import loop starts, so progress
+// denominators (tables_total / rows_total) are full-size from the first
+// poll. Idempotent per Migrator instance; completed or already-registered
+// tables are left untouched (resume semantics preserved). Returns the
+// estimates for callers to use as a COUNT-failure fallback.
+func (m *Migrator) preRegisterTables(ctx context.Context, tables []string) map[string]int64 {
+	if len(tables) == 0 || m.cpMgr == nil {
+		return m.estimates
+	}
+	if m.preRegistered {
+		return m.estimates
+	}
+	m.preRegistered = true
+
+	m.estimates = m.estimateRowCounts(ctx, tables)
+	estimates := m.estimates
+	registered := 0
+	for _, table := range tables {
+		if m.cpMgr.IsTableCompleted(table) {
+			continue
+		}
+		if _, ok := m.cpMgr.GetTable(table); ok {
+			continue
+		}
+		m.cpMgr.GetOrCreateTable(table, estimates[table])
+		registered++
+	}
+	zap.L().Info("pre-registered tables for stable progress denominators",
+		zap.Int("selected", len(tables)), zap.Int("newly_registered", registered))
+	return estimates
 }
 
 func (m *Migrator) exportTable(ctx context.Context, table string, opts common.DataOpts) (int64, int64, error) {
@@ -350,6 +551,9 @@ func (m *Migrator) exportTableFallback(ctx context.Context, schema, table string
 			m.cpMgr.UpdateTableProgress(table, rowCount, 0)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read rows from %s: %w", table, err)
+	}
 
 	if err := bw.Flush(); err != nil {
 		return fmt.Errorf("flush csv writer: %w", err)
@@ -361,6 +565,15 @@ func (m *Migrator) exportTableFallback(ctx context.Context, schema, table string
 func (m *Migrator) importViaLightning(ctx context.Context, opts common.DataOpts, tables []string) error {
 	logger := zap.L()
 	logger.Info("TiDB Lightning import starting", zap.String("dir", opts.TempDir))
+
+	// Record the import mode before the lightning process (and its scanner
+	// loop) starts, so progress polls during the import use the
+	// table-count formula instead of the streaming rows formula.
+	if m.cpMgr != nil {
+		if err := m.cpMgr.SetImportMode(checkpoint.ImportModeLightning); err != nil {
+			logger.Warn("failed to record import mode", zap.Error(err))
+		}
+	}
 
 	entries, err := os.ReadDir(opts.TempDir)
 	if err != nil {
@@ -382,7 +595,7 @@ func (m *Migrator) importViaLightning(ctx context.Context, opts common.DataOpts,
 		return nil
 	}
 
-// Clean up stale Lightning checkpoint to avoid conflicts from previous failed runs
+	// Clean up stale Lightning checkpoint to avoid conflicts from previous failed runs
 	checkpointPath := filepath.Join(opts.TempDir, "tidb_lightning_checkpoint.pb")
 	if _, err := os.Stat(checkpointPath); err == nil {
 		logger.Info("removing stale Lightning checkpoint", zap.String("path", checkpointPath))
@@ -442,7 +655,23 @@ func (m *Migrator) importViaLightning(ctx context.Context, opts common.DataOpts,
 		}
 	}
 
-	lightningBin := lightningpkg.FindBinary(m.cfg.Migration.TempDir)
+	// Lightning binary resolution: an explicitly configured path wins (and is
+	// validated here — same semantics as the wizard's /validate-lightning gate);
+	// empty keeps the auto-discovery chain (PATH → embedded). Runtime backstop
+	// for API/CLI callers that bypass the web gate.
+	lightningBin := ""
+	if p := m.cfg.Migration.LightningPath; strings.TrimSpace(p) != "" {
+		fi, err := os.Stat(p)
+		if err != nil {
+			return fmt.Errorf("lightning_path %q: %w (检查路径是否存在)", p, err)
+		}
+		if fi.IsDir() {
+			return fmt.Errorf("lightning_path %q 是目录，需要指向可执行文件", p)
+		}
+		lightningBin = p
+	} else {
+		lightningBin = lightningpkg.FindBinary(m.cfg.Migration.TempDir)
+	}
 	if lightningBin == "" {
 		return fmt.Errorf("tidb-lightning not found: install tidb-lightning or use a build with embedded binary")
 	}
@@ -597,7 +826,7 @@ analyze = "off"
 	}
 
 	configPath := filepath.Join(absDir, "lightning.toml")
-	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
 		return fmt.Errorf("write lightning config: %w", err)
 	}
 	defer os.Remove(configPath)
@@ -621,27 +850,75 @@ analyze = "off"
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start tidb-lightning: %w", err)
 	}
+
+	// Full lightning log file: tee every RAW stdout line (before filtering)
+	// to <temp_dir>/tidb-lightning.log. The CLI flag --log-file=- (stdout)
+	// overrides the config [lightning] file setting, so a Go-side tee is the
+	// only way to keep both the streamed parsing and a complete standalone
+	// log file (incl. WARN lines filtered out of the migration log).
+	// O_TRUNC: each run starts a fresh file (no unbounded growth across
+	// migrations in the same temp_dir); 0600 because the config dump inside
+	// contains host/user/pd-addr in clear text. Cleanup follows temp_dir.
+	lightningLogPath := filepath.Join(absDir, "tidb-lightning.log")
+	lightningLogFile, logFileErr := os.OpenFile(lightningLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if logFileErr != nil {
+		logger.Warn("cannot create lightning log file, continuing without it",
+			zap.String("file", lightningLogPath), zap.Error(logFileErr))
+	} else {
+		defer lightningLogFile.Close()
+		logger.Info("lightning log file", zap.String("file", lightningLogPath))
+	}
+
 	var srcPathRe = regexp.MustCompile(`\([^)]*\.go:\d+\)`)
+	var importCounter importTableCounter
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	logWriteFailed := false
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		raw := scanner.Text()
+		if lightningLogFile != nil && !logWriteFailed {
+			if _, werr := lightningLogFile.WriteString(raw + "\n"); werr != nil {
+				// Disk full / file gone: warn ONCE, then stop writing instead
+				// of silently truncating a file we already announced.
+				logger.Warn("writing lightning log file failed, tee disabled for the rest of this run",
+					zap.String("file", lightningLogPath), zap.Error(werr))
+				logWriteFailed = true
+			}
+		}
 
+		line := strings.TrimSpace(raw)
 		line = srcPathRe.ReplaceAllString(line, "")
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		if strings.Contains(line, "[ERROR]") || strings.Contains(line, "[FATAL]") {
+		switch filterLightningLine(line) {
+		case logDrop:
+			// filtered out
+		case logError:
 			logger.Error("lightning: " + line)
-		} else if strings.Contains(line, "[WARN]") {
-			// Filter out all Lightning WARN logs - not useful for users viewing migration logs
-		} else if strings.Contains(line, "restore table `") ||
-			strings.Contains(line, "checksum for table") ||
-			strings.Contains(line, "the whole procedure") ||
-			strings.Contains(line, "tidb lightning exit") {
+		case logWarn:
+			logger.Warn("lightning: " + line)
+		default:
 			logger.Info("lightning: " + line)
+			// The "restore file completed" line fires once per source CSV and
+			// carries [table=`db`.`tbl`]; count distinct tables into the
+			// checkpoint so the web UI can show import progress.
+			if table, ok := parseImportedTable(line); ok {
+				if n, isNew := importCounter.add(table); isNew {
+					if err := m.cpMgr.SetImportedTables(n); err != nil {
+						logger.Warn("failed to record imported table count",
+							zap.Int("count", n), zap.Error(err))
+					}
+				}
+			}
 		}
+	}
+	if serr := scanner.Err(); serr != nil {
+		// Stream broke (over-long line / pipe error): lightning output may be
+		// truncated, but the process result below is still authoritative.
+		logger.Warn("reading lightning stdout ended with error, captured log may be incomplete",
+			zap.Error(serr))
 	}
 
 	if err := cmd.Wait(); err != nil {
@@ -650,6 +927,86 @@ analyze = "off"
 
 	logger.Info("TiDB Lightning import completed successfully")
 	return nil
+}
+
+type lightningLogLevel int
+
+const (
+	logDrop lightningLogLevel = iota
+	logInfo
+	logWarn
+	logError
+)
+
+// filterLightningLine decides whether a (already trimmed, caller-stripped)
+// tidb-lightning stdout line should surface in the migration log, and at what
+// severity. Per-table visibility, EXACTLY ONE line per table: only the
+// "restore file completed" line passes (it fires once per source file, and
+// each table exports to one CSV, carrying table=`db`.`tbl`); restore-table /
+// engine lifecycle lines and per-chunk counters stay filtered to keep the
+// task log concise. WARN is dropped EXCEPT checksum-related warnings —
+// checksum = "optional" means a failed checksum only warns, and hiding it
+// would report a corrupt import as success. The complete unfiltered log
+// remains in tidb-lightning.log.
+func filterLightningLine(line string) lightningLogLevel {
+	if strings.Contains(line, "[ERROR]") || strings.Contains(line, "[FATAL]") {
+		return logError
+	}
+	if strings.Contains(line, "[WARN]") {
+		if strings.Contains(line, "checksum") {
+			return logWarn
+		}
+		return logDrop
+	}
+	if strings.Contains(line, "the whole procedure") ||
+		strings.Contains(line, "tidb lightning exit") {
+		return logInfo
+	}
+	if strings.Contains(line, "[INFO]") && !strings.Contains(line, "[cfg]") {
+		if strings.Contains(line, "restore file completed") {
+			return logInfo
+		}
+	}
+	return logDrop
+}
+
+// importedTableRegexp extracts the table name from a lightning
+// "restore file completed" line: [table=`db`.`tbl`].
+var importedTableRegexp = regexp.MustCompile("\\[table=`([^`]*)`\\.`([^`]*)`\\]")
+
+// parseImportedTable returns the qualified table name (`db`.`tbl` → db.tbl)
+// from a lightning log line that reports a completed file restore. ok is
+// false for lines without a [table=`db`.`tbl`] marker.
+func parseImportedTable(line string) (table string, ok bool) {
+	m := importedTableRegexp.FindStringSubmatch(line)
+	if m == nil {
+		return "", false
+	}
+	return m[1] + "." + m[2], true
+}
+
+// importTableCounter counts DISTINCT tables whose files finished importing
+// (chunked tables emit one "restore file completed" per CSV chunk).
+type importTableCounter struct {
+	mu   sync.Mutex
+	seen map[string]bool
+	n    int
+}
+
+// add records table and returns the total distinct count so far and whether
+// this table was newly seen.
+func (c *importTableCounter) add(table string) (n int, isNew bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.seen == nil {
+		c.seen = make(map[string]bool)
+	}
+	if c.seen[table] {
+		return c.n, false
+	}
+	c.seen[table] = true
+	c.n++
+	return c.n, true
 }
 
 func isBadConnection(err error) bool {
@@ -664,7 +1021,13 @@ func isBadConnection(err error) bool {
 		strings.Contains(msg, "EOF")
 }
 
-func (m *Migrator) applyTargetPolicy(ctx context.Context, tidbDB *sql.DB, tables []string) error {
+// execContext is the subset of *sql.DB that policy application needs; it
+// exists so tests can fake the target connection (F-10 anchor).
+type execContext interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func (m *Migrator) applyTargetPolicy(ctx context.Context, tidbDB execContext, tables []string) error {
 	policy := m.cfg.Migration.TargetPolicy
 	if policy == "" || policy == "insert" {
 		return nil
@@ -740,6 +1103,10 @@ func (m *Migrator) ensureTablesExist(ctx context.Context, tidbDB *sql.DB, pgSche
 				return err
 			}
 			columns = append(columns, c)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("read columns for %s: %w", table, err)
 		}
 		rows.Close()
 
@@ -841,6 +1208,45 @@ func (m *Migrator) importViaSQL(ctx context.Context, opts common.DataOpts) error
 		return fmt.Errorf("get table list: %w", err)
 	}
 
+	// No-op when Run already pre-registered; guards direct entry points.
+	estimates := m.preRegisterTables(ctx, tables)
+
+	// This entry is also the lightning→stream fallback: at that point each
+	// table's RowsDone still holds its CSV-export final value
+	// (rowsDone==rowsTotal) — including tables whose state is already
+	// completed, because the export loop marked them so. Keeping those
+	// values would make the stream progress formula report 100% on the first
+	// poll after fallback. Reset RowsDone to 0 for EVERY table (RowsTotal is
+	// untouched, so denominators stay intact): importViaSQL re-streams all
+	// tables and rewrites RowsDone per batch, so "RowsDone = rows imported
+	// into TiDB" holds from the start. On the pure-stream path RowsDone
+	// starts at 0 anyway, making the reset a no-op there.
+	//
+	// IMPORTANT: this reset must complete BEFORE SetImportMode(stream) below
+	// is persisted. Between those two points a poll would otherwise see
+	// mode=stream together with rowsDone==rowsTotal and flash 100% for one
+	// frame; while the reset is still in progress the poller keeps the
+	// lightning formula (mode=lightning, imported=0 → 0.525), and once the
+	// mode flips the rows-based formula already reads rowsDone=0 → 0.525.
+	for _, t := range tables {
+		if err := m.cpMgr.UpdateTable(t, func(tc *checkpoint.TableCheckpoint) {
+			tc.RowsDone = 0
+		}); err != nil {
+			logger.Warn("failed to reset rows done for stream import",
+				zap.String("table", t), zap.Error(err))
+		}
+	}
+
+	// Entry point for BOTH direct streaming runs and the lightning→stream
+	// fallback: switch the poller to the rows-based formula only after the
+	// RowsDone reset above has been persisted, overwriting the earlier
+	// "lightning" value.
+	if m.cpMgr != nil {
+		if err := m.cpMgr.SetImportMode(checkpoint.ImportModeStream); err != nil {
+			logger.Warn("failed to record import mode", zap.Error(err))
+		}
+	}
+
 	tidbDB, err := sql.Open("mysql", m.cfg.Target.DSN())
 	if err != nil {
 		return err
@@ -859,6 +1265,21 @@ func (m *Migrator) importViaSQL(ctx context.Context, opts common.DataOpts) error
 		return fmt.Errorf("ping TiDB: %w", err)
 	}
 
+	// F-10 (leader ruling seq 189): apply target policy on the streaming
+	// path too — previously only the Lightning branch truncated, so a
+	// resume with use_lightning=false re-streamed into tables still holding
+	// the previous run's rows (1062 duplicate-key debt). Same semantics as
+	// the Lightning branch: truncate only, drop is handled by schema
+	// migration.
+	if m.cfg.Migration.TargetPolicy == "truncate" {
+		logger.Info("applying target policy before streaming import",
+			zap.String("policy", m.cfg.Migration.TargetPolicy),
+			zap.Int("tables", len(tables)))
+		if applyErr := m.applyTargetPolicy(ctx, tidbDB, tables); applyErr != nil {
+			return fmt.Errorf("apply target policy: %w", applyErr)
+		}
+	}
+
 	batchSize := opts.BatchSize
 	if batchSize <= 0 {
 		batchSize = 5000
@@ -872,39 +1293,70 @@ func (m *Migrator) importViaSQL(ctx context.Context, opts common.DataOpts) error
 	var firstErr error
 	var errMu sync.Mutex
 
-	for _, table := range tables {
-		rowCount, err := m.getRowCount(ctx, table)
-		if err != nil {
-			logger.Warn("failed to get row count", zap.String("table", table), zap.Error(err))
-			rowCount = 0
-		}
-		m.cpMgr.GetOrCreateTable(table, rowCount)
-		m.cpMgr.MarkTableRunning(table)
-
-		sem <- struct{}{}
-		wg.Add(1)
-
-		go func(tableName string, estimatedRows int64) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			if err := m.streamTable(ctx, tidbDB, schema, tableName, batchSize, estimatedRows); err != nil {
-				m.cpMgr.MarkTableFailed(tableName, err.Error())
-				if m.cfg.Migration.OnError != "skip" {
-					errMu.Lock()
-					if firstErr == nil {
-						firstErr = fmt.Errorf("stream table %s: %w", tableName, err)
-					}
-					errMu.Unlock()
-					return
-				}
-				logger.Warn("table stream error", zap.String("table", tableName), zap.Error(err))
-				return
-			}
-		}(table, rowCount)
+	// FK-aware import order: TiDB enforces foreign keys, so a child table
+	// streamed before its parent hits 1452. Import in topological levels —
+	// parents first — keeping tables within a level parallel and
+	// alphabetical (F-08). Errors here only degrade to the plain
+	// alphabetical order, never fail the import.
+	levels := [][]string{tables}
+	if fkEdges, err := m.loadFKDependencies(ctx, schema, tables); err != nil {
+		logger.Warn("failed to load FK dependencies, importing in alphabetical order",
+			zap.Error(err))
+	} else if len(fkEdges) > 0 {
+		levels = topoLevels(tables, fkEdges)
+		logger.Info("import order planned by FK topology",
+			zap.Int("levels", len(levels)))
 	}
 
-	wg.Wait()
+	for _, level := range levels {
+		for _, table := range level {
+			rowCount, err := m.getRowCount(ctx, table)
+			if err != nil {
+				logger.Warn("failed to get row count, keeping estimate", zap.String("table", table), zap.Error(err))
+				if estimates != nil {
+					rowCount = estimates[table]
+				} else {
+					rowCount = 0
+				}
+			} else {
+				m.setExactRowsTotal(table, rowCount)
+			}
+			m.cpMgr.GetOrCreateTable(table, rowCount)
+
+			sem <- struct{}{}
+			wg.Add(1)
+
+			go func(tableName string, estimatedRows int64) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				// Stamped inside the goroutine (canon: Lightning export
+				// path above) — semaphore queue wait must not inflate the
+				// table's own duration.
+				m.cpMgr.MarkTableRunning(tableName)
+
+				if err := m.streamTable(ctx, tidbDB, schema, tableName, batchSize, estimatedRows); err != nil {
+					m.cpMgr.MarkTableFailed(tableName, err.Error())
+					if m.cfg.Migration.OnError != "skip" {
+						errMu.Lock()
+						if firstErr == nil {
+							firstErr = fmt.Errorf("stream table %s: %w", tableName, err)
+						}
+						errMu.Unlock()
+						return
+					}
+					logger.Warn("table stream error", zap.String("table", tableName), zap.Error(err))
+					return
+				}
+			}(table, rowCount)
+		}
+		// Level barrier: every parent in this level must finish before any
+		// child table starts (within a level there are no FK edges).
+		wg.Wait()
+		if firstErr != nil {
+			return firstErr
+		}
+	}
 
 	if firstErr != nil {
 		return firstErr
@@ -971,8 +1423,9 @@ func (m *Migrator) streamTable(ctx context.Context, tidbDB *sql.DB, schema, tabl
 			valuePtrs[i] = &values[i]
 		}
 		if err := rows.Scan(valuePtrs...); err != nil {
-			logger.Warn("scan error", zap.String("table", table), zap.Error(err))
-			continue
+			// Silently skipping broken rows under-reports the table and
+			// still marks it completed — data loss posing as success (F-05).
+			return fmt.Errorf("scan row in %s: %w", table, err)
 		}
 
 		converted := make([]interface{}, len(cols))
@@ -995,6 +1448,11 @@ func (m *Migrator) streamTable(ctx context.Context, tidbDB *sql.DB, schema, tabl
 			logger.Info("batch inserted", zap.String("table", table), zap.Int("rows_in_batch", totalRows), zap.Int64("total", rowCount))
 			batch = batch[:0]
 		}
+	}
+	// A mid-stream failure leaves rows.Next()==false without any scan error;
+	// without this check a partial table would be marked completed (F-05).
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("stream rows for %s: %w", table, err)
 	}
 
 	if len(batch) > 0 {
@@ -1083,7 +1541,7 @@ func convertSQLValue(val interface{}) interface{} {
 }
 
 func tryConvertArray(s string) interface{} {
-	if isPGArray(s) {
+	if isPGArrayLiteral(s) {
 		return pgArrayToJSON(s)
 	}
 	return s
@@ -1095,6 +1553,19 @@ func isPGArray(s string) bool {
 	}
 	return true
 }
+
+// isPGArrayLiteral reports whether s is a PostgreSQL array literal
+// ({1,2,3}) and NOT a JSON object ({"a":1}). JSON objects always contain a
+// quoted key followed by a colon; the colon may carry spaces before it
+// (`{"a" : 1}` — preserved verbatim by PG json columns), so the check must
+// allow whitespace between the quote and the colon. Converting JSON objects
+// as PG arrays rewrites them into garbage. Shared by both the CSV and
+// streaming paths (F-05, F-07).
+func isPGArrayLiteral(s string) bool {
+	return isPGArray(s) && !jsonKeyColonRe.MatchString(s)
+}
+
+var jsonKeyColonRe = regexp.MustCompile(`"\s*:`)
 
 func pgArrayToJSON(s string) string {
 	inner := s[1 : len(s)-1]
@@ -1196,11 +1667,7 @@ func convertStringValue(s string) string {
 	// PG arrays use {elem1,elem2,...} syntax, JSON objects use {"key":"val"}.
 	// JSON already starts with {" (object) or [" (array).
 	// Only convert if it's a PG array, not JSON.
-	if len(s) > 1 && s[0] == '{' && s[len(s)-1] == '}' {
-		// JSON objects contain "key": pattern — don't touch them
-		if strings.Contains(s, `":`) {
-			return s
-		}
+	if isPGArrayLiteral(s) {
 		return pgArrayToJSON(s)
 	}
 	return s
@@ -1216,7 +1683,7 @@ func convertValue(val interface{}) string {
 			return "1"
 		}
 		return "0"
-case []byte:
+	case []byte:
 		return convertStringValue(string(v))
 	case string:
 		return convertStringValue(v)
@@ -1268,6 +1735,9 @@ func (m *Migrator) buildSelectCols(ctx context.Context, schema, table string) (s
 			return "*", nil
 		}
 		cols = append(cols, c)
+	}
+	if err := rows.Err(); err != nil {
+		return "*", nil
 	}
 	if len(cols) == 0 {
 		return "*", nil
@@ -1380,6 +1850,18 @@ func (m *Migrator) calculateChunkBoundariesByOffset(numChunks, chunkSize int64) 
 	return boundaries
 }
 
+// offsetChunkQuery builds the ctid-ordered page query for offset-mode
+// chunks. The LIMIT must equal the cursor stride (chunkSize) or rows are
+// silently lost between chunks; the last chunk reads to the end (F-05).
+func offsetChunkQuery(selectCols, schema, table string, chunkSize, offset int64, isLast bool) string {
+	if isLast {
+		return fmt.Sprintf("SELECT %s FROM %s.%s ORDER BY ctid LIMIT ALL OFFSET %d",
+			selectCols, quotePG(schema), quotePG(table), offset)
+	}
+	return fmt.Sprintf("SELECT %s FROM %s.%s ORDER BY ctid LIMIT %d OFFSET %d",
+		selectCols, quotePG(schema), quotePG(table), chunkSize, offset)
+}
+
 func (m *Migrator) exportChunk(
 	ctx context.Context,
 	schema, table, pkColumn, selectCols string,
@@ -1387,6 +1869,7 @@ func (m *Migrator) exportChunk(
 	chunkFile string,
 	opts common.DataOpts,
 	isOffsetMode bool,
+	chunkSize int64,
 ) (int64, int64, error) {
 	f, err := os.Create(chunkFile)
 	if err != nil {
@@ -1398,14 +1881,12 @@ func (m *Migrator) exportChunk(
 	var rows *sql.Rows
 
 	if isOffsetMode {
+		// Offset mode walks the table in chunkSize strides, so each chunk
+		// must read exactly chunkSize rows (final chunk: to the end).
+		// The old LIMIT BatchSize*2 lost chunkSize-2*BatchSize rows per
+		// chunk on non-integer-PK tables (F-05).
 		offset := boundary.MinValue.(int64)
-		if boundary.IsLast {
-			query = fmt.Sprintf("SELECT %s FROM %s.%s ORDER BY ctid LIMIT %d OFFSET %d",
-				selectCols, quotePG(schema), quotePG(table), opts.BatchSize*2, offset)
-		} else {
-			query = fmt.Sprintf("SELECT %s FROM %s.%s ORDER BY ctid LIMIT %d OFFSET %d",
-				selectCols, quotePG(schema), quotePG(table), opts.BatchSize*2, offset)
-		}
+		query = offsetChunkQuery(selectCols, schema, table, chunkSize, offset, boundary.IsLast)
 		rows, err = m.pgDB.QueryContext(ctx, query)
 	} else {
 		if boundary.IsLast {
@@ -1452,6 +1933,9 @@ func (m *Migrator) exportChunk(
 		}
 		byteCount += int64(n)
 		rowCount++
+	}
+	if err := rows.Err(); err != nil {
+		return rowCount, byteCount, fmt.Errorf("iterate chunk %d rows: %w", boundary.Index, err)
 	}
 
 	if err := bw.Flush(); err != nil {
@@ -1550,7 +2034,7 @@ func (m *Migrator) exportTableChunked(
 			defer func() { <-sem }()
 
 			chunkFile := filepath.Join(opts.TempDir, fmt.Sprintf("%s.%d.csv", table, b.Index))
-			rows, bytes, exportErr := m.exportChunk(ctx, schema, table, pkColumn, selectCols, b, chunkFile, opts, isOffsetMode)
+			rows, bytes, exportErr := m.exportChunk(ctx, schema, table, pkColumn, selectCols, b, chunkFile, opts, isOffsetMode, chunkSize)
 			if exportErr != nil {
 				m.cpMgr.MarkChunkFailed(table, b.Index, exportErr.Error())
 				mu.Lock()
@@ -1592,4 +2076,116 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm%.3fs", minutes, seconds)
 	}
 	return fmt.Sprintf("%.3fs", seconds)
+}
+
+// loadFKDependencies returns child->parents foreign-key edges restricted to
+// the given table set (a single pg_catalog query; self-references dropped).
+func (m *Migrator) loadFKDependencies(ctx context.Context, schema string, tables []string) (map[string][]string, error) {
+	if m.pgDB == nil {
+		return nil, nil
+	}
+	inSet := make(map[string]bool, len(tables))
+	for _, t := range tables {
+		inSet[t] = true
+	}
+	query := `
+		SELECT src.relname, ref.relname
+		FROM pg_constraint con
+		JOIN pg_class src ON src.oid = con.conrelid
+		JOIN pg_namespace ns ON ns.oid = src.relnamespace
+		JOIN pg_class ref ON ref.oid = con.confrelid
+		WHERE con.contype = 'f' AND ns.nspname = $1`
+	rows, err := m.pgDB.QueryContext(ctx, query, schema)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	edges := make(map[string][]string)
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var child, parent string
+		if err := rows.Scan(&child, &parent); err != nil {
+			return nil, err
+		}
+		if child == parent || !inSet[child] || !inSet[parent] {
+			continue
+		}
+		key := child + "\x00" + parent
+		if !seen[key] {
+			seen[key] = true
+			edges[child] = append(edges[child], parent)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return edges, nil
+}
+
+// topoLevels groups tables into topological levels: level 0 holds tables
+// with no parents in the set, each later level holds tables whose parents
+// are all in earlier levels. Tables inside a level are alphabetically
+// sorted and have no FK relationship among themselves, so they can stream
+// in parallel. Cycles (mutually-referencing tables) cannot be ordered —
+// the remainder is appended as one final alphabetical level. Deterministic
+// for identical input (F-08).
+func topoLevels(tables []string, fkEdges map[string][]string) [][]string {
+	sorted := append([]string(nil), tables...)
+	sort.Strings(sorted)
+
+	remaining := make(map[string]bool, len(sorted))
+	indegree := make(map[string]int, len(sorted)) // unplaced parents count
+	for _, t := range sorted {
+		remaining[t] = true
+		indegree[t] = 0
+	}
+	for child, parents := range fkEdges {
+		if !remaining[child] {
+			continue
+		}
+		for _, p := range parents {
+			if p != child && remaining[p] {
+				indegree[child]++
+			}
+		}
+	}
+
+	var levels [][]string
+	for len(remaining) > 0 {
+		var level []string
+		for _, t := range sorted {
+			if remaining[t] && indegree[t] == 0 {
+				level = append(level, t)
+			}
+		}
+		if len(level) == 0 {
+			// Cycle: order the rest alphabetically in one final level.
+			for _, t := range sorted {
+				if remaining[t] {
+					level = append(level, t)
+				}
+			}
+			levels = append(levels, level)
+			return levels
+		}
+		for _, t := range level {
+			delete(remaining, t)
+		}
+		for child, parents := range fkEdges {
+			if !remaining[child] {
+				continue
+			}
+			for _, p := range parents {
+				for _, t := range level {
+					if p == t {
+						indegree[child]--
+						break
+					}
+				}
+			}
+		}
+		levels = append(levels, level)
+	}
+	return levels
 }

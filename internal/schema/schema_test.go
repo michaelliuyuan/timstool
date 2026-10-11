@@ -3,7 +3,43 @@ package schema
 import (
 	"strings"
 	"testing"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
+
+// TestProgressRegistrationNames anchors the ①b fix: the schema progress
+// registration set must align with the DATA migration set. With a whitelist
+// (opts.Tables non-empty) only the intersection is registered — a
+// whitelisted-out table must not produce a checkpoint entry, or data-phase
+// tables_done would never reach tables_total. Empty whitelist ⇒ all
+// collected tables (CollectTables already applied ExcludeTables).
+func TestProgressRegistrationNames(t *testing.T) {
+	tables := []TableInfo{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+
+	if got := progressRegistrationNames(tables, nil); len(got) != 3 {
+		t.Errorf("empty include: got %v, want all 3", got)
+	}
+	got := progressRegistrationNames(tables, []string{"a", "c", "zz"})
+	if len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Errorf("include {a,c,zz}: got %v, want [a c] (intersection only, zz dropped)", got)
+	}
+	if got := progressRegistrationNames(tables, []string{"zz"}); len(got) != 0 {
+		t.Errorf("include {zz}: got %v, want empty", got)
+	}
+	// Exclude pin (DDL 范围口径, 23e9a24): CollectTables filters excluded
+	// tables BEFORE registration (contains() at collector.go), so with
+	// exclude={"b"} the collected+registered set is N-1 and "b" produces
+	// no checkpoint entry — schema and data sets stay aligned end to end.
+	collected := []TableInfo{{Name: "a"}, {Name: "c"}} // b excluded upstream
+	if got := progressRegistrationNames(collected, nil); len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Errorf("exclude scenario: got %v, want [a c]", got)
+	}
+	if contains([]string{"b"}, "b") != true || contains([]string{"b"}, "a") != false {
+		t.Error("contains() exclude semantics broken")
+	}
+}
 
 func TestMapType(t *testing.T) {
 	tests := []struct {
@@ -40,14 +76,18 @@ func TestMapType(t *testing.T) {
 
 func TestMapTypeWithPrecision(t *testing.T) {
 	tests := []struct {
-		pgType    PGType
-		prec      int
-		scale     int
-		expected  string
+		pgType   PGType
+		prec     int
+		scale    int
+		expected string
 	}{
 		{PGNumeric, 10, 2, "DECIMAL(10,2)"},
 		{PGNumeric, 10, 0, "DECIMAL(10)"},
-		{PGNumeric, 0, 0, "DECIMAL"},
+		// BUG-0932: unbounded numeric maps to the fidelity default, never
+		// bare DECIMAL (= decimal(10,0) on TiDB, silently rounds decimals).
+		{PGNumeric, 0, 0, "DECIMAL(65,30)"},
+		{PGDecimal, 0, 0, "DECIMAL(65,30)"},
+		{PGNumeric, 12, 2, "DECIMAL(12,2)"},
 		{PGVarchar, 255, 0, "VARCHAR(255)"},
 		{PGChar, 10, 0, "CHAR(10)"},
 		{PGInteger, 0, 0, "INT"},
@@ -217,6 +257,150 @@ func TestConvertDefaultValue(t *testing.T) {
 		if result != tt.expected {
 			t.Errorf("convertDefaultValue(%s, %s) = %s, want %s", tt.input, tt.pgType, result, tt.expected)
 		}
+	}
+}
+
+// TestBuildColumnDDLStripsTextFamilyDefault anchors BUG-0930 commit 1: a
+// literal DEFAULT on a column mapped to the TEXT/BLOB/JSON family must be
+// STRIPPED (recorded for warning/report) instead of emitted — TiDB rejects
+// it with 1101 and the whole schema phase fails. varchar(n) defaults stay.
+func TestBuildColumnDDLStripsTextFamilyDefault(t *testing.T) {
+	buildCol := func(pgType PGType, maxLength int, nullable bool) (string, []StrippedDefault) {
+		b := NewDDLBuilder()
+		col := Column{
+			TableName: "t1", ColumnName: "status", PGType: pgType,
+			MaxLength: maxLength, IsNullable: nullable, DefaultValue: "'applied'",
+		}
+		ddl, err := b.buildColumnDDL(col)
+		if err != nil {
+			t.Fatalf("buildColumnDDL: %v", err)
+		}
+		return ddl, b.strippedDefaults
+	}
+
+	// text + default → stripped, NOT NULL flag recorded.
+	ddl, sd := buildCol(PGText, 0, false)
+	if strings.Contains(strings.ToUpper(ddl), "DEFAULT") {
+		t.Errorf("text+default must strip DEFAULT, got: %s", ddl)
+	}
+	if len(sd) != 1 || sd[0].Table != "t1" || sd[0].Column != "status" || sd[0].Default != "'applied'" || !sd[0].NotNull {
+		t.Errorf("stripped record = %+v, want one NOT NULL entry for t1.status", sd)
+	}
+
+	// varchar(n) + default → KEPT (legal on VARCHAR).
+	ddl, sd = buildCol(PGVarchar, 64, true)
+	if !strings.Contains(ddl, "DEFAULT 'applied'") {
+		t.Errorf("varchar(n)+default must keep DEFAULT, got: %s", ddl)
+	}
+	if len(sd) != 0 {
+		t.Errorf("varchar must not record a strip, got %+v", sd)
+	}
+
+	// bytea → BLOB, json → JSON, xml → LONGTEXT: same family strip.
+	for _, pt := range []PGType{PGBytea, PGJSON, PGXML} {
+		ddl, sd = buildCol(pt, 0, true)
+		if strings.Contains(strings.ToUpper(ddl), "DEFAULT") {
+			t.Errorf("%s+default must strip DEFAULT, got: %s", pt, ddl)
+		}
+		if len(sd) != 1 {
+			t.Errorf("%s must record one strip, got %+v", pt, sd)
+		}
+	}
+
+	// unknown PG type falls back to TEXT → same strip.
+	ddl, sd = buildCol(PGType("weird_type"), 0, true)
+	if !strings.Contains(strings.ToUpper(ddl), "TEXT") || strings.Contains(strings.ToUpper(ddl), "DEFAULT") {
+		t.Errorf("unknown-type fallback TEXT must strip DEFAULT, got: %s", ddl)
+	}
+	if len(sd) != 1 {
+		t.Errorf("unknown-type must record one strip, got %+v", sd)
+	}
+
+	// adversarial angle 2: PG text DEFAULT CURRENT_TIMESTAMP maps to a TEXT
+	// column — CURRENT_TIMESTAMP is illegal there too (1101), must strip.
+	b := NewDDLBuilder()
+	col := Column{
+		TableName: "t1", ColumnName: "ts_col", PGType: PGText,
+		IsNullable: true, DefaultValue: "CURRENT_TIMESTAMP",
+	}
+	ddl, err := b.buildColumnDDL(col)
+	if err != nil {
+		t.Fatalf("buildColumnDDL: %v", err)
+	}
+	if strings.Contains(strings.ToUpper(ddl), "DEFAULT") {
+		t.Errorf("text+CURRENT_TIMESTAMP must strip DEFAULT, got: %s", ddl)
+	}
+	if len(b.strippedDefaults) != 1 || b.strippedDefaults[0].Default != "CURRENT_TIMESTAMP" {
+		t.Errorf("text+CURRENT_TIMESTAMP must record strip, got %+v", b.strippedDefaults)
+	}
+
+	// regression guard: timestamp + CURRENT_TIMESTAMP(6) → KEPT (not a
+	// blocked family; keyword defaults are legal on TIMESTAMP/DATETIME).
+	b2 := NewDDLBuilder()
+	col2 := Column{
+		TableName: "t1", ColumnName: "created_at", PGType: PGTimestamp,
+		IsNullable: true, DefaultValue: "CURRENT_TIMESTAMP(6)",
+	}
+	ddl, err = b2.buildColumnDDL(col2)
+	if err != nil {
+		t.Fatalf("buildColumnDDL: %v", err)
+	}
+	if !strings.Contains(strings.ToUpper(ddl), "DEFAULT CURRENT_TIMESTAMP") {
+		t.Errorf("timestamp+CURRENT_TIMESTAMP(6) must keep DEFAULT, got: %s", ddl)
+	}
+	if len(b2.strippedDefaults) != 0 {
+		t.Errorf("timestamp must not record a strip, got %+v", b2.strippedDefaults)
+	}
+}
+
+// TestUnboundedNumericFidelityMapping anchors BUG-0932: an unbounded PG
+// numeric column must map to DECIMAL(65,30) (never bare DECIMAL =
+// decimal(10,0) on TiDB) and emit a per-column warning.
+func TestUnboundedNumericFidelityMapping(t *testing.T) {
+	core, logs := observer.New(zapcore.WarnLevel)
+	prev := zap.ReplaceGlobals(zap.New(core))
+	defer prev()
+
+	b := NewDDLBuilder()
+	col := Column{
+		TableName: "t1", ColumnName: "amount", PGType: PGNumeric,
+		IsNullable: true,
+	}
+	ddl, err := b.buildColumnDDL(col)
+	if err != nil {
+		t.Fatalf("buildColumnDDL: %v", err)
+	}
+	if !strings.Contains(ddl, "DECIMAL(65,30)") {
+		t.Errorf("unbounded numeric must map to DECIMAL(65,30), got: %s", ddl)
+	}
+	if strings.Contains(ddl, "DECIMAL(10,0)") {
+		t.Errorf("must never emit decimal(10,0), got: %s", ddl)
+	}
+	found := false
+	for _, e := range logs.All() {
+		if e.Message == "unbounded numeric mapped to DECIMAL(65,30) fidelity default" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected fidelity-mapping warn for t1.amount, got logs: %v", logs.All())
+	}
+
+	// explicit precision must NOT warn.
+	logs.TakeAll()
+	col2 := Column{
+		TableName: "t1", ColumnName: "rate", PGType: PGNumeric,
+		NumericPrec: 12, NumericScale: 2, IsNullable: true,
+	}
+	ddl, err = b.buildColumnDDL(col2)
+	if err != nil {
+		t.Fatalf("buildColumnDDL: %v", err)
+	}
+	if !strings.Contains(ddl, "DECIMAL(12,2)") {
+		t.Errorf("numeric(12,2) must stay DECIMAL(12,2), got: %s", ddl)
+	}
+	if n := len(logs.All()); n != 0 {
+		t.Errorf("explicit precision must not warn, got %d entries", n)
 	}
 }
 

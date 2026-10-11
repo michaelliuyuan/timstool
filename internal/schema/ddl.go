@@ -3,10 +3,40 @@ package schema
 import (
 	"fmt"
 	"strings"
+
+	"go.uber.org/zap"
 )
 
 type DDLBuilder struct {
 	statements []string
+	// strippedDefaults records every TEXT/BLOB/JSON-family column whose
+	// literal DEFAULT was stripped (BUG-0930 commit 1): TiDB/MySQL reject
+	// literal defaults on these families (err 1101), so the default is
+	// dropped with a warning instead of failing the whole schema phase.
+	strippedDefaults []StrippedDefault
+}
+
+// StrippedDefault is one stripped column default, for warnings and the
+// migration report (visible compensation list).
+type StrippedDefault struct {
+	Table   string
+	Column  string
+	Default string
+	NotNull bool // NOT NULL + DEFAULT both set: after stripping, inserts omitting the column will fail
+}
+
+// StrippedDefaults returns the recorded strip list (caller consumes).
+func (b *DDLBuilder) StrippedDefaults() []StrippedDefault {
+	return b.strippedDefaults
+}
+
+// blocksColumnDefault reports whether the mapped TiDB type belongs to the
+// TEXT/BLOB/JSON families that cannot carry ANY DEFAULT (err 1101) —
+// literal or keyword (CURRENT_TIMESTAMP included). TIMESTAMP/DATETIME and
+// other families never match the substrings and keep their defaults.
+func blocksColumnDefault(mysqlType, def string) bool {
+	t := strings.ToUpper(mysqlType)
+	return strings.Contains(t, "TEXT") || strings.Contains(t, "BLOB") || strings.Contains(t, "JSON")
 }
 
 func NewDDLBuilder() *DDLBuilder {
@@ -67,6 +97,18 @@ func (b *DDLBuilder) buildColumnDDL(col Column) (string, error) {
 		mysqlType = "TEXT"
 	}
 
+	// BUG-0932: unbounded PG numeric/decimal maps to the fidelity default
+	// DECIMAL(65,30) — warn per column (same channel/format as the 0930
+	// stripped-default warnings; visible in the schema phase tab). The
+	// predicate is the shared isUnboundedNumeric so warn and mapping
+	// cannot drift apart.
+	if isUnboundedNumeric(col.PGType, col.NumericPrec, col.NumericScale) {
+		zap.L().Warn("unbounded numeric mapped to DECIMAL(65,30) fidelity default",
+			zap.String("table", col.TableName),
+			zap.String("column", col.ColumnName),
+			zap.String("pg_type", string(col.PGType)))
+	}
+
 	if col.ColumnName == "" {
 		return "", fmt.Errorf("empty column name")
 	}
@@ -87,7 +129,19 @@ func (b *DDLBuilder) buildColumnDDL(col Column) (string, error) {
 	} else if col.DefaultValue != "" {
 		def := convertDefaultValue(col.DefaultValue, col.PGType)
 		if def != "" {
-			parts = append(parts, "DEFAULT "+def)
+			if blocksColumnDefault(mysqlType, def) {
+				// BUG-0930: TiDB 1101 guard — strip the literal default
+				// on TEXT/BLOB/JSON-family columns instead of emitting DDL
+				// that fails the whole schema phase.
+				b.strippedDefaults = append(b.strippedDefaults, StrippedDefault{
+					Table:   col.TableName,
+					Column:  col.ColumnName,
+					Default: def,
+					NotNull: !col.IsNullable,
+				})
+			} else {
+				parts = append(parts, "DEFAULT "+def)
+			}
 		}
 	}
 
@@ -171,7 +225,139 @@ func (b *DDLBuilder) BuildViewDDL(view View) string {
 	if !strings.HasPrefix(strings.ToUpper(def), "SELECT") {
 		return fmt.Sprintf("-- WARNING: view %s has complex definition, manual review needed\n-- %s", view.Name, def)
 	}
+	// pg_get_viewdef always emits PG casts (::text, ::character varying(10),
+	// ::timestamp without time zone, ...). TiDB rejects them with ER 1064,
+	// so strip casts outside string literals before applying (F-07).
+	def = stripPGCasts(def)
 	return fmt.Sprintf("CREATE OR REPLACE VIEW %s AS %s", QuoteIdentifier(view.Name), def)
+}
+
+// stripPGCasts removes `::<type>` casts from a view definition. Text inside
+// single-quoted literals (with ” escapes) is left untouched; multi-word PG
+// types (character varying, double precision, timestamp without time zone)
+// and sized types (numeric(10,2)) are consumed as a whole.
+func stripPGCasts(def string) string {
+	var b strings.Builder
+	i := 0
+	n := len(def)
+	for i < n {
+		c := def[i]
+		if c == '\'' {
+			// copy the entire literal verbatim, honoring '' escapes
+			j := i + 1
+			for j < n {
+				if def[j] == '\'' {
+					if j+1 < n && def[j+1] == '\'' {
+						j += 2
+						continue
+					}
+					j++
+					break
+				}
+				j++
+			}
+			b.WriteString(def[i:j])
+			i = j
+			continue
+		}
+		if c == ':' && i+1 < n && def[i+1] == ':' {
+			end := skipPGCastType(def, i+2)
+			if end > i+2 {
+				i = end
+				continue
+			}
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
+}
+
+// skipPGCastType returns the index just past a PG type name starting at def[i],
+// or i if no type name is present.
+func skipPGCastType(def string, i int) int {
+	n := len(def)
+	start := i
+	readWord := func(k int) (string, int) {
+		j := k
+		for j < n && (isIdentChar(def[j])) {
+			j++
+		}
+		return def[k:j], j
+	}
+	word, j := readWord(i)
+	if word == "" {
+		return start
+	}
+	lower := strings.ToLower(word)
+	switch lower {
+	case "character", "bit":
+		// character varying / bit varying
+		k := j
+		for k < n && (def[k] == ' ' || def[k] == '\t' || def[k] == '\n' || def[k] == '\r') {
+			k++
+		}
+		if w2, j2 := readWord(k); strings.ToLower(w2) == "varying" {
+			j = j2
+		}
+	case "double":
+		k := j
+		for k < n && (def[k] == ' ' || def[k] == '\t' || def[k] == '\n' || def[k] == '\r') {
+			k++
+		}
+		if w2, j2 := readWord(k); strings.ToLower(w2) == "precision" {
+			j = j2
+		}
+	case "timestamp", "time":
+		// optional precision modifier before the with/without clause:
+		// ::timestamp(3) with time zone (timestamptz(3) — real
+		// pg_get_viewdef output, F-07 amendment)
+		if j < n && def[j] == '(' {
+			k := j + 1
+			for k < n && (def[k] >= '0' && def[k] <= '9' || def[k] == ',' || def[k] == ' ') {
+				k++
+			}
+			if k < n && def[k] == ')' {
+				j = k + 1
+			}
+		}
+		k := j
+		for k < n && (def[k] == ' ' || def[k] == '\t' || def[k] == '\n' || def[k] == '\r') {
+			k++
+		}
+		if w2, j2 := readWord(k); strings.ToLower(w2) == "with" || strings.ToLower(w2) == "without" {
+			k = j2
+			for k < n && (def[k] == ' ' || def[k] == '\t' || def[k] == '\n' || def[k] == '\r') {
+				k++
+			}
+			if w3, j3 := readWord(k); strings.ToLower(w3) == "time" {
+				k = j3
+				for k < n && (def[k] == ' ' || def[k] == '\t' || def[k] == '\n' || def[k] == '\r') {
+					k++
+				}
+				if w4, j4 := readWord(k); strings.ToLower(w4) == "zone" {
+					j = j4
+				} else {
+					j = k
+				}
+			}
+		}
+	}
+	// optional type modifier: (N) or (N,M)
+	if j < n && def[j] == '(' {
+		k := j + 1
+		for k < n && (def[k] >= '0' && def[k] <= '9' || def[k] == ',' || def[k] == ' ') {
+			k++
+		}
+		if k < n && def[k] == ')' {
+			j = k + 1
+		}
+	}
+	return j
+}
+
+func isIdentChar(c byte) bool {
+	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 }
 
 func (b *DDLBuilder) BuildEnumDDL(enum EnumType) string {

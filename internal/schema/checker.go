@@ -10,7 +10,7 @@ import (
 )
 
 type TargetChecker struct {
-	cfg        config.Config
+	cfg         config.Config
 	existTables map[string]bool
 }
 
@@ -38,6 +38,9 @@ func (tc *TargetChecker) LoadExistingTables(ctx context.Context) error {
 			return err
 		}
 		tc.existTables[strings.ToLower(name)] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read existing tables: %w", err)
 	}
 	return nil
 }

@@ -95,7 +95,8 @@ func (r *schemaReader) readTables(ctx context.Context, db *sql.DB, database stri
 func (r *schemaReader) readColumns(ctx context.Context, db *sql.DB, database, table string) ([]source.Column, []string, error) {
 	query := `
 		SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT,
-		       EXTRA, COLUMN_COMMENT, NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_KEY
+		       EXTRA, COLUMN_COMMENT, NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_KEY,
+		       DATETIME_PRECISION
 		FROM information_schema.COLUMNS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 		ORDER BY ORDINAL_POSITION`
@@ -112,12 +113,13 @@ func (r *schemaReader) readColumns(ctx context.Context, db *sql.DB, database, ta
 	for rows.Next() {
 		var (
 			colName, dataType, colType, isNullable string
-			colDefault, extra, comment            sql.NullString
-			colKey                                sql.NullString
-			numPrec, numScale                     sql.NullInt64
+			colDefault, extra, comment             sql.NullString
+			colKey                                 sql.NullString
+			numPrec, numScale                      sql.NullInt64
+			dtPrec                                 sql.NullInt64
 		)
 		if err := rows.Scan(&colName, &dataType, &colType, &isNullable,
-			&colDefault, &extra, &comment, &numPrec, &numScale, &colKey); err != nil {
+			&colDefault, &extra, &comment, &numPrec, &numScale, &colKey, &dtPrec); err != nil {
 			return nil, nil, err
 		}
 
@@ -135,6 +137,16 @@ func (r *schemaReader) readColumns(ctx context.Context, db *sql.DB, database, ta
 		sc := 0
 		if numScale.Valid {
 			sc = int(numScale.Int64)
+		}
+
+		// Temporal types: fsp comes from DATETIME_PRECISION (MySQL 8 returns
+		// NULL in NUMERIC_PRECISION for temporal columns — never use it as fsp).
+		// Whitelist 0-6; anything outside (NULL/garbage) degrades to 0 = bare type.
+		if isTemporalDataType(dataType) {
+			prec = 0
+			if dtPrec.Valid && dtPrec.Int64 >= 0 && dtPrec.Int64 <= 6 {
+				prec = int(dtPrec.Int64)
+			}
 		}
 
 		mapped := tm.MapType(colType, prec, sc)
@@ -164,12 +176,19 @@ func (r *schemaReader) readColumns(ctx context.Context, db *sql.DB, database, ta
 	return columns, pk, rows.Err()
 }
 
+// readIndexes walks STATISTICS with COLUMN_NAME and EXPRESSION selected
+// SEPARATELY (MS-10c2 pen-5): the functional-key-part flag is
+// COLUMN_NAME IS NULL — a type-aware signal, replacing the earlier
+// COALESCE string-shape probe that could not tell a non-parenthesized
+// expression (lower(`a-b`), the deployed-server I_S shape) from a legal
+// column name.
 func (r *schemaReader) readIndexes(ctx context.Context, db *sql.DB, database, table string) ([]source.Index, error) {
 	query := `
-		SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE, SEQ_IN_INDEX
+		SELECT INDEX_NAME, COLUMN_NAME, EXPRESSION, NON_UNIQUE, SEQ_IN_INDEX
 		FROM information_schema.STATISTICS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-		ORDER BY INDEX_NAME, SEQ_IN_INDEX`
+		ORDER BY INDEX_NAME, SEQ_IN_INDEX
+	`
 
 	rows, err := db.QueryContext(ctx, query, database, table)
 	if err != nil {
@@ -181,13 +200,14 @@ func (r *schemaReader) readIndexes(ctx context.Context, db *sql.DB, database, ta
 		name   string
 		unique bool
 	}
-	idxMap := make(map[idxKey][]string)
+	idxMap := make(map[idxKey][]source.IndexPart)
 	var idxOrder []idxKey
 
 	for rows.Next() {
-		var idxName, colName string
+		var idxName string
+		var colName, expr sql.NullString
 		var nonUnique, seq int
-		if err := rows.Scan(&idxName, &colName, &nonUnique, &seq); err != nil {
+		if err := rows.Scan(&idxName, &colName, &expr, &nonUnique, &seq); err != nil {
 			return nil, err
 		}
 		// Skip PRIMARY (already in PK column list from readColumns)
@@ -198,22 +218,55 @@ func (r *schemaReader) readIndexes(ctx context.Context, db *sql.DB, database, ta
 		if _, exists := idxMap[key]; !exists {
 			idxOrder = append(idxOrder, key)
 		}
-		idxMap[key] = append(idxMap[key], colName)
+		idxMap[key] = append(idxMap[key], source.IndexPart{
+			Value:        exprString(colName, expr),
+			IsExpression: !colName.Valid,
+		})
 	}
 
 	var indexes []source.Index
 	for _, key := range idxOrder {
 		indexes = append(indexes, source.Index{
-			Name:    key.name,
-			Columns: idxMap[key],
-			Unique:  key.unique,
+			Name:   key.name,
+			Parts:  idxMap[key],
+			Unique: key.unique,
 		})
 	}
 	return indexes, rows.Err()
 }
 
+// exprString picks the key-part text: the plain column name when present,
+// otherwise the EXPRESSION original (verbatim, parens or not — the
+// renderer canonicalizes the wrapping).
+func exprString(colName, expr sql.NullString) string {
+	if colName.Valid {
+		return colName.String
+	}
+	if expr.Valid {
+		return expr.String
+	}
+	return ""
+}
+
 // schemaReader is the MySQL SchemaReader implementation.
 type schemaReader struct{ src *Source }
+
+// NewSchemaReaderForDB exposes a SchemaReader over an already-open *sql.DB
+// (the DDL exporter reuses its connection instead of opening a second one).
+// Only Database matters to the reader; credentials stay with the caller.
+func NewSchemaReaderForDB(db *sql.DB, database string) source.SchemaReader {
+	return &schemaReader{src: &Source{cfg: source.SourceConfig{Database: database}, db: db}}
+}
+
+// isTemporalDataType reports whether dataType is a temporal type whose
+// optional precision (fsp) lives in information_schema DATETIME_PRECISION.
+func isTemporalDataType(dataType string) bool {
+	switch dataType {
+	case "timestamp", "datetime", "time", "TIMESTAMP", "DATETIME", "TIME":
+		return true
+	}
+	return false
+}
 
 func stringsContains(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {

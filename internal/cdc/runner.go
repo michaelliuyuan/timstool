@@ -7,11 +7,13 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"go.uber.org/zap"
 )
 
@@ -32,6 +34,12 @@ type Runner struct {
 
 	statusFile string    // CDC→Web status JSON path (#t48 B); empty = disabled
 	startTime  time.Time // for uptime in the status report
+
+	// Degradable-skip bookkeeping (F-09 group 1). Written only by the DDL
+	// poller goroutine, read by writeStatus — guarded by ddlSkipMu.
+	ddlSkipMu   sync.Mutex
+	ddlSkipped  int64
+	ddlLastSkip string
 
 	log *zap.Logger
 }
@@ -108,8 +116,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.log.Info("cdc runner: starting")
 	r.startTime = time.Now()
 
-	// Load checkpoint for resume
-	cp, err := r.checkpoint.Load()
+	// Load checkpoint for resume (MS-11d: refuse cross-source stale files).
+	cp, err := r.checkpoint.LoadForSource(SourceKindPostgres)
 	if err != nil {
 		return fmt.Errorf("cdc runner: load checkpoint: %w", err)
 	}
@@ -274,6 +282,20 @@ func (r *Runner) writeStatus() {
 		stats.UptimeSeconds = time.Since(r.startTime).Seconds()
 	}
 
+	// Degradable-skip visibility (F-09 group 1): DDL skips from the poller,
+	// DML skips from the applier — one face each, never silent.
+	r.ddlSkipMu.Lock()
+	stats.DDLSkipped = r.ddlSkipped
+	if r.ddlLastSkip != "" {
+		stats.LastSkipReason = r.ddlLastSkip
+	}
+	r.ddlSkipMu.Unlock()
+	if stats.LastSkipReason == "" && r.applier != nil {
+		if s := r.applier.Stats(); s.LastSkipReason != "" {
+			stats.LastSkipReason = s.LastSkipReason
+		}
+	}
+
 	state := CDCSelfRunning
 	fatal := ""
 	if srcErr := r.source.Err(); srcErr != nil {
@@ -293,7 +315,7 @@ func (r *Runner) writeStatus() {
 		FatalError:  fatal,
 		Stats:       stats,
 		Checkpoint: CDCStatusCheckpoint{
-			LSN:       cp.LSN.String(),
+			LSN:       cp.Position(),
 			UpdatedAt: cp.Timestamp,
 		},
 	}
@@ -308,7 +330,7 @@ func (r *Runner) Stats() map[string]interface{} {
 		"source_events":  r.source.EventsReceived(),
 		"source_lsn":     r.source.CurrentLSN().String(),
 		"source_running": r.source.IsRunning(),
-		"checkpoint_lsn": r.checkpoint.GetLSN().String(),
+		"checkpoint_lsn": r.checkpoint.Position(),
 	}
 
 	if r.applier != nil {
@@ -329,12 +351,8 @@ func (r *Runner) Stats() map[string]interface{} {
 // trigger, and starts the DDL poll goroutine. Returns the DDL error channel
 // (receives a fatal DDL apply error that should halt the pipeline). #t59.
 func (r *Runner) setupDDLReplication(ctx context.Context, targetDB *sql.DB) (chan error, error) {
-	sslmode := r.srcCfg.SSLMode
-	if sslmode == "" {
-		sslmode = "disable"
-	}
-	dsn := fmt.Sprintf("postgresql://%s:%s@%s:%d/%s?sslmode=%s",
-		r.srcCfg.User, r.srcCfg.Password, r.srcCfg.Host, r.srcCfg.Port, r.srcCfg.Database, sslmode)
+	dsn := config.BuildPGDSN(r.srcCfg.Host, r.srcCfg.Port, r.srcCfg.User, r.srcCfg.Password,
+		r.srcCfg.Database, r.srcCfg.SSLMode, nil)
 	srcDB, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open source for ddl tracker: %w", err)
@@ -410,6 +428,27 @@ func (r *Runner) runDDLPoller(ctx context.Context, targetDB *sql.DB, errCh chan<
 				continue
 			}
 			if _, err := targetDB.ExecContext(ctx, ddl); err != nil {
+				if isDegradableError(err) {
+					// F-09 group 1: object-state mismatch (untranslatable quoted
+					// DDL → 1064, idempotent replay → 1050/1061/1091, missing
+					// object → 1146). Skip VISIBLY — log ERROR, mark the ddl_log
+					// row (queryable + manually compensable), count it in the
+					// status JSON — then advance the cursor and keep the chain
+					// alive. Anything else still halts loudly below.
+					reason := fmt.Sprintf("[ddl/%s] %s: %v", e.ObjectType, e.ObjectName, err)
+					r.log.Error("cdc runner: ddl apply failed; SKIPPING (degradable, chain continues; compensate via pg2tidb_ddl_log)",
+						zap.Int64("id", e.ID), zap.String("object_type", e.ObjectType), zap.String("ddl", ddl), zap.Error(err))
+					if r.ddlTracker != nil {
+						r.ddlTracker.MarkSkipped(ctx, e.ID, reason)
+					}
+					r.ddlSkipMu.Lock()
+					r.ddlSkipped++
+					r.ddlLastSkip = reason
+					r.ddlSkipMu.Unlock()
+					lastID = e.ID
+					r.checkpoint.SetLastDDLID(e.ID)
+					continue
+				}
 				r.log.Error("cdc runner: ddl apply failed; halting",
 					zap.Int64("id", e.ID), zap.String("ddl", ddl), zap.Error(err))
 				errCh <- fmt.Errorf("ddl apply (id=%d, %q): %w", e.ID, ddl, err)
@@ -418,6 +457,12 @@ func (r *Runner) runDDLPoller(ctx context.Context, targetDB *sql.DB, errCh chan<
 			lastID = e.ID
 			r.checkpoint.SetLastDDLID(e.ID)
 			r.log.Info("cdc runner: ddl applied", zap.Int64("id", e.ID), zap.String("ddl", ddl))
+			// A successful DDL may have just created previously-missing
+			// tables — clear the applier's 1146 short-circuit set so their
+			// DML resumes immediately (F-10 group 2 item 3).
+			if r.applier != nil {
+				r.applier.ResetMissingTables()
+			}
 		}
 	}
 }

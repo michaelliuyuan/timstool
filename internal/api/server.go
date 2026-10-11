@@ -24,10 +24,10 @@ type TableState struct {
 }
 
 type Server struct {
-	reader   StateReader
-	addr     string
-	server   *http.Server
-	started  time.Time
+	reader  StateReader
+	addr    string
+	server  *http.Server
+	started time.Time
 }
 
 func NewServer(reader StateReader, host string, port int) *Server {
@@ -77,14 +77,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	total := c + f + p + running
 
 	resp := map[string]interface{}{
-		"phase":       s.reader.GetPhase(),
-		"started_at":  s.started.Format(time.RFC3339),
-		"elapsed":     time.Since(s.started).String(),
-		"total":       total,
-		"completed":   c,
-		"failed":      f,
-		"pending":     p,
-		"running":     running,
+		"phase":      s.reader.GetPhase(),
+		"started_at": s.started.Format(time.RFC3339),
+		"elapsed":    time.Since(s.started).String(),
+		"total":      total,
+		"completed":  c,
+		"failed":     f,
+		"pending":    p,
+		"running":    running,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

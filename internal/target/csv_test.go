@@ -50,8 +50,8 @@ func TestRenderCSVRow_TSVFormat(t *testing.T) {
 func TestRenderCSVRow_NullAndBackslash(t *testing.T) {
 	cols := []source.Column{{Name: "a"}, {Name: "b"}}
 	row := source.Row{
-		"a": {Val: nil},           // NULL → \N
-		"b": {Val: `back\slash`},  // backslash → escaped \\
+		"a": {Val: nil},          // NULL → \N
+		"b": {Val: `back\slash`}, // backslash → escaped \\
 	}
 	got := RenderCSVRow(cols, row)
 	if !strings.HasPrefix(got, `\N`+"\t") {

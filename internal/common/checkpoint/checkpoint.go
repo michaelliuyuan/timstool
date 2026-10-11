@@ -30,6 +30,16 @@ type TableCheckpoint struct {
 	FinishedAt time.Time                `json:"finished_at,omitempty"`
 	Error      string                   `json:"error,omitempty"`
 	Chunks     map[int]*ChunkCheckpoint `json:"chunks,omitempty"`
+
+	// SchemaState tracks per-table SCHEMA migration progress, fully
+	// independent of State: State is the data-resume cursor (resume skips
+	// tables whose State==completed, checkpoint.go IsTableCompleted /
+	// GetPendingTables), so the schema phase must never write it — a table
+	// whose DDL was applied but whose rows were not exported would
+	// otherwise be silently skipped on resume. Schema registration also
+	// never touches RowsTotal so the data-phase row denominators stay
+	// clean (GetOrCreateTable keeps an existing entry's RowsTotal).
+	SchemaState State `json:"schema_state,omitempty"`
 }
 
 type ChunkCheckpoint struct {
@@ -54,12 +64,38 @@ func (tc *TableCheckpoint) Progress() float64 {
 }
 
 type Checkpoint struct {
-	Version   string                      `json:"version"`
-	CreatedAt time.Time                   `json:"created_at"`
-	UpdatedAt time.Time                   `json:"updated_at"`
-	Phase     string                      `json:"phase"`
-	Tables    map[string]*TableCheckpoint `json:"tables"`
+	Version        string                      `json:"version"`
+	CreatedAt      time.Time                   `json:"created_at"`
+	UpdatedAt      time.Time                   `json:"updated_at"`
+	Phase          string                      `json:"phase"`
+	Tables         map[string]*TableCheckpoint `json:"tables"`
+	ImportedTables int                         `json:"imported_tables"`
+	ImportMode     string                      `json:"import_mode"`
+	// Phases is the per-phase lifecycle state machine (P1). Historical
+	// checkpoints written before the field exist simply lack it (nil map)
+	// — consumers must fall back to ordinal inference then.
+	Phases map[string]*PhaseRecord `json:"phases,omitempty"`
 }
+
+// PhaseRecord tracks one pipeline phase's lifecycle (P1): pending →
+// running → completed/failed, or skipped outright.
+type PhaseRecord struct {
+	Name       string    `json:"name"`
+	Status     State     `json:"status"`
+	SubPhase   string    `json:"sub_phase,omitempty"`
+	StartedAt  time.Time `json:",omitempty"`
+	FinishedAt time.Time `json:",omitempty"`
+	Error      string    `json:"error,omitempty"`
+	Warn       bool      `json:"warn,omitempty"`
+}
+
+// Import modes recorded in the checkpoint so progress consumers (webapi)
+// can pick the correct import-fraction formula. Exported to avoid raw
+// string constants scattered across packages.
+const (
+	ImportModeLightning = "lightning"
+	ImportModeStream    = "stream"
+)
 
 type Manager struct {
 	mu       sync.Mutex
@@ -179,9 +215,20 @@ func (m *Manager) MarkTableRunning(tableName string) error {
 
 func (m *Manager) MarkTableCompleted(tableName string, rowsDone int64) error {
 	return m.UpdateTable(tableName, func(tc *TableCheckpoint) {
-		tc.State = StateCompleted
+		// Sticky completion (mirrors MarkSchemaTableCompleted): once a
+		// table is completed, a later re-mark only converges the row
+		// counters — State stays completed and the FIRST completion's
+		// FinishedAt is never rewritten, so per-table durations stay real.
+		if tc.State != StateCompleted {
+			tc.State = StateCompleted
+			tc.FinishedAt = time.Now()
+		}
+		// Raise the denominator if more rows were actually exported than the
+		// registered estimate, so aggregated progress never exceeds 100%.
+		if rowsDone > tc.RowsTotal {
+			tc.RowsTotal = rowsDone
+		}
 		tc.RowsDone = rowsDone
-		tc.FinishedAt = time.Now()
 	})
 }
 
@@ -193,11 +240,95 @@ func (m *Manager) MarkTableFailed(tableName string, errStr string) error {
 	})
 }
 
+// RegisterSchemaTables marks all given tables as registered for the SCHEMA
+// phase (tables_total becomes correct immediately). It never touches State /
+// RowsDone / RowsTotal — only SchemaState — so data-phase resume and row
+// denominators are unaffected (see TableCheckpoint.SchemaState).
+func (m *Manager) RegisterSchemaTables(names []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, name := range names {
+		tc, ok := m.data.Tables[name]
+		if !ok {
+			tc = &TableCheckpoint{TableName: name, State: StatePending}
+			m.data.Tables[name] = tc
+		}
+		tc.SchemaState = StatePending
+	}
+	m.save()
+	return nil
+}
+
+// MarkSchemaTableCompleted marks one table's schema DDL as applied.
+// Idempotent and sticky-on-failure: completed is not rewritten, and a
+// FAILED table is never flipped back to completed by a later successful
+// statement on the same table (e.g. CREATE INDEX failed, deferred
+// ALTER/INDEX then succeeded) — the failure must stay visible. Resetting
+// to pending only happens via RegisterSchemaTables on resume.
+func (m *Manager) MarkSchemaTableCompleted(tableName string) error {
+	return m.UpdateTable(tableName, func(tc *TableCheckpoint) {
+		if tc.SchemaState == StateCompleted || tc.SchemaState == StateFailed {
+			return
+		}
+		tc.SchemaState = StateCompleted
+	})
+}
+
+// MarkSchemaTableFailed marks one table's schema DDL as failed.
+// No completed guard on purpose: a table whose CREATE TABLE succeeded
+// can still end failed when a later INDEX/ALTER on it failed — failed is
+// the honest terminal state ("the table's full DDL set did not land").
+func (m *Manager) MarkSchemaTableFailed(tableName string, errStr string) error {
+	return m.UpdateTable(tableName, func(tc *TableCheckpoint) {
+		tc.SchemaState = StateFailed
+	})
+}
+
 func (m *Manager) UpdateTableProgress(tableName string, rowsDone int64, bytesDone int64) error {
 	return m.UpdateTable(tableName, func(tc *TableCheckpoint) {
+		// Keep the denominator >= rowsDone so progress stays <= 100%.
+		if rowsDone > tc.RowsTotal {
+			tc.RowsTotal = rowsDone
+		}
 		tc.RowsDone = rowsDone
 		tc.BytesDone = bytesDone
 	})
+}
+
+// SetImportedTables records the number of tables already imported by
+// tidb-lightning (deduplicated count) and persists it.
+func (m *Manager) SetImportedTables(n int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data.ImportedTables = n
+	m.save()
+	return nil
+}
+
+// GetImportedTables returns the recorded number of imported tables.
+func (m *Manager) GetImportedTables() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.data.ImportedTables
+}
+
+// SetImportMode records the active data-import mode (lightning / stream)
+// and persists it, so the progress poller picks the matching formula even
+// across process restarts and the lightning→stream fallback chain.
+func (m *Manager) SetImportMode(mode string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data.ImportMode = mode
+	m.save()
+	return nil
+}
+
+// GetImportMode returns the recorded import mode ("" for historical
+// checkpoints written before the field existed).
+func (m *Manager) GetImportMode() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.data.ImportMode
 }
 
 func (m *Manager) GetPhase() string {
@@ -221,6 +352,123 @@ func (m *Manager) SetPhaseWithReload(phase string) error {
 	m.data.Phase = phase
 	m.save()
 	return nil
+}
+
+// InitPhases seeds the phase state machine: every given phase starts
+// pending, except those flagged skip which are immediately recorded as
+// skipped (they will never run in this pipeline).
+func (m *Manager) InitPhases(skip map[string]bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.data.Phases == nil {
+		m.data.Phases = make(map[string]*PhaseRecord)
+	}
+	for name, isSkip := range skip {
+		st := StatePending
+		if isSkip {
+			st = StateSkipped
+		}
+		m.data.Phases[name] = &PhaseRecord{Name: name, Status: st}
+	}
+	m.save()
+	return nil
+}
+
+// StartPhase marks a phase running.
+func (m *Manager) StartPhase(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.data.Phases == nil {
+		m.data.Phases = make(map[string]*PhaseRecord)
+	}
+	rec, ok := m.data.Phases[name]
+	if !ok {
+		rec = &PhaseRecord{Name: name}
+		m.data.Phases[name] = rec
+	}
+	rec.Status = StateRunning
+	rec.StartedAt = time.Now()
+	rec.FinishedAt = time.Time{}
+	rec.Error = ""
+	rec.Warn = false
+	m.save()
+	return nil
+}
+
+// FinishPhase records the phase outcome: err == nil → completed (warn
+// flags "completed with warnings"), err != nil → failed with the error.
+func (m *Manager) FinishPhase(name string, err error, warn bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.finishPhaseLocked(name, err, warn)
+	m.save()
+	return nil
+}
+
+// FinishPhaseWithReload is the dual-instance-safe variant of FinishPhase:
+// it reloads the checkpoint from disk before recording the outcome, so a
+// manager holding a stale in-memory copy (e.g. the orchestrator's manager
+// while the data migrator writes through its own instance) does not
+// overwrite the data-plane progress already persisted by the other writer.
+// Mirrors SetPhaseWithReload.
+func (m *Manager) FinishPhaseWithReload(name string, err error, warn bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_ = m.load()
+	m.finishPhaseLocked(name, err, warn)
+	m.save()
+	return nil
+}
+
+func (m *Manager) finishPhaseLocked(name string, err error, warn bool) {
+	if m.data.Phases == nil {
+		m.data.Phases = make(map[string]*PhaseRecord)
+	}
+	rec, ok := m.data.Phases[name]
+	if !ok {
+		rec = &PhaseRecord{Name: name, StartedAt: time.Now()}
+		m.data.Phases[name] = rec
+	}
+	rec.FinishedAt = time.Now()
+	rec.Warn = warn
+	if err != nil {
+		rec.Status = StateFailed
+		rec.Error = err.Error()
+	} else {
+		rec.Status = StateCompleted
+		rec.Error = ""
+	}
+}
+
+// SetSubPhase records the current sub-step of a phase (e.g. schema-build /
+// schema-execute / data-export / data-import) for precise UI labels.
+func (m *Manager) SetSubPhase(phase, sub string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.data.Phases == nil {
+		m.data.Phases = make(map[string]*PhaseRecord)
+	}
+	rec, ok := m.data.Phases[phase]
+	if !ok {
+		rec = &PhaseRecord{Name: phase, Status: StateRunning, StartedAt: time.Now()}
+		m.data.Phases[phase] = rec
+	}
+	rec.SubPhase = sub
+	m.save()
+	return nil
+}
+
+// GetPhases returns a copy of the phase state machine (nil map for
+// historical checkpoints written before the field existed).
+func (m *Manager) GetPhases() map[string]*PhaseRecord {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make(map[string]*PhaseRecord, len(m.data.Phases))
+	for k, v := range m.data.Phases {
+		cp := *v
+		result[k] = &cp
+	}
+	return result
 }
 
 func (m *Manager) IsTableCompleted(tableName string) bool {
@@ -266,6 +514,7 @@ func (m *Manager) ResetAllTables() {
 		tc.State = StatePending
 		tc.RowsDone = 0
 		tc.BytesDone = 0
+		tc.SchemaState = ""
 	}
 	m.save()
 }
@@ -293,6 +542,7 @@ func (m *Manager) Reset() error {
 	defer m.mu.Unlock()
 	m.data.Tables = make(map[string]*TableCheckpoint)
 	m.data.Phase = ""
+	m.data.Phases = nil
 	m.save()
 	return nil
 }

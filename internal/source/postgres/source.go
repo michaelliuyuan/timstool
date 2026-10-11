@@ -10,9 +10,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"net/url"
 	"strings"
 
+	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/common/version"
 	"github.com/michaelliuyuan/timstool/internal/schema"
 	"github.com/michaelliuyuan/timstool/internal/source"
 
@@ -31,11 +32,15 @@ func init() {
 // (common + source groups; advanced deferred — doc multi-source-web-form-design
 // §5/§7). Labels mirror the legacy PG form for zero visual regression (§9).
 var postgresMeta = source.SourceMeta{
-	Name:         "postgres",
-	DisplayName:  "PostgreSQL",
-	Implemented:  true,
-	DefaultPort:  5432,
-	Capabilities: source.Capabilities{Schema: true, Data: true, CDC: true},
+	Name:        "postgres",
+	DisplayName: "PostgreSQL",
+	ShortName:   "PG",
+	Implemented: true,
+	DefaultPort: 5432,
+	Capabilities: source.Capabilities{
+		Schema: true, Data: true, CDC: true,
+		Compare: true, Watermark: true, Assess: true, DDLExport: true,
+	},
 	Fields: []source.FieldSpec{
 		{Key: "host", Label: "主机地址", Type: "text", Required: true, Default: "localhost", Placeholder: "localhost", Group: "common"},
 		{Key: "port", Label: "端口", Type: "number", Required: true, Default: 5432, Group: "common"},
@@ -45,10 +50,10 @@ var postgresMeta = source.SourceMeta{
 		{Key: "schema", Label: "Schema", Type: "text", Default: "public", Group: "source"},
 		{Key: "sslmode", Label: "SSL模式", Type: "select", Default: "disable", Group: "source",
 			Options: []source.Option{
-				{Label: "disable", Value: "disable"},
-				{Label: "require", Value: "require"},
-				{Label: "verify-ca", Value: "verify-ca"},
-				{Label: "verify-full", Value: "verify-full"},
+				{Label: "禁用", Value: "disable"},
+				{Label: "要求加密", Value: "require"},
+				{Label: "验证 CA", Value: "verify-ca"},
+				{Label: "完全验证", Value: "verify-full"},
 			}},
 	},
 }
@@ -95,7 +100,8 @@ func (s *Source) Version(ctx context.Context) (string, error) {
 	if err := s.db.QueryRowContext(ctx, "SELECT version()").Scan(&v); err != nil {
 		return "", err
 	}
-	return v, nil
+	// S1-UI-07: compact form for the UI — the raw string carries build details.
+	return version.ShortPostgreSQL(v), nil
 }
 
 // Config exposes the source config for the readers.
@@ -126,8 +132,7 @@ func dsn(c source.SourceConfig) string {
 	if sslmode == "" {
 		sslmode = "disable"
 	}
-	return fmt.Sprintf("postgresql://%s:%s@%s:%d/%s?sslmode=%s",
-		url.QueryEscape(c.User), url.QueryEscape(c.Password), c.Host, c.Port, c.Database, sslmode)
+	return config.BuildPGDSN(c.Host, c.Port, c.User, c.Password, c.Database, sslmode, nil)
 }
 
 // --- Dialect ---

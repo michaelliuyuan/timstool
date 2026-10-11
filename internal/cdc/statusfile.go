@@ -23,19 +23,25 @@ const (
 
 // CDCStatusFile is the JSON the CDC process writes and the web UI reads.
 type CDCStatusFile struct {
-	Schema      int                  `json:"schema"`
-	Timestamp   time.Time            `json:"timestamp"`
-	PID         int                  `json:"pid"`
-	Slot        string               `json:"slot"`
-	Publication string               `json:"publication"`
-	LSN         string               `json:"lsn"`
-	State       CDCSelfState         `json:"state"`
-	FatalError  string               `json:"fatal_error,omitempty"`
-	Stats       CDCStatusStats       `json:"stats"`
-	Checkpoint  CDCStatusCheckpoint  `json:"checkpoint"`
+	Schema      int                 `json:"schema"`
+	Timestamp   time.Time           `json:"timestamp"`
+	PID         int                 `json:"pid"`
+	Slot        string              `json:"slot"`
+	Publication string              `json:"publication"`
+	LSN         string              `json:"lsn"`
+	State       CDCSelfState        `json:"state"`
+	FatalError  string              `json:"fatal_error,omitempty"`
+	Stats       CDCStatusStats      `json:"stats"`
+	Checkpoint  CDCStatusCheckpoint `json:"checkpoint"`
 }
 
 // CDCStatusStats holds the apply-side counters the dashboard renders.
+//
+// Scope note (identity pin, F-09): SourceEvents counts on the SOURCE side
+// and includes DDL log rows, which never flow through the applier. The
+// counter identity received = applied + failed + skipped holds ONLY over
+// the four applier counters (SourceEvents vs EventsReceived included);
+// assertions must anchor those, not SourceEvents.
 type CDCStatusStats struct {
 	SourceEvents  int64   `json:"source_events"`
 	Applied       int64   `json:"applied"`
@@ -46,6 +52,11 @@ type CDCStatusStats struct {
 	LagSeconds    float64 `json:"lag_seconds"`
 	UptimeSeconds float64 `json:"uptime_seconds"`
 	LastError     string  `json:"last_error,omitempty"`
+	// Degradable-skip visibility (F-09 group 1): DDL skips counted by the
+	// runner's poller; LastSkipReason carries the object-type-classified
+	// reason (DDL or DML face). Skipped above already counts DML skips.
+	DDLSkipped     int64  `json:"ddl_skipped,omitempty"`
+	LastSkipReason string `json:"last_skip_reason,omitempty"`
 }
 
 // CDCStatusCheckpoint is the last-saved checkpoint snapshot.

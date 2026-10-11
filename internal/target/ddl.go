@@ -88,7 +88,12 @@ func RenderCreateTable(t source.Table) string {
 		b.WriteString("INDEX ")
 		b.WriteString(QuoteIdent(idx.Name))
 		b.WriteString(" (")
-		writeIdentList(&b, idx.Columns)
+		for i, part := range idx.Parts {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			renderIndexPart(&b, part)
+		}
 		b.WriteString(")")
 	}
 	b.WriteString(")")
@@ -126,6 +131,28 @@ func writeIdentList(b *strings.Builder, names []string) {
 		}
 		b.WriteString(QuoteIdent(n))
 	}
+}
+
+// renderIndexPart renders one index key part, driven by the type-aware
+// IsExpression flag (MS-10c2 pen-5): expression parts replay their
+// information_schema EXPRESSION original verbatim, wrapped in exactly one
+// paren pair if the server emitted it WITHOUT outer parens (the deployed
+// I_S shape, black-box seq848 — SHOW CREATE canonical form is "(expr)";
+// the paren-shape string test survives ONLY inside this branch as the
+// wrap de-dup defense, never overriding the flag). Column parts are
+// backtick-quoted REGARDLESS of their string shape — which dissolves the
+// pathological "(x)" column-name family (a column named "(x)" is
+// unbuildable in practice and previously loud-failed anyway).
+func renderIndexPart(b *strings.Builder, part source.IndexPart) {
+	if part.IsExpression {
+		expr := part.Value
+		if !(strings.HasPrefix(expr, "(") && strings.HasSuffix(expr, ")")) {
+			expr = "(" + expr + ")"
+		}
+		b.WriteString(expr)
+		return
+	}
+	b.WriteString(QuoteIdent(part.Value))
 }
 
 // QuoteIdent quotes a TiDB/MySQL identifier with backticks (doubled internally).

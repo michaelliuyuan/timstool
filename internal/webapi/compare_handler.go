@@ -185,10 +185,10 @@ func (s *Server) startCompareTask(ctx context.Context, taskID string, spec *comp
 	if !resume {
 		_ = os.RemoveAll(filepath.Join(s.dataDir, "compare", taskID))
 	}
-	go s.runCompare(ctx, taskID, spec, resume)
+	go s.runMongoCompare(ctx, taskID, spec, resume)
 }
 
-func (s *Server) runCompare(ctx context.Context, taskID string, spec *compareTaskSpec, resume bool) {
+func (s *Server) runMongoCompare(ctx context.Context, taskID string, spec *compareTaskSpec, resume bool) {
 	s.logCollector.GetBuffer(taskID)
 	s.logCollector.Append(taskID, "INFO", "MongoDB compare task started", "")
 

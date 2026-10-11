@@ -32,101 +32,6 @@ type tidbColMapping struct {
 	name    string
 }
 
-// detectTableKey queries PG information_schema to determine whether a table
-// has a primary key or unique index and returns the key columns.
-func (v *Validator) detectTableKey(ctx context.Context, pgDB *sql.DB, schema, table string) (*TableKeyInfo, error) {
-	info := &TableKeyInfo{}
-
-	// Check for primary key
-	pkRows, err := pgDB.QueryContext(ctx, `
-		SELECT kcu.column_name
-		FROM information_schema.table_constraints tc
-		JOIN information_schema.key_column_usage kcu
-			ON tc.constraint_name = kcu.constraint_name
-			AND tc.table_schema = kcu.table_schema
-		WHERE tc.table_schema = $1
-			AND tc.table_name = $2
-			AND tc.constraint_type = 'PRIMARY KEY'
-		ORDER BY kcu.ordinal_position
-	`, schema, table)
-	if err != nil {
-		return nil, fmt.Errorf("query primary key: %w", err)
-	}
-	defer pkRows.Close()
-
-	for pkRows.Next() {
-		var col string
-		if err := pkRows.Scan(&col); err != nil {
-			return nil, fmt.Errorf("scan pk column: %w", err)
-		}
-		info.PKColumns = append(info.PKColumns, col)
-	}
-	info.HasPK = len(info.PKColumns) > 0
-
-	if info.HasPK {
-		return info, nil
-	}
-
-	// No primary key — check for unique indexes
-	// Query pg_indexes for unique indexes (not already covered by PK)
-	uidxRows, err := pgDB.QueryContext(ctx, `
-		SELECT indexdef
-		FROM pg_indexes
-		WHERE schemaname = $1
-			AND tablename = $2
-			AND indexdef LIKE '%UNIQUE%'
-			AND indexdef NOT LIKE '%pkey%'
-	`, schema, table)
-	if err != nil {
-		return nil, fmt.Errorf("query unique indexes: %w", err)
-	}
-	defer uidxRows.Close()
-
-	for uidxRows.Next() {
-		var def string
-		if err := uidxRows.Scan(&def); err != nil {
-			return nil, fmt.Errorf("scan unique index def: %w", err)
-		}
-		// Parse column names from CREATE UNIQUE INDEX ... ON table (col1, col2, ...)
-		cols := parseIndexColumns(def)
-		if len(cols) > 0 {
-			info.HasUniqueIndex = true
-			info.UniqueColumns = cols
-			break // use the first unique index found
-		}
-	}
-
-	return info, nil
-}
-
-// parseIndexColumns extracts column names from a CREATE UNIQUE INDEX statement.
-func parseIndexColumns(indexDef string) []string {
-	// Find the last parenthesized group: ... ON table (col1, col2, ...)
-	idx := strings.LastIndex(indexDef, "(")
-	if idx < 0 {
-		return nil
-	}
-	inner := indexDef[idx+1:]
-	end := strings.Index(inner, ")")
-	if end < 0 {
-		return nil
-	}
-	inner = inner[:end]
-
-	parts := strings.Split(inner, ",")
-	var cols []string
-	for _, p := range parts {
-		col := strings.TrimSpace(p)
-		// Remove optional ASC/DESC/NULLS options
-		col = strings.Split(col, " ")[0]
-		col = strings.Trim(col, "\"")
-		if col != "" {
-			cols = append(cols, col)
-		}
-	}
-	return cols
-}
-
 // validateHashGroup performs hash-group-based validation for tables without
 // a reliable unique key. It computes a hash of each row's values (sorted by
 // column name for cross-DB consistency) and compares the multiset of hashes
@@ -163,8 +68,15 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 	}
 
 	// Query TiDB for the full table first so we can build a unified skip set.
-	tidbQuery := fmt.Sprintf("SELECT * FROM %s", quoteMySQL(table))
-	tidbRows, err := tidbConn.QueryContext(ctx, tidbQuery)
+	var tidbRows *sql.Rows
+	var err error
+	if wm := v.wmFilter(); wm != nil {
+		tidbRows, err = tidbConn.QueryContext(ctx,
+			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wm.Value)
+	} else {
+		tidbRows, err = tidbConn.QueryContext(ctx,
+			fmt.Sprintf("SELECT * FROM %s", v.tgtDialect.QuoteIdent(table)))
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("hash group: query TiDB: %v", err)
@@ -337,10 +249,10 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 		if pgCnt != tidbCnt {
 			if tidbCnt == 0 {
 				mismatchDetails = append(mismatchDetails,
-					fmt.Sprintf("PG has %d row(s) with hash %s not found in TiDB", pgCnt, truncate(h, 16)))
+					fmt.Sprintf("%s has %d row(s) with hash %s not found in TiDB", v.srcLabel(), pgCnt, truncate(h, 16)))
 			} else {
 				mismatchDetails = append(mismatchDetails,
-					fmt.Sprintf("hash %s: PG count=%d TiDB count=%d", truncate(h, 16), pgCnt, tidbCnt))
+					fmt.Sprintf("hash %s: %s count=%d TiDB count=%d", truncate(h, 16), v.srcLabel(), pgCnt, tidbCnt))
 			}
 		}
 	}
@@ -350,7 +262,7 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 		pgCnt := pgHashCounts[h]
 		if pgCnt == 0 {
 			mismatchDetails = append(mismatchDetails,
-				fmt.Sprintf("TiDB has %d row(s) with hash %s not found in PG", tidbCnt, truncate(h, 16)))
+				fmt.Sprintf("TiDB has %d row(s) with hash %s not found in %s", tidbCnt, truncate(h, 16), v.srcLabel()))
 		}
 	}
 
@@ -365,8 +277,8 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 		tr.Status = reporter.StatusPass
 	}
 
-	tr.Suggestion = fmt.Sprintf("hash group validation: %d PG hashes vs %d TiDB rows, %d mismatches",
-		len(pgHashCounts), tidbRowCount, len(mismatchDetails))
+	tr.Suggestion = fmt.Sprintf("hash group validation: %d %s hashes vs %d TiDB rows, %d mismatches",
+		len(pgHashCounts), v.srcLabel(), tidbRowCount, len(mismatchDetails))
 
 	return tr
 }
@@ -493,8 +405,15 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 	pgAggregate := fmt.Sprintf("%x", md5.Sum([]byte(strings.Join(pgHashes, ","))))
 
 	// Query TiDB full table
-	tidbQuery := fmt.Sprintf("SELECT * FROM %s", quoteMySQL(table))
-	tidbRows, err := tidbConn.QueryContext(ctx, tidbQuery)
+	var tidbRows *sql.Rows
+	var err error
+	if wm := v.wmFilter(); wm != nil {
+		tidbRows, err = tidbConn.QueryContext(ctx,
+			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wm.Value)
+	} else {
+		tidbRows, err = tidbConn.QueryContext(ctx,
+			fmt.Sprintf("SELECT * FROM %s", v.tgtDialect.QuoteIdent(table)))
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("aggregate hash: query TiDB: %v", err)
@@ -509,23 +428,9 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 		return tr
 	}
 
-	tidbColNameToIdx := make(map[string]int)
-	for i, c := range tidbCols {
-		tidbColNameToIdx[strings.ToLower(c.Name())] = i
-	}
-
-	var tidbHashCols []tidbColMapping
-	for _, name := range pgColNames {
-		idx, ok := tidbColNameToIdx[strings.ToLower(name)]
-		if !ok {
-			continue
-		}
-		dt := strings.ToLower(tidbCols[idx].DatabaseTypeName())
-		if isApproximateFloatType(dt) || strings.Contains(dt, "json") {
-			continue
-		}
-		tidbHashCols = append(tidbHashCols, tidbColMapping{tidbIdx: idx, name: name})
-	}
+	// MS-03: target-side hash-column matching relocated into the target
+	// dialect (docs/MS03-DIALECT-MAP.md, TargetDialect.MatchHashColumns).
+	tidbHashCols := v.tgtDialect.MatchHashColumns(pgColNames, tidbCols)
 
 	tidbValues := make([]interface{}, len(tidbCols))
 	tidbPtrs := make([]interface{}, len(tidbCols))
@@ -549,13 +454,13 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 
 	if pgAggregate != tidbAggregate {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("aggregate hash mismatch: pg=%s tidb=%s", truncate(pgAggregate, 16), truncate(tidbAggregate, 16))
+		tr.Error = fmt.Sprintf("aggregate hash mismatch: src=%s tidb=%s", truncate(pgAggregate, 16), truncate(tidbAggregate, 16))
 	} else {
 		tr.Status = reporter.StatusPass
 	}
 
-	tr.Suggestion = fmt.Sprintf("aggregate hash validation: pg_hash=%s tidb_hash=%s, %d PG rows vs %d TiDB rows",
-		truncate(pgAggregate, 16), truncate(tidbAggregate, 16), len(pgHashes), len(tidbHashes))
+	tr.Suggestion = fmt.Sprintf("aggregate hash validation: src_hash=%s tidb_hash=%s, %d %s rows vs %d TiDB rows",
+		truncate(pgAggregate, 16), truncate(tidbAggregate, 16), len(pgHashes), v.srcLabel(), len(tidbHashes))
 
 	return tr
 }
@@ -606,8 +511,15 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 	}
 
 	// Query TiDB full table and assign to buckets
-	tidbQuery := fmt.Sprintf("SELECT * FROM %s", quoteMySQL(table))
-	tidbRows, err := tidbConn.QueryContext(ctx, tidbQuery)
+	var tidbRows *sql.Rows
+	var err error
+	if wm := v.wmFilter(); wm != nil {
+		tidbRows, err = tidbConn.QueryContext(ctx,
+			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wm.Value)
+	} else {
+		tidbRows, err = tidbConn.QueryContext(ctx,
+			fmt.Sprintf("SELECT * FROM %s", v.tgtDialect.QuoteIdent(table)))
+	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("bucket compare: query TiDB: %v", err)
@@ -622,23 +534,9 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 		return tr
 	}
 
-	tidbColNameToIdx := make(map[string]int)
-	for i, c := range tidbCols {
-		tidbColNameToIdx[strings.ToLower(c.Name())] = i
-	}
-
-	var tidbHashCols []tidbColMapping
-	for _, name := range pgColNames {
-		idx, ok := tidbColNameToIdx[strings.ToLower(name)]
-		if !ok {
-			continue
-		}
-		dt := strings.ToLower(tidbCols[idx].DatabaseTypeName())
-		if isApproximateFloatType(dt) || strings.Contains(dt, "json") {
-			continue
-		}
-		tidbHashCols = append(tidbHashCols, tidbColMapping{tidbIdx: idx, name: name})
-	}
+	// MS-03: target-side hash-column matching relocated into the target
+	// dialect (docs/MS03-DIALECT-MAP.md, TargetDialect.MatchHashColumns).
+	tidbHashCols := v.tgtDialect.MatchHashColumns(pgColNames, tidbCols)
 
 	tidbValues := make([]interface{}, len(tidbCols))
 	tidbPtrs := make([]interface{}, len(tidbCols))
@@ -671,7 +569,7 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 			mismatchedBuckets++
 			if len(mismatchDetails) < 5 {
 				mismatchDetails = append(mismatchDetails,
-					fmt.Sprintf("bucket %d: PG=%d rows TiDB=%d rows", i, pgCount, tidbCount))
+					fmt.Sprintf("bucket %d: %s=%d rows TiDB=%d rows", i, v.srcLabel(), pgCount, tidbCount))
 			}
 			continue
 		}
@@ -709,8 +607,8 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 		tr.Status = reporter.StatusPass
 	}
 
-	tr.Suggestion = fmt.Sprintf("bucket validation: %d buckets, %d mismatched, %d PG rows",
-		bucketCount, mismatchedBuckets, len(pgData))
+	tr.Suggestion = fmt.Sprintf("bucket validation: %d buckets, %d mismatched, %d %s rows",
+		bucketCount, mismatchedBuckets, len(pgData), v.srcLabel())
 
 	return tr
 }

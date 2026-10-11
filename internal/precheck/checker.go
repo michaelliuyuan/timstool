@@ -59,9 +59,9 @@ func (c *Checker) Run(ctx context.Context, opts common.PrecheckOpts) (*reporter.
 
 	for _, item := range items {
 		tr := reporter.TableReport{
-			TableName: item.Name,
-			Status:    item.Status,
-			Error:     item.Message,
+			TableName:  item.Name,
+			Status:     item.Status,
+			Error:      item.Message,
 			Suggestion: item.Detail,
 		}
 		rpt.AddTableReport(tr)

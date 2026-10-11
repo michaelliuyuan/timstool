@@ -41,11 +41,15 @@ func (c *Collector) CollectTables(ctx context.Context, schema string, excludeTab
 			tableNames = append(tableNames, name)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list tables: %w", err)
+	}
 
 	var tables []TableInfo
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 8)
+	var failed []string
 
 	for _, name := range tableNames {
 		wg.Add(1)
@@ -57,6 +61,9 @@ func (c *Collector) CollectTables(ctx context.Context, schema string, excludeTab
 			table, err := c.collectTable(ctx, schema, tableName)
 			if err != nil {
 				zap.L().Warn("failed to collect table", zap.String("table", tableName), zap.Error(err))
+				mu.Lock()
+				failed = append(failed, fmt.Sprintf("%s: %v", tableName, err))
+				mu.Unlock()
 				return
 			}
 			mu.Lock()
@@ -66,6 +73,11 @@ func (c *Collector) CollectTables(ctx context.Context, schema string, excludeTab
 	}
 
 	wg.Wait()
+	// A table dropped from the list would silently miss schema migration
+	// and land in TiDB via a lossier fallback path — surface it (F-05).
+	if len(failed) > 0 {
+		return tables, fmt.Errorf("collect tables failed: %s", strings.Join(failed, "; "))
+	}
 	return tables, nil
 }
 
@@ -140,6 +152,9 @@ func (c *Collector) collectColumns(ctx context.Context, schema, table string) ([
 		col.IsAutoIncr = strings.Contains(strings.ToUpper(col.DefaultValue), "NEXTVAL")
 		columns = append(columns, col)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read columns for %s: %w", table, err)
+	}
 	return columns, nil
 }
 
@@ -186,6 +201,9 @@ func (c *Collector) collectIndexes(ctx context.Context, schema, table string) ([
 		}
 		indexMap[idxName].Columns = append(indexMap[idxName].Columns, colName)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read indexes for %s: %w", table, err)
+	}
 
 	var result []Index
 	for _, idx := range indexMap {
@@ -194,26 +212,36 @@ func (c *Collector) collectIndexes(ctx context.Context, schema, table string) ([
 	return result, nil
 }
 
-func (c *Collector) collectForeignKeys(ctx context.Context, schema, table string) ([]ForeignKey, error) {
-	query := `
+func foreignKeysQuery() string {
+	// pg_catalog + unnest WITH ORDINALITY pairs conkey[i] with confkey[i]
+	// positionally. The previous information_schema join (kcu x ccu on
+	// constraint_name only) produced a cross product for composite FKs,
+	// mis-aligning Columns and RefColumns (F-05).
+	return `
 		SELECT
-			tc.constraint_name,
-			kcu.column_name,
-			ccu.table_name AS referenced_table,
-			ccu.column_name AS referenced_column,
-			COALESCE(rc.delete_rule, 'NO ACTION'),
-			COALESCE(rc.update_rule, 'NO ACTION')
-		FROM information_schema.table_constraints tc
-		JOIN information_schema.key_column_usage kcu
-			ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-		JOIN information_schema.constraint_column_usage ccu
-			ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
-		LEFT JOIN information_schema.referential_constraints rc
-			ON tc.constraint_name = rc.constraint_name
-		WHERE tc.constraint_type = 'FOREIGN KEY'
-			AND tc.table_schema = $1 AND tc.table_name = $2
-		ORDER BY tc.constraint_name, kcu.ordinal_position
+			con.conname,
+			src_att.attname AS column_name,
+			ref_cls.relname AS referenced_table,
+			ref_att.attname AS referenced_column,
+			CASE con.confdeltype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT'
+				WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END,
+			CASE con.confupdtype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT'
+				WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END
+		FROM pg_constraint con
+		JOIN pg_class src_cls ON src_cls.oid = con.conrelid
+		JOIN pg_namespace ns ON ns.oid = src_cls.relnamespace
+		JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(src_attnum, ref_attnum, ord) ON true
+		JOIN pg_attribute src_att ON src_att.attrelid = con.conrelid AND src_att.attnum = k.src_attnum
+		JOIN pg_class ref_cls ON ref_cls.oid = con.confrelid
+		JOIN pg_attribute ref_att ON ref_att.attrelid = con.confrelid AND ref_att.attnum = k.ref_attnum
+		WHERE con.contype = 'f'
+			AND ns.nspname = $1 AND src_cls.relname = $2
+		ORDER BY con.conname, k.ord
 	`
+}
+
+func (c *Collector) collectForeignKeys(ctx context.Context, schema, table string) ([]ForeignKey, error) {
+	query := foreignKeysQuery()
 	rows, err := c.db.QueryContext(ctx, query, schema, table)
 	if err != nil {
 		return nil, err
@@ -237,6 +265,9 @@ func (c *Collector) collectForeignKeys(ctx context.Context, schema, table string
 		}
 		fkMap[constraintName].Columns = append(fkMap[constraintName].Columns, colName)
 		fkMap[constraintName].RefColumns = append(fkMap[constraintName].RefColumns, refCol)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read foreign keys for %s: %w", table, err)
 	}
 
 	var result []ForeignKey
@@ -283,6 +314,9 @@ func (c *Collector) CollectViews(ctx context.Context, schema string) ([]View, er
 		v.Schema = schema
 		views = append(views, v)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read views: %w", err)
+	}
 	return views, nil
 }
 
@@ -308,6 +342,9 @@ func (c *Collector) CollectEnums(ctx context.Context, schema string) ([]EnumType
 			return nil, err
 		}
 		enumMap[typeName] = append(enumMap[typeName], value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read enums: %w", err)
 	}
 
 	var enums []EnumType
@@ -336,6 +373,10 @@ func (c *Collector) CollectUnsupported(ctx context.Context, schema string) ([]Ob
 				})
 			}
 		}
+		if iterErr := rows.Err(); iterErr != nil {
+			rows.Close()
+			return nil, fmt.Errorf("read triggers: %w", iterErr)
+		}
 		rows.Close()
 	}
 
@@ -354,6 +395,10 @@ func (c *Collector) CollectUnsupported(ctx context.Context, schema string) ([]Ob
 					Unsupported: true, Note: "stored functions not supported in TiDB",
 				})
 			}
+		}
+		if iterErr := rows2.Err(); iterErr != nil {
+			rows2.Close()
+			return nil, fmt.Errorf("read functions: %w", iterErr)
 		}
 		rows2.Close()
 	}

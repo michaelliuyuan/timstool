@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/michaelliuyuan/timstool/internal/source"
 )
 
@@ -75,6 +76,15 @@ func TestMySQLTypeMapper(t *testing.T) {
 		{"datetime", 0, 0, "DATETIME"},
 		{"datetime(6)", 6, 0, "DATETIME(6)"},
 		{"timestamp", 0, 0, "TIMESTAMP"},
+		// fsp shapes (F-fsp fix): temporal fsp flows from DATETIME_PRECISION
+		{"timestamp(6)", 6, 0, "TIMESTAMP(6)"},
+		{"timestamp(3)", 3, 0, "TIMESTAMP(3)"},
+		{"datetime(6)", 6, 0, "DATETIME(6)"},
+		{"time(3)", 3, 0, "TIME(3)"},
+		{"time", 0, 0, "TIME"},
+		// production trap shape: temporal column with NUMERIC_PRECISION=NULL
+		// arrives as prec=0 regardless of the "(6)" in COLUMN_TYPE text
+		{"timestamp(6)", 0, 0, "TIMESTAMP"},
 		{"date", 0, 0, "DATE"},
 		{"year", 0, 0, "YEAR"},
 
@@ -99,6 +109,22 @@ func TestMySQLTypeMapper(t *testing.T) {
 					tc.srcType, tc.prec, tc.scale, got.Name, tc.wantTiDB)
 			}
 		})
+	}
+}
+
+// TestIsTemporalDataType anchors the DATETIME_PRECISION consumer set: exactly
+// timestamp/datetime/time carry fsp there (date/year do NOT — their
+// DATETIME_PRECISION is NULL and NUMERIC_PRECISION must not leak in as fsp).
+func TestIsTemporalDataType(t *testing.T) {
+	for _, dt := range []string{"timestamp", "datetime", "time", "TIMESTAMP", "DATETIME", "TIME"} {
+		if !isTemporalDataType(dt) {
+			t.Errorf("isTemporalDataType(%q) = false, want true", dt)
+		}
+	}
+	for _, dt := range []string{"date", "year", "int", "varchar", "decimal", ""} {
+		if isTemporalDataType(dt) {
+			t.Errorf("isTemporalDataType(%q) = true, want false", dt)
+		}
 	}
 }
 
@@ -149,7 +175,51 @@ func TestMySQLDescribe(t *testing.T) {
 	if charset.Group != "source" {
 		t.Errorf("charset.Group = %q, want source", charset.Group)
 	}
-	if !meta.Capabilities.Data || meta.Capabilities.CDC {
-		t.Errorf("mysql capabilities = %+v, want Data=true CDC=false", meta.Capabilities)
+	// MS-11 pen 4: cdc flipped ON (binlog CDC via the canal adapter).
+	if !meta.Capabilities.Data || !meta.Capabilities.CDC {
+		t.Errorf("mysql capabilities = %+v, want Data=true CDC=true (MS-11)", meta.Capabilities)
+	}
+}
+
+// TestMySQLDSNPasswordRoundTrip anchors B-F02-9: the DSN is NOT URL syntax,
+// credentials must be embedded literally — a password containing '@' (or
+// other URL-reserved chars) must survive a driver-side parse unchanged.
+// QueryEscape here previously turned "TiDB@2026" into "TiDB%402026" and the
+// driver sent the mangled literal to auth (1045 denied).
+func TestMySQLDSNPasswordRoundTrip(t *testing.T) {
+	cfg := source.SourceConfig{
+		Host: "10.0.0.9", Port: 4000,
+		User:     "root",
+		Password: "TiDB@2026",
+		Database: "db",
+	}
+	dsnStr := dsn(cfg)
+	parsed, err := mysql.ParseDSN(dsnStr)
+	if err != nil {
+		t.Fatalf("ParseDSN(%q) err = %v", dsnStr, err)
+	}
+	if parsed.User != cfg.User {
+		t.Errorf("User = %q, want %q", parsed.User, cfg.User)
+	}
+	if parsed.Passwd != cfg.Password {
+		t.Errorf("Passwd = %q, want %q (QueryEscape regression?)", parsed.Passwd, cfg.Password)
+	}
+	if parsed.Addr != "10.0.0.9:4000" {
+		t.Errorf("Addr = %q, want 10.0.0.9:4000", parsed.Addr)
+	}
+	if parsed.DBName != cfg.Database {
+		t.Errorf("DBName = %q, want %q", parsed.DBName, cfg.Database)
+	}
+
+	// URL-reserved chars across the board must pass through literally.
+	for _, pwd := range []string{"p@ss:word+100%", "a/b?c#d", "正常密码!@#"} {
+		cfg.Password = pwd
+		parsed, err := mysql.ParseDSN(dsn(cfg))
+		if err != nil {
+			t.Fatalf("ParseDSN password %q err = %v", pwd, err)
+		}
+		if parsed.Passwd != pwd {
+			t.Errorf("Passwd = %q, want %q", parsed.Passwd, pwd)
+		}
 	}
 }

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 )
 
@@ -72,7 +72,8 @@ func DefaultBatchConfig() BatchConfig {
 	}
 }
 
-// ApplierStats tracks apply progress.
+// ApplierStats tracks apply progress. It is guarded by mu and must never be
+// copied (mu is a sync.Mutex); read it via Snapshot.
 type ApplierStats struct {
 	mu sync.Mutex
 
@@ -84,13 +85,39 @@ type ApplierStats struct {
 	LastLSN        string
 	LastFlushTime  time.Time
 	LastError      string
+	LastSkipReason string
 }
 
-// Snapshot returns a copy of the current stats.
-func (s *ApplierStats) Snapshot() ApplierStats {
+// ApplierStatsSnapshot is a lock-free, copy-safe DTO of ApplierStats for
+// cross-goroutine reads and JSON serialization (e.g. CDCState.Stats).
+type ApplierStatsSnapshot struct {
+	EventsReceived int64     `json:"events_received"`
+	EventsApplied  int64     `json:"events_applied"`
+	EventsFailed   int64     `json:"events_failed"`
+	EventsSkipped  int64     `json:"events_skipped"`
+	BatchesFlushed int64     `json:"batches_flushed"`
+	LastLSN        string    `json:"last_lsn"`
+	LastFlushTime  time.Time `json:"last_flush_time"`
+	LastError      string    `json:"last_error"`
+	LastSkipReason string    `json:"last_skip_reason,omitempty"`
+}
+
+// Snapshot returns a lock-free copy of the current stats. Copying ApplierStats
+// itself would copy the embedded sync.Mutex and break mutual exclusion.
+func (s *ApplierStats) Snapshot() ApplierStatsSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return *s
+	return ApplierStatsSnapshot{
+		EventsReceived: s.EventsReceived,
+		EventsApplied:  s.EventsApplied,
+		EventsFailed:   s.EventsFailed,
+		EventsSkipped:  s.EventsSkipped,
+		BatchesFlushed: s.BatchesFlushed,
+		LastLSN:        s.LastLSN,
+		LastFlushTime:  s.LastFlushTime,
+		LastError:      s.LastError,
+		LastSkipReason: s.LastSkipReason,
+	}
 }
 
 // Applier receives CDCEvents and applies them to the TiDB target in batches.
@@ -112,7 +139,20 @@ type Applier struct {
 
 	fatalMu  sync.Mutex
 	fatalErr error // set when the applier halts on a structural failure; see Fatal()
+
+	// missingTables is the 1146 short-circuit set (F-10 group 2 item 3):
+	// tableKey → time the exhaustion was recorded. A table whose event has
+	// exhausted the schema retries is KNOWN missing; further events for it
+	// skip immediately instead of burning 10×500ms each. Entries expire
+	// (missingTTL) so manual table compensation is re-probed even without
+	// a DDL poller callback.
+	missingMu     sync.Mutex
+	missingTables map[string]time.Time
 }
+
+// missingTTL bounds how long a confirmed-missing table stays short-circuited
+// without external confirmation (DDL applied / manual compensation).
+const missingTTL = 60 * time.Second
 
 // tableBuffer accumulates events for a single table, maintaining insert order.
 type tableBuffer struct {
@@ -147,12 +187,13 @@ func NewApplier(db *sql.DB, cfg BatchConfig, transformer *Transformer) *Applier 
 		cfg.FlushInterval = 5 * time.Second
 	}
 	return &Applier{
-		cfg:         cfg,
-		db:          db,
-		log:         zap.NewNop(),
-		stats:       &ApplierStats{},
-		buffers:     make(map[string]*tableBuffer),
-		transformer: transformer,
+		cfg:           cfg,
+		db:            db,
+		log:           zap.NewNop(),
+		stats:         &ApplierStats{},
+		buffers:       make(map[string]*tableBuffer),
+		missingTables: make(map[string]time.Time),
+		transformer:   transformer,
 	}
 }
 
@@ -214,7 +255,9 @@ func (a *Applier) Start(ctx context.Context, events <-chan *CDCEvent) error {
 				return nil
 			}
 
+			a.stats.mu.Lock()
 			a.stats.EventsReceived++
+			a.stats.mu.Unlock()
 
 			// Buffer the event (per-table, preserves arrival order within a table)
 			a.bufferEvent(event)
@@ -312,6 +355,14 @@ func (a *Applier) worker(ctx context.Context, workCh <-chan *CDCEvent, id int) {
 				}
 				return
 			}
+			var sk *skippedError
+			if errors.As(err, &sk) {
+				// Intentionally not applied (internal table / skip list /
+				// degradable schema mismatch) — already counted as skipped
+				// inside applyEvent. Counting it here again as applied would
+				// break received = applied + skipped + failed.
+				continue
+			}
 			a.log.Error("apply event failed",
 				zap.Int("worker", id),
 				zap.String("table", tableKey(event.Schema, event.Table)),
@@ -325,24 +376,62 @@ func (a *Applier) worker(ctx context.Context, workCh <-chan *CDCEvent, id int) {
 		} else {
 			a.stats.mu.Lock()
 			a.stats.EventsApplied++
-			a.stats.LastLSN = event.LSN.String()
+			a.stats.LastLSN = event.Position()
 			a.stats.LastFlushTime = time.Now()
 			a.stats.mu.Unlock()
 		}
 	}
 }
 
+// skippedError marks an event intentionally not applied. The worker must
+// count it ONLY as skipped — never applied, never failed — so the status
+// counters stay self-consistent (received = applied + skipped + failed).
+type skippedError struct{ reason string }
+
+func (e *skippedError) Error() string { return "event skipped: " + e.reason }
+
+// markMissing records a table as confirmed-missing (1146 retries exhausted).
+func (a *Applier) markMissing(tk string) {
+	a.missingMu.Lock()
+	a.missingTables[tk] = time.Now()
+	a.missingMu.Unlock()
+}
+
+// isMissing reports whether tk is short-circuited as missing (TTL-fresh).
+func (a *Applier) isMissing(tk string) bool {
+	a.missingMu.Lock()
+	defer a.missingMu.Unlock()
+	at, ok := a.missingTables[tk]
+	if !ok {
+		return false
+	}
+	if time.Since(at) > missingTTL {
+		delete(a.missingTables, tk) // expired: re-probe (manual compensation)
+		return false
+	}
+	return true
+}
+
+// ResetMissingTables clears the 1146 short-circuit set. The DDL poller calls
+// this after every successful DDL apply — a CREATE TABLE most likely just
+// made one or more short-circuited tables exist again.
+func (a *Applier) ResetMissingTables() {
+	a.missingMu.Lock()
+	a.missingTables = make(map[string]time.Time)
+	a.missingMu.Unlock()
+}
+
 // applyEvent applies a single event to TiDB.
 func (a *Applier) applyEvent(ctx context.Context, event *CDCEvent) error {
 	// Never replicate CDC's own internal tables (e.g. the DDLTracker's
-	// timstool_ddl_log). A `FOR ALL TABLES` publication streams their writes as
+	// pg2tidb_ddl_log). A `FOR ALL TABLES` publication streams their writes as
 	// DML, but they don't exist on the target — applying them would 1146-halt
 	// the pipeline on every DDL. #t61 production fix.
 	if isCDCInternalTable(event.Table) {
 		a.stats.mu.Lock()
 		a.stats.EventsSkipped++
 		a.stats.mu.Unlock()
-		return nil
+		return &skippedError{reason: "cdc internal table " + event.Table}
 	}
 	// Check skip table
 	for _, skip := range a.cfg.SkipTables {
@@ -350,8 +439,19 @@ func (a *Applier) applyEvent(ctx context.Context, event *CDCEvent) error {
 			a.stats.mu.Lock()
 			a.stats.EventsSkipped++
 			a.stats.mu.Unlock()
-			return nil
+			return &skippedError{reason: "skip-listed table " + skip}
 		}
+	}
+
+	// 1146 short-circuit (F-10 group 2 item 3): this table was already
+	// CONFIRMED missing (retries exhausted earlier) — skip immediately
+	// instead of burning the 10×500ms schema window per event.
+	tk := tableKey(event.Schema, event.Table)
+	if a.isMissing(tk) {
+		a.stats.mu.Lock()
+		a.stats.EventsSkipped++
+		a.stats.mu.Unlock()
+		return &skippedError{reason: "short-circuit: table confirmed missing earlier this window: " + tk}
 	}
 
 	sql, err := a.transformer.TransformEvent(event)
@@ -385,10 +485,22 @@ func (a *Applier) applyEvent(ctx context.Context, event *CDCEvent) error {
 			// Non-schema fatal (syntax / unknown column / access): don't retry.
 			return fmt.Errorf("apply fatal: %w", err)
 		case isSchemaError(err):
-			// Target table not created yet — wait for DDL replication, then halt
-			// loudly if it never catches up (don't silently drop the DML).
+			// Target table not created yet — wait for DDL replication.
+			// F-09 group 1 (degradable replay): if the DDL never catches up
+			// (e.g. its CREATE was skipped as a 1064), the event is dropped
+			// LOUDLY instead of halting the chain: EventsSkipped counter +
+			// LastError/LastSkipReason surface in the status JSON. Never
+			// silent divergence.
 			if attempt >= schemaRetries {
-				return &StructuralError{Msg: fmt.Sprintf("schema mismatch after %d retries (target table likely not created by DDL yet): %v", schemaRetries, err)}
+				a.log.Error("cdc applier: schema mismatch after retries, skipping event (degradable; target table missing; same-table events now short-circuited)",
+					zap.String("sql", sql), zap.Error(err))
+				a.stats.mu.Lock()
+				a.stats.EventsSkipped++
+				a.stats.LastError = err.Error()
+				a.stats.LastSkipReason = fmt.Sprintf("[dml/1146] %s: %v", tk, err)
+				a.stats.mu.Unlock()
+				a.markMissing(tk)
+				return &skippedError{reason: fmt.Sprintf("[dml/1146] %s: %v", tk, err)}
 			}
 			if err := sleepCtx(ctx, schemaBackoff); err != nil {
 				return err
@@ -453,8 +565,8 @@ func (a *Applier) Fatal() error {
 	return a.fatalErr
 }
 
-// Stats returns the current apply statistics.
-func (a *Applier) Stats() ApplierStats {
+// Stats returns the current apply statistics as a lock-free snapshot.
+func (a *Applier) Stats() ApplierStatsSnapshot {
 	return a.stats.Snapshot()
 }
 
@@ -491,9 +603,9 @@ func tableKey(schema, table string) string {
 // publication streams their writes, but they don't exist on the target, so
 // applying them would 1146-halt the pipeline (a self-capture loop). This is a
 // hard-coded default blacklist independent of user config (#t61 production fix).
-// timstool_ddl_log is the DDLTracker's capture log (#t59).
+// pg2tidb_ddl_log is the DDLTracker's capture log (#t59).
 var cdcInternalTables = map[string]bool{
-	"timstool_ddl_log": true,
+	"pg2tidb_ddl_log": true,
 }
 
 // isCDCInternalTable reports whether a table is CDC's own infrastructure (matched
@@ -536,6 +648,41 @@ func isSchemaError(err error) bool {
 		if strings.Contains(msg, p) {
 			return true
 		}
+	}
+	return false
+}
+
+// isDegradableError reports an "object-state mismatch" error on the TiDB
+// target that a replay may legitimately skip WITH VISIBLE RECORD (F-09 group
+// 1): the object's actual state diverges from what the DDL/DML expected
+// (quoted mixed-case DDL the transformer could not fully translate → 1064;
+// table missing because its CREATE was skipped → 1146; already-applied DDL
+// replayed at-least-once → 1050/1061/1091).
+//
+// Matching is by the driver's NUMERIC error code (*mysql.MySQLError.Number),
+// never by substring: a table or database literally named e.g.
+// 'myError_1064_x' inside an access-denied (1142) message must not trick us
+// into skipping a fail-hard error.
+//
+// The list is deliberately EXPLICIT and must stay narrow:
+//   - transient errors (lock wait 1205, deadlock 1213, connection, timeout)
+//     belong to the retry paths, NEVER to skip — skipping them would drop
+//     live data;
+//   - access/privilege and driver-level errors stay fail-hard;
+//   - 1054 (unknown column) is NOT here: column-level drift is a true schema
+//     divergence — skipping it silently drops column data.
+func isDegradableError(err error) bool {
+	var myErr *mysql.MySQLError
+	if !errors.As(err, &myErr) {
+		return false
+	}
+	switch myErr.Number {
+	case 1064, // syntax (untranslatable DDL)
+		1146, // table doesn't exist
+		1050, // table already exists (idempotent replay)
+		1061, // duplicate index (idempotent replay)
+		1091: // index doesn't exist (idempotent replay)
+		return true
 	}
 	return false
 }

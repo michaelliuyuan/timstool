@@ -2,11 +2,14 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
@@ -19,6 +22,17 @@ type Config struct {
 	Logging   LoggingConfig   `yaml:"logging" json:"logging"`
 	Web       WebConfig       `yaml:"web" json:"web"`
 	CDC       CDCConfig       `yaml:"cdc" json:"cdc"`
+	Security  SecurityConfig  `yaml:"security" json:"-"`
+}
+
+// SecurityConfig holds the web control-plane auth token (MS-11f P0-1). The
+// token gates the destructive CDC endpoints (X-Auth-Token header). Empty =
+// fail-closed: every destructive op is rejected until an operator sets a
+// token in config.yaml and restarts the web server. json:"-" on every face —
+// the value must never be echoed by any JSON response or persisted into
+// task config blobs (zero-echo constraint, ruling seq83 #1).
+type SecurityConfig struct {
+	Token string `yaml:"token" json:"-"`
 }
 
 // CompareConfig controls data comparison/validation behavior, especially for
@@ -57,7 +71,36 @@ type CompareConfig struct {
 	ChecksumChunkSize int64 `yaml:"checksum_chunk_size" json:"checksumChunkSize"`
 
 	// ChecksumParallel for checksum mode: number of concurrent chunks.
+	// Deprecated (#t4): superseded by Concurrency — still honored as a
+	// legacy fallback when Concurrency is unset.
 	ChecksumParallel int `yaml:"checksum_parallel" json:"checksumParallel"`
+
+	// Concurrency is the unified total-concurrency budget (#t4): the number
+	// of database query work units (table validations and checksum chunks
+	// alike) that may execute at the same time across BOTH pools. It is also
+	// the hard cap for connection acquisition — every conn is obtained
+	// inside a budget slot, which structurally prevents the pool-vs-WaitGroup
+	// deadlock the nested (table-level × chunk-level) semaphores caused.
+	// 0 = derive from legacy migration.parallel / checksum_parallel; clamped
+	// to [1,8] (both pools are capped at 8).
+	Concurrency int `yaml:"concurrency" json:"concurrency"`
+
+	// Watermark scopes the comparison to rows whose watermark column is
+	// within bounds on BOTH sides (#t3), eliminating the permanent-diff
+	// illusion caused by ongoing source writes + sync lag. nil = unfiltered
+	// (zero regression for CLI / migration pipeline paths).
+	Watermark *WatermarkFilter `yaml:"watermark,omitempty" json:"watermark,omitempty"`
+}
+
+// WatermarkFilter is the compare-side watermark filter group. Column passes
+// an identifier allow-list; Value is ALWAYS bound as a query parameter
+// (never concatenated). Timestamptz values follow the UTC input convention
+// (the PG session is forced to UTC while a filter is active).
+type WatermarkFilter struct {
+	Column   string `yaml:"column" json:"column"`
+	Value    string `yaml:"value" json:"value"`
+	Op       string `yaml:"op" json:"op"`               // "<=" (default) | "<"
+	BaseMode string `yaml:"base_mode" json:"base_mode"` // quick | sample | checksum (default checksum)
 }
 
 type SourceConfig struct {
@@ -80,13 +123,84 @@ func (s SourceConfig) SourceType() string {
 	return s.Type
 }
 
-func (s SourceConfig) DSN() string {
-	sslmode := s.SSLMode
+// ConnectTimeoutSec is the DSN-injected connect timeout (F-06 item 3):
+// PG uses connect_timeout=<sec>, the MySQL/TiDB driver uses timeout=<dur>
+// for the dial. 10s keeps a dead host from stalling handlers for minutes.
+const ConnectTimeoutSec = 10
+
+// Upper bounds for tuning knobs (F-08-2 ride d): values beyond these are
+// almost certainly operator error (unit confusion, typo) and would degrade
+// the source database or blow up a single transaction.
+const (
+	MaxParallel  = 64
+	MaxBatchSize = 1000000
+)
+
+// BuildPGDSN assembles a libpq URL with CORRECTLY escaped userinfo (F-06
+// item 4): url.UserPassword percent-encodes specials (@ : / ? # % space & =
+// + etc.) in user/password, unlike fmt.Sprintf concatenation which a single
+// '@' or '/' in the password would silently break. extra adds further query
+// parameters (e.g. replication=database for the CDC stream connection).
+func BuildPGDSN(host string, port int, user, password, database, sslmode string, extra map[string]string) string {
 	if sslmode == "" {
 		sslmode = "disable"
 	}
-	return fmt.Sprintf("postgresql://%s:%s@%s:%d/%s?sslmode=%s",
-		url.QueryEscape(s.User), url.QueryEscape(s.Password), s.Host, s.Port, s.Database, sslmode)
+	q := url.Values{}
+	q.Set("sslmode", sslmode)
+	q.Set("connect_timeout", strconv.Itoa(ConnectTimeoutSec))
+	for k, v := range extra {
+		q.Set(k, v)
+	}
+	u := url.URL{
+		Scheme:   "postgresql",
+		User:     url.UserPassword(user, password),
+		Host:     net.JoinHostPort(host, strconv.Itoa(port)),
+		Path:     "/" + database,
+		RawQuery: q.Encode(),
+	}
+	return u.String()
+}
+
+// BuildMySQLDSN assembles a go-sql-driver DSN via mysql.Config.FormatDSN,
+// which escapes user/passwd/dbname specials — a password containing
+// '@ : / ? ( )' stays intact instead of derailing the DSN parser (F-06
+// item 4). extra becomes additional params (e.g. charset); loc selects the
+// time zone param (nil = driver default UTC, time.Local = loc=Local).
+func BuildMySQLDSN(host string, port int, user, password, database string, extra map[string]string, loc *time.Location) string {
+	cfg := mysql.NewConfig()
+	cfg.Net = "tcp"
+	cfg.Addr = net.JoinHostPort(host, strconv.Itoa(port))
+	cfg.User = user
+	cfg.Passwd = password
+	cfg.DBName = database
+	cfg.ParseTime = true
+	cfg.Timeout = ConnectTimeoutSec * time.Second
+	cfg.ReadTimeout = 300 * time.Second
+	cfg.WriteTimeout = 300 * time.Second
+	cfg.Params = extra
+	cfg.Loc = loc
+	return cfg.FormatDSN()
+}
+
+func (s SourceConfig) DSN() string {
+	return BuildPGDSN(s.Host, s.Port, s.User, s.Password, s.Database, s.SSLMode, nil)
+}
+
+// DSNByType returns the source DSN dispatched on the NORMALIZED source type
+// (MS-08): postgres keeps the legacy PG DSN (byte-identical to DSN()); mysql
+// assembles the go-sql-driver DSN (schema == database on MySQL - the driver
+// connects to Database; SSLMode is a PG-only concept and is ignored). Unknown
+// types are unreachable behind the webapi capability guard (srcCapable) and
+// default to the PG shape here.
+func (s SourceConfig) DSNByType() string {
+	if s.SourceType() == "mysql" {
+		// time_zone='+00:00' pins the SESSION clock to UTC (same shape as
+		// incremental.go incTargetDSN): DATETIME scans then land as UTC
+		// time.Time, aligning the MySQL source with the PG source and the
+		// TiDB write sessions instead of the server's system_time_zone.
+		return BuildMySQLDSN(s.Host, s.Port, s.User, s.Password, s.Database, map[string]string{"charset": "utf8mb4", "time_zone": "'+00:00'"}, nil)
+	}
+	return s.DSN()
 }
 
 type TargetConfig struct {
@@ -100,29 +214,54 @@ type TargetConfig struct {
 }
 
 func (t TargetConfig) DSN() string {
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=true&timeout=30s&readTimeout=300s&writeTimeout=300s",
-		t.User, t.Password, t.Host, t.Port, t.Database)
+	return BuildMySQLDSN(t.Host, t.Port, t.User, t.Password, t.Database, map[string]string{"charset": "utf8mb4"}, nil)
+}
+
+// DSNPinnedUTC is the validate-read-session variant (F-13): the session
+// clock is pinned to UTC so a TIMESTAMP renders as the same instant on both
+// sides of the comparison. The data-path DSN() above stays untouched — its
+// wall-clock coupling with the source write session is load-bearing.
+func (t TargetConfig) DSNPinnedUTC() string {
+	return BuildMySQLDSN(t.Host, t.Port, t.User, t.Password, t.Database,
+		map[string]string{"charset": "utf8mb4", "time_zone": "'+00:00'"}, nil)
 }
 
 type MigrationConfig struct {
-	Parallel            int      `yaml:"parallel"`
-	BatchSize           int      `yaml:"batch_size"`
-	TempDir             string   `yaml:"temp_dir"`
-	Tables              []string `yaml:"tables"`
-	ExcludeTables       []string `yaml:"exclude_tables"`
-	UseLightning        bool     `yaml:"use_lightning"`
-	OnError             string   `yaml:"on_error"`
-	CheckpointDir       string   `yaml:"checkpoint_dir"`
-	ReadTimeout         string   `yaml:"read_timeout"`
-	WriteTimeout        string   `yaml:"write_timeout"`
-	TargetPolicy        string   `yaml:"target_policy"` // insert, truncate, drop
-	LargeTableThreshold int64    `yaml:"large_table_threshold" json:"largeTableThreshold"`
-	ChunkSize           int64    `yaml:"chunk_size" json:"chunkSize"`
-	ChunkParallel       int      `yaml:"chunk_parallel" json:"chunkParallel"`
-	SkipPrecheck        bool     `yaml:"skip_precheck" json:"skipPrecheck"`
-	SkipSchema          bool     `yaml:"skip_schema" json:"skipSchema"`
-	SkipData            bool     `yaml:"skip_data" json:"skipData"`
-	SkipValidate        bool     `yaml:"skip_validate" json:"skipValidate"`
+	Parallel      int      `yaml:"parallel"`
+	BatchSize     int      `yaml:"batch_size"`
+	TempDir       string   `yaml:"temp_dir"`
+	Tables        []string `yaml:"tables"`
+	ExcludeTables []string `yaml:"exclude_tables"`
+	UseLightning  bool     `yaml:"use_lightning"`
+	LightningPath string   `yaml:"lightning_path" json:"lightning_path"` // explicit tidb-lightning binary; empty = auto-discover (PATH → embedded)
+	// UseDumpling (MS-11p): MySQL export-side fast-path switch. Off (default)
+	// = current behavior byte-identical (auto-discovery + stream fallback).
+	// On = explicit choice: an unresolvable path or a failed dump FAILS the
+	// task — never a silent swap to the stream path.
+	UseDumpling         bool   `yaml:"use_dumpling" json:"use_dumpling"`
+	DumplingPath        string `yaml:"dumpling_path" json:"dumpling_path"` // explicit tidb-dumpling binary; empty = auto-discover (PATH → common locations)
+	OnError             string `yaml:"on_error"`
+	CheckpointDir       string `yaml:"checkpoint_dir"`
+	ReadTimeout         string `yaml:"read_timeout"`
+	WriteTimeout        string `yaml:"write_timeout"`
+	TargetPolicy        string `yaml:"target_policy"` // insert, truncate, drop
+	LargeTableThreshold int64  `yaml:"large_table_threshold" json:"largeTableThreshold"`
+	ChunkSize           int64  `yaml:"chunk_size" json:"chunkSize"`
+	ChunkParallel       int    `yaml:"chunk_parallel" json:"chunkParallel"`
+	SkipPrecheck        bool   `yaml:"skip_precheck" json:"skipPrecheck"`
+	SkipSchema          bool   `yaml:"skip_schema" json:"skipSchema"`
+	SkipData            bool   `yaml:"skip_data" json:"skipData"`
+	SkipValidate        bool   `yaml:"skip_validate" json:"skipValidate"`
+
+	// CDCChain (Full+Incremental Chaining): when true, the task pre-creates the
+	// CDC publication + replication slot BEFORE the full migration starts (so
+	// WAL during the migration window is retained) and auto-starts the CDC
+	// supervisor after the migration succeeds. PostgreSQL sources only.
+	CDCChain bool `yaml:"cdc_chain" json:"cdcChain"`
+
+	// ChainStartLSN records the slot consistent point captured at task start
+	// (in-memory bookkeeping persisted in the task's config JSON; not user-set).
+	ChainStartLSN string `yaml:"-" json:"chain_start_lsn,omitempty"`
 }
 
 func (m MigrationConfig) ReadTimeoutDuration() time.Duration {
@@ -201,6 +340,11 @@ type CDCConfig struct {
 
 	// CheckpointFile is the LSN checkpoint file path.
 	CheckpointFile string `yaml:"checkpoint_file" json:"checkpointFile"`
+
+	// ServerID is the MySQL binlog dump registration id (MS-11). Must be
+	// non-zero and unique in the replication topology when the source is
+	// MySQL. Unused for PostgreSQL sources.
+	ServerID uint32 `yaml:"server_id" json:"serverId,omitempty"`
 }
 
 // ValidCDCModes are the accepted values for CDCConfig.Mode.
@@ -268,8 +412,8 @@ func DefaultConfig() *Config {
 		CDC: CDCConfig{
 			Enable:           true, // enabled by default
 			Mode:             "full_incr",
-			SlotName:         "timstool_cdc",
-			Publication:      "timstool_pub",
+			SlotName:         "pg2tidb_cdc",
+			Publication:      "pg2tidb_pub",
 			BatchSize:        1000,
 			Parallel:         1, // serial by default — correctness-first (see #t48 Bug#8)
 			ConflictStrategy: "replace",
@@ -295,10 +439,31 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// parseOverrideInt strictly parses a whole string as an integer override:
+// unlike fmt.Sscanf("%d") it rejects trailing garbage ("80x" fails instead
+// of silently meaning 80).
+func parseOverrideInt(v string) (int, error) {
+	return strconv.Atoi(strings.TrimSpace(v))
+}
+
 func LoadWithOverrides(path string, overrides map[string]string) (*Config, error) {
 	cfg, err := Load(path)
 	if err != nil {
 		return nil, err
+	}
+
+	parseInt := func(key, v string, dst *int) error {
+		n, err := parseOverrideInt(v)
+		if err != nil {
+			return fmt.Errorf("override %s=%q: must be an integer", key, v)
+		}
+		*dst = n
+		return nil
+	}
+	if v, ok := overrides["source.port"]; ok {
+		if err := parseInt("source.port", v, &cfg.Source.Port); err != nil {
+			return nil, err
+		}
 	}
 
 	if v, ok := overrides["source.host"]; ok {
@@ -320,7 +485,9 @@ func LoadWithOverrides(path string, overrides map[string]string) (*Config, error
 		cfg.Target.Host = v
 	}
 	if v, ok := overrides["target.port"]; ok {
-		fmt.Sscanf(v, "%d", &cfg.Target.Port)
+		if err := parseInt("target.port", v, &cfg.Target.Port); err != nil {
+			return nil, err
+		}
 	}
 	if v, ok := overrides["target.user"]; ok {
 		cfg.Target.User = v
@@ -335,10 +502,14 @@ func LoadWithOverrides(path string, overrides map[string]string) (*Config, error
 		cfg.Target.PDAddr = v
 	}
 	if v, ok := overrides["migration.parallel"]; ok {
-		fmt.Sscanf(v, "%d", &cfg.Migration.Parallel)
+		if err := parseInt("migration.parallel", v, &cfg.Migration.Parallel); err != nil {
+			return nil, err
+		}
 	}
 	if v, ok := overrides["migration.batch_size"]; ok {
-		fmt.Sscanf(v, "%d", &cfg.Migration.BatchSize)
+		if err := parseInt("migration.batch_size", v, &cfg.Migration.BatchSize); err != nil {
+			return nil, err
+		}
 	}
 	if v, ok := overrides["logging.level"]; ok {
 		cfg.Logging.Level = v
@@ -365,10 +536,14 @@ func LoadWithOverrides(path string, overrides map[string]string) (*Config, error
 		cfg.CDC.Publication = v
 	}
 	if v, ok := overrides["cdc.batch_size"]; ok {
-		fmt.Sscanf(v, "%d", &cfg.CDC.BatchSize)
+		if err := parseInt("cdc.batch_size", v, &cfg.CDC.BatchSize); err != nil {
+			return nil, err
+		}
 	}
 	if v, ok := overrides["cdc.parallel"]; ok {
-		fmt.Sscanf(v, "%d", &cfg.CDC.Parallel)
+		if err := parseInt("cdc.parallel", v, &cfg.CDC.Parallel); err != nil {
+			return nil, err
+		}
 	}
 	if v, ok := overrides["cdc.conflict_strategy"]; ok {
 		cfg.CDC.ConflictStrategy = v
@@ -397,10 +572,16 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("target.port must be positive")
 	}
 	if c.Migration.Parallel <= 0 {
-		return fmt.Errorf("migration.parallel must be positive")
+		return fmt.Errorf("migration.parallel must be between 1 and %d", MaxParallel)
+	}
+	if c.Migration.Parallel > MaxParallel {
+		return fmt.Errorf("migration.parallel must be between 1 and %d (got %d) — 并行过高会压垮源库连接数", MaxParallel, c.Migration.Parallel)
 	}
 	if c.Migration.BatchSize <= 0 {
-		return fmt.Errorf("migration.batch_size must be positive")
+		return fmt.Errorf("migration.batch_size must be between 1 and %d", MaxBatchSize)
+	}
+	if c.Migration.BatchSize > MaxBatchSize {
+		return fmt.Errorf("migration.batch_size must be between 1 and %d (got %d) — 批次过大会撑爆内存/单事务", MaxBatchSize, c.Migration.BatchSize)
 	}
 	if c.Migration.OnError != "abort" && c.Migration.OnError != "skip" {
 		return fmt.Errorf("migration.on_error must be 'abort' or 'skip'")
@@ -415,14 +596,26 @@ func (c *Config) Validate() error {
 		if !ValidCDCModes[c.CDC.Mode] {
 			return fmt.Errorf("cdc.mode must be 'full_incr' or 'incr_only'")
 		}
-		if c.CDC.BatchSize <= 0 {
-			return fmt.Errorf("cdc.batch_size must be positive")
+		if c.CDC.BatchSize <= 0 || c.CDC.BatchSize > MaxBatchSize {
+			return fmt.Errorf("cdc.batch_size must be between 1 and %d (got %d)", MaxBatchSize, c.CDC.BatchSize)
 		}
-		if c.CDC.Parallel <= 0 {
-			return fmt.Errorf("cdc.parallel must be positive")
+		if c.CDC.Parallel <= 0 || c.CDC.Parallel > MaxParallel {
+			return fmt.Errorf("cdc.parallel must be between 1 and %d (got %d)", MaxParallel, c.CDC.Parallel)
 		}
 		if !ValidCDCConflictStrategies[c.CDC.ConflictStrategy] {
 			return fmt.Errorf("cdc.conflict_strategy must be one of replace, insert_ignore, upsert, skip")
+		}
+		// MS-11 v1 (ruling seq 953 #2): MySQL binlog CDC is DML-only —
+		// online DDL hard-stops the stream with an explicit remediation
+		// message, so DDL tracking is rejected up front (never silently
+		// ignored).
+		if c.Source.SourceType() == "mysql" {
+			if c.CDC.ServerID == 0 {
+				return fmt.Errorf("cdc.server_id must be a non-zero unique replication id for MySQL binlog CDC")
+			}
+			if c.CDC.SyncDDL {
+				return fmt.Errorf("cdc.sync_ddl 不支持 MySQL 源（v1 仅 DML；在线 DDL 会硬停链）——请设 sync_ddl: false")
+			}
 		}
 	}
 	return nil

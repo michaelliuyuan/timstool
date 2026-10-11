@@ -61,6 +61,12 @@ Prerequisites:
 		srcCfg.Tables = cfg.CDC.Tables
 		srcCfg.ExcludeTables = cfg.CDC.ExcludeTables
 
+		// MS-11: MySQL sources route to the binlog runner (v1 DML-only,
+		// file:pos); PostgreSQL keeps the logical-replication runner.
+		if cfg.Source.SourceType() == "mysql" {
+			return runBinlogCDC(cmd, cfg)
+		}
+
 		// CDC params default to cfg.CDC.* (see CDCConfig); explicit flags override.
 		srcCfg.SlotName = cfg.CDC.SlotName
 		if cmd.Flags().Changed("slot") {

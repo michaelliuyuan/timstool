@@ -32,7 +32,7 @@ var validateCmd = &cobra.Command{
 		defer logger.Sync()
 
 		level, _ := cmd.Flags().GetString("level")
-			mode, _ := cmd.Flags().GetString("mode")
+		mode, _ := cmd.Flags().GetString("mode")
 		sampleRatio, _ := cmd.Flags().GetFloat64("sample-ratio")
 		tables, _ := cmd.Flags().GetStringSlice("tables")
 		reportFile, _ := cmd.Flags().GetString("report")
@@ -40,7 +40,7 @@ var validateCmd = &cobra.Command{
 		v := validator.NewValidator(*cfg)
 		rpt, err := v.Run(cmd.Context(), common.ValidateOpts{
 			Level:       level,
-				Mode:        mode,
+			Mode:        mode,
 			SampleRatio: sampleRatio,
 			Tables:      tables,
 			ReportFile:  reportFile,

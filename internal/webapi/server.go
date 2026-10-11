@@ -2,14 +2,18 @@ package webapi
 
 import (
 	"context"
-	"database/sql"
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -22,13 +26,18 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/common/logger"
 	"github.com/michaelliuyuan/timstool/internal/common/reporter"
+	"github.com/michaelliuyuan/timstool/internal/common/version"
+	"github.com/michaelliuyuan/timstool/internal/dumpling"
+	"github.com/michaelliuyuan/timstool/internal/lightning"
 	"github.com/michaelliuyuan/timstool/internal/orchestrator"
+	"github.com/michaelliuyuan/timstool/internal/source"
+	"github.com/michaelliuyuan/timstool/internal/source/mysql"
 	"github.com/michaelliuyuan/timstool/internal/store"
 	"go.uber.org/zap"
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: sameOriginCheck,
 }
 
 type Server struct {
@@ -49,47 +58,150 @@ type Server struct {
 	// supervise / restart / stop / adopt. nil when CDC control is not wired.
 	cdcSupervisor *CDCSupervisor
 
+	// cdcWatchdog revives the CDC child when it dies while desired (P1 #t5):
+	// adopted-child death, restart-cap exhaustion, and startup rebuild.
+	cdcWatchdog *cdcWatchdog
+
+	// cdcCfgFilePath is the config.yaml the CDC child loads (-c). Wired by
+	// cmd/web; falls back to the supervisor's copy (A1 connection card).
+	cdcCfgFilePath string
+
+	// cdcProbe overrides the live DB prober for /cdc/precheck (tests).
+	cdcProbe cdcDBProber
+
+	// cdcChainProbe overrides the publication/slot provisioner used by the
+	// 全量+增量衔接 chain (tests).
+	cdcChainProbe cdcChainProber
+
+	// replicaIdentityExec overrides the ALTER TABLE ... REPLICA IDENTITY FULL
+	// executor (tests).
+	replicaIdentityExec replicaIdentityExecutor
+
 	// running tasks
 	runningTasks map[string]context.CancelFunc
+
+	// taskRuns holds the generation token of the CURRENT run per task —
+	// the ownership check that keeps a superseded (resume-cancelled) run
+	// from clobbering the fresh run's status/log core (F-08).
+	taskRuns map[string]uint64
+	runSeq   uint64
+
+	// taskMu guards runningTasks, taskRuns and logCores: handler goroutines
+	// (start/resume/cancel) and per-task runMigration goroutines touch
+	// these maps concurrently — an unguarded map write is a fatal
+	// concurrent-map-write crash for the whole web process (F-08).
+	taskMu sync.Mutex
+
+	// standalone compare tasks (独立数据比对): single-run invariant + state
+	compare compareState
 
 	// log collection
 	logCollector *LogCollector
 	logCores     map[string]*TaskLogCore
+
+	// authToken is the STARTUP SNAPSHOT of config security.token (MS-11f
+	// 笔①): "" = fail-closed (all destructive CDC ops 403). Snapshot
+	// semantics — runtime config edits never affect the running gate.
+	authToken string
+
+	// audit trail (MS-11f 笔①): in-memory ring (backstop + anomaly-checker
+	// source) and the timestamp of the last SUCCESSFUL audited stop.
+	auditMu         sync.Mutex
+	auditRing       []auditEntry
+	lastStopAuditAt time.Time
+
+	// alarms is the anomaly-stop ring surfaced on /cdc/status .alarms.
+	alarmsMu sync.Mutex
+	alarms   []CDCAlarm
+
+	// cdcAnomaly watches for un-audited CDC stops (MS-11f 笔① c). nil when
+	// CDC control isn't wired (the checker needs the supervisor).
+	cdcAnomaly *cdcAnomalyChecker
+}
+
+// wsClient is one connected browser tab. Each client owns a dedicated
+// writer goroutine (writePump) so a slow or dead consumer can only stall
+// its own send buffer — never the hub's broadcast loop (F-08).
+type wsClient struct {
+	conn *websocket.Conn
+	send chan []byte
 }
 
 type Hub struct {
-	clients    map[*websocket.Conn]bool
+	clients    map[*wsClient]bool
 	broadcast  chan []byte
-	register   chan *websocket.Conn
-	unregister chan *websocket.Conn
+	register   chan *wsClient
+	unregister chan *wsClient
 }
 
 func newHub() *Hub {
 	return &Hub{
-		clients:    make(map[*websocket.Conn]bool),
+		clients:    make(map[*wsClient]bool),
 		broadcast:  make(chan []byte, 256),
-		register:   make(chan *websocket.Conn),
-		unregister: make(chan *websocket.Conn),
+		register:   make(chan *wsClient),
+		unregister: make(chan *wsClient),
 	}
 }
+
+// wsWriteTimeout bounds a single frame write; a consumer slower than this
+// is dropped instead of blocking the broadcast loop.
+const wsWriteTimeout = 10 * time.Second
+
+const wsSendBuffer = 64
 
 func (h *Hub) Run() {
 	for {
 		select {
-		case conn := <-h.register:
-			h.clients[conn] = true
-		case conn := <-h.unregister:
-			delete(h.clients, conn)
-			conn.Close()
+		case c := <-h.register:
+			h.clients[c] = true
+			go h.writePump(c)
+		case c := <-h.unregister:
+			delete(h.clients, c)
+			// Safe: the only sender to c.send is this same goroutine (the
+			// broadcast branch), and delete above already removed the
+			// client from future broadcasts — no send-on-closed race.
+			// Closing lets writePump drain and exit instead of leaking on
+			// idle disconnects (F-08).
+			close(c.send)
+			c.conn.Close()
 		case msg := <-h.broadcast:
-			for conn := range h.clients {
-				if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-					delete(h.clients, conn)
-					conn.Close()
+			for c := range h.clients {
+				// Non-blocking: a client whose buffer is full is skipped
+				// (progress broadcasts are periodic; losing one frame of
+				// a stalled consumer is fine, stalling everyone is not).
+				select {
+				case c.send <- msg:
+				default:
 				}
 			}
 		}
 	}
+}
+
+func (h *Hub) writePump(c *wsClient) {
+	for msg := range c.send {
+		_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			// conn dead or too slow: the read pump in handleWebSocket will
+			// unregister this client; just stop writing.
+			return
+		}
+	}
+}
+
+// sameOriginCheck rejects cross-origin WebSocket handshakes: a browser
+// page from another origin must not be able to subscribe to task logs
+// (F-08). Non-browser clients (no Origin header) are allowed.
+func sameOriginCheck(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return u.Host == r.Host
 }
 
 func NewServer(store *store.Store, host string, port int, dataDir string, staticFS embed.FS, cdcSupervisor *CDCSupervisor, cdcStatusFile string, cdcStale time.Duration) *Server {
@@ -102,6 +214,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		addr:          fmt.Sprintf("%s:%d", host, port),
 		hub:           newHub(),
 		runningTasks:  make(map[string]context.CancelFunc),
+		taskRuns:      make(map[string]uint64),
 		dataDir:       dataDir,
 		logCollector:  NewLogCollector(),
 		logCores:      make(map[string]*TaskLogCore),
@@ -113,55 +226,165 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 	// 领养监控 — detect via status file + PID, no zombie/duplicate).
 	if cdcSupervisor != nil {
 		cdcSupervisor.Adopt(cdcStatusFile, cdcStale, pidAlive)
+		// P1 watchdog (#t5): in-process liveness guard — revives adopted
+		// deaths, restart-cap failures, and rebuilds a CDC that died with
+		// the previous web process. 30s tick = revive backoff.
+		s.cdcWatchdog = newCDCWatchdog(cdcSupervisor, cdcStatusFile, cdcStale, 30*time.Second, pidAlive, zap.L())
+		go s.cdcWatchdog.Run()
+		// MS-11f 笔① c: anomaly-stop checker — running→stopped without a
+		// covering audit stop raises exactly one ERROR alarm. Independent
+		// of the watchdog on purpose: an API stop clears desired and the
+		// watchdog's !desired early-return would skip exactly that case.
+		s.cdcAnomaly = newCDCAnomalyChecker(s, 30*time.Second, zap.L())
+		go s.cdcAnomaly.run()
 	}
+
+	// Compare tasks: a persisted "running" state means the previous process
+	// died mid-run; fail them so the UI is not stuck (M3).
+	s.recoverStaleCompares()
+
+	// F-08-2 ride b: migration tasks left in "running" by a dead previous
+	// process are zombies — no goroutine owns them. Mark them failed with an
+	// interrupted message so the UI unsticks and resume stays available.
+	if n, err := s.store.FailAllRunning("服务重启导致任务中断（上个进程在运行中退出）；可从断点续传或重新开始"); err != nil {
+		zap.L().Warn("stale-running recovery failed", zap.Error(err))
+	} else if n > 0 {
+		zap.L().Info("recovered stale running tasks", zap.Int("count", n))
+	}
+
+	// F-02 (P2-6): remove crash-orphaned datasource temp files — they hold the
+	// full plaintext registry.
+	s.cleanupDataSourceTempFiles()
+	s.cleanupIncrementalTempFiles()
+	s.markInterruptedIncrementalRuns()
+	// FEAT-INC-LOGS: drop log archive dirs of deleted jobs (delete also
+	// removes its own dir inline; this catches crash-orphaned ones).
+	s.sweepIncrementalLogDirs()
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(60 * time.Second))
+	// F-10: the global 60s Timeout moved into /api/v1 groups below — a
+	// root-level middleware.Timeout would cap the long-running group at 60s
+	// regardless of its own 120s deadline (chi applies the min).
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Auth-Token"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
 
 	r.Route("/api/v1", func(r chi.Router) {
-		r.Get("/health", s.handleHealth)
-		r.Get("/features", s.handleFeatures)
-		// Multi-source config endpoints (#t67 WSC)
-		r.Get("/sources", s.handleSources)
-		r.Get("/sources/{type}/config-schema", s.handleSourceConfigSchema)
-		r.Post("/sources/{type}/test", s.handleSourceTest)
-		r.Post("/sources/tables", s.handleSourceTables)
-		r.Post("/sources/meta", s.handleSourceMeta)
-		r.Post("/test-connection", s.handleTestConnectionMulti)
-		r.Post("/config/test-connection", s.handleTestConnection)
-		r.Post("/config/list-tables", s.handleListTables)
-		r.Post("/tasks", s.handleCreateTask)
-		r.Post("/mongocompare/tasks", s.handleCreateCompareTask)
-		r.Get("/tasks", s.handleListTasks)
-		r.Route("/tasks/{taskID}", func(r chi.Router) {
-			r.Get("/", s.handleGetTask)
-			r.Post("/start", s.handleStartTask)
-			r.Post("/pause", s.handlePauseTask)
-			r.Post("/resume", s.handleResumeTask)
-			r.Post("/cancel", s.handleCancelTask)
-			r.Delete("/", s.handleDeleteTask)
-			r.Get("/progress", s.handleTaskProgress)
-			r.Get("/report", s.handleTaskReport)
-			r.Get("/logs", s.handleTaskLogs)
-			r.Get("/phases", s.handleTaskPhases)
+		// Default protection plane: 60s for every standard endpoint
+		// (preserves the pre-F-10 global timeout semantics).
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Timeout(60 * time.Second))
+			r.Get("/health", s.handleHealth)
+			r.Get("/features", s.handleFeatures)
+			// Multi-source config endpoints (#t67 WSC)
+			r.Get("/sources", s.handleSources)
+			r.Get("/sources/{type}/config-schema", s.handleSourceConfigSchema)
+			r.Post("/sources/{type}/test", s.handleSourceTest)
+			r.Post("/sources/tables", s.handleSourceTables)
+			// Hierarchical metadata browse (mongodb M1, MetaBrowser capability).
+			r.Post("/sources/meta", s.handleSourceMeta)
+			r.Post("/test-connection", s.handleTestConnectionMulti)
+			r.Post("/config/test-connection", s.handleTestConnection)
+			r.Post("/config/list-tables", s.handleListTables)
+			// Unified datasource registry (F-02): server-side named connection
+			// profiles; passwords are write-only (never echoed) and resolved
+			// server-side when tasks/compare/DDL/assess reference them by id.
+			r.Get("/datasources", s.handleListDataSources)
+			r.Post("/datasources", s.handleCreateDataSource)
+			r.Route("/datasources/{id}", func(r chi.Router) {
+				r.Put("/", s.handleUpdateDataSource)
+				r.Delete("/", s.handleDeleteDataSource)
+				r.Post("/test", s.handleTestDataSource)
+			})
+			r.Post("/validate-lightning", s.handleValidateLightning)
+			r.Post("/validate-dumpling", s.handleValidateDumpling)
+			// Migration options persistence (迁移选项记忆): server-side single
+			// source of truth so the wizard can prefill last-used Lightning path /
+			// temp dir across sessions, browsers, and service restarts.
+			r.Get("/migration-options", s.handleGetMigrationOptions)
+			r.Put("/migration-options", s.handlePutMigrationOptions)
+			r.Post("/tasks", s.handleCreateTask)
+			// MongoDB↔MongoDB consistency compare (M3): own task namespace,
+			// prefixed to stay clear of the /compare MySQL domain below.
+			r.Post("/mongocompare/tasks", s.handleCreateCompareTask)
+			r.Get("/tasks", s.handleListTasks)
+			r.Route("/tasks/{taskID}", func(r chi.Router) {
+				r.Get("/", s.handleGetTask)
+				r.Post("/start", s.handleStartTask)
+				r.Post("/pause", s.handlePauseTask)
+				r.Post("/resume", s.handleResumeTask)
+				r.Post("/cancel", s.handleCancelTask)
+				r.Delete("/", s.handleDeleteTask)
+				r.Get("/progress", s.handleTaskProgress)
+				r.Get("/report", s.handleTaskReport)
+				r.Get("/logs", s.handleTaskLogs)
+				r.Get("/phases", s.handleTaskPhases)
+			})
+			r.Get("/ws", s.handleWebSocket)
+			// Source DDL export (F-01): schema listing + zip download
+			// Standalone comparison (独立数据比对): run the validator against
+			// explicit connections without migrating; own task namespace.
+			r.Post("/compare/tasks", s.handleCreateCompare)
+			r.Get("/compare/options", s.handleGetCompareOptions)
+			r.Put("/compare/options", s.handlePutCompareOptions)
+			r.Get("/compare/tasks", s.handleListCompares)
+			r.Route("/compare/tasks/{compareID}", func(r chi.Router) {
+				r.Get("/", s.handleGetCompare)
+				r.Get("/report", s.handleCompareReport)
+				r.Post("/cancel", s.handleCancelCompare)
+				r.Delete("/", s.handleDeleteCompare)
+			})
+			// CDC endpoints (#t48 B: read CDC process status file). The six
+			// destructive routes go through the MS-11f token gate (snapshot
+			// of security.token; fail-closed 403 when unset, 401 on a
+			// missing/wrong token); reads stay open per the ticket.
+			r.Get("/cdc/status", s.handleCDCStatus)
+			r.Get("/cdc/stats", s.handleCDCStats)
+			r.Get("/cdc/checkpoint", s.handleCDCCheckpoint)
+			r.Post("/cdc/start", s.requireCDCOpToken("cdc.start", s.handleCDCStart))
+			r.Post("/cdc/stop", s.requireCDCOpToken("cdc.stop", s.handleCDCStop))
+			// CDC connection config + precheck + resume inspection (A1/A2/A3)
+			r.Get("/cdc/config", s.handleGetCDCConfig)
+			r.Put("/cdc/config", s.requireCDCOpToken("cdc.config.put", s.handlePutCDCConfig))
+			r.Post("/cdc/config/import", s.requireCDCOpToken("cdc.config.import", s.handleImportCDCConfig))
+			r.Post("/cdc/config/import-from-datasource", s.requireCDCOpToken("cdc.config.import_from_datasource", s.handleImportCDCFromDataSource))
+			r.Get("/cdc/slot", s.handleCDCSlot)
+			r.Post("/cdc/checkpoint/reset", s.requireCDCOpToken("cdc.checkpoint.reset", s.handleCDCResetCheckpoint))
+			// Timestamp-watermark incremental sync (F-04): pull-based table
+			// granularity jobs, manual trigger only, PostgreSQL sources only.
+			r.Get("/incremental/jobs", s.handleListIncrementalJobs)
+			r.Post("/incremental/jobs", s.handleCreateIncrementalJob)
+			r.Route("/incremental/jobs/{id}", func(r chi.Router) {
+				r.Put("/", s.handleUpdateIncrementalJob)
+				r.Delete("/", s.handleDeleteIncrementalJob)
+				r.Post("/run", s.handleRunIncrementalJob)
+				r.Get("/runs/{run_id}/logs", s.handleIncrementalRunLogs)
+			})
+			r.Get("/sources/tables/{table}/columns", s.handleIncrementalColumns)
+			// #t1 batch column listing: one source connection for the
+			// multi-table binding flow (single-conn fan-out, capped at 200).
+			r.Post("/incremental/columns-batch", s.handleIncrementalColumnsBatch)
+			r.Post("/incremental/suggest-watermark", s.handleSuggestWatermark)
 		})
-		r.Get("/ws", s.handleWebSocket)
-		r.Post("/assess", s.handleAssess)
-		// CDC endpoints (#t48 B: read CDC process status file)
-		r.Get("/cdc/status", s.handleCDCStatus)
-		r.Get("/cdc/stats", s.handleCDCStats)
-		r.Get("/cdc/checkpoint", s.handleCDCCheckpoint)
-		r.Post("/cdc/start", s.handleCDCStart)
-		r.Post("/cdc/stop", s.handleCDCStop)
+
+		// F-10 long-running endpoints: 120s deadline, three-layer aligned —
+		// handler ctx deadline = http.Server WriteTimeout (120s) = frontend
+		// LONG_TIMEOUT (120s). Anything genuinely slower needs the job/poll
+		// pattern (backlog).
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.Timeout(120 * time.Second))
+			r.Post("/assess", s.handleAssess)
+			r.Post("/ddl-export/schemas", s.handleDDLSchemas)
+			r.Post("/ddl-export", s.handleDDLExport)
+			r.Get("/cdc/precheck", s.handleCDCPrecheck)
+			r.Post("/cdc/replica-identity", s.requireCDCOpToken("cdc.replica_identity", s.handleCDCReplicaIdentity))
+		})
 	})
 
 	if staticFS != (embed.FS{}) {
@@ -252,14 +475,17 @@ func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request) {
 }
 
 type TestConnectionRequest struct {
-	Type     string `json:"type"` // "source" or "target"
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	User     string `json:"user"`
-	Password string `json:"password"`
-	Database string `json:"database"`
-	Schema   string `json:"schema,omitempty"`
-	SSLMode  string `json:"sslmode,omitempty"`
+	Type       string `json:"type"` // "source" or "target"
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	User       string `json:"user"`
+	Password   string `json:"password"`
+	Database   string `json:"database"`
+	Schema     string `json:"schema,omitempty"`
+	SSLMode    string `json:"sslmode,omitempty"`
+	PDAddr     string `json:"pd_addr,omitempty"`
+	StatusPort int    `json:"status_port,omitempty"`
+	SourceRef  string `json:"source_ref,omitempty"` // F-02: list-tables by datasource id
 }
 
 func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
@@ -269,10 +495,33 @@ func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// P2-5: honor the documented source_ref — resolve the stored profile
+	// server-side so the password never travels to the browser.
+	var refType string
+	if req.SourceRef != "" {
+		e, err := s.resolveDataSourceRef(req.SourceRef)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+			return
+		}
+		sc := dataSourceToSourceConfig(e)
+		req.Host = sc.Host
+		req.Port = sc.Port
+		req.User = sc.User
+		req.Password = sc.Password
+		req.Database = sc.Database
+		req.Schema = sc.Schema
+		req.SSLMode = sc.SSLMode
+		// MS-09: this endpoint is pure connectivity — a source_ref of any
+		// capable kind is dispatched on its type (inline bodies carry no
+		// type and keep the legacy PG-only semantics).
+		refType = sc.Type
+	}
+
 	var result map[string]interface{}
 	switch req.Type {
 	case "source":
-		result = s.testPGConnection(r.Context(), &req)
+		result = s.testPGConnection(r.Context(), &req, refType)
 	case "target":
 		result = s.testTiDBConnection(r.Context(), &req)
 	default:
@@ -282,8 +531,13 @@ func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, result)
 }
 
-func (s *Server) testPGConnection(ctx context.Context, req *TestConnectionRequest) map[string]interface{} {
+// testPGConnection tests a SOURCE connection. refType threads the resolved
+// datasource ref's type (MS-09): inline bodies pass "" and keep the legacy
+// PG-only endpoint semantics; a ref dispatches on its real type via
+// openSourceTestConn.
+func (s *Server) testPGConnection(ctx context.Context, req *TestConnectionRequest, refType string) map[string]interface{} {
 	cfg := config.SourceConfig{
+		Type:     refType,
 		Host:     req.Host,
 		Port:     req.Port,
 		User:     req.User,
@@ -300,8 +554,7 @@ func (s *Server) testPGConnection(ctx context.Context, req *TestConnectionReques
 	}
 
 	start := time.Now()
-	dsn := cfg.DSN()
-	pgConn, err := openPGTestConn(dsn)
+	pgConn, err := openSourceTestConn(cfg)
 	elapsed := time.Since(start)
 
 	result := map[string]interface{}{
@@ -319,20 +572,23 @@ func (s *Server) testPGConnection(ctx context.Context, req *TestConnectionReques
 	}
 	defer pgConn.Close()
 
-	var version string
-	pgConn.QueryRowContext(ctx, "SELECT version()").Scan(&version)
+	var versionRaw string
+	pgConn.QueryRowContext(ctx, "SELECT version()").Scan(&versionRaw)
 	result["ok"] = true
-	result["version"] = version
+	// S1-UI-07: compact form for the UI — the raw string carries build details.
+	result["version"] = version.ShortPostgreSQL(versionRaw)
 	return result
 }
 
 func (s *Server) testTiDBConnection(ctx context.Context, req *TestConnectionRequest) map[string]interface{} {
 	cfg := config.TargetConfig{
-		Host:     req.Host,
-		Port:     req.Port,
-		User:     req.User,
-		Password: req.Password,
-		Database: req.Database,
+		Host:       req.Host,
+		Port:       req.Port,
+		User:       req.User,
+		Password:   req.Password,
+		Database:   req.Database,
+		PDAddr:     req.PDAddr,
+		StatusPort: req.StatusPort,
 	}
 
 	start := time.Now()
@@ -345,6 +601,7 @@ func (s *Server) testTiDBConnection(ctx context.Context, req *TestConnectionRequ
 		"port":     cfg.Port,
 		"database": cfg.Database,
 		"elapsed":  elapsed.String(),
+		"mysql_ok": false, // explicit: the field is always present in the response
 	}
 
 	if err != nil {
@@ -354,11 +611,149 @@ func (s *Server) testTiDBConnection(ctx context.Context, req *TestConnectionRequ
 	}
 	defer mysqlConn.Close()
 
-	var version string
-	mysqlConn.QueryRowContext(ctx, "SELECT tidb_version()").Scan(&version)
-	result["ok"] = true
-	result["version"] = version
+	var versionRaw string
+	mysqlConn.QueryRowContext(ctx, "SELECT tidb_version()").Scan(&versionRaw)
+	result["mysql_ok"] = true
+	// PD / Status probes: only when the user provided the values — providing
+	// them signals Lightning import, so a wrong value must fail the test HERE
+	// (at config time) instead of surfacing at import time as
+	// "[pd] failed to get cluster id". Probes run in parallel, 3s cap each.
+	pd, st := s.probeTargetExtras(ctx, req.Host, req.PDAddr, req.StatusPort)
+	if pd.provided {
+		if pd.ok {
+			result["pd_ok"] = true
+			if pd.clusterID != "" {
+				result["pd_cluster_id"] = pd.clusterID
+			}
+		} else {
+			result["pd_ok"] = false
+			result["pd_error"] = pd.errMsg
+		}
+	}
+	if st.provided {
+		if st.ok {
+			result["status_ok"] = true
+		} else {
+			result["status_ok"] = false
+			result["status_error"] = st.errMsg
+		}
+	}
+
+	// Aggregate: MySQL ok + (provided ⇒ probe ok) for each of PD/Status.
+	ok := true
+	var reasons []string
+	if pd.provided && !pd.ok {
+		ok = false
+		reasons = append(reasons, "PD 探活失败："+pd.errMsg)
+	}
+	if st.provided && !st.ok {
+		ok = false
+		reasons = append(reasons, "Status 端口探活失败："+st.errMsg)
+	}
+	result["ok"] = ok
+	if len(reasons) > 0 {
+		result["error"] = strings.Join(reasons, "；")
+	}
+	// S1-UI-07: compact form for the UI — tidb_version() is a 15+ line blob.
+	result["version"] = version.ShortTiDB(versionRaw)
 	return result
+}
+
+// probeOutcome describes one optional PD/Status probe result.
+type probeOutcome struct {
+	provided  bool
+	ok        bool
+	errMsg    string
+	clusterID string
+}
+
+// probeTargetExtras runs the optional PD and TiDB-status probes in parallel
+// (3s cap each) for the target connection test. Extracted from
+// testTiDBConnection so the aggregation semantics are unit-testable without a
+// live MySQL target.
+func (s *Server) probeTargetExtras(ctx context.Context, host, pdAddr string, statusPort int) (pd, st probeOutcome) {
+	var wg sync.WaitGroup
+	if pdAddr != "" {
+		pd.provided = true
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cid, perr := probePD(ctx, pdAddr)
+			pd.ok = perr == nil
+			pd.clusterID = cid
+			if perr != nil {
+				pd.errMsg = perr.Error()
+			}
+		}()
+	}
+	if statusPort > 0 {
+		st.provided = true
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			serr := probeTiDBStatus(ctx, host, statusPort)
+			st.ok = serr == nil
+			if serr != nil {
+				st.errMsg = serr.Error()
+			}
+		}()
+	}
+	wg.Wait()
+	return pd, st
+}
+
+// probePD checks PD reachability via its HTTP API and returns the cluster id
+// so the user can confirm they pointed at the right cluster.
+func probePD(ctx context.Context, pdAddr string) (string, error) {
+	// Tolerate user input like "http://host:2379/" or "host:2379/": strip any
+	// scheme and trailing slashes so the http:// prefix below is never doubled
+	// and the path stays exact.
+	pdAddr = strings.TrimRight(pdAddr, "/")
+	if i := strings.Index(pdAddr, "://"); i >= 0 {
+		pdAddr = pdAddr[i+3:]
+		pdAddr = strings.TrimRight(pdAddr, "/")
+	}
+	if pdAddr == "" {
+		return "", fmt.Errorf("PD 地址为空")
+	}
+	c := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+pdAddr+"/pd/api/v1/cluster", nil)
+	if err != nil {
+		return "", fmt.Errorf("构造 PD 请求失败: %w", err)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("%w（确认 PD 地址 host:port 正确，经代理时填真实 PD 端口而非 SQL 端口）", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 399 {
+		return "", fmt.Errorf("PD 返回 HTTP %d", resp.StatusCode)
+	}
+	var body struct {
+		ClusterID uint64 `json:"cluster_id"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&body) == nil && body.ClusterID != 0 {
+		return fmt.Sprintf("%d", body.ClusterID), nil
+	}
+	return "", nil // reachable; older PD may not return the field
+}
+
+// probeTiDBStatus checks the TiDB status port (default 10080) via /status.
+func probeTiDBStatus(ctx context.Context, host string, port int) error {
+	c := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s:%d/status", host, port), nil)
+	if err != nil {
+		return fmt.Errorf("构造 Status 请求失败: %w", err)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w（确认 Status 端口正确，默认 10080，本环境可能为 10081）", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 399 {
+		return fmt.Errorf("Status 返回 HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
@@ -372,7 +767,30 @@ func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// F-02: a source_ref resolves the request's inline fields server-side so
+	// the table-selection step works without credentials in the browser.
+	var refType string
+	if req.SourceRef != "" {
+		e, err := s.resolveDataSourceRef(req.SourceRef)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+			return
+		}
+		if e.Type != "postgres" {
+			s.writeError(w, http.StatusBadRequest, "source_ref: 该端点仅支持 PostgreSQL 数据源")
+			return
+		}
+		sc := dataSourceToSourceConfig(e)
+		req.Host, req.Port = sc.Host, sc.Port
+		req.User, req.Password, req.Database, req.Schema, req.SSLMode =
+			sc.User, sc.Password, sc.Database, sc.Schema, sc.SSLMode
+		// MS-09 deep-defense: thread the resolved entry's type so the
+		// connection layer dispatch is real, not silently PG.
+		refType = sc.Type
+	}
+
 	cfg := config.SourceConfig{
+		Type:     refType,
 		Host:     req.Host,
 		Port:     req.Port,
 		User:     req.User,
@@ -388,7 +806,7 @@ func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 		cfg.SSLMode = "disable"
 	}
 
-	pgConn, err := openPGTestConn(cfg.DSN())
+	pgConn, err := openSourceTestConn(cfg)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "connect failed: "+err.Error())
 		return
@@ -429,10 +847,40 @@ func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 }
 
 type CreateTaskRequest struct {
-	Name   string              `json:"name"`
-	Source config.SourceConfig `json:"source"`
-	Target config.TargetConfig `json:"target"`
-	Opts   MigrationOptsBody   `json:"opts"`
+	Name      string              `json:"name"`
+	Source    config.SourceConfig `json:"source"`
+	Target    config.TargetConfig `json:"target"`
+	Opts      MigrationOptsBody   `json:"opts"`
+	SourceRef string              `json:"source_ref"` // datasource id (F-02): server resolves + snapshots
+	TargetRef string              `json:"target_ref"` // datasource id (must be type=tidb)
+}
+
+// resolveTaskRefs resolves sourceRef/targetRef into the request's connection
+// configs (snapshot at creation: later datasource edits/deletes never affect
+// the created task). A set ref takes precedence over inline fields — the
+// frontend sends refs instead of credentials, never both.
+func (s *Server) resolveTaskRefs(req *CreateTaskRequest) error {
+	if req.SourceRef != "" {
+		e, err := s.resolveDataSourceRef(req.SourceRef)
+		if err != nil {
+			return fmt.Errorf("source_ref: %w", err)
+		}
+		if e.Type == "tidb" {
+			return fmt.Errorf("source_ref: tidb 数据源不能用作迁移源端")
+		}
+		req.Source = dataSourceToSourceConfig(e)
+	}
+	if req.TargetRef != "" {
+		e, err := s.resolveDataSourceRef(req.TargetRef)
+		if err != nil {
+			return fmt.Errorf("target_ref: %w", err)
+		}
+		if e.Type != "tidb" {
+			return fmt.Errorf("target_ref: 目标端数据源类型必须是 tidb")
+		}
+		req.Target = dataSourceToTargetConfig(e)
+	}
+	return nil
 }
 
 type MigrationOptsBody struct {
@@ -442,15 +890,405 @@ type MigrationOptsBody struct {
 	Tables            []string `json:"tables"`
 	ExcludeTables     []string `json:"exclude_tables"`
 	UseLightning      bool     `json:"use_lightning"`
+	LightningPath     string   `json:"lightning_path"`
+	UseDumpling       bool     `json:"use_dumpling"`
+	DumplingPath      string   `json:"dumpling_path"`
 	SkipPrecheck      bool     `json:"skip_precheck"`
 	SkipSchema        bool     `json:"skip_schema"`
 	SkipData          bool     `json:"skip_data"`
 	SkipValidate      bool     `json:"skip_validate"`
+	CDCChain          bool     `json:"cdc_chain"`
 	TargetPolicy      string   `json:"target_policy"`
 	CompareMode       string   `json:"compare_mode"`
 	SampleRatio       float64  `json:"sample_ratio"`
 	ChecksumChunkSize int64    `json:"checksum_chunk_size"`
 	ChecksumParallel  int      `json:"checksum_parallel"`
+}
+
+// validateLightningRequest is the body for POST /api/validate-lightning.
+// Lightning path gate for the web wizard: an empty path probes auto-discovery
+// (PATH → embedded), a non-empty path must exist, be a regular file, and be
+// executable (x-bit checked on unix; the deployment target is Linux — on
+// Windows dev machines the x-bit is meaningless, so only existence applies).
+type validateLightningRequest struct {
+	Path string `json:"path"`
+}
+
+type validateLightningResponse struct {
+	Success      bool   `json:"success"`
+	Message      string `json:"message"`
+	ResolvedPath string `json:"resolved_path"`
+	Version      string `json:"version,omitempty"`
+}
+
+// webapiFindLightning / webapiLightningVersion are the validate-lightning
+// handler seams (MS-11q): unit anchors fake discovery and the version probe
+// without a real tidb-lightning on the machine.
+var (
+	webapiFindLightning    = lightning.FindBinary
+	webapiLightningVersion = lightning.Version
+)
+
+func (s *Server) handleValidateLightning(w http.ResponseWriter, r *http.Request) {
+	var req validateLightningRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	path := strings.TrimSpace(req.Path)
+	if path == "" {
+		resolved := webapiFindLightning(s.dataDir)
+		if resolved == "" {
+			s.writeJSON(w, http.StatusOK, validateLightningResponse{
+				Success: false,
+				Message: "未配置 lightning 路径，且自动发现失败：PATH 中无 tidb-lightning，内嵌二进制不可用",
+			})
+			return
+		}
+		path = resolved
+	} else {
+		fi, err := os.Stat(path)
+		if err != nil {
+			s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: fmt.Sprintf("路径不存在：%s", path)})
+			return
+		}
+		if fi.IsDir() {
+			s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: "路径是目录，需要指向 tidb-lightning 可执行文件"})
+			return
+		}
+		if runtime.GOOS != "windows" && fi.Mode()&0111 == 0 {
+			s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: "文件存在但没有执行权限（需要 x 位，Linux 上 chmod +x）"})
+			return
+		}
+	}
+
+	// Live probe (探真, MS-11q — mirrors dumpling): the version string is the
+	// evidence the binary truly runs — a broken ELF or wrong-arch download
+	// fails HERE, not mid-migration.
+	ver, err := webapiLightningVersion(r.Context(), path)
+	if err != nil {
+		msg := fmt.Sprintf("tidb-lightning 路径校验通过但 -V 探真失败：%v", err)
+		if ver != "" {
+			msg += fmt.Sprintf("（输出：%s）", ver)
+		}
+		s.writeJSON(w, http.StatusOK, validateLightningResponse{Success: false, Message: msg, ResolvedPath: path})
+		return
+	}
+	auto := ""
+	if strings.TrimSpace(req.Path) == "" {
+		auto = "（自动发现）"
+	}
+	s.writeJSON(w, http.StatusOK, validateLightningResponse{
+		Success:      true,
+		Message:      fmt.Sprintf("tidb-lightning 验证通过%s：%s", auto, ver),
+		ResolvedPath: path,
+		Version:      ver,
+	})
+}
+
+// webapiFindDumpling / webapiDumplingVersion are the validate-dumpling
+// handler seams (MS-11p): unit anchors fake discovery and the version probe
+// without a real tidb-dumpling on the machine.
+var (
+	webapiFindDumpling    = dumpling.FindBinary
+	webapiDumplingVersion = dumpling.Version
+)
+
+// validateDumplingRequest is the body for POST /api/validate-dumpling.
+// Mirror of the Lightning path gate with the MS-11p enhancement: an empty
+// path probes auto-discovery (PATH → common locations), a non-empty path
+// must exist, be a regular file, and (on unix) carry the x-bit. Passing
+// that, the handler runs `<path> --version` (5s timeout) and returns the
+// REAL version string — dumpling has no embedded fallback, so the live
+// probe is the only honest evidence the binary executes on this machine.
+type validateDumplingRequest struct {
+	Path string `json:"path"`
+}
+
+type validateDumplingResponse struct {
+	Success      bool   `json:"success"`
+	Message      string `json:"message"`
+	ResolvedPath string `json:"resolved_path"`
+	Version      string `json:"version,omitempty"`
+}
+
+func (s *Server) handleValidateDumpling(w http.ResponseWriter, r *http.Request) {
+	var req validateDumplingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	path := strings.TrimSpace(req.Path)
+	if path == "" {
+		resolved := webapiFindDumpling("")
+		if resolved == "" {
+			s.writeJSON(w, http.StatusOK, validateDumplingResponse{
+				Success: false,
+				Message: "未配置 dumpling 路径，且自动发现失败：PATH 中无 tidb-dumpling/dumpling，常见部署位也无",
+			})
+			return
+		}
+		path = resolved
+	} else {
+		fi, err := os.Stat(path)
+		if err != nil {
+			s.writeJSON(w, http.StatusOK, validateDumplingResponse{Success: false, Message: fmt.Sprintf("路径不存在：%s", path)})
+			return
+		}
+		if fi.IsDir() {
+			s.writeJSON(w, http.StatusOK, validateDumplingResponse{Success: false, Message: "路径是目录，需要指向 tidb-dumpling 可执行文件"})
+			return
+		}
+		if runtime.GOOS != "windows" && fi.Mode()&0111 == 0 {
+			s.writeJSON(w, http.StatusOK, validateDumplingResponse{Success: false, Message: "文件存在但没有执行权限（需要 x 位，Linux 上 chmod +x）"})
+			return
+		}
+	}
+
+	// Live probe (探真): the version string is the evidence the binary
+	// truly runs — a broken ELF or wrong-arch download fails HERE, not
+	// mid-migration.
+	ver, err := webapiDumplingVersion(r.Context(), path)
+	if err != nil {
+		msg := fmt.Sprintf("tidb-dumpling 路径校验通过但 --version 探真失败：%v", err)
+		if ver != "" {
+			msg += fmt.Sprintf("（输出：%s）", ver)
+		}
+		s.writeJSON(w, http.StatusOK, validateDumplingResponse{Success: false, Message: msg, ResolvedPath: path})
+		return
+	}
+	auto := ""
+	if strings.TrimSpace(req.Path) == "" {
+		auto = "（自动发现）"
+	}
+	s.writeJSON(w, http.StatusOK, validateDumplingResponse{
+		Success:      true,
+		Message:      fmt.Sprintf("tidb-dumpling 验证通过%s：%s", auto, ver),
+		ResolvedPath: path,
+		Version:      ver,
+	})
+}
+
+// migrationOptionsBody is the persisted shape of the wizard's migration
+// options step (temp_dir / use_lightning / lightning_path, plus the
+// target-cluster-only extras pd_addr / status_port — host/port/user/
+// password stay per-task and are never persisted).
+type migrationOptionsBody struct {
+	TempDir       string `json:"temp_dir"`
+	UseLightning  bool   `json:"use_lightning"`
+	LightningPath string `json:"lightning_path"`
+	UseDumpling   bool   `json:"use_dumpling"`
+	DumplingPath  string `json:"dumpling_path"`
+	PDAddr        string `json:"pd_addr,omitempty"`
+	StatusPort    int    `json:"status_port,omitempty"`
+}
+
+func (s *Server) migrationOptionsFile() string {
+	return filepath.Join(s.dataDir, "migration-options.json")
+}
+
+func (s *Server) handleGetMigrationOptions(w http.ResponseWriter, r *http.Request) {
+	raw, err := os.ReadFile(s.migrationOptionsFile())
+	if err != nil {
+		// No saved options yet: return empty values; the frontend keeps its
+		// defaults (temp_dir=/tmp/timstool, lightning off).
+		s.writeJSON(w, http.StatusOK, migrationOptionsBody{})
+		return
+	}
+	var opts migrationOptionsBody
+	if err := json.Unmarshal(raw, &opts); err != nil {
+		// Corrupted persistence file: log it, fall back to defaults rather
+		// than breaking the wizard (the next successful PUT rewrites it).
+		zap.L().Warn("migration-options.json corrupted, ignoring saved options",
+			zap.String("file", s.migrationOptionsFile()), zap.Error(err))
+		s.writeJSON(w, http.StatusOK, migrationOptionsBody{})
+		return
+	}
+	s.writeJSON(w, http.StatusOK, opts)
+}
+
+func (s *Server) handlePutMigrationOptions(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	var req migrationOptionsBody
+	if err := json.Unmarshal(raw, &req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// R1 merge semantics: PUT is a partial update, not a whole-object
+	// replace. Fields explicitly present in the body override the saved
+	// values; fields absent from the body keep their saved values (so a
+	// client sending only pd_addr cannot wipe the temp_dir/lightning memory).
+	var presence map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &presence); err != nil {
+		presence = nil
+	}
+
+	// Normalize once, then validate and persist the SAME trimmed values, so a
+	// whitespace-only temp_dir cannot slip past validation and be stored raw.
+	req.TempDir = strings.TrimSpace(req.TempDir)
+	req.LightningPath = strings.TrimSpace(req.LightningPath)
+	req.DumplingPath = strings.TrimSpace(req.DumplingPath)
+	// Empty pd_addr means "clear the remembered address"; status_port must be
+	// a valid port number (0 = not provided / skip probing).
+	// A1: strip an optional scheme prefix and trailing slash so the stored
+	// value matches what probePD accepts and the lightning toml consumes.
+	req.PDAddr = normalizePDAddr(req.PDAddr)
+	if req.StatusPort < 0 || req.StatusPort > 65535 {
+		s.writeError(w, http.StatusBadRequest, "status_port 必须在 0-65535 之间（0 表示不探测）")
+		return
+	}
+
+	// Validate before persisting: temp_dir must be creatable; an explicit
+	// lightning path must exist, be a regular file and (on Linux) executable.
+	// An empty lightning path is allowed and means auto-discovery at run time.
+	// UNC paths (\\server\share) are rejected: this is a local tool and temp
+	// dirs on remote shares are neither intended nor tested.
+	if req.TempDir != "" {
+		if strings.HasPrefix(req.TempDir, `\\`) || strings.HasPrefix(req.TempDir, "//") {
+			s.writeError(w, http.StatusBadRequest, "临时目录不支持 UNC/网络共享路径，请使用本地目录")
+			return
+		}
+		if err := os.MkdirAll(req.TempDir, 0o755); err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("临时目录不可用：%v", err))
+			return
+		}
+	}
+	if req.UseLightning && req.LightningPath != "" {
+		fi, err := os.Stat(req.LightningPath)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("lightning 路径不存在：%s", req.LightningPath))
+			return
+		}
+		if fi.IsDir() {
+			s.writeError(w, http.StatusBadRequest, "lightning 路径是目录，需要指向 tidb-lightning 可执行文件")
+			return
+		}
+		if runtime.GOOS != "windows" && fi.Mode()&0111 == 0 {
+			s.writeError(w, http.StatusBadRequest, "lightning 文件存在但没有执行权限（需要 x 位，Linux 上 chmod +x）")
+			return
+		}
+	}
+	// MS-11p: same gate shape for the dumpling export-side path — an
+	// explicit path saved with the switch on must exist and be usable, so a
+	// broken path cannot be persisted into a task that would then fail at
+	// run time (semantics A: fail EARLY, at save time, with a 400).
+	if req.UseDumpling && req.DumplingPath != "" {
+		fi, err := os.Stat(req.DumplingPath)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("dumpling 路径不存在：%s", req.DumplingPath))
+			return
+		}
+		if fi.IsDir() {
+			s.writeError(w, http.StatusBadRequest, "dumpling 路径是目录，需要指向 tidb-dumpling 可执行文件")
+			return
+		}
+		if runtime.GOOS != "windows" && fi.Mode()&0111 == 0 {
+			s.writeError(w, http.StatusBadRequest, "dumpling 文件存在但没有执行权限（需要 x 位，Linux 上 chmod +x）")
+			return
+		}
+	}
+
+	// Merge with the previously saved options: only fields explicitly present
+	// in the request body are applied; absent fields keep their saved values.
+	merged := s.loadMigrationOptions()
+	if _, ok := presence["temp_dir"]; ok {
+		merged.TempDir = req.TempDir
+	}
+	if _, ok := presence["use_lightning"]; ok {
+		merged.UseLightning = req.UseLightning
+	}
+	if _, ok := presence["lightning_path"]; ok {
+		merged.LightningPath = req.LightningPath
+	}
+	if _, ok := presence["use_dumpling"]; ok {
+		merged.UseDumpling = req.UseDumpling
+	}
+	if _, ok := presence["dumpling_path"]; ok {
+		merged.DumplingPath = req.DumplingPath
+	}
+	if _, ok := presence["pd_addr"]; ok {
+		merged.PDAddr = req.PDAddr
+	}
+	if _, ok := presence["status_port"]; ok {
+		merged.StatusPort = req.StatusPort
+	}
+
+	if err := s.writeMigrationOptions(&merged); err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("保存失败：%v", err))
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+}
+
+// loadMigrationOptions returns the currently persisted options, or the zero
+// value when nothing has been saved yet (or the file is corrupted — the next
+// successful PUT rewrites it).
+func (s *Server) loadMigrationOptions() migrationOptionsBody {
+	raw, err := os.ReadFile(s.migrationOptionsFile())
+	if err != nil {
+		return migrationOptionsBody{}
+	}
+	var opts migrationOptionsBody
+	if err := json.Unmarshal(raw, &opts); err != nil {
+		return migrationOptionsBody{}
+	}
+	return opts
+}
+
+// normalizePDAddr strips an optional URL scheme and trailing slash so a
+// remembered pd_addr is stored in the same form probePD accepts and the
+// lightning toml consumes (e.g. "http://host:2389/" → "host:2389").
+func normalizePDAddr(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if i := strings.Index(addr, "://"); i >= 0 {
+		addr = addr[i+3:]
+	}
+	return strings.TrimRight(addr, "/")
+}
+
+// writeMigrationOptions persists the options atomically (write temp file in
+// dataDir, then rename over the target) so a crash mid-write can never leave a
+// truncated JSON behind, and logs corruption instead of failing silently.
+func (s *Server) writeMigrationOptions(opts *migrationOptionsBody) error {
+	if err := os.MkdirAll(s.dataDir, 0o755); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
+	raw, err := json.MarshalIndent(opts, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(s.dataDir, "migration-options-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(raw); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, s.migrationOptionsFile()); err != nil {
+		// Rename can fail (e.g. target locked on Windows); clean up the temp
+		// file so failed saves never accumulate .tmp leftovers.
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
@@ -460,12 +1298,34 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.resolveTaskRefs(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	if req.Source.Host == "" || req.Target.Host == "" {
 		s.writeError(w, http.StatusBadRequest, "source and target host are required")
 		return
 	}
 	if req.Name == "" {
 		req.Name = fmt.Sprintf("Migration %s", time.Now().Format("2006-01-02 15:04:05"))
+	}
+
+	// BUG-0930: reject contradictory table sets at creation — a table in
+	// both the include list and the exclude list is always a misconfig
+	// (data-side include wins but schema DDL is excluded → mid-run failure).
+	if len(req.Opts.Tables) > 0 && len(req.Opts.ExcludeTables) > 0 {
+		exSet := make(map[string]struct{}, len(req.Opts.ExcludeTables))
+		for _, t := range req.Opts.ExcludeTables {
+			exSet[t] = struct{}{}
+		}
+		for _, t := range req.Opts.Tables {
+			if _, ok := exSet[t]; ok {
+				s.writeError(w, http.StatusBadRequest,
+					fmt.Sprintf("tables 与 exclude_tables 存在交集（表 %s 同时被勾选和排除），请修正后重试", t))
+				return
+			}
+		}
 	}
 
 	task := &store.Task{
@@ -482,6 +1342,9 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 			Tables:        req.Opts.Tables,
 			ExcludeTables: req.Opts.ExcludeTables,
 			UseLightning:  req.Opts.UseLightning,
+			LightningPath: req.Opts.LightningPath,
+			UseDumpling:   req.Opts.UseDumpling,
+			DumplingPath:  req.Opts.DumplingPath,
 			TempDir:       req.Opts.TempDir,
 			CheckpointDir: fmt.Sprintf(".checkpoint/%s", task.ID),
 			OnError:       "abort",
@@ -490,6 +1353,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 			SkipSchema:    req.Opts.SkipSchema,
 			SkipData:      req.Opts.SkipData,
 			SkipValidate:  req.Opts.SkipValidate,
+			CDCChain:      req.Opts.CDCChain,
 		},
 		Logging: config.LoggingConfig{Level: "info", Format: "console"},
 		Compare: config.CompareConfig{
@@ -504,6 +1368,23 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if cfg.Migration.BatchSize <= 0 {
 		cfg.Migration.BatchSize = 100000
+	}
+	// F-08-2 ride d: reject out-of-range tuning knobs at task creation with
+	// an actionable message (unit confusion / typo would degrade the source).
+	if cfg.Migration.Parallel > config.MaxParallel {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("parallel 必须在 1-%d 之间（当前 %d）", config.MaxParallel, cfg.Migration.Parallel))
+		return
+	}
+	if cfg.Migration.BatchSize > config.MaxBatchSize {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("batch_size 必须在 1-%d 之间（当前 %d）", config.MaxBatchSize, cfg.Migration.BatchSize))
+		return
+	}
+	// F-12: shape defense — the migration compare knobs (cfg.Compare) fed the
+	// PG-pipeline validate (runValidate) with the same unclamped ratio; gate
+	// here too, aligned with the compare create path and PUT options.
+	if req.Opts.SampleRatio < 0 || req.Opts.SampleRatio > 1 {
+		s.writeError(w, http.StatusBadRequest, "sample_ratio must be within [0,1]")
+		return
 	}
 	if cfg.Migration.TempDir == "" {
 		cfg.Migration.TempDir = "/tmp/timstool"
@@ -594,11 +1475,74 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning); err != nil {
+	// 全量+增量衔接 (P1): provision the CDC start point BEFORE the migration
+	// starts so the migration window's changes are retained (PG: publication +
+	// slot retain WAL; MySQL: the binlog itself is the retention). Any failure
+	// aborts the start — better not to run than to silently lose the window.
+	if cfg.Migration.CDCChain {
+		if !srcCapable(cfg.Source.SourceType(), source.CapCDC) {
+			// MS-06 absorbs this guard (ruling seq 347): SourceType()
+			// normalizes "" to postgres, so the legacy empty-means-postgres
+			// ALLOW behavior is kept (C1 two-shape table, MS06-DIALECT-MAP).
+			s.writeError(w, http.StatusBadRequest, "cdc_chain 仅支持 PostgreSQL/MySQL 源端")
+			return
+		}
+		lsn, reused, err := s.prepareCDCChainFor(&cfg)
+		if err != nil {
+			s.store.SetTaskError(taskID, err.Error())
+			s.writeError(w, http.StatusConflict, "全量+增量衔接预建失败，任务未启动："+err.Error())
+			return
+		}
+		cfg.Migration.ChainStartLSN = lsn
+		if cfgBytes, mErr := json.Marshal(&cfg); mErr == nil {
+			if uErr := s.store.UpdateTaskConfig(taskID, string(cfgBytes)); uErr != nil {
+				zap.L().Warn("cdc chain: persist ChainStartLSN failed (task continues, LSN recorded in log only)",
+					zap.String("task", taskID), zap.Error(uErr))
+			} else {
+				task.ConfigJSON = string(cfgBytes)
+			}
+		}
+		if sourceIsMySQL(cfg.Source) {
+			// MS-11 pen 4: no slot/publication — the binlog retains the
+			// window natively; the recorded master file:pos is the replay start.
+			s.logCollector.Append(taskID, "INFO",
+				fmt.Sprintf("CDC chain 预建完成：已记录源端 master 位点 %s；全量期间 binlog 天然保留（注意 expire_logs_days/binlog 空间），成功后自动衔接增量（conflict_strategy=%s 幂等去重）",
+					lsn, chainConflictStrategy(&cfg)), "")
+		} else {
+			s.logCollector.Append(taskID, "INFO",
+				fmt.Sprintf("CDC chain 预建完成：slot=%s（%s，起点 LSN=%s）；全量期间源端 WAL 将被保留，注意 max_slot_wal_keep_size 不要设置过小",
+					chainSlotName(&cfg), map[bool]string{true: "复用已有", false: "新建"}[reused], lsn), "")
+		}
+	}
+
+	// F-08 (adversarial 🟡, order fix): swapRunning BEFORE writing Running —
+	// a stale run (start-on-paused) returning in the write→swap gap would
+	// still own the task and clobber the fresh Running with a terminal
+	// state. After the swap any interleaving is ownership-gate-guarded; the
+	// stale cancel fires right here, outside the lock.
+	ctx, cancel := context.WithCancel(context.Background())
+	oldCancel, runID := s.swapRunning(taskID, cancel)
+	if oldCancel != nil {
+		oldCancel()
+	}
+
+	// F-08-2 item 7 ("Plan A"): stamp the ownership generation into the row
+	// TOGETHER with Running, IMMEDIATELY after the swap (F-09 item 5 order
+	// fix): while the row still carries the old generation, an in-flight
+	// stale write conditioned on that old run_id can land. Stamping before
+	// the reset/cleanup tail closes that window — ResetTaskForRerun does
+	// not touch status/run_id, so clearing fields after the stamp is safe.
+	if err := s.store.SetTaskRun(taskID, runID); err != nil {
+		// We already swapped ownership — roll the (never-started) entry back
+		// so the map stays clean; the ctx is dropped by defer-less cancel.
+		cancel()
+		s.endRun(taskID, runID)
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
+	// Stale cancel BEFORE cleanup (seq 84 ruling): the old flow stops first,
+	// so its last checkpoint write is far less likely to race RemoveAll.
 	// Reset all progress fields for a fresh run
 	_ = s.store.ResetTaskForRerun(taskID)
 
@@ -606,22 +1550,37 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 	s.logCollector.RemoveBuffer(taskID)
 	os.RemoveAll(fmt.Sprintf(".checkpoint/%s", taskID))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	s.runningTasks[taskID] = cancel
-
-	go s.runMigration(ctx, taskID, cfg)
+	go s.runMigration(ctx, taskID, cfg, runID)
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "started", "task_id": taskID})
 }
 
-func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Config) {
+// runPipeline is the orchestrator seam: tests swap it to drive runMigration
+// without touching real databases.
+var runPipeline = func(ctx context.Context, cfg config.Config, pipeCfg orchestrator.PipelineConfig) ([]orchestrator.PipelineResult, error) {
+	o := orchestrator.NewOrchestrator(cfg)
+	return o.Run(ctx, pipeCfg)
+}
+
+func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Config, runID uint64) {
 	logCore := NewTaskLogCore(s.logCollector, taskID, nil)
-	s.logCores[taskID] = logCore
+	s.setLogCore(taskID, logCore)
+
+	// Ownership guard (F-08 v2 ruling): a superseded (resume-swapped)
+	// run must not write terminal state, delete the fresh run's log
+	// core, or unregister the fresh run's extra logger core. endRun is
+	// the single cleanup point and only acts while this run's
+	// generation token is still current.
+	owns := func() bool { return s.ownsRun(taskID, runID) }
 
 	defer func() {
 		logCore.Disable()
-		delete(s.logCores, taskID)
-		logger.UnregisterExtraCore()
+		// F-09 adversarial L2: unregister THIS core unconditionally —
+		// identity-based removal is exact and idempotent. Gating it on
+		// endRun leaked the core of every superseded run (endRun false)
+		// into the global registry for the process lifetime.
+		logger.UnregisterExtraCore(logCore)
+		_ = s.endRun(taskID, runID)
 	}()
 
 	s.logCollector.GetBuffer(taskID)
@@ -631,29 +1590,59 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 
 	progressCtx, progressCancel := context.WithCancel(ctx)
 	defer progressCancel()
-	go s.pollProgress(progressCtx, taskID, cfg.Migration.CheckpointDir)
+	go s.pollProgress(progressCtx, taskID, cfg.Migration.CheckpointDir, runID)
 
-	o := orchestrator.NewOrchestrator(cfg)
 	pipeCfg := orchestrator.PipelineConfig{
 		SkipPrecheck: cfg.Migration.SkipPrecheck,
 		SkipSchema:   cfg.Migration.SkipSchema,
 		SkipData:     cfg.Migration.SkipData,
 		SkipValidate: cfg.Migration.SkipValidate,
 	}
-
-	results, err := o.Run(ctx, pipeCfg)
+	results, err := runPipeline(ctx, cfg, pipeCfg)
 
 	progressCancel()
 
 	if ctx.Err() == context.Canceled {
-		s.logCollector.Append(taskID, "WARN", "Migration task cancelled", "")
-		s.store.UpdateTaskStatus(taskID, store.TaskStatusCancelled)
+		if owns() {
+			s.logCollector.Append(taskID, "WARN", "Migration task cancelled", "")
+			// Conditioned write (F-08-2 item 7): the DB row itself rejects
+			// the write if ownership was swapped in the µs since owns().
+			if ok, werr := s.store.UpdateTaskStatusIfRun(taskID, store.TaskStatusCancelled, runID); werr != nil {
+				s.logCollector.Append(taskID, "ERROR", "write cancelled status: "+werr.Error(), "")
+			} else if !ok {
+				s.logCollector.Append(taskID, "INFO", "stale run lost DB ownership while cancelling; fresh run's state kept", "")
+			}
+		} else {
+			// Superseded by a newer run (resume cancelled this stale one):
+			// the fresh run already flipped the status to Running — leave it.
+			s.logCollector.Append(taskID, "INFO", "stale run cancelled (superseded by resume)", "")
+		}
 		return
 	}
 
-	if err != nil {
+	// Ownership gate (F-08 v2 ruling): a superseded run whose pipeline
+	// returned BEFORE the resume's cancel was observed (ctx.Err()==nil)
+	// must not write any terminal state, result, progress, or start a
+	// CDC chain — the fresh run owns the task now.
+	if !owns() {
+		s.logCollector.Append(taskID, "INFO", "stale run finished (superseded by resume); skipping terminal state write", "")
+		return
+	}
+
+	// Chained-mode validation demotion (P1 deviation B): when the orchestrator
+	// aborts on a validate-phase failure it returns that failure as err AND
+	// records it in results. Re-check onlyValidateFailed here so a chained
+	// task with validate-only failures still reaches the demotion branch
+	// below instead of failing fast at SetTaskError.
+	if err != nil && !onlyValidateFailed(results, cfg.Migration.CDCChain) {
 		s.logCollector.Append(taskID, "ERROR", "Migration failed: "+err.Error(), "")
-		s.store.SetTaskError(taskID, err.Error())
+		// Conditioned write: even if ownership was swapped after the last
+		// owns() check, the run_id guard keeps the fresh Running intact.
+		if ok, werr := s.store.SetTaskErrorIfRun(taskID, err.Error(), runID); werr != nil {
+			s.logCollector.Append(taskID, "ERROR", "write failed status: "+werr.Error(), "")
+		} else if !ok {
+			s.logCollector.Append(taskID, "INFO", "stale run finished (superseded by resume); skipping terminal state write", "")
+		}
 		return
 	}
 
@@ -680,28 +1669,35 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 			zap.Int("tables_done", tDone),
 			zap.Int64("rows_total", rTotal),
 			zap.Int64("rows_done", rDone))
-		var prog float64
-		if rTotal > 0 {
-			prog = float64(rDone) / float64(rTotal)
-			if prog > 1.0 {
-				prog = 1.0
-			}
-		} else if tTotal > 0 {
-			prog = float64(tDone) / float64(tTotal)
+		prog := computeTaskProgress(cpPhase, tDone, tTotal, rDone, rTotal, cpMgr.GetImportedTables(), cpMgr.GetImportMode())
+		// Conditioned write: a superseded run's final progress sync must not
+		// clobber the fresh run's counters; only a live owner broadcasts.
+		if ok, _ := s.store.UpdateTaskProgressIfRun(taskID, cpPhase, prog, tDone, tTotal, rDone, rTotal, runID); ok {
+			s.BroadcastProgress(taskID, map[string]interface{}{
+				"phase":        cpPhase,
+				"progress":     prog,
+				"tables_done":  tDone,
+				"tables_total": tTotal,
+				"rows_done":    rDone,
+				"rows_total":   rTotal,
+			})
 		}
-		_ = s.store.UpdateTaskProgress(taskID, cpPhase, prog, tDone, tTotal, rDone, rTotal)
-		s.BroadcastProgress(taskID, map[string]interface{}{
-			"phase":        cpPhase,
-			"progress":     prog,
-			"tables_done":  tDone,
-			"tables_total": tTotal,
-			"rows_done":    rDone,
-			"rows_total":   rTotal,
-		})
+	}
+
+	// Second ownership gate: the progress sync above is a long tail — the
+	// run may have been superseded (resume/start swap) after the first gate
+	// passed. Result + terminal writes must not clobber the fresh run.
+	if !owns() {
+		s.logCollector.Append(taskID, "INFO", "stale run finished (superseded by resume); skipping terminal state write", "")
+		return
 	}
 
 	resultData, _ := json.Marshal(results)
-	s.store.SetTaskResult(taskID, string(resultData))
+	if ok, werr := s.store.SetTaskResultIfRun(taskID, string(resultData), runID); werr != nil {
+		s.logCollector.Append(taskID, "ERROR", "write task result: "+werr.Error(), "")
+	} else if !ok {
+		s.logCollector.Append(taskID, "INFO", "stale run finished (superseded by resume); skipping terminal state write", "")
+	}
 
 	allSuccess := true
 	for _, r := range results {
@@ -710,16 +1706,44 @@ func (s *Server) runMigration(ctx context.Context, taskID string, cfg config.Con
 			break
 		}
 	}
-	if allSuccess {
+	// Chained-mode validation demotion (P1 deviation B): during a chained
+	// migration the source keeps taking writes, so the post-full row-count
+	// validation compares against a moving snapshot and reports false diffs.
+	// When CDCChain is on and ONLY the validate phase failed, demote it: the
+	// task completes, the failure is logged as WARN, and the CDC replay from
+	// the pre-created slot converges the window data. Any other failing phase
+	// keeps the hard failed semantics.
+	onlyValidateFailed := onlyValidateFailed(results, cfg.Migration.CDCChain)
+	if allSuccess || onlyValidateFailed {
+		if onlyValidateFailed {
+			s.logCollector.Append(taskID, "WARN",
+				fmt.Sprintf("校验未通过（%v；全量期间源端持续写入导致的预期差异）：已按「全量+增量衔接」降级为告警，差异将由 CDC 从预建点位重放收敛；增量稳定后可用「数据比对」核验", err), "")
+			s.BroadcastProgress(taskID, map[string]interface{}{
+				"phase":   "validate_demoted",
+				"message": "校验差异由 CDC 重放收敛（chained 模式降级为告警）",
+			})
+		}
 		s.logCollector.Append(taskID, "INFO", "Migration completed successfully", "")
-		s.store.UpdateTaskStatus(taskID, store.TaskStatusCompleted)
+		// Conditioned write: Completed only lands if this generation still
+		// owns the row; the CDC chain follows the same ownership verdict.
+		if ok, werr := s.store.UpdateTaskStatusIfRun(taskID, store.TaskStatusCompleted, runID); werr == nil && ok {
+			// 全量+增量衔接 (P1): auto-start CDC from the pre-created slot. The
+			// message (success or loud failure) lands in the task log + broadcast.
+			if cfg.Migration.CDCChain {
+				s.startCDCChainAfterSuccess(taskID, &cfg)
+			}
+		}
 	} else {
 		s.logCollector.Append(taskID, "WARN", "Migration completed with errors", "")
-		s.store.UpdateTaskStatus(taskID, store.TaskStatusFailed)
+		if ok, werr := s.store.UpdateTaskStatusIfRun(taskID, store.TaskStatusFailed, runID); werr != nil {
+			s.logCollector.Append(taskID, "ERROR", "write failed status: "+werr.Error(), "")
+		} else if !ok {
+			s.logCollector.Append(taskID, "INFO", "stale run finished (superseded by resume); skipping terminal state write", "")
+		}
 	}
 }
 
-func (s *Server) pollProgress(ctx context.Context, taskID string, checkpointDir string) {
+func (s *Server) pollProgress(ctx context.Context, taskID string, checkpointDir string, runID uint64) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -733,7 +1757,8 @@ func (s *Server) pollProgress(ctx context.Context, taskID string, checkpointDir 
 				continue
 			}
 
-			phase := cpMgr.GetPhase()
+			rawPhase := cpMgr.GetPhase()
+			phase := rawPhase
 			if phase == "data-migration" || phase == "data-export" || phase == "data-import" {
 				phase = "data"
 			}
@@ -741,37 +1766,169 @@ func (s *Server) pollProgress(ctx context.Context, taskID string, checkpointDir 
 
 			var tablesDone, tablesTotal int
 			var rowsDone, rowsTotal int64
-			for _, tc := range tables {
-				tablesTotal++
-				rowsTotal += tc.RowsTotal
-				rowsDone += tc.RowsDone
-				if tc.State == checkpoint.StateCompleted || tc.State == checkpoint.StateFailed {
-					tablesDone++
+			if rawPhase == "schema" {
+				// Schema phase: count ONLY schema-registered tables by
+				// their SchemaState — data rows/states are irrelevant here
+				// (and a resumed task's stale data states must not inflate
+				// the schema counters).
+				for _, tc := range tables {
+					if tc.SchemaState == "" {
+						continue
+					}
+					tablesTotal++
+					if tc.SchemaState == checkpoint.StateCompleted || tc.SchemaState == checkpoint.StateFailed {
+						tablesDone++
+					}
+				}
+			} else {
+				for _, tc := range tables {
+					tablesTotal++
+					rowsTotal += tc.RowsTotal
+					rowsDone += tc.RowsDone
+					if tc.State == checkpoint.StateCompleted || tc.State == checkpoint.StateFailed {
+						tablesDone++
+					}
 				}
 			}
 
-			var progress float64
-			if rowsTotal > 0 {
-				progress = float64(rowsDone) / float64(rowsTotal)
-				if progress > 1.0 {
-					progress = 1.0
-				}
-			} else if tablesTotal > 0 {
-				progress = float64(tablesDone) / float64(tablesTotal)
+			importedTables := cpMgr.GetImportedTables()
+			importMode := cpMgr.GetImportMode()
+			progress := computeTaskProgress(rawPhase, tablesDone, tablesTotal, rowsDone, rowsTotal, importedTables, importMode)
+
+			// Conditioned: a superseded run's poller stops writing/broadcasting
+			// the moment a fresh generation takes the row (F-08-2 item 7).
+			ok, _ := s.store.UpdateTaskProgressIfRun(taskID, phase, progress, tablesDone, tablesTotal, rowsDone, rowsTotal, runID)
+			if !ok {
+				continue
 			}
 
-			_ = s.store.UpdateTaskProgress(taskID, phase, progress, tablesDone, tablesTotal, rowsDone, rowsTotal)
-
-			s.BroadcastProgress(taskID, map[string]interface{}{
+			msg := map[string]interface{}{
 				"phase":        phase,
 				"progress":     progress,
 				"tables_done":  tablesDone,
 				"tables_total": tablesTotal,
 				"rows_done":    rowsDone,
 				"rows_total":   rowsTotal,
-			})
+			}
+			if rawPhase == "data-import" {
+				msg["imported_tables"] = importedTables
+			}
+			// Server-side elapsed (kills the browser/server clock-skew class
+			// of bugs): the client renders this instead of differencing its
+			// own clock against started_at.
+			if elapsed, ok := s.taskElapsedSeconds(taskID); ok {
+				msg["elapsed_seconds"] = elapsed
+			}
+			s.BroadcastProgress(taskID, msg)
 		}
 	}
+}
+
+// taskElapsedSeconds returns the task's elapsed seconds computed entirely
+// server-side (finished-started, or now-started while running). Negative
+// values (started_at in the future — clock oddities) are clamped to 0.
+func (s *Server) taskElapsedSeconds(taskID string) (int64, bool) {
+	task, err := s.store.GetTask(taskID)
+	if err != nil || task == nil || task.StartedAt == nil {
+		return 0, false
+	}
+	end := time.Now()
+	if task.FinishedAt != nil {
+		end = *task.FinishedAt
+	}
+	d := end.Sub(*task.StartedAt)
+	if d < 0 {
+		d = 0
+	}
+	return int64(d / time.Second), true
+}
+
+// weightedProgress combines the three migration stages into one total
+// progress value.
+//
+// 权重定死，不做配置：schema 5%，导出 47.5%，导入 47.5%。
+func weightedProgress(schemaDone, exportFrac, importFrac float64) float64 {
+	const (
+		wSchema = 0.05
+		wExport = 0.475
+		wImport = 0.475
+	)
+	p := wSchema*schemaDone + wExport*exportFrac + wImport*importFrac
+	if p > 1.0 {
+		p = 1.0
+	}
+	return p
+}
+
+// computeTaskProgress derives the weighted total progress for a checkpoint
+// phase. validate and later stages report 100%; schema (and precheck) keep
+// the coarse table-based ratio; data phases use the fixed 5/47.5/47.5
+// weighting with the import fraction chosen by the recorded import mode:
+//
+//   - lightning: importFrac = importedTables/tablesTotal (0 while no table
+//     has finished restoring — never the rows ratio), exportFrac = rows ratio.
+//   - stream:    export counts as complete, importFrac = rows ratio.
+//   - "" (historical checkpoint): imported_tables>0 selects the lightning
+//     formula, otherwise the stream formula.
+func computeTaskProgress(rawPhase string, tablesDone, tablesTotal int, rowsDone, rowsTotal int64, importedTables int, importMode string) float64 {
+	rowsFrac := func() float64 {
+		if rowsTotal <= 0 {
+			return 0
+		}
+		return float64(rowsDone) / float64(rowsTotal)
+	}
+	tablesFrac := func() float64 {
+		if tablesTotal <= 0 {
+			return 0
+		}
+		return float64(importedTables) / float64(tablesTotal)
+	}
+
+	switch rawPhase {
+	case "validate", "completed":
+		return 1.0
+	case "schema", "precheck", "":
+		// UX-0931: route the schema-phase table ratio through the same
+		// weighted model as the data phases (schema weight 5%), so the
+		// overall progress climbs 0→5% during schema and continues 5%→100%
+		// into data — never regressing 100%→5% at the phase switch.
+		if tablesTotal > 0 {
+			p := float64(tablesDone) / float64(tablesTotal)
+			if p > 1.0 {
+				p = 1.0
+			}
+			return weightedProgress(p, 0, 0)
+		}
+		return 0
+	}
+
+	// Data phases ("data", "data-migration", "data-export", "data-import").
+	schemaDone := 1.0
+	exportFrac := rowsFrac()
+	importFrac := 0.0
+	if rawPhase == "data-import" {
+		mode := importMode
+		if mode == "" && importedTables > 0 {
+			// Historical-checkpoint compatibility only: checkpoints written
+			// before import_mode existed. New checkpoints always carry a
+			// mode — the migrator sets it before flipping the phase to
+			// data-import, so the mode=="" && imported==0 window below is
+			// unreachable for fresh runs.
+			mode = checkpoint.ImportModeLightning
+		}
+		if mode == checkpoint.ImportModeLightning {
+			exportFrac = rowsFrac()
+			importFrac = tablesFrac()
+		} else {
+			// stream (explicit or inferred): rows double as the import
+			// signal; the CSV export stage never ran (or is irrelevant).
+			// With R1 the stream entry point zeroes RowsDone, so the rows
+			// ratio starts at 0 and this branch reports 0.525 upward.
+			exportFrac = 1.0
+			importFrac = rowsFrac()
+		}
+	}
+	return weightedProgress(schemaDone, exportFrac, importFrac)
 }
 
 func (s *Server) handlePauseTask(w http.ResponseWriter, r *http.Request) {
@@ -815,22 +1972,132 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 	var cfg config.Config
 	json.Unmarshal([]byte(task.ConfigJSON), &cfg)
 
-	s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning)
+	// F-10 group 1 — resume Plan B ("clear target and re-import"): a resumed
+	// task re-runs the FULL migration, and re-inserting into tables that
+	// still hold the first attempt's rows is what produced the 1062 debt.
+	// Force the truncate target policy for this run (drop, if the user
+	// configured the stronger policy, is kept) and drop the task's
+	// checkpoint so the data phase starts fresh. The table scope is the
+	// task's own configured table set (getTables + Tables/ExcludeTables) —
+	// never other tasks' tables. Chained (CDC) tasks converge the re-import
+	// window via the pre-created slot replay, unchanged.
+	if cfg.Migration.TargetPolicy != "drop" {
+		cfg.Migration.TargetPolicy = "truncate"
+	}
+	os.RemoveAll(fmt.Sprintf(".checkpoint/%s", taskID))
+	s.logCollector.Append(taskID, "INFO",
+		"任务恢复：已按「清空目标表数据并全量重导」执行（truncate 策略，范围仅限本任务表集）；增量衔接任务由 CDC 从预建点位重放收敛", "")
+
+	// F-08 v2 ruling: swap-then-cancel, and SWAP BEFORE writing Running —
+	// if the status write happened first, a stale run returning in that
+	// gap still owns the task and could clobber the fresh Running with a
+	// terminal state. After the swap any interleaving is gate-guarded.
 	ctx, cancel := context.WithCancel(context.Background())
-	s.runningTasks[taskID] = cancel
-	go s.runMigration(ctx, taskID, cfg)
+	oldCancel, runID := s.swapRunning(taskID, cancel)
+	if oldCancel != nil {
+		oldCancel()
+	}
+	// F-08-2 item 7: stamp generation + Running in one conditioned write.
+	if err := s.store.SetTaskRun(taskID, runID); err != nil {
+		// Symmetric with start: roll back the swapped (never-started)
+		// entry and fail the request — a resume without a stamped
+		// generation would silently skip every conditioned write and
+		// leave the task stuck in paused.
+		cancel()
+		s.endRun(taskID, runID)
+		s.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	go s.runMigration(ctx, taskID, cfg, runID)
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
 }
 
 func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
-	if cancel, ok := s.runningTasks[taskID]; ok {
+	// F-08 v2 ruling: pure cancel keeps the entry — the OWNING run's
+	// cancel branch writes Cancelled and its defer cleans up. Only when
+	// there is no live run (paused/finished/never started) does the
+	// handler write the terminal status itself.
+	if cancel := s.runningCancel(taskID); cancel != nil {
 		cancel()
-		delete(s.runningTasks, taskID)
+	} else {
+		s.store.UpdateTaskStatus(taskID, store.TaskStatusCancelled)
 	}
-	s.store.UpdateTaskStatus(taskID, store.TaskStatusCancelled)
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
+}
+
+// beginRun registers the cancel func and a fresh generation token for a
+// new run of taskID, returning the token (the run's ownership id).
+func (s *Server) beginRun(taskID string, cancel context.CancelFunc) uint64 {
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	s.runSeq++
+	s.runningTasks[taskID] = cancel
+	s.taskRuns[taskID] = s.runSeq
+	return s.runSeq
+}
+
+// swapRunning atomically replaces the task's run entry with a fresh
+// generation (resume path, F-08 v2 ruling): the stale run loses ownership
+// the instant the new entry is written, closing the cancel→set gap. The
+// old cancel func (or nil) is returned for the caller to invoke OUTSIDE
+// the lock.
+func (s *Server) swapRunning(taskID string, cancel context.CancelFunc) (oldCancel context.CancelFunc, newRunID uint64) {
+	s.taskMu.Lock()
+	oldCancel = s.runningTasks[taskID]
+	s.runSeq++
+	s.runningTasks[taskID] = cancel
+	s.taskRuns[taskID] = s.runSeq
+	newRunID = s.runSeq
+	s.taskMu.Unlock()
+	return oldCancel, newRunID
+}
+
+// runningCancel returns the currently registered cancel func (or nil),
+// WITHOUT removing the entry: the pure-cancel handler cancels but leaves
+// the owning run to write its own terminal state and clean up (F-08 v2
+// ruling).
+func (s *Server) runningCancel(taskID string) context.CancelFunc {
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	return s.runningTasks[taskID]
+}
+
+// endRun is the owning run's single cleanup point: if runID is still the
+// current generation it removes the run entry and the log core and
+// reports ownership. logger core unregistration is the caller's job
+// (outside the lock).
+func (s *Server) endRun(taskID string, runID uint64) bool {
+	s.taskMu.Lock()
+	owned := s.taskRuns[taskID] == runID
+	if owned {
+		delete(s.taskRuns, taskID)
+		delete(s.runningTasks, taskID)
+		delete(s.logCores, taskID)
+	}
+	s.taskMu.Unlock()
+	return owned
+}
+
+// ownsRun reports whether runID is still the current generation for
+// taskID — the run's ownership token (F-08).
+func (s *Server) ownsRun(taskID string, runID uint64) bool {
+	s.taskMu.Lock()
+	defer s.taskMu.Unlock()
+	return s.taskRuns[taskID] == runID
+}
+
+func (s *Server) setLogCore(taskID string, core *TaskLogCore) {
+	s.taskMu.Lock()
+	s.logCores[taskID] = core
+	s.taskMu.Unlock()
+}
+
+func (s *Server) deleteLogCore(taskID string) {
+	s.taskMu.Lock()
+	delete(s.logCores, taskID)
+	s.taskMu.Unlock()
 }
 
 func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
@@ -919,6 +2186,19 @@ func (s *Server) buildTaskReport(task *store.Task) *reporter.Report {
 	if task.ConfigJSON != "" {
 		json.Unmarshal([]byte(task.ConfigJSON), &cfg)
 	}
+	report.TaskID = task.ID
+	report.Source = fmt.Sprintf("%s:%d/%s", cfg.Source.Host, cfg.Source.Port, cfg.Source.Database)
+	report.Target = fmt.Sprintf("%s:%d/%s", cfg.Target.Host, cfg.Target.Port, cfg.Target.Database)
+	switch {
+	case cfg.Migration.CDCChain:
+		report.Mode = "全量+增量衔接（CDC chain）"
+	case cfg.Migration.UseDumpling:
+		report.Mode = "Dumpling 导出 + Lightning 离线导入"
+	case cfg.Migration.UseLightning:
+		report.Mode = "Lightning 离线导入"
+	default:
+		report.Mode = "在线迁移"
+	}
 	cpDir := cfg.Migration.CheckpointDir
 	if cpDir == "" {
 		cpDir = fmt.Sprintf(".checkpoint/%s", task.ID)
@@ -932,7 +2212,14 @@ func (s *Server) buildTaskReport(task *store.Task) *reporter.Report {
 				Duration:   "",
 			}
 			if !tc.FinishedAt.IsZero() && !tc.StartedAt.IsZero() {
-				tr.Duration = reporter.FormatDuration(tc.FinishedAt.Sub(tc.StartedAt))
+				// MS-11o A2: legacy rows can carry FinishedAt before StartedAt
+				// (clock oddities) — clamp the display side to 0, mirroring
+				// taskElapsedSeconds, instead of rendering a negative duration.
+				d := tc.FinishedAt.Sub(tc.StartedAt)
+				if d < 0 {
+					d = 0
+				}
+				tr.Duration = reporter.FormatDuration(d)
 			}
 			switch tc.State {
 			case checkpoint.StateCompleted:
@@ -979,10 +2266,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	s.hub.register <- conn
+	c := &wsClient{conn: conn, send: make(chan []byte, wsSendBuffer)}
+	s.hub.register <- c
 
 	defer func() {
-		s.hub.unregister <- conn
+		s.hub.unregister <- c
 	}()
 
 	for {
@@ -1080,23 +2368,46 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type PhaseInfo struct {
-		Name       string                   `json:"name"`
-		Label      string                   `json:"label"`
-		Status     string                   `json:"status"`
-		SubLabel   string                   `json:"sub_label,omitempty"`
-		Tables     []map[string]interface{} `json:"tables,omitempty"`
-		TableCount int                      `json:"table_count"`
-		TablesDone int                      `json:"tables_done"`
-		RowsTotal  int64                    `json:"rows_total"`
-		RowsDone   int64                    `json:"rows_done"`
-		Logs       []map[string]interface{} `json:"logs,omitempty"`
+		Name           string                   `json:"name"`
+		Label          string                   `json:"label"`
+		Status         string                   `json:"status"`
+		SubLabel       string                   `json:"sub_label,omitempty"`
+		Tables         []map[string]interface{} `json:"tables,omitempty"`
+		TableCount     int                      `json:"table_count"`
+		TablesDone     int                      `json:"tables_done"`
+		ImportedTables int                      `json:"imported_tables"`
+		RowsTotal      int64                    `json:"rows_total"`
+		RowsDone       int64                    `json:"rows_done"`
+		Duration       float64                  `json:"duration,omitempty"`
+		Warn           bool                     `json:"warn,omitempty"`
+		Error          string                   `json:"error,omitempty"`
+		Logs           []map[string]interface{} `json:"logs,omitempty"`
 	}
+
+	// P1: ONE read-only checkpoint manager for the whole handler — the
+	// previous per-phase NewReadOnlyManager pair could observe two
+	// different on-disk states inside a single request (torn read).
+	cpMgr, cpErr := checkpoint.NewReadOnlyManager(fmt.Sprintf(".checkpoint/%s", taskID))
+	var phaseRecs map[string]*checkpoint.PhaseRecord
+	if cpErr == nil {
+		phaseRecs = cpMgr.GetPhases()
+	}
+	// Historical checkpoints (written before the phase machine existed)
+	// have no phases map — fall back to the ordinal inference below.
+	useMachine := len(phaseRecs) > 0
 
 	phaseNames := []struct{ name, label string }{
 		{"precheck", "预检查"},
 		{"schema", "Schema 迁移"},
 		{"data", "数据迁移"},
 		{"validate", "数据验证"},
+	}
+
+	subPhaseLabels := map[string]string{
+		"schema-build":   "构建 DDL",
+		"schema-execute": "执行 DDL",
+		"data-export":    "数据导出",
+		"data-import":    "数据导入",
 	}
 
 	var phases []PhaseInfo
@@ -1107,7 +2418,27 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 			Status: "pending",
 		}
 
-		if task.Status == "completed" {
+		if useMachine {
+			// The phase state machine is the single source of truth.
+			if rec, ok := phaseRecs[p.name]; ok && rec.Status != "" {
+				pi.Status = string(rec.Status)
+				if lbl, ok := subPhaseLabels[rec.SubPhase]; ok {
+					pi.SubLabel = lbl
+				}
+				pi.Warn = rec.Warn
+				pi.Error = rec.Error
+				if !rec.StartedAt.IsZero() && !rec.FinishedAt.IsZero() {
+					// MS-11o A2: same negative-clamp as the report table face —
+					// a phase record with FinishedAt before StartedAt renders 0,
+					// never a negative duration.
+					d := rec.FinishedAt.Sub(rec.StartedAt)
+					if d < 0 {
+						d = 0
+					}
+					pi.Duration = d.Seconds()
+				}
+			}
+		} else if task.Status == "completed" {
 			pi.Status = "completed"
 		} else if task.Phase == p.name {
 			if task.Status == "running" {
@@ -1128,33 +2459,70 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if p.name == "data" {
-			cpMgr, cpErr := checkpoint.NewReadOnlyManager(fmt.Sprintf(".checkpoint/%s", taskID))
-			if cpErr == nil {
-				cpPhase := cpMgr.GetPhase()
-				switch cpPhase {
-				case "data-export":
-					pi.SubLabel = "数据导出"
-				case "data-import":
+		if p.name == "data" && cpErr == nil {
+			cpPhase := cpMgr.GetPhase()
+			// SubLabel source of truth: in machine mode it comes solely
+			// from the machine's SubPhase (set above); this legacy
+			// coarse-phase switch may only assign it on the legacy
+			// fallback path. ImportedTables fills in both modes — in
+			// machine mode keyed off the machine SubPhase (the CIR
+			// pipeline keeps the coarse phase at "data" while its
+			// SubPhase already says data-import), on legacy keyed off
+			// the coarse phase.
+			fillImported := cpPhase == "data-import"
+			if useMachine {
+				if rec, ok := phaseRecs["data"]; ok && rec.SubPhase == "data-import" {
+					fillImported = true
+				}
+			}
+			if fillImported {
+				if !useMachine {
 					pi.SubLabel = "数据导入"
 				}
-				tables := cpMgr.GetAllTables()
-				if len(tables) > 0 {
-					for _, tc := range tables {
-						tableInfo := map[string]interface{}{
-							"name":       tc.TableName,
-							"state":      string(tc.State),
-							"rows_done":  tc.RowsDone,
-							"rows_total": tc.RowsTotal,
-						}
-						pi.Tables = append(pi.Tables, tableInfo)
-						pi.TableCount++
-						pi.RowsTotal += tc.RowsTotal
-						pi.RowsDone += tc.RowsDone
-						if tc.State == checkpoint.StateCompleted || tc.State == checkpoint.StateFailed {
-							pi.TablesDone++
-						}
+				// TablesDone counts export-time completed states,
+				// which stay "completed" through the whole Lightning
+				// import — the real import progress is the checkpoint's
+				// imported-table counter (same source as the top bar).
+				pi.ImportedTables = cpMgr.GetImportedTables()
+			} else if !useMachine && cpPhase == "data-export" {
+				pi.SubLabel = "数据导出"
+			}
+			tables := cpMgr.GetAllTables()
+			// While the schema phase is current, the registered entries
+			// are schema bookkeeping (data State still pending) — the
+			// data tab must stay empty as before, not preview 0/N.
+			if cpPhase != "schema" && len(tables) > 0 {
+				for _, tc := range tables {
+					tableInfo := map[string]interface{}{
+						"name":       tc.TableName,
+						"state":      string(tc.State),
+						"rows_done":  tc.RowsDone,
+						"rows_total": tc.RowsTotal,
 					}
+					pi.Tables = append(pi.Tables, tableInfo)
+					pi.TableCount++
+					pi.RowsTotal += tc.RowsTotal
+					pi.RowsDone += tc.RowsDone
+					if tc.State == checkpoint.StateCompleted || tc.State == checkpoint.StateFailed {
+						pi.TablesDone++
+					}
+				}
+			}
+		}
+		if p.name == "schema" && cpErr == nil {
+			// Schema phase: fill the per-table list from SchemaState so the
+			// schema tab shows 0/N → N/N plus a per-table status list.
+			for _, tc := range cpMgr.GetAllTables() {
+				if tc.SchemaState == "" {
+					continue // not schema-registered
+				}
+				pi.Tables = append(pi.Tables, map[string]interface{}{
+					"name":  tc.TableName,
+					"state": string(tc.SchemaState),
+				})
+				pi.TableCount++
+				if tc.SchemaState == checkpoint.StateCompleted || tc.SchemaState == checkpoint.StateFailed {
+					pi.TablesDone++
 				}
 			}
 		}
@@ -1199,55 +2567,118 @@ func (s *Server) handleTaskPhases(w http.ResponseWriter, r *http.Request) {
 // handleAssess runs a compatibility assessment and returns JSON for the frontend.
 func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Host     string `json:"host"`
-		Port     int    `json:"port"`
-		User     string `json:"user"`
-		Password string `json:"password"`
-		Database string `json:"database"`
-		Schema   string `json:"schema"`
-		Format   string `json:"format"` // "json" (default) or "html"
+		Host      string `json:"host"`
+		Port      int    `json:"port"`
+		User      string `json:"user"`
+		Password  string `json:"password"`
+		Database  string `json:"database"`
+		Schema    string `json:"schema"`
+		Format    string `json:"format"`     // "json" (default) or "html"
+		SourceRef string `json:"source_ref"` // datasource id (F-02): postgres only
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
+	// MS-10b: the datasource kind rides on the ref resolution (inline form
+	// stays "" = PG legacy shape); it only routes the connection/scanner.
+	var srcType string
+	if req.SourceRef != "" {
+		e, err := s.resolveDataSourceRef(req.SourceRef)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
+			return
+		}
+		if !srcCapable(e.Type, source.CapAssess) {
+			// MS-06 absorbs this guard (ruling seq 347): raw stored type in,
+			// empty/unknown keep the same 400 text via the capability read.
+			s.writeError(w, http.StatusBadRequest, "source_ref: 该数据源类型不支持兼容评估")
+			return
+		}
+		srcType = e.Type
+		sc := dataSourceToSourceConfig(e)
+		req.Host, req.Port = sc.Host, sc.Port
+		req.User, req.Password, req.Database, req.Schema = sc.User, sc.Password, sc.Database, sc.Schema
+	}
+
 	if req.Host == "" || req.Database == "" {
 		s.writeError(w, http.StatusBadRequest, "host and database are required")
 		return
 	}
-	if req.Schema == "" {
-		req.Schema = "public"
+
+	// MS-10b: the assess connection routes through the MS-09 dispatch
+	// (openSourceTestConn) instead of the hardcoded pgx pair, so MySQL
+	// sources ride the go-sql-driver DSN with the MS-08d UTC session pin.
+	// srcType stays "" on the legacy inline form (normalize to PG).
+	connCfg := config.SourceConfig{
+		Type:     srcType,
+		Host:     req.Host,
+		Port:     req.Port,
+		User:     req.User,
+		Password: req.Password,
+		Database: req.Database,
+		Schema:   req.Schema,
 	}
-	if req.Port == 0 {
-		req.Port = 5432
+	driver, _ := sourceConnSpec(connCfg)
+	if connCfg.Port == 0 {
+		// Type-aware port fallback (was hardcoded 5432): a MySQL source
+		// without an explicit port must land on 3306, not the PG default.
+		if driver == "mysql" {
+			connCfg.Port = 3306
+		} else {
+			connCfg.Port = 5432
+		}
+	}
+	// Type-aware schema fallback (was hardcoded "public"): MySQL has no
+	// PG-style schema - the database IS the schema (MS-10a incSchema shape).
+	schema := connCfg.Schema
+	if schema == "" {
+		if driver == "mysql" {
+			schema = connCfg.Database
+		} else {
+			schema = "public"
+		}
 	}
 
-	dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
-		req.User, req.Password, req.Host, req.Port, req.Database)
-
-	pgDB, err := sql.Open("pgx", dsn)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "connect failed: "+err.Error())
+	// MS-10b2 item 8: a MySQL system schema (mysql/information_schema/
+	// performance_schema/sys/metrics_schema) is rejected 400 up front —
+	// the scanner would otherwise happily return a 200 empty/builtin-only
+	// set. The guard reads the shared exported source/mysql.SystemDatabases
+	// (single truth, same set the ddlexport SHOW DATABASES walk uses);
+	// surrounding whitespace is trimmed so "mysql " cannot slip past.
+	if assessSchemaRejected(driver, schema) {
+		s.writeError(w, http.StatusBadRequest, "schema: 系统库不支持兼容评估（"+schema+"）")
 		return
 	}
-	defer pgDB.Close()
 
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
+	srcDB, err := openSourceTestConn(connCfg)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer srcDB.Close()
 
-	// Scan and assess
-	scanner := assess.NewScanner(pgDB, req.Schema)
+	// F-10: no handler-level timeout here — the deadline belongs to the
+	// chi 120s long-running group; an inner WithTimeout(r.Context(), …)
+	// would only ever shorten it.
+	ctx := r.Context()
+
+	// Scan and assess (dialect dispatched on the routed driver).
+	scanner := assess.NewScannerFor(driver, srcDB, schema)
 	result, err := scanner.ScanAll(ctx)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "scan failed: "+err.Error())
 		return
 	}
 
-	assessor := assess.NewAssessor()
+	// MS-10b2: the assessor is calibrated for the routed source kind —
+	// MySQL grades native types via the shared mapper truth and the view
+	// dialect subset; PG (and legacy "" inline) stays byte-identical.
+	assessor := assess.NewAssessorFor(driver)
 	dims := assessor.Assess(result)
 
-	rg := assess.NewReportGenerator(dims)
+	rg := assess.NewReportGenerator(dims, connCfg.SourceType())
 
 	// If HTML format requested, return HTML
 	if req.Format == "html" {
@@ -1259,4 +2690,12 @@ func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
 	// Default: return JSON
 	report := rg.Report()
 	s.writeJSON(w, http.StatusOK, report)
+}
+
+// assessSchemaRejected is the MS-10b2 item-8 assess guard: MySQL system
+// schemas (shared source/mysql.SystemDatabases truth, case-insensitive,
+// whitespace-tolerant) must never enter the scanner. Unit-anchored in
+// assess_guard_test.go; the HTTP-level 400 rides the black-box ticket.
+func assessSchemaRejected(driver, schema string) bool {
+	return driver == "mysql" && mysql.SystemDatabases[strings.ToLower(strings.TrimSpace(schema))]
 }

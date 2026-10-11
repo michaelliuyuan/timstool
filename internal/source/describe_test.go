@@ -5,9 +5,9 @@ import (
 	"testing"
 
 	"github.com/michaelliuyuan/timstool/internal/source"
-	// Trigger adapter init() so postgres/mysql/mongodb RegisterMeta runs
-	// alongside the stubs (which live in package source). The real binary
-	// imports these via main; this test must do the same to see all sources.
+	// Trigger adapter init() so postgres/mysql RegisterMeta runs alongside the
+	// stubs (which live in package source). The real binary imports these via
+	// main; this test must do the same to see all sources.
 	_ "github.com/michaelliuyuan/timstool/internal/source/mongo"
 	_ "github.com/michaelliuyuan/timstool/internal/source/mysql"
 	_ "github.com/michaelliuyuan/timstool/internal/source/postgres"
@@ -43,8 +43,8 @@ func TestDescribeImplementedVsStub(t *testing.T) {
 		t.Errorf("postgres meta = %+v, want Implemented/5432/CDC=true", pg)
 	}
 	my, _ := source.Describe("mysql")
-	if !my.Implemented || my.DefaultPort != 3306 || my.Capabilities.CDC {
-		t.Errorf("mysql meta = %+v, want Implemented/3306/CDC=false", my)
+	if !my.Implemented || my.DefaultPort != 3306 || !my.Capabilities.CDC {
+		t.Errorf("mysql meta = %+v, want Implemented/3306/CDC=true (MS-11)", my)
 	}
 	ora, err := source.Describe("oracle")
 	if err != nil {
@@ -62,6 +62,40 @@ func TestDescribeUnknown(t *testing.T) {
 	_, err := source.Describe("definitely-not-a-source")
 	if err == nil || !strings.Contains(err.Error(), "unknown source") {
 		t.Fatalf("Describe(unknown) err = %v, want unknown-source error", err)
+	}
+}
+
+// TestPostgresSSLModeOptionsLocalized (MS-11i pen1): the ConnectionForm renders
+// option LABELS verbatim, so PG sslmode labels must be Chinese UI wording while
+// VALUES stay the libpq enum literals (disable/require/verify-ca/verify-full).
+func TestPostgresSSLModeOptionsLocalized(t *testing.T) {
+	pg, err := source.Describe("postgres")
+	if err != nil {
+		t.Fatalf("Describe(postgres) err = %v", err)
+	}
+	var field *source.FieldSpec
+	for i := range pg.Fields {
+		if pg.Fields[i].Key == "sslmode" {
+			field = &pg.Fields[i]
+			break
+		}
+	}
+	if field == nil {
+		t.Fatal("postgres meta has no sslmode field")
+	}
+	want := []source.Option{
+		{Label: "禁用", Value: "disable"},
+		{Label: "要求加密", Value: "require"},
+		{Label: "验证 CA", Value: "verify-ca"},
+		{Label: "完全验证", Value: "verify-full"},
+	}
+	if len(field.Options) != len(want) {
+		t.Fatalf("sslmode options = %d, want %d", len(field.Options), len(want))
+	}
+	for i, o := range want {
+		if field.Options[i] != o {
+			t.Errorf("sslmode option[%d] = %+v, want %+v", i, field.Options[i], o)
+		}
 	}
 }
 

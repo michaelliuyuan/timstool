@@ -149,12 +149,18 @@ func TestMongoCompareRoutesDispatch(t *testing.T) {
 		t.Errorf("new route: kind=%v want %q", created["kind"], compareTaskKind)
 	}
 
-	// The old unprefixed path must no longer dispatch to the mongodb handler
-	// (404 on this tree; post-merge it belongs to the MySQL compare domain).
+	// The old unprefixed path must no longer dispatch to the MONGODB compare
+	// handler. Post-merge it serves the remote MySQL compare domain — which
+	// also returns 201, but its response carries no kind discriminator (the
+	// mongocompare DTO does). Assert on the discriminator, not the status.
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/compare/tasks", strings.NewReader(body))
 	rec = httptest.NewRecorder()
 	s.router.ServeHTTP(rec, req)
-	if rec.Code == http.StatusCreated {
-		t.Fatalf("old route still dispatches to mongocompare handler: %d %s", rec.Code, rec.Body.String())
+	var oldRoute map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &oldRoute); err != nil {
+		t.Fatalf("old route decode: %v body=%s", err, rec.Body.String())
+	}
+	if _, isMongo := oldRoute["kind"]; isMongo {
+		t.Fatalf("old route dispatched to mongocompare handler (kind present): %s", rec.Body.String())
 	}
 }
