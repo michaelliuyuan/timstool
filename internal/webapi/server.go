@@ -140,6 +140,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		r.Post("/config/test-connection", s.handleTestConnection)
 		r.Post("/config/list-tables", s.handleListTables)
 		r.Post("/tasks", s.handleCreateTask)
+		r.Post("/compare/tasks", s.handleCreateCompareTask)
 		r.Get("/tasks", s.handleListTasks)
 		r.Route("/tasks/{taskID}", func(r chi.Router) {
 			r.Get("/", s.handleGetTask)
@@ -561,6 +562,28 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// MongoDB compare tasks (M3) run their own pipeline; branch before the
+	// migration config parse so the migration path stays untouched. The start
+	// body may carry {"resume": true} to continue from engine checkpoints;
+	// default is a clean run (OutDir wiped).
+	if spec, ok := parseCompareTask(task.ConfigJSON); ok {
+		var startBody struct {
+			Resume bool `json:"resume"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&startBody)
+		if err := s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning); err != nil {
+			s.writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		_ = s.store.ResetTaskForRerun(taskID)
+		s.logCollector.RemoveBuffer(taskID)
+		ctx, cancel := context.WithCancel(context.Background())
+		s.runningTasks[taskID] = cancel
+		s.startCompareTask(ctx, taskID, spec, startBody.Resume)
+		s.writeJSON(w, http.StatusOK, map[string]string{"status": "started", "task_id": taskID})
+		return
+	}
+
 	var cfg config.Config
 	if err := json.Unmarshal([]byte(task.ConfigJSON), &cfg); err != nil {
 		s.writeError(w, http.StatusInternalServerError, "invalid task config")
@@ -771,6 +794,17 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if task.Status != store.TaskStatusPaused {
 		s.writeError(w, http.StatusConflict, "task is not paused")
+		return
+	}
+
+	// MongoDB compare tasks (M3): resume through the compare pipeline with
+	// engine checkpoints intact (OutDir not wiped).
+	if spec, ok := parseCompareTask(task.ConfigJSON); ok {
+		s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning)
+		ctx, cancel := context.WithCancel(context.Background())
+		s.runningTasks[taskID] = cancel
+		s.startCompareTask(ctx, taskID, spec, true)
+		s.writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
 		return
 	}
 
