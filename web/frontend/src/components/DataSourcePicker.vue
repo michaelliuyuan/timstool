@@ -20,7 +20,7 @@ const options = computed(() => byType(props.types))
 const isManual = computed(() => props.modelValue === '')
 const selectedName = computed(() => get(props.modelValue)?.name || '')
 
-const typeLabels: Record<string, string> = { postgres: 'PostgreSQL', mysql: 'MySQL', tidb: 'TiDB' }
+const typeLabels: Record<string, string> = { postgres: 'PostgreSQL', mysql: 'MySQL', tidb: 'TiDB', mongodb: 'MongoDB' }
 
 function onSelect(val: string | undefined) {
   // '' option = "手动填写"

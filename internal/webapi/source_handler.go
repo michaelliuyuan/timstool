@@ -134,7 +134,13 @@ func (s *Server) testSource(ctx context.Context, srcType string, fields map[stri
 	}
 
 	result["success"] = true
-	result["message"] = fmt.Sprintf("Connected to %s %s:%d", src.Name(), cfg.Host, cfg.Port)
+	// Port 0 means the profile stored none (the adapter applies its own
+	// default at dial time) — printing ":0" would be a lie about the target.
+	if cfg.Port == 0 {
+		result["message"] = fmt.Sprintf("Connected to %s %s", src.Name(), cfg.Host)
+	} else {
+		result["message"] = fmt.Sprintf("Connected to %s %s:%d", src.Name(), cfg.Host, cfg.Port)
+	}
 	if v, ok := src.(versioner); ok {
 		if ver, err := v.Version(cctx); err == nil {
 			result["version"] = strings.TrimSpace(ver)

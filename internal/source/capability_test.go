@@ -185,6 +185,11 @@ var typeBranchFixture = map[string]int{
 	// sanctioned dispatch (single SourceType()=="mysql" branch, mirrors the
 	// mutex-guard shape; PG never hits the gate).
 	"internal/webapi/cdc_handler.go": 1,
+	// M6: compare datasource-ref type check in resolveCompareRef — API input
+	// validation (a compare endpoint may only reference a mongodb datasource;
+	// same class as datasource.go's update-consistency check), not capability
+	// routing: compare.go's capability guard above stays the feature gate.
+	"internal/webapi/compare_handler.go": 1,
 }
 
 // Ruling pattern (seq 82): catches .Type/srcType/SourceType() compares plus

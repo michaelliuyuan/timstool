@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -95,5 +96,112 @@ func TestHandleCreateCompareTaskValidation(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: status=%d want 400, body=%s", c.name, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+// TestResolveCompareRef (M6): datasource refs fold into the endpoint as a
+// creation-time snapshot — field-key mapping (camelCase datasource authDb →
+// snake_case auth_db), explicit-fields-override, the mongodb-only type gate,
+// and the ref-id strip (the persisted spec carries no live reference).
+func TestResolveCompareRef(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	// No ref: no-op.
+	e := &compareEndpoint{Host: "h"}
+	if err := s.resolveCompareRef(e); err != nil || e.Host != "h" {
+		t.Fatalf("no-ref call must be a no-op: %+v %v", e, err)
+	}
+
+	// Unknown ref id.
+	if err := s.resolveCompareRef(&compareEndpoint{DatasourceID: "nope"}); err == nil {
+		t.Fatal("unknown ref must error")
+	}
+
+	// Non-mongodb datasource is rejected by compare.
+	w, req := doReq("POST", "/api/v1/datasources", `{"name":"pg1","type":"postgres","fields":{"host":"h"}}`)
+	s.handleCreateDataSource(w, req)
+	pgID := dsBody(t, w)["id"].(string)
+	err := s.resolveCompareRef(&compareEndpoint{DatasourceID: pgID})
+	if err == nil || !strings.Contains(err.Error(), "mongodb") {
+		t.Fatalf("postgres ref must be rejected with a mongodb-only message: %v", err)
+	}
+
+	// Full fold from a mongodb profile.
+	w, req = doReq("POST", "/api/v1/datasources", `{
+		"name":"legacy","type":"mongodb",
+		"fields":{"host":"10.1.2.3","port":27018,"user":"u","password":"pw","authDb":"admin","tls":"true"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	mgID := dsBody(t, w)["id"].(string)
+
+	e = &compareEndpoint{DatasourceID: mgID}
+	if err := s.resolveCompareRef(e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Host != "10.1.2.3" || e.Port != 27018 || e.User != "u" || e.Password != "pw" || e.AuthDB != "admin" || !e.TLS {
+		t.Fatalf("fold mismatch: %+v", e)
+	}
+	if e.DatasourceID != "" {
+		t.Fatalf("ref id must be stripped after the fold (snapshot purity): %+v", e)
+	}
+
+	// Explicit discrete fields override the stored profile.
+	e = &compareEndpoint{DatasourceID: mgID, Host: "override", Port: 27019}
+	if err := s.resolveCompareRef(e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Host != "override" || e.Port != 27019 || e.User != "u" {
+		t.Fatalf("explicit-wins fold mismatch: %+v", e)
+	}
+
+	// tls "false"/absent stays off.
+	w, req = doReq("POST", "/api/v1/datasources", `{"name":"notls","type":"mongodb","fields":{"host":"h"}}`)
+	s.handleCreateDataSource(w, req)
+	noTLS := dsBody(t, w)["id"].(string)
+	e = &compareEndpoint{DatasourceID: noTLS}
+	if err := s.resolveCompareRef(e); err != nil {
+		t.Fatal(err)
+	}
+	if e.TLS {
+		t.Fatalf("tls must stay off for a profile without it: %+v", e)
+	}
+}
+
+// TestCreateCompareTask_WithDatasourceRef (M6): the create endpoint resolves
+// refs end-to-end — the persisted ConfigJSON holds the folded snapshot
+// (credentials in, datasource_id out).
+func TestCreateCompareTask_WithDatasourceRef(t *testing.T) {
+	s, _ := newTestServer(t)
+	w, req := doReq("POST", "/api/v1/datasources", `{
+		"name":"legacy","type":"mongodb",
+		"fields":{"host":"10.1.2.3","port":27018,"user":"u","password":"pw","authDb":"admin"}
+	}`)
+	s.handleCreateDataSource(w, req)
+	mgID := dsBody(t, w)["id"].(string)
+
+	rec := postCompareSpec(t, s, `{
+		"source": {"datasource_id": "`+mgID+`", "database": "testdb"},
+		"target": {"datasource_id": "`+mgID+`", "database": "testdb"}
+	}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create with refs: %d %s", rec.Code, rec.Body.String())
+	}
+	id := dsBody(t, rec)["id"].(string)
+	task, err := s.store.GetTask(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, ok := parseCompareTask(task.ConfigJSON)
+	if !ok {
+		t.Fatalf("not a compare config: %s", task.ConfigJSON)
+	}
+	if spec.Source.Host != "10.1.2.3" || spec.Source.Port != 27018 || spec.Source.Password != "pw" || spec.Source.AuthDB != "admin" {
+		t.Fatalf("snapshot not folded into persisted spec: %+v", spec.Source)
+	}
+	if spec.Source.DatasourceID != "" || spec.Target.DatasourceID != "" {
+		t.Fatalf("persisted spec must not carry datasource refs: %+v", spec)
+	}
+	if _, err := spec.Source.dialConfig(); err != nil {
+		t.Fatalf("folded snapshot must dial: %v", err)
 	}
 }

@@ -75,11 +75,13 @@ func viewDataSource(e *dataSourceEntry) dataSourceView {
 }
 
 // dataSourceTypes are the allowed datasource types (D3: postgres+tidb first,
-// mysql released in the same batch).
+// mysql released in the same batch; mongodb joined in M6 — compare-only
+// kind, its connection test goes through the source registry → mongoconn).
 var dataSourceTypes = map[string]int{
 	"postgres": 5432,
 	"mysql":    3306,
 	"tidb":     4000,
+	"mongodb":  27017,
 }
 
 func (s *Server) datasourcesFile() string { return s.dataDir + "/datasources.json" }
@@ -188,7 +190,7 @@ func validateDataSourceBody(name, dsType string, fields map[string]any) error {
 	}
 	defPort, ok := dataSourceTypes[dsType]
 	if !ok {
-		return fmt.Errorf("type must be one of postgres/mysql/tidb")
+		return fmt.Errorf("type must be one of postgres/mysql/tidb/mongodb")
 	}
 	if stringField(fields, "host") == "" {
 		return fmt.Errorf("host is required")

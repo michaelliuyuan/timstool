@@ -254,7 +254,10 @@ export interface CreateTaskRequest {
 // MongoDB compare task (M3 API face, snake_case per task-API convention).
 // One source database vs one target database (v1 semantics); uri OR discrete
 // fields per side (discrete wins server-side; passwords never round-trip the
-// API — the server stores ConfigJSON with json:"-").
+// API — the server stores ConfigJSON with json:"-"). M6: tls rides along as
+// an optional switch, and datasource_id references a saved mongodb
+// datasource which the server folds into a creation-time snapshot (explicit
+// discrete fields override the stored profile).
 export interface CompareEndpoint {
   uri?: string
   host?: string
@@ -262,7 +265,9 @@ export interface CompareEndpoint {
   user?: string
   password?: string
   auth_db?: string
+  tls?: boolean
   database: string
+  datasource_id?: string
 }
 
 export interface CompareTaskSpec {
@@ -407,7 +412,7 @@ export interface CompareOptions {
 export interface DataSource {
   id: string
   name: string
-  type: 'postgres' | 'mysql' | 'tidb'
+  type: 'postgres' | 'mysql' | 'tidb' | 'mongodb'
   fields: Record<string, any>
   has_password: boolean
   created_at: string

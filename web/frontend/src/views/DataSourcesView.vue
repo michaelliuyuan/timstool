@@ -23,8 +23,9 @@ const typeOptions = [
   { value: 'postgres', label: 'PostgreSQL' },
   { value: 'mysql', label: 'MySQL' },
   { value: 'tidb', label: 'TiDB（目标端）' },
+  { value: 'mongodb', label: 'MongoDB（对比）' },
 ]
-const typeLabels: Record<string, string> = { postgres: 'PostgreSQL', mysql: 'MySQL', tidb: 'TiDB' }
+const typeLabels: Record<string, string> = { postgres: 'PostgreSQL', mysql: 'MySQL', tidb: 'TiDB', mongodb: 'MongoDB' }
 
 // tidb is not a migration *source* adapter, so it has no FieldSpec meta —
 // its form is defined here (target-side fields only).
@@ -192,7 +193,7 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
       <div v-else class="ds-grid">
         <div v-for="d in sorted" :key="d.id" class="ds-card">
           <div class="ds-card-head">
-            <el-tag :type="d.type === 'tidb' ? 'warning' : d.type === 'mysql' ? 'info' : 'success'" effect="plain" size="small">
+            <el-tag :type="d.type === 'tidb' ? 'warning' : d.type === 'mysql' ? 'info' : d.type === 'mongodb' ? 'primary' : 'success'" effect="plain" size="small">
               {{ typeLabels[d.type] || d.type }}
             </el-tag>
             <span class="ds-card-name" :title="d.name">{{ d.name }}</span>
@@ -244,8 +245,13 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
           <div v-if="editing" class="ds-hint">类型创建后不可修改（如需更换请新建）</div>
         </el-form-item>
         <el-form-item v-for="f in fieldsFor(form.type)" :key="f.key" :label="f.label" :required="f.required">
+          <el-switch
+            v-if="f.type === 'switch'"
+            v-model="form.fields[f.key]"
+            style="width: 180px"
+          />
           <el-input-number
-            v-if="f.type === 'number'"
+            v-else-if="f.type === 'number'"
             v-model="form.fields[f.key]"
             :min="1"
             :max="65535"

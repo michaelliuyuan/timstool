@@ -45,14 +45,20 @@ import (
 
 // compareEndpoint is one side of the comparison. Either a full URI or the
 // discrete fields may be supplied; discrete fields win when both are given.
+// datasource_id (M6) references a saved mongodb datasource: the server
+// resolves it into this endpoint's snapshot at CREATE time (F-02 semantics —
+// later edits/deletes of the datasource never affect the task), with any
+// explicitly supplied discrete field overriding the stored profile.
 type compareEndpoint struct {
-	URI      string `json:"uri"`
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	User     string `json:"user"`
-	Password string `json:"password"`
-	AuthDB   string `json:"auth_db"`
-	Database string `json:"database"`
+	URI          string `json:"uri"`
+	Host         string `json:"host"`
+	Port         int    `json:"port"`
+	User         string `json:"user"`
+	Password     string `json:"password"`
+	AuthDB       string `json:"auth_db"`
+	TLS          bool   `json:"tls,omitempty"`
+	Database     string `json:"database"`
+	DatasourceID string `json:"datasource_id,omitempty"`
 }
 
 // dialConfig maps this endpoint onto the version-adaptive dial (M5):
@@ -68,11 +74,62 @@ func (e compareEndpoint) dialConfig() (mongoconn.DialConfig, error) {
 		// authSource only when explicitly set, preserving the driver
 		// default (admin / connection database) otherwise (M1 parity).
 		cfg.AuthDB = strings.TrimSpace(e.AuthDB)
+		cfg.TLS = e.TLS
 	}
 	if e.Host == "" && e.URI == "" {
 		return cfg, fmt.Errorf("endpoint needs either host or uri")
 	}
 	return cfg, nil
+}
+
+// resolveCompareRef folds the referenced datasource into the endpoint (M6).
+// The stored profile is the base; discrete fields already present on the
+// endpoint override it (explicit wins). The password never travels to the
+// browser, so the client cannot have filled it — the stored one is used
+// unless the request explicitly carries one. Field-key mapping follows the
+// two registries: datasource fields are camelCase per mongoMeta (authDb),
+// the compare DTO is snake_case (auth_db).
+func (s *Server) resolveCompareRef(e *compareEndpoint) error {
+	if e.DatasourceID == "" {
+		return nil
+	}
+	entry, err := s.resolveDataSourceRef(e.DatasourceID)
+	if err != nil {
+		return fmt.Errorf("datasource %q: %v", e.DatasourceID, err)
+	}
+	if entry.Type != "mongodb" {
+		return fmt.Errorf("datasource %q is %q, compare requires a mongodb datasource", e.DatasourceID, entry.Type)
+	}
+	if e.Host == "" {
+		e.Host = stringField(entry.Fields, "host")
+	}
+	if e.Port == 0 {
+		if p := stringField(entry.Fields, "port"); p != "" {
+			if n, err := dsParsePort(p); err == nil {
+				e.Port = n
+			}
+		}
+	}
+	if e.User == "" {
+		e.User = stringField(entry.Fields, "user")
+	}
+	if e.Password == "" {
+		e.Password = stringField(entry.Fields, "password")
+	}
+	if strings.TrimSpace(e.AuthDB) == "" {
+		e.AuthDB = stringField(entry.Fields, "authDb")
+	}
+	if !e.TLS {
+		switch strings.ToLower(strings.TrimSpace(stringField(entry.Fields, "tls"))) {
+		case "true", "1", "on", "yes":
+			e.TLS = true
+		}
+	}
+	// The ref has served its purpose: everything below works on the folded
+	// snapshot, and the persisted spec carries no live reference back to
+	// the (mutable, deletable) datasource registry entry.
+	e.DatasourceID = ""
+	return nil
 }
 
 // compareTaskSpec is the persisted compare-task configuration (stored under
@@ -119,6 +176,17 @@ func (s *Server) handleCreateCompareTask(w http.ResponseWriter, r *http.Request)
 	var req compareTaskSpec
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	// Resolve datasource refs into connection snapshots FIRST (F-02: the
+	// snapshot is taken at creation; later datasource edits/deletes never
+	// affect the task). The resolved spec — not the ref — is persisted.
+	if err := s.resolveCompareRef(&req.Source); err != nil {
+		s.writeError(w, http.StatusBadRequest, "source: "+err.Error())
+		return
+	}
+	if err := s.resolveCompareRef(&req.Target); err != nil {
+		s.writeError(w, http.StatusBadRequest, "target: "+err.Error())
 		return
 	}
 	if _, err := req.Source.dialConfig(); err != nil {

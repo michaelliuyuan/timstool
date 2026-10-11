@@ -5,12 +5,16 @@ import { ElMessage } from 'element-plus'
 import apiClient from '../api'
 import type { CompareTaskSpec } from '../api'
 import ConnectionForm from '../components/ConnectionForm.vue'
+import DataSourcePicker from '../components/DataSourcePicker.vue'
 import { useSourceSchema } from '../composables/useSourceSchema'
 
 // MongoDB compare task creation (M4): schema-driven forms for both sides
 // (the /sources metadata is the single source of truth — no hard-coded
 // fields), database names, and an advanced collapse for engine knobs.
 // Submit: create → start (clean run) → task detail.
+// M6: each side may reference a saved mongodb datasource instead of a
+// manual form (server-side credential snapshot; explicit manual fields
+// override the stored profile server-side).
 const router = useRouter()
 const { load, getSource } = useSourceSchema()
 
@@ -20,6 +24,8 @@ const advancedOpen = ref(false)
 
 const srcModel = reactive<Record<string, any>>({ host: 'localhost', port: 27017 })
 const tgtModel = reactive<Record<string, any>>({ host: 'localhost', port: 27017 })
+const srcRef = ref('')
+const tgtRef = ref('')
 const srcDb = ref('')
 const tgtDb = ref('')
 const tgtSameAsSrc = ref(true)
@@ -46,13 +52,22 @@ onMounted(async () => {
 })
 
 async function testSide(side: 'src' | 'tgt') {
-  const model = side === 'src' ? srcModel : tgtModel
   testing.value[side] = true
   testState.value[side] = undefined
   try {
-    const { data } = await apiClient.testSourceConnection('mongodb', { ...model })
-    testState.value[side] = !!data.success
-    if (!data.success) ElMessage.warning(`连接失败: ${data.message || '未知错误'}`)
+    // Referenced datasource: credentials live server-side — test through
+    // the datasource test endpoint, not the inline field form.
+    const refId = side === 'src' ? srcRef.value : tgtRef.value
+    if (refId) {
+      const { data } = await apiClient.testDataSource(refId)
+      testState.value[side] = !!data.success
+      if (!data.success) ElMessage.warning(`连接失败: ${data.message || '未知错误'}`)
+    } else {
+      const model = side === 'src' ? srcModel : tgtModel
+      const { data } = await apiClient.testSourceConnection('mongodb', { ...model })
+      testState.value[side] = !!data.success
+      if (!data.success) ElMessage.warning(`连接失败: ${data.message || '未知错误'}`)
+    }
   } catch (e: any) {
     ElMessage.error(e.response?.data?.error || '连接测试失败')
   } finally {
@@ -61,6 +76,11 @@ async function testSide(side: 'src' | 'tgt') {
 }
 
 function endpointOf(side: 'src' | 'tgt'): CompareTaskSpec['source'] {
+  // Datasource reference: only the database name is needed here — the
+  // server folds host/port/user/password/authDb/tls from the stored
+  // profile into a creation-time snapshot.
+  const refId = side === 'src' ? srcRef.value : tgtRef.value
+  if (refId) return { datasource_id: refId, database: '' }
   const model = side === 'src' ? srcModel : tgtModel
   const ep: CompareTaskSpec['source'] = { database: '' }
   if (model.host) ep.host = model.host
@@ -69,6 +89,8 @@ function endpointOf(side: 'src' | 'tgt'): CompareTaskSpec['source'] {
   if (model.password) ep.password = model.password
   // the /sources field key is authDb; the compare DTO key is auth_db
   if (model.authDb) ep.auth_db = model.authDb
+  // the meta form renders tls as a switch (boolean)
+  if (model.tls) ep.tls = true
   return ep
 }
 
@@ -122,7 +144,12 @@ async function submit() {
     <el-card v-if="mongoMeta?.implemented" style="margin-bottom: 20px;">
       <template #header>源端（被对比方）</template>
       <el-form label-width="160px">
-        <ConnectionForm :meta="mongoMeta" :model="srcModel" />
+        <el-form-item label="连接方式">
+          <DataSourcePicker v-model="srcRef" :types="['mongodb']" />
+        </el-form-item>
+        <template v-if="!srcRef">
+          <ConnectionForm :meta="mongoMeta" :model="srcModel" />
+        </template>
         <el-form-item label="数据库名" required>
           <el-input v-model="srcDb" placeholder="例如 orders" style="max-width: 320px;" />
         </el-form-item>
@@ -139,7 +166,12 @@ async function submit() {
     <el-card v-if="mongoMeta?.implemented" style="margin-bottom: 20px;">
       <template #header>目标端（对比方）</template>
       <el-form label-width="160px">
-        <ConnectionForm :meta="mongoMeta" :model="tgtModel" />
+        <el-form-item label="连接方式">
+          <DataSourcePicker v-model="tgtRef" :types="['mongodb']" />
+        </el-form-item>
+        <template v-if="!tgtRef">
+          <ConnectionForm :meta="mongoMeta" :model="tgtModel" />
+        </template>
         <el-form-item>
           <el-checkbox v-model="tgtSameAsSrc">目标数据库名与源端相同</el-checkbox>
         </el-form-item>
