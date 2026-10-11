@@ -5,10 +5,9 @@ import (
 	"fmt"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/michaelliuyuan/timstool/internal/mongocompare/canon"
+	"github.com/michaelliuyuan/timstool/internal/mongoconn"
 )
 
 // DocDelta is one document-level difference of the L6 drill-down: a missing
@@ -26,26 +25,23 @@ type DocDelta struct {
 // (same BSON rank, different type tag — e.g. int32 vs double of equal value)
 // report as a cross missing pair. Composite _id types (Object/Array/Regex)
 // degrade to a full-bucket map join.
-func DiffBucket(ctx context.Context, sc, tc *mongo.Collection, query bson.D, opts canon.Opts, batch int) ([]DocDelta, error) {
+func DiffBucket(ctx context.Context, sc, tc mongoconn.Coll, query bson.D, opts canon.Opts, batch int) ([]DocDelta, error) {
 	if batch <= 0 {
 		batch = 1000
 	}
-	findOpts := func() *options.FindOptionsBuilder {
-		return options.Find().
-			SetSort(bson.D{{Key: "_id", Value: 1}}).
-			SetBatchSize(int32(batch))
-	}
+	findOpts := func() mongoconn.FindOpts { return mongoconn.FindOpts{Batch: batch} }
 
-	probe, err := sc.Find(ctx, query, options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetLimit(1))
+	probe, err := sc.Find(ctx, query, mongoconn.FindOpts{Batch: 1, Limit: 1})
 	if err != nil {
 		return nil, err
 	}
-	var probeDocs []bson.D
-	if err := probe.All(ctx, &probeDocs); err != nil {
-		return nil, err
+	var probeDoc bson.D
+	if probe.Next(ctx) {
+		probeDoc = probe.Doc()
 	}
-	if len(probeDocs) > 0 {
-		id, _ := idOf(probeDocs[0])
+	_ = probe.Close(ctx)
+	if len(probeDoc) > 0 {
+		id, _ := idOf(probeDoc)
 		if _, ok := canon.CompareIDs(id, id); !ok {
 			return diffBucketMap(ctx, sc, tc, query, opts, findOpts)
 		}
@@ -53,36 +49,34 @@ func DiffBucket(ctx context.Context, sc, tc *mongo.Collection, query bson.D, opt
 	return diffBucketMerge(ctx, sc, tc, query, opts, findOpts)
 }
 
+// docIter wraps mongoconn.DocIter with one-document lookahead.
 type docIter struct {
-	cur  *mongo.Cursor
+	it   mongoconn.DocIter
 	next bson.D
 	done bool
 }
 
-func newDocIter(ctx context.Context, coll *mongo.Collection, query bson.D, opts *options.FindOptionsBuilder) (*docIter, error) {
-	cur, err := coll.Find(ctx, query, opts)
+func newDocIter(ctx context.Context, coll mongoconn.Coll, query bson.D, opts mongoconn.FindOpts) (*docIter, error) {
+	it, err := coll.Find(ctx, query, opts)
 	if err != nil {
 		return nil, err
 	}
-	it := &docIter{cur: cur}
-	it.advance(ctx)
-	return it, nil
+	d := &docIter{it: it}
+	d.advance(ctx)
+	return d, nil
 }
 
-func (it *docIter) advance(ctx context.Context) {
-	if it.cur.Next(ctx) {
-		var d bson.D
-		if err := it.cur.Decode(&d); err == nil {
-			it.next = d
-			return
-		}
+func (d *docIter) advance(ctx context.Context) {
+	if d.it.Next(ctx) {
+		d.next = d.it.Doc()
+		return
 	}
-	it.done = true
+	d.done = true
 }
 
-func (it *docIter) close(ctx context.Context) { _ = it.cur.Close(ctx) }
+func (d *docIter) close(ctx context.Context) { _ = d.it.Close(ctx) }
 
-func diffBucketMerge(ctx context.Context, sc, tc *mongo.Collection, query bson.D, opts canon.Opts, findOpts func() *options.FindOptionsBuilder) ([]DocDelta, error) {
+func diffBucketMerge(ctx context.Context, sc, tc mongoconn.Coll, query bson.D, opts canon.Opts, findOpts func() mongoconn.FindOpts) ([]DocDelta, error) {
 	itA, err := newDocIter(ctx, sc, query, findOpts())
 	if err != nil {
 		return nil, err
@@ -138,18 +132,14 @@ func diffBucketMerge(ctx context.Context, sc, tc *mongo.Collection, query bson.D
 	return deltas, nil
 }
 
-func diffBucketMap(ctx context.Context, sc, tc *mongo.Collection, query bson.D, opts canon.Opts, findOpts func() *options.FindOptionsBuilder) ([]DocDelta, error) {
+func diffBucketMap(ctx context.Context, sc, tc mongoconn.Coll, query bson.D, opts canon.Opts, findOpts func() mongoconn.FindOpts) ([]DocDelta, error) {
 	m := make(map[string]bson.D)
 	cur, err := sc.Find(ctx, query, findOpts())
 	if err != nil {
 		return nil, err
 	}
 	for cur.Next(ctx) {
-		var d bson.D
-		if err := cur.Decode(&d); err != nil {
-			_ = cur.Close(ctx)
-			return nil, err
-		}
+		d := cur.Doc()
 		id, _ := idOf(d)
 		m[canon.Canonical(id, opts)] = d
 	}
@@ -165,11 +155,7 @@ func diffBucketMap(ctx context.Context, sc, tc *mongo.Collection, query bson.D, 
 		return nil, err
 	}
 	for cur2.Next(ctx) {
-		var d bson.D
-		if err := cur2.Decode(&d); err != nil {
-			_ = cur2.Close(ctx)
-			return nil, err
-		}
+		d := cur2.Doc()
 		id, _ := idOf(d)
 		k := canon.Canonical(id, opts)
 		src, ok := m[k]

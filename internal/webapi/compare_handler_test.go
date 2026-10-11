@@ -32,35 +32,38 @@ func TestParseCompareTask(t *testing.T) {
 	}
 }
 
-func TestCompareEndpointClientOptions(t *testing.T) {
-	// Structured building (M1 pattern): credentials must land in
-	// options.Credential, never string-concatenated into a URI — passwords
-	// with @ : / % would break URI parsing (review finding A).
+func TestCompareEndpointDialConfig(t *testing.T) {
+	// Structured mapping (M1 pattern): credentials stay literal fields,
+	// never string-concatenated into a URI — passwords with @ : / % would
+	// break URI parsing (review finding A). M5: the endpoint maps onto the
+	// version-adaptive DialConfig.
 	e := compareEndpoint{Host: "h", Port: 27018, User: "u", Password: "p@:/x", AuthDB: "adb"}
-	opts, err := e.clientOptions()
+	cfg, err := e.dialConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(opts.Hosts) != 1 || opts.Hosts[0] != "h:27018" {
-		t.Errorf("hosts=%v, want [h:27018]", opts.Hosts)
+	if cfg.Host != "h" || cfg.Port != 27018 || cfg.User != "u" || cfg.Password != "p@:/x" || cfg.AuthDB != "adb" {
+		t.Errorf("cfg = %+v, want structured credential passthrough", cfg)
 	}
-	if opts.Auth == nil || opts.Auth.Username != "u" || opts.Auth.Password != "p@:/x" || opts.Auth.AuthSource != "adb" {
-		t.Errorf("auth=%+v, want structured credential", opts.Auth)
+	if cfg.URI != "" {
+		t.Errorf("URI = %q, want empty when discrete fields given", cfg.URI)
 	}
-	// No auth when user empty; no authSource when auth_db empty.
+	// No credentials: zero-value fields (the dial applies driver defaults).
 	e2 := compareEndpoint{Host: "h2"}
-	opts2, _ := e2.clientOptions()
-	if opts2.Auth != nil {
-		t.Errorf("auth=%+v, want nil", opts2.Auth)
+	cfg2, _ := e2.dialConfig()
+	if cfg2.User != "" || cfg2.AuthDB != "" {
+		t.Errorf("cfg2 = %+v, want empty credential fields", cfg2)
 	}
 	// Bare URI passes through; discrete fields win over URI; neither = error.
-	if opts3, _ := (&compareEndpoint{URI: "mongodb://x"}).clientOptions(); len(opts3.Hosts) == 0 && opts3.GetURI() == "" {
-		t.Error("uri-only endpoint produced empty options")
+	cfg3, err3 := (&compareEndpoint{URI: "mongodb://x"}).dialConfig()
+	if err3 != nil || cfg3.URI != "mongodb://x" {
+		t.Errorf("uri-only endpoint: cfg=%+v err=%v, want URI passthrough", cfg3, err3)
 	}
-	if opts4, _ := (&compareEndpoint{URI: "mongodb://z", Host: "h"}).clientOptions(); opts4.Hosts[0] != "h" && len(opts4.Hosts) == 0 {
-		t.Error("discrete fields should win over uri")
+	cfg4, _ := (&compareEndpoint{URI: "mongodb://z", Host: "h"}).dialConfig()
+	if cfg4.Host != "h" || cfg4.URI != "" {
+		t.Errorf("cfg4 = %+v, want discrete fields to win over uri", cfg4)
 	}
-	if _, err := (&compareEndpoint{}).clientOptions(); err == nil {
+	if _, err := (&compareEndpoint{}).dialConfig(); err == nil {
 		t.Error("empty endpoint should error")
 	}
 }

@@ -55,7 +55,7 @@ POST /api/v1/tasks/{id}/cancel         # 取消（再启动 = 全新对比）
 2. **undefined vs null**：按 canonical-bson-spec v1 修订移除（现代驱动不产 undefined）。
 3. **跨实现字节一致为 non-goal**：canonical 串的跨语言（Go/js）字节一致不承诺；一致性以「同型同值 ⇔ 同串」的注入性与 Go 版本内稳定性为准。
 4. **v1 单库对单库**：全实例对比与库表映射留待后续版本。
-5. **版本下限 MongoDB 4.4+（wire 9）**：mongo-driver v2 的硬性握手下限；更老实例（如 wire 4 的 3.x）连接即报 `wire version ... requires at least 9`。双版本支持（v2 现代 + v1 legacy 自适应）为 M5 待立项项，落地后本条改写为双支持矩阵。
+5. **版本支持矩阵（M5 双驱动自适应）**：连接层按 `isMaster` 探测的 maxWireVersion **逐连接**自动选路——wire ≥ 9（MongoDB 4.4+）走 mongo-driver v2 原生路径；wire < 9 走 v1 桥（内部 `internal/mongoconn`，v1 仅作字节管道，全部解码统一 v2 bson，canonical 语义双路径逐字节一致，有桥接等价测试锚定）。桥的官方支持区间为 **MongoDB 3.6+（wire 6+，驱动 v1.12）**；wire 4–5（3.2/3.4）为 **best-effort**——通过放宽 v1 驱动下限实现，全管线（元数据/计数/哈希/钻取）已在真实 3.2.4 实例上实测通过，但超出驱动官方矩阵，以实测为准。两侧都连不上时报 `ProbeError`（含地址与双驱动错误，不静默选错路径）。
 
 ## 运维备忘
 

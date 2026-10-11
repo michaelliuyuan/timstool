@@ -5,9 +5,10 @@
 // IncrementalCapture) is an ErrNotImplemented placeholder following the
 // stub-source convention (source.go ErrNotImplemented). What it does provide:
 //
-//   - Connect: driver connect (clientOptions-based, no URI string building) +
-//     Ping + ListDatabases (verifies read access), suitable for the Web
-//     connection test (it also implements Version).
+//   - Connect: version-adaptive dial (M5 internal/mongoconn — v2 native for
+//     wire 9+/4.4+, v1 bridge for 3.x) + Ping + ListDatabases (verifies read
+//     access), suitable for the Web connection test (it also implements
+//     Version).
 //   - ListDatabases/ListCollections: the source.MetaBrowser capability — the
 //     strongly-typed metadata tree (counts, index summaries incl. TTL) used
 //     by the compare module (M2 skips TTL collections via ExpireAfterSeconds)
@@ -18,16 +19,11 @@ package mongo
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"strings"
 	"time"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
-
+	"github.com/michaelliuyuan/timstool/internal/mongoconn"
 	"github.com/michaelliuyuan/timstool/internal/source"
 )
 
@@ -62,40 +58,25 @@ var mongoMeta = source.SourceMeta{
 // ErrNotImplemented placeholders).
 type Source struct {
 	cfg    source.SourceConfig
-	client *mongo.Client
+	client mongoconn.Client
 }
 
 func (s *Source) Name() string { return "mongodb" }
 
-// buildClientOptions assembles the driver client options from the source
-// config, structured (no URI string escaping to get wrong): hosts, optional
-// credential with authSource, optional TLS.
-func buildClientOptions(c source.SourceConfig) *options.ClientOptions {
-	host := c.Host
-	if host == "" {
-		host = "localhost"
+// dialConfig maps the source config onto the version-adaptive dial (M5):
+// structured fields, TLS read through the loose switch-form convention.
+func dialConfig(c source.SourceConfig) mongoconn.DialConfig {
+	cfg := mongoconn.DialConfig{
+		Host:     c.Host,
+		Port:     c.Port,
+		User:     c.User,
+		Password: c.Password,
+		AuthDB:   strings.TrimSpace(c.Options["authDb"]),
 	}
-	port := c.Port
-	if port == 0 {
-		port = 27017
+	if v, ok := c.Options["tls"]; ok && isTruthy(v) {
+		cfg.TLS = true
 	}
-	opts := options.Client().SetHosts([]string{fmt.Sprintf("%s:%d", host, port)})
-	if c.User != "" {
-		cred := options.Credential{Username: c.User}
-		if c.Password != "" {
-			cred.Password = c.Password
-		}
-		// authSource is only sent when the user filled authDb, preserving the
-		// driver's default (admin / connection database) otherwise.
-		if authDb := strings.TrimSpace(c.Options["authDb"]); authDb != "" {
-			cred.AuthSource = authDb
-		}
-		opts.SetAuth(cred)
-	}
-	if isTruthy(c.Options["tls"]) {
-		opts.SetTLSConfig(&tls.Config{}) // system CAs, verify server by default
-	}
-	return opts
+	return cfg
 }
 
 // isTruthy reads a switch-style field value ("true"/"1"/"on" from any of the
@@ -108,22 +89,20 @@ func isTruthy(v string) bool {
 	return false
 }
 
-// Connect dials the deployment, verifies it with Ping, and confirms read
-// access with ListDatabases (the connection-test contract, M1 acceptance).
+// Connect dials the deployment through the version-adaptive layer (v2 for
+// wire 9+, v1 bridge for old servers — per-connection probe, M5), verifies it
+// with Ping, and confirms read access with ListDatabases (the
+// connection-test contract, M1 acceptance).
 func (s *Source) Connect(ctx context.Context) error {
 	if s.client != nil {
 		return nil // already connected (idempotent, mirrors pg/mysql behavior)
 	}
-	client, err := mongo.Connect(buildClientOptions(s.cfg))
+	client, err := mongoconn.Dial(ctx, dialConfig(s.cfg))
 	if err != nil {
-		return fmt.Errorf("mongodb source: connect: %w", err)
-	}
-	if err := client.Ping(ctx, readpref.Primary()); err != nil {
-		_ = client.Disconnect(context.Background())
-		return fmt.Errorf("mongodb source: ping: %w", err)
+		return fmt.Errorf("mongodb source: %w", err)
 	}
 	// Verify the credentials can actually read (catches bad authSource etc.).
-	if _, err := client.ListDatabases(ctx, bson.D{}); err != nil {
+	if _, err := client.ListDatabases(ctx); err != nil {
 		_ = client.Disconnect(context.Background())
 		return fmt.Errorf("mongodb source: listDatabases: %w", err)
 	}
@@ -143,9 +122,9 @@ func (s *Source) Close() error {
 	return err
 }
 
-// Client exposes the connected driver client (for the M2 compare engine).
+// Conn exposes the version-adaptive connection (for the M2+ compare engine).
 // Requires Connect first; nil before that.
-func (s *Source) Client() *mongo.Client { return s.client }
+func (s *Source) Conn() mongoconn.Client { return s.client }
 
 // Config exposes the source config (for readers/the compare engine).
 func (s *Source) Config() source.SourceConfig { return s.cfg }
@@ -156,13 +135,7 @@ func (s *Source) Version(ctx context.Context) (string, error) {
 	if s.client == nil {
 		return "", fmt.Errorf("mongodb source: not connected")
 	}
-	var res struct {
-		Version string `bson:"version"`
-	}
-	if err := s.client.Database("admin").RunCommand(ctx, bson.D{{Key: "buildInfo", Value: 1}}).Decode(&res); err != nil {
-		return "", err
-	}
-	return "MongoDB " + res.Version, nil
+	return s.client.Version(ctx)
 }
 
 // --- Migration-oriented placeholders (ErrNotImplemented convention) ---

@@ -129,11 +129,14 @@ type IndexKey struct {
 
 // IndexInfo summarizes one collection index. ExpireAfterSeconds is non-nil
 // only for TTL indexes — the compare engine uses it to skip data comparison
-// on TTL collections (their contents expire by design).
+// on TTL collections (their contents expire by design). Sparse/Clustered
+// ride along for the engine's canonical index form (M5).
 type IndexInfo struct {
 	Name               string     `json:"name"`
 	Keys               []IndexKey `json:"keys,omitempty"`
 	Unique             bool       `json:"unique,omitempty"`
+	Sparse             bool       `json:"sparse,omitempty"`
+	Clustered          bool       `json:"clustered,omitempty"`
 	ExpireAfterSeconds *int32     `json:"expire_after_seconds,omitempty"`
 }
 

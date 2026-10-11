@@ -37,11 +37,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
 	"github.com/michaelliuyuan/timstool/internal/mongocompare"
+	"github.com/michaelliuyuan/timstool/internal/mongoconn"
 	"github.com/michaelliuyuan/timstool/internal/store"
 )
 
@@ -57,36 +55,24 @@ type compareEndpoint struct {
 	Database string `json:"database"`
 }
 
-// clientOptions assembles driver options for this endpoint. Discrete fields
-// build structured options (M1 pattern, internal/source/mongo/source.go
-// buildClientOptions: "no URI string escaping to get wrong" — passwords
-// containing @ : / % must not be string-concatenated into a URI). A bare URI
-// is passed through verbatim; its escaping is the caller's responsibility.
-func (e compareEndpoint) clientOptions() (*options.ClientOptions, error) {
+// dialConfig maps this endpoint onto the version-adaptive dial (M5):
+// discrete fields build the structured config (M1 pattern — "no URI string
+// escaping to get wrong"; passwords containing @ : / % must not be
+// string-concatenated into a URI). A bare URI is passed through verbatim;
+// its escaping is the caller's responsibility.
+func (e compareEndpoint) dialConfig() (mongoconn.DialConfig, error) {
+	cfg := mongoconn.DialConfig{URI: e.URI}
 	if e.Host != "" {
-		host := e.Host
-		if e.Port != 0 {
-			host = fmt.Sprintf("%s:%d", host, e.Port)
-		}
-		opts := options.Client().SetHosts([]string{host})
-		if e.User != "" {
-			cred := options.Credential{Username: e.User}
-			if e.Password != "" {
-				cred.Password = e.Password
-			}
-			// authSource only when explicitly set, preserving the driver
-			// default (admin / connection database) otherwise (M1 parity).
-			if authDB := strings.TrimSpace(e.AuthDB); authDB != "" {
-				cred.AuthSource = authDB
-			}
-			opts.SetAuth(cred)
-		}
-		return opts, nil
+		cfg.Host, cfg.Port, cfg.URI = e.Host, e.Port, ""
+		cfg.User, cfg.Password = e.User, e.Password
+		// authSource only when explicitly set, preserving the driver
+		// default (admin / connection database) otherwise (M1 parity).
+		cfg.AuthDB = strings.TrimSpace(e.AuthDB)
 	}
-	if e.URI != "" {
-		return options.Client().ApplyURI(e.URI), nil
+	if e.Host == "" && e.URI == "" {
+		return cfg, fmt.Errorf("endpoint needs either host or uri")
 	}
-	return nil, fmt.Errorf("endpoint needs either host or uri")
+	return cfg, nil
 }
 
 // compareTaskSpec is the persisted compare-task configuration (stored under
@@ -135,11 +121,11 @@ func (s *Server) handleCreateCompareTask(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if _, err := req.Source.clientOptions(); err != nil {
+	if _, err := req.Source.dialConfig(); err != nil {
 		s.writeError(w, http.StatusBadRequest, "source: "+err.Error())
 		return
 	}
-	if _, err := req.Target.clientOptions(); err != nil {
+	if _, err := req.Target.dialConfig(); err != nil {
 		s.writeError(w, http.StatusBadRequest, "target: "+err.Error())
 		return
 	}
@@ -290,19 +276,19 @@ func (s *Server) pollCompareProgress(ctx context.Context, taskID, outDir string)
 	}
 }
 
-func connectMongo(ctx context.Context, e compareEndpoint) (*mongo.Client, error) {
-	opts, err := e.clientOptions()
+func connectMongo(ctx context.Context, e compareEndpoint) (mongoconn.Client, error) {
+	cfg, err := e.dialConfig()
 	if err != nil {
 		return nil, err
 	}
-	client, err := mongo.Connect(opts)
+	client, err := mongoconn.Dial(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := client.Ping(pingCtx, readpref.Primary()); err != nil {
-		client.Disconnect(context.Background())
+	if err := client.Ping(pingCtx); err != nil {
+		_ = client.Disconnect(context.Background())
 		return nil, err
 	}
 	return client, nil

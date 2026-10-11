@@ -5,9 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-
 	"github.com/michaelliuyuan/timstool/internal/source"
 )
 
@@ -45,7 +42,7 @@ func TestMongoRegistered(t *testing.T) {
 	// source group (authDb/tls) — the exact set from the M1 task brief.
 	wantKeys := []string{"host", "port", "user", "password", "authDb", "tls"}
 	if len(meta.Fields) != len(wantKeys) {
-		t.Fatalf("Fields length = %d, want %d (%v)", len(meta.Fields), len(wantKeys), meta.Fields)
+		t.Fatalf("Fields length = %d, want %v (%v)", len(meta.Fields), wantKeys, meta.Fields)
 	}
 	for i, f := range meta.Fields {
 		if f.Key != wantKeys[i] {
@@ -92,19 +89,6 @@ func TestMongoMigrationPlaceholders(t *testing.T) {
 	}
 }
 
-// TestIsBrowsableCollection: the empty type (older drivers) must be treated as
-// a collection so those collections are never silently dropped from listings.
-func TestIsBrowsableCollection(t *testing.T) {
-	for _, typ := range []string{"collection", ""} {
-		if !isBrowsableCollection(typ) {
-			t.Errorf("isBrowsableCollection(%q) = false, want true", typ)
-		}
-	}
-	if isBrowsableCollection("view") {
-		t.Error(`isBrowsableCollection("view") = true, want false`)
-	}
-}
-
 // TestMongoInterfaces: the adapter satisfies the small connect/browse
 // capabilities (source.Connector / source.MetaBrowser) for the compare track.
 // Browse calls before Connect fail with a friendly error, not a panic.
@@ -134,112 +118,33 @@ func TestMongoInterfaces(t *testing.T) {
 	}
 }
 
-// TestMongoClientOptions covers the structured (clientOptions-based) client
-// construction: host/port defaults, credential + authSource, TLS switch — the
-// URI-string-escaping pitfalls this replaces (arbitration merge item 1).
-func TestMongoClientOptions(t *testing.T) {
-	// Defaults: empty host/port fall back to localhost:27017.
-	opts := buildClientOptions(source.SourceConfig{})
-	if len(opts.Hosts) != 1 || opts.Hosts[0] != "localhost:27017" {
-		t.Errorf("default Hosts = %v, want [localhost:27017]", opts.Hosts)
+// TestDialConfigMapping covers the source-config → DialConfig mapping (the
+// structured-credential convention this layer enforces before the
+// version-adaptive dial): literal credential passthrough (no URI string
+// escaping to get wrong), authDb trim, TLS loose-value reading.
+func TestDialConfigMapping(t *testing.T) {
+	cfg := dialConfig(source.SourceConfig{Host: "mdb1", Port: 28018, User: "u", Password: "p@/+:&="})
+	if cfg.Host != "mdb1" || cfg.Port != 28018 || cfg.User != "u" || cfg.Password != "p@/+:&=" {
+		t.Errorf("cfg = %+v, want literal field passthrough", cfg)
+	}
+	if cfg.TLS {
+		t.Error("TLS set without tls option, want false")
 	}
 
-	// Explicit host/port.
-	opts = buildClientOptions(source.SourceConfig{Host: "mdb1", Port: 28018})
-	if len(opts.Hosts) != 1 || opts.Hosts[0] != "mdb1:28018" {
-		t.Errorf("Hosts = %v, want [mdb1:28018]", opts.Hosts)
+	cfg = dialConfig(source.SourceConfig{Host: "h", User: "u", Password: "p",
+		Options: map[string]string{"authDb": "  myauth  "}})
+	if cfg.AuthDB != "myauth" {
+		t.Errorf("AuthDB = %q, want trimmed myauth", cfg.AuthDB)
 	}
 
-	// Credentials without authDb: no AuthSource override (driver default).
-	opts = buildClientOptions(source.SourceConfig{Host: "h", Port: 27017, User: "u", Password: "p@/+:&="})
-	if opts.Auth == nil || opts.Auth.Username != "u" || opts.Auth.Password != "p@/+:&=" {
-		t.Errorf("Auth = %+v, want username u + literal password (no escaping needed)", opts.Auth)
-	}
-	if opts.Auth.AuthSource != "" {
-		t.Errorf("AuthSource = %q, want empty (driver default)", opts.Auth.AuthSource)
-	}
-
-	// Credentials + authDb.
-	opts = buildClientOptions(source.SourceConfig{Host: "h", Port: 27017, User: "u", Password: "p",
-		Options: map[string]string{"authDb": "myauth"}})
-	if opts.Auth == nil || opts.Auth.AuthSource != "myauth" {
-		t.Errorf("Auth = %+v, want AuthSource=myauth", opts.Auth)
-	}
-
-	// authDb without credentials is ignored (no auth block at all).
-	opts = buildClientOptions(source.SourceConfig{Host: "h", Port: 27017,
-		Options: map[string]string{"authDb": "admin"}})
-	if opts.Auth != nil {
-		t.Errorf("Auth = %+v, want nil without credentials", opts.Auth)
-	}
-
-	// TLS off by default, on via the switch (loose JSON values included).
-	opts = buildClientOptions(source.SourceConfig{Host: "h", Port: 27017})
-	if opts.TLSConfig != nil {
-		t.Error("TLSConfig set without tls option, want nil")
-	}
 	for _, v := range []string{"true", "1", "on", "True"} {
-		opts = buildClientOptions(source.SourceConfig{Host: "h", Port: 27017,
-			Options: map[string]string{"tls": v}})
-		if opts.TLSConfig == nil {
-			t.Errorf("TLSConfig nil for tls=%q, want set", v)
+		cfg = dialConfig(source.SourceConfig{Host: "h", Options: map[string]string{"tls": v}})
+		if !cfg.TLS {
+			t.Errorf("TLS false for tls=%q, want true", v)
 		}
 	}
-	opts = buildClientOptions(source.SourceConfig{Host: "h", Port: 27017,
-		Options: map[string]string{"tls": "false"}})
-	if opts.TLSConfig != nil {
-		t.Error("TLSConfig set for tls=false, want nil")
+	cfg = dialConfig(source.SourceConfig{Host: "h", Options: map[string]string{"tls": "false"}})
+	if cfg.TLS {
+		t.Error("TLS true for tls=false, want false")
 	}
-}
-
-// TestIndexSummaries covers the driver-spec → source.IndexInfo conversion:
-// order-preserved keys, unique flag, TTL passthrough (M2 hard requirement:
-// the engine skips TTL collections via ExpireAfterSeconds).
-func TestIndexSummaries(t *testing.T) {
-	ttl := int32(3600)
-	unique := true
-	compound := mustBSON(t, bson.D{{Key: "a", Value: 1}, {Key: "b", Value: -1}})
-	single := mustBSON(t, bson.D{{Key: "createdAt", Value: 1}})
-	textish := mustBSON(t, bson.D{{Key: "title", Value: "text"}})
-
-	specs := []mongo.IndexSpecification{
-		{Name: "compound_idx", KeysDocument: compound},
-		{Name: "ttl_idx", KeysDocument: single, Unique: &unique, ExpireAfterSeconds: &ttl},
-		{Name: "text_idx", KeysDocument: textish},
-	}
-
-	out := indexSummaries(specs)
-	if len(out) != 3 {
-		t.Fatalf("indexSummaries len = %d, want 3", len(out))
-	}
-
-	// Order-preserved compound keys.
-	if k := out[0].Keys; len(k) != 2 || k[0].Field != "a" || k[1].Field != "b" {
-		t.Errorf("compound keys = %+v, want [a b] in order", k)
-	}
-	if v, ok := out[0].Keys[0].Order.(int32); !ok || v != 1 {
-		t.Errorf("keys[0].Order = %#v, want int32(1)", out[0].Keys[0].Order)
-	}
-
-	// Unique + TTL passthrough.
-	if !out[1].Unique || out[1].ExpireAfterSeconds == nil || *out[1].ExpireAfterSeconds != 3600 {
-		t.Errorf("ttl_idx = %+v, want Unique + ExpireAfterSeconds=3600", out[1])
-	}
-	if out[0].ExpireAfterSeconds != nil {
-		t.Errorf("non-TTL index ExpireAfterSeconds = %v, want nil", out[0].ExpireAfterSeconds)
-	}
-
-	// Non-numeric direction (text) survives as-is.
-	if v, ok := out[2].Keys[0].Order.(string); !ok || v != "text" {
-		t.Errorf("text direction = %#v, want \"text\"", out[2].Keys[0].Order)
-	}
-}
-
-func mustBSON(t *testing.T, doc bson.D) bson.Raw {
-	t.Helper()
-	b, err := bson.Marshal(doc)
-	if err != nil {
-		t.Fatalf("bson.Marshal: %v", err)
-	}
-	return bson.Raw(b)
 }

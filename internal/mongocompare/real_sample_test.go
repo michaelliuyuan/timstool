@@ -85,13 +85,10 @@ func TestRealSampleLive(t *testing.T) {
 	// hashing a no-op: skip — the modified run below is the real assertion.)
 
 	s := env.compare("testdb", dstDB, Config{Buckets: 8, ParallelBuckets: 4})
-	if len(s.Collections) == 0 {
-		t.Fatalf("no collections compared (testdb.users vanished mid-run?)")
-	}
-	c := s.Collections[0]
-	if s.Overall != OverallDiff {
-		t.Fatalf("overall = %q, want diff (err=%q count-check=%+v)",
-			s.Overall, c.Checks.Error, c.Checks.Count)
+	c := findColl(t, s, "users")
+	if c.Overall != OverallDiff {
+		t.Fatalf("users overall = %q, want diff (err=%q count-check=%+v)",
+			c.Overall, c.Checks.Error, c.Checks.Count)
 	}
 	got := c.Checks.Diff["count"]
 	if got != 3 {
@@ -159,11 +156,8 @@ func TestRealSampleEqualLive(t *testing.T) {
 	}
 
 	s := env.compare("testdb", dstDB, Config{Buckets: 8})
-	if len(s.Collections) == 0 {
-		t.Fatalf("no collections compared (testdb.users vanished mid-run?)")
-	}
-	c := s.Collections[0]
-	if s.Overall != OverallEqual {
+	c := findColl(t, s, "users")
+	if c.Overall != OverallEqual {
 		for _, b := range c.Checks.Hash {
 			if !b.Match {
 				t.Logf("mismatch bucket %d: src(count=%d hash=%s) dst(count=%d hash=%s)",
@@ -180,14 +174,31 @@ func TestRealSampleEqualLive(t *testing.T) {
 			}
 			t.Logf("delta: type=%s id=%v fields=%+v", d.Type, d.ID, d.Fields)
 		}
-		t.Fatalf("overall = %q, want equal (err=%q count-check=%+v deltas=%d)",
-			s.Overall, c.Checks.Error, c.Checks.Count, len(ds))
+		t.Fatalf("users overall = %q, want equal (err=%q count-check=%+v deltas=%d)",
+			c.Overall, c.Checks.Error, c.Checks.Count, len(ds))
 	}
 	for _, b := range c.Checks.Hash {
 		if !b.Match {
 			t.Errorf("bucket %d mismatch on identical clone (src=%d dst=%d)", b.Bucket, b.SrcCount, b.DstCount)
 		}
 	}
+}
+
+// findColl locates one collection's result row. The real-sample tests assert
+// on the users row specifically: testdb is a real restored sample database
+// and may legitimately carry other collections (e.g. a hand-made types_probe
+// of unknown provenance) that no clone target reproduces — the engine is
+// right to report them missing; the assertions must not depend on the
+// library's full collection list.
+func findColl(t *testing.T, s *Summary, coll string) CollectionResult {
+	t.Helper()
+	for _, c := range s.Collections {
+		if c.Coll == coll {
+			return c
+		}
+	}
+	t.Fatalf("collection %q not compared (rows: %d)", coll, len(s.Collections))
+	return CollectionResult{}
 }
 
 // copyIndexes recreates srcColl's secondary indexes (name, keys, unique) on

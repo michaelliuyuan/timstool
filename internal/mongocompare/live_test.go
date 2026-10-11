@@ -16,6 +16,8 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+
+	"github.com/michaelliuyuan/timstool/internal/mongoconn"
 )
 
 // smokeAddrFor parses TIMSTOOL_MONGO_SMOKE (host[:port], default
@@ -32,6 +34,7 @@ func smokeAddrFor(v string) string {
 type liveTestEnv struct {
 	t        *testing.T
 	client   *mongo.Client
+	conn     mongoconn.Client
 	tmp      string
 	lastOut  string
 	dbs      []string
@@ -58,7 +61,7 @@ func liveEnv(t *testing.T) *liveTestEnv {
 	tmp := t.TempDir()
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 	sweepOnce.Do(func() { (&liveTestEnv{t: t, client: client}).sweepLegacyMd() })
-	return &liveTestEnv{t: t, client: client, tmp: tmp,
+	return &liveTestEnv{t: t, client: client, conn: mongoconn.WrapV2(client), tmp: tmp,
 		uniq: fmt.Sprintf("%dx%d", os.Getpid(), atomic.AddInt64(&envSeq, 1))}
 }
 
@@ -157,7 +160,7 @@ func (e *liveTestEnv) compare(srcDB, dstDB string, cfg Config) *Summary {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	s, err := CompareDatabases(ctx, e.client, e.client, srcDB, dstDB, cfg)
+	s, err := CompareDatabases(ctx, e.conn, e.conn, srcDB, dstDB, cfg)
 	if err != nil {
 		e.t.Fatalf("compare %s vs %s: %v", srcDB, dstDB, err)
 	}

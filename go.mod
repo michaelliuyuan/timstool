@@ -17,6 +17,7 @@ require (
 	github.com/shopspring/decimal v1.2.0
 	github.com/siddontang/go-log v0.0.0-20180807004314-8d05993dda07
 	github.com/spf13/cobra v1.8.1
+	go.mongodb.org/mongo-driver v1.12.2
 	go.mongodb.org/mongo-driver/v2 v2.9.2
 	go.uber.org/zap v1.27.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -28,6 +29,7 @@ require (
 	github.com/Masterminds/semver v1.5.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/goccy/go-json v0.10.2 // indirect
+	github.com/golang/snappy v0.0.4 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jackc/pgio v1.0.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
@@ -35,6 +37,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/montanaflynn/stats v0.7.1 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/pingcap/failpoint v0.0.0-20240528011301-b51a646c7c86 // indirect
 	github.com/pingcap/log v1.1.1-0.20230317032135-a0d097d16e22 // indirect

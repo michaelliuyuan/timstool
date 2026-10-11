@@ -382,7 +382,7 @@ CDC 功能细节（INSERT/UPDATE/DELETE、事务顺序性、checkpoint-on-failur
 
 MongoDB↔MongoDB 一致性对比（独立任务类型，与迁移流水线互不影响）：逐集合做存在性、索引集、文档数、分桶哈希对比，失配桶自动下钻到字段级差异明细。Web 界面「MongoDB 对比」入口创建；API 走 `POST /api/v1/mongocompare/tasks` + 任务启停端点（支持 checkpoint 断点续跑）。
 
-结果三态 + ttl_skip；产物含 `summary.json` 与逐集合差异 ndjson。系统对象过滤、resume 语义（数据未变前提 + 边界漂移自动重算）、限制声明（版本下限 MongoDB 4.4+、大字段摘要未实现、跨实现字节一致 non-goal、v1 单库对单库）等见 [docs/mongodb-compare.md](docs/mongodb-compare.md)。
+结果三态 + ttl_skip；产物含 `summary.json` 与逐集合差异 ndjson。系统对象过滤、resume 语义（数据未变前提 + 边界漂移自动重算）、限制声明（版本双驱动自适应：4.4+ 原生路径、3.x 走 v1 桥（3.6+ 官方、3.2/3.4 best-effort）、大字段摘要未实现、跨实现字节一致 non-goal、v1 单库对单库）等见 [docs/mongodb-compare.md](docs/mongodb-compare.md)。
 
 ---
 

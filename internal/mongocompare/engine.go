@@ -19,9 +19,10 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/michaelliuyuan/timstool/internal/mongocompare/canon"
+	"github.com/michaelliuyuan/timstool/internal/mongoconn"
+	"github.com/michaelliuyuan/timstool/internal/source"
 )
 
 // Level is one comparison stage.
@@ -124,19 +125,19 @@ type Summary struct {
 // CompareClients enumerates the source client's user databases (skipping
 // admin/config/local and system.* collections) and compares each collection
 // against the same-named database on the target client.
-func CompareClients(ctx context.Context, src, dst *mongo.Client, cfg Config) (*Summary, error) {
+func CompareClients(ctx context.Context, src, dst mongoconn.Client, cfg Config) (*Summary, error) {
 	c := cfg.withDefaults()
 	s := newSummary(c)
 	if err := prepOutDir(c); err != nil {
 		return nil, err
 	}
 
-	res, err := src.ListDatabases(ctx, bson.D{})
+	dbs, err := src.ListDatabases(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list databases: %w", err)
 	}
 	var all []CollectionResult
-	for _, d := range res.Databases {
+	for _, d := range dbs {
 		if d.Name == "admin" || d.Name == "config" || d.Name == "local" {
 			continue
 		}
@@ -154,7 +155,7 @@ func CompareClients(ctx context.Context, src, dst *mongo.Client, cfg Config) (*S
 // CompareDatabases compares every collection of srcDB against dstDB (the
 // pair may live on the same client — the single-instance test path — or on
 // two clients with different names, e.g. a task's source/target mapping).
-func CompareDatabases(ctx context.Context, src, dst *mongo.Client, srcDB, dstDB string, cfg Config) (*Summary, error) {
+func CompareDatabases(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB string, cfg Config) (*Summary, error) {
 	c := cfg.withDefaults()
 	s := newSummary(c)
 	if err := prepOutDir(c); err != nil {
@@ -218,22 +219,18 @@ func finalize(s *Summary, rows []CollectionResult) {
 
 // compareDB enumerates srcDB's non-system collections and compares each one
 // against the same-named collection in dstDB.
-func compareDB(ctx context.Context, src, dst *mongo.Client, srcDB, dstDB string, c Config) ([]CollectionResult, error) {
-	cur, err := src.Database(srcDB).ListCollections(ctx, bson.D{})
+func compareDB(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB string, c Config) ([]CollectionResult, error) {
+	names, err := src.ListCollectionNames(ctx, srcDB)
 	if err != nil {
 		return nil, fmt.Errorf("list collections %s: %w", srcDB, err)
 	}
-	var specs []mongo.CollectionSpecification
-	if err := cur.All(ctx, &specs); err != nil {
-		return nil, err
-	}
 	type task struct{ db, coll string }
 	var tasks []task
-	for _, spec := range specs {
-		if strings.HasPrefix(spec.Name, "system.") {
+	for _, name := range names {
+		if strings.HasPrefix(name, "system.") {
 			continue
 		}
-		tasks = append(tasks, task{srcDB, spec.Name})
+		tasks = append(tasks, task{srcDB, name})
 	}
 
 	results := make([]CollectionResult, len(tasks))
@@ -245,7 +242,7 @@ func compareDB(ctx context.Context, src, dst *mongo.Client, srcDB, dstDB string,
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			results[i] = compareCollection(ctx, src.Database(t.db), dst.Database(dstDB), t.coll, c)
+			results[i] = compareCollection(ctx, src, dst, t.db, dstDB, t.coll, c)
 		}(i, t)
 	}
 	wg.Wait()
@@ -313,12 +310,14 @@ func (cp *checkpoint) save(cfg Config, db, coll string) {
 	_ = os.WriteFile(cpPath(cfg.OutDir, db, coll), b, 0o644)
 }
 
-func compareCollection(ctx context.Context, sdb, tdb *mongo.Database, coll string, cfg Config) CollectionResult {
+// compareCollection compares one collection: src/srcDB against dst/dstDB.
+// Works through the version-adaptive connection (M5) — both driver paths
+// produce the same neutral index/count/cursor surfaces.
+func compareCollection(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB, coll string, cfg Config) CollectionResult {
 	var r CollectionResult
-	db := sdb.Name()
-	r.DB, r.Coll, r.Overall = db, coll, OverallEqual
-	sc := sdb.Collection(coll)
-	tc := tdb.Collection(coll)
+	r.DB, r.Coll, r.Overall = srcDB, coll, OverallEqual
+	sc := src.Collection(srcDB, coll)
+	tc := dst.Collection(dstDB, coll)
 
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -329,17 +328,19 @@ func compareCollection(ctx context.Context, sdb, tdb *mongo.Database, coll strin
 
 	// Schema: existence on target.
 	if cfg.has(LevelSchema) {
-		cur, err := tdb.ListCollections(ctx, bson.D{{Key: "name", Value: coll}})
+		names, err := dst.ListCollectionNames(ctx, dstDB)
 		if err != nil {
 			r.Overall, r.Checks.Error = OverallError, err.Error()
 			return r
 		}
-		var specs []mongo.CollectionSpecification
-		if err := cur.All(ctx, &specs); err != nil {
-			r.Overall, r.Checks.Error = OverallError, err.Error()
-			return r
+		found := false
+		for _, n := range names {
+			if n == coll {
+				found = true
+				break
+			}
 		}
-		if len(specs) == 0 {
+		if !found {
 			r.Overall = OverallDiff
 			r.Checks.Schema = map[string]any{"diff": []string{"missing-in-target"}}
 			return r
@@ -348,7 +349,7 @@ func compareCollection(ctx context.Context, sdb, tdb *mongo.Database, coll strin
 	}
 
 	// TTL probe + index level.
-	srcIdx, err := sc.Indexes().ListSpecifications(ctx)
+	srcIdx, err := sc.IndexSpecs(ctx)
 	if err != nil {
 		r.Overall, r.Checks.Error = OverallError, err.Error()
 		return r
@@ -361,7 +362,7 @@ func compareCollection(ctx context.Context, sdb, tdb *mongo.Database, coll strin
 		}
 	}
 	if cfg.has(LevelIndex) {
-		dstIdx, err := tc.Indexes().ListSpecifications(ctx)
+		dstIdx, err := tc.IndexSpecs(ctx)
 		if err != nil {
 			r.Overall, r.Checks.Error = OverallError, err.Error()
 			return r
@@ -383,8 +384,8 @@ func compareCollection(ctx context.Context, sdb, tdb *mongo.Database, coll strin
 	}
 
 	if cfg.has(LevelCount) {
-		scN, err1 := sc.CountDocuments(ctx, bson.D{})
-		tcN, err2 := tc.CountDocuments(ctx, bson.D{})
+		scN, err1 := sc.CountDocuments(ctx)
+		tcN, err2 := tc.CountDocuments(ctx)
 		if err1 != nil || err2 != nil {
 			r.Overall, r.Checks.Error = OverallError, firstErr(err1, err2)
 			return r
@@ -395,16 +396,16 @@ func compareCollection(ctx context.Context, sdb, tdb *mongo.Database, coll strin
 		}
 	}
 
-	cp := loadCheckpoint(cfg, db, coll)
+	cp := loadCheckpoint(cfg, srcDB, coll)
 	if cfg.has(LevelHash) || cfg.has(LevelDiff) {
-		rangeStats, err := IDRange(ctx, sc)
+		rangeStats, err := sc.IDRange(ctx)
 		if err != nil {
 			r.Overall, r.Checks.Error = OverallError, err.Error()
 			return r
 		}
 		if rangeStats.N == 0 {
 			cp.Done = true
-			cp.save(cfg, db, coll)
+			cp.save(cfg, srcDB, coll)
 			r.Checks.Hash = []BucketResult{}
 		} else {
 			plan := PlanBuckets(rangeStats.Min, rangeStats.Max, cfg.Buckets)
@@ -420,8 +421,17 @@ func compareCollection(ctx context.Context, sdb, tdb *mongo.Database, coll strin
 					defer func() { <-sem }()
 					loCanon := canon.Canonical(b.Lo, cfg.Opts)
 					hiCanon := canon.Canonical(b.Hi, cfg.Opts)
-					if prev, ok := cp.Buckets[b.Index]; ok &&
-						prev.LoCanon == loCanon && prev.HiCanon == hiCanon {
+					// Checkpoint reuse read takes the same mutex as the write
+					// below (concurrent buckets of one collection share cp —
+					// an unlocked read races the writer goroutine; caught by
+					// the M5 bridge-equivalence run, latent since M2).
+					mu.Lock()
+					prev, reusable := cp.Buckets[b.Index]
+					if reusable {
+						reusable = prev.LoCanon == loCanon && prev.HiCanon == hiCanon
+					}
+					mu.Unlock()
+					if reusable {
 						// Reusable: same semantics version AND same boundaries
 						// as the recomputed plan (data-shift protection).
 						results[i] = BucketResult{
@@ -455,7 +465,7 @@ func compareCollection(ctx context.Context, sdb, tdb *mongo.Database, coll strin
 						SrcHash: br.SrcHash, DstHash: br.DstHash,
 						LoCanon: loCanon, HiCanon: hiCanon,
 					}
-					cp.save(cfg, db, coll)
+					cp.save(cfg, srcDB, coll)
 					mu.Unlock()
 				}(i, b)
 			}
@@ -481,7 +491,7 @@ func compareCollection(ctx context.Context, sdb, tdb *mongo.Database, coll strin
 					byIdx[br.Bucket] = true
 				}
 			}
-			rangeStats, err := IDRange(ctx, sc)
+			rangeStats, err := sc.IDRange(ctx)
 			if err == nil && rangeStats.N > 0 {
 				for _, b := range PlanBuckets(rangeStats.Min, rangeStats.Max, cfg.Buckets) {
 					if byIdx[b.Index] {
@@ -507,11 +517,11 @@ func compareCollection(ctx context.Context, sdb, tdb *mongo.Database, coll strin
 		} else if r.Checks.Diff == nil && len(deltas) == 0 && r.Overall != OverallError {
 			r.Checks.Diff = map[string]any{"count": 0}
 		}
-		writeDeltas(cfg, db, coll, deltas)
+		writeDeltas(cfg, srcDB, coll, deltas)
 	}
 
 	cp.Done = true
-	cp.save(cfg, db, coll)
+	cp.save(cfg, srcDB, coll)
 	return r
 }
 
@@ -534,10 +544,11 @@ func writeDeltas(cfg Config, db, coll string, deltas []DocDelta) {
 
 // diffIndexSets compares the normalized index summaries of both sides. The
 // js normIdx dropped v/ns from the raw index documents; the Go port builds a
-// canonical string from the driver's typed IndexSpecification (name, ordered
-// key document, unique/sparse/TTL/partial filter), which is version-stable.
-func diffIndexSets(src, dst []mongo.IndexSpecification) []string {
-	norm := func(specs []mongo.IndexSpecification) map[string]bool {
+// canonical string from the neutral source.IndexInfo (name, ordered key
+// document, unique/sparse/clustered/TTL), which is version-stable and
+// driver-agnostic (M5: identical on the v2 and v1-bridge paths).
+func diffIndexSets(src, dst []source.IndexInfo) []string {
+	norm := func(specs []source.IndexInfo) map[string]bool {
 		m := make(map[string]bool, len(specs))
 		for _, ix := range specs {
 			m[indexCanon(ix)] = true
@@ -559,23 +570,25 @@ func diffIndexSets(src, dst []mongo.IndexSpecification) []string {
 	return out
 }
 
-func indexCanon(ix mongo.IndexSpecification) string {
+func indexCanon(ix source.IndexInfo) string {
 	d := bson.D{{Key: "name", Value: ix.Name}}
-	if len(ix.KeysDocument) > 0 {
-		var key bson.D
-		_ = bson.Unmarshal(ix.KeysDocument, &key)
+	if len(ix.Keys) > 0 {
+		key := make(bson.D, 0, len(ix.Keys))
+		for _, k := range ix.Keys {
+			key = append(key, bson.E{Key: k.Field, Value: k.Order})
+		}
 		d = append(d, bson.E{Key: "key", Value: key})
 	}
-	if ix.Unique != nil && *ix.Unique {
+	if ix.Unique {
 		d = append(d, bson.E{Key: "unique", Value: true})
 	}
 	if ix.ExpireAfterSeconds != nil {
 		d = append(d, bson.E{Key: "expireAfterSeconds", Value: *ix.ExpireAfterSeconds})
 	}
-	if ix.Sparse != nil && *ix.Sparse {
+	if ix.Sparse {
 		d = append(d, bson.E{Key: "sparse", Value: true})
 	}
-	if ix.Clustered != nil && *ix.Clustered {
+	if ix.Clustered {
 		d = append(d, bson.E{Key: "clustered", Value: true})
 	}
 	return canon.Canonical(d, canon.Opts{})
