@@ -2,23 +2,25 @@ package webapi
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/michaelliuyuan/timstool/internal/store"
 )
 
-// TestTaskViewWireContract welds the seq=89 gap shut through the real
+// TestTaskEnvelopeWireContract welds the seq=89 gap shut through the real
 // serialization path: every task-bearing response must carry a server-derived
 // kind discriminator and must never expose config_json (credentials live
 // there). httptest response bodies are asserted directly — fixture-shaped
 // mocks may not self-certify this contract.
-func TestTaskViewWireContract(t *testing.T) {
+func TestTaskEnvelopeWireContract(t *testing.T) {
 	st, err := store.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("store: %v", err)
@@ -31,7 +33,7 @@ func TestTaskViewWireContract(t *testing.T) {
 	if err := st.CreateTask(mig); err != nil {
 		t.Fatalf("seed migration: %v", err)
 	}
-	cmp := &store.Task{ID: "tvcmp1", Name: "md compare", ConfigJSON: `{"kind":"compare","compare":{"source":{"uri":"mongodb://x","database":"d","user":"u","password":"sekrit-cmp"}}}`}
+	cmp := &store.Task{ID: "tvcmp1", Name: "md compare", ConfigJSON: `{"kind":"mongocompare","compare":{"source":{"uri":"mongodb://x","database":"d","user":"u","password":"sekrit-cmp"}}}`}
 	if err := st.CreateTask(cmp); err != nil {
 		t.Fatalf("seed compare: %v", err)
 	}
@@ -99,7 +101,7 @@ func TestTaskViewWireContract(t *testing.T) {
 		assertWire(t, "get", rec.Body.Bytes(), tc.id, tc.kind)
 	}
 
-	// POST /compare/tasks: creation response already carries the kind.
+	// POST /mongocompare/tasks: creation response already carries the kind.
 	rec = postCompareSpec(t, s, `{"source":{"host":"localhost","database":"d1"},"target":{"host":"localhost","database":"d2"}}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create compare: %d %s", rec.Code, rec.Body.String())
@@ -113,5 +115,46 @@ func TestTaskViewWireContract(t *testing.T) {
 	}
 	if _, leaked := created["config_json"]; leaked {
 		t.Error("create compare: config_json leaked into response")
+	}
+}
+
+// TestMongoCompareRoutesDispatch exercises the REAL router (NewServer-built,
+// middleware chain included) — the seq=89 "real serialization path" lesson
+// extended to the routing layer: handler-direct tests cannot see route
+// collisions (two registrations of method+path panic chi at startup). The
+// mongocompare prefix is the collision firewall against the remote MySQL
+// compare domain (/compare/tasks) during integration.
+func TestMongoCompareRoutesDispatch(t *testing.T) {
+	st, err := store.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	defer st.Close()
+	s := NewServer(st, "127.0.0.1", 0, t.TempDir(), embed.FS{}, nil, "", time.Minute)
+
+	body := `{"source":{"host":"localhost","database":"d1"},"target":{"host":"localhost","database":"d2"}}`
+
+	// New prefixed route dispatches to the compare handler end to end.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/mongocompare/tasks", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("new route: %d %s", rec.Code, rec.Body.String())
+	}
+	var created map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("new route decode: %v body=%s", err, rec.Body.String())
+	}
+	if created["kind"] != compareTaskKind {
+		t.Errorf("new route: kind=%v want %q", created["kind"], compareTaskKind)
+	}
+
+	// The old unprefixed path must no longer dispatch to the mongodb handler
+	// (404 on this tree; post-merge it belongs to the MySQL compare domain).
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/compare/tasks", strings.NewReader(body))
+	rec = httptest.NewRecorder()
+	s.router.ServeHTTP(rec, req)
+	if rec.Code == http.StatusCreated {
+		t.Fatalf("old route still dispatches to mongocompare handler: %d %s", rec.Code, rec.Body.String())
 	}
 }

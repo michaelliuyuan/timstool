@@ -67,7 +67,7 @@ func TestCompareEndpointClientOptions(t *testing.T) {
 
 func postCompareSpec(t *testing.T, s *Server, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/compare/tasks", bytes.NewReader([]byte(body)))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/mongocompare/tasks", bytes.NewReader([]byte(body)))
 	rec := httptest.NewRecorder()
 	s.handleCreateCompareTask(rec, req)
 	return rec

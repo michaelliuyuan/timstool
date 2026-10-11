@@ -13,7 +13,7 @@ MongoDB↔MongoDB 一致性对比：对源端与目标端的数据库逐集合�
 ## 使用（API）
 
 ```
-POST /api/v1/compare/tasks
+POST /api/v1/mongocompare/tasks
 {
   "source": {"host": "10.0.0.1", "port": 27017, "user": "u", "password": "p", "auth_db": "admin", "database": "orders"},
   "target": {"host": "10.0.0.2", "port": 27017, "database": "orders"},

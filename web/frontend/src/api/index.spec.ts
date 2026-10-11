@@ -30,8 +30,8 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 }
 
 describe('isCompareTask — wire-contract kind discrimination', () => {
-  it('returns true for kind="compare" (no config_json in fixture, as served)', () => {
-    expect(isCompareTask(makeTask({ kind: 'compare' }))).toBe(true)
+  it('returns true for kind="mongocompare" (no config_json in fixture, as served)', () => {
+    expect(isCompareTask(makeTask({ kind: 'mongocompare' }))).toBe(true)
   })
   it('returns false for kind="migration"', () => {
     expect(isCompareTask(makeTask({ kind: 'migration' }))).toBe(false)
@@ -50,8 +50,8 @@ describe('isCompareTask — wire-contract kind discrimination', () => {
 describe('parseCompareResult — single-parse result discrimination', () => {
   it('returns the compare payload for a clean result_json', () => {
     const t = makeTask({
-      kind: 'compare',
-      result_json: '{"kind":"compare","overall":"equal","counts":{"equal":2,"diff":0,"src_only":0,"dst_only":0},"duration_sec":1,"summary_path":"s","diff_dir":"d"}',
+      kind: 'mongocompare',
+      result_json: '{"kind":"mongocompare","overall":"equal","counts":{"equal":2,"diff":0,"src_only":0,"dst_only":0},"duration_sec":1,"summary_path":"s","diff_dir":"d"}',
     })
     const r = parseCompareResult(t)
     expect(r?.overall).toBe('equal')

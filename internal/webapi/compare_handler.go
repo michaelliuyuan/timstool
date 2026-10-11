@@ -5,7 +5,7 @@
 //   - compare tasks do NOT go through orchestrator — this handler drives
 //     mongocompare.CompareDatabases directly, mirroring the M1
 //     source_handler.go purely-additive pattern (mysql/pg paths untouched).
-//   - task kind is encoded inside ConfigJSON ({"kind":"compare", ...}); the
+//   - task kind is encoded inside ConfigJSON ({"kind":"mongocompare", ...}); the
 //     store schema is not extended (red line: no store/orchestrator edits).
 //   - v1 semantics: one source database vs one target database (src/dst db
 //     names may differ, via source.database/target.database). Whole-instance
@@ -113,7 +113,7 @@ type compareTaskEnvelope struct {
 	Compare compareTaskSpec `json:"compare"`
 }
 
-const compareTaskKind = "compare"
+const compareTaskKind = "mongocompare"
 
 // parseCompareTask returns the spec when cfgJSON is a compare task.
 func parseCompareTask(cfgJSON string) (*compareTaskSpec, bool) {
@@ -128,7 +128,7 @@ func parseCompareTask(cfgJSON string) (*compareTaskSpec, bool) {
 }
 
 // handleCreateCompareTask creates a standalone mongodb compare task.
-// Route: POST /api/v1/compare/tasks (registered next to POST /tasks).
+// Route: POST /api/v1/mongocompare/tasks (registered next to POST /tasks).
 func (s *Server) handleCreateCompareTask(w http.ResponseWriter, r *http.Request) {
 	var req compareTaskSpec
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -175,7 +175,7 @@ func (s *Server) handleCreateCompareTask(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, http.StatusInternalServerError, "failed to create task: "+err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusCreated, newTaskView(task))
+	s.writeJSON(w, http.StatusCreated, newTaskEnvelope(task))
 }
 
 // startCompareTask is the compare branch of task start/resume. A fresh start

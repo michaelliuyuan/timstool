@@ -11,7 +11,7 @@ export interface Task {
   name: string
   status: 'created' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled'
   /** Server-derived discriminator ("compare" | "migration"); config_json never leaves the backend. */
-  kind?: 'compare' | 'migration'
+  kind?: 'mongocompare' | 'migration'
   phase: string
   progress: number
   tables_total: number
@@ -145,7 +145,7 @@ export interface CompareTaskSpec {
 // Compare result (the kind discriminator inside result_json of finished
 // compare tasks).
 export interface CompareResult {
-  kind: 'compare'
+  kind: 'mongocompare'
   overall: 'equal' | 'diff' | 'error' | 'ttl_skip'
   counts: { equal: number; diff: number; error: number; ttl_skip: number }
   duration_sec: number
@@ -159,7 +159,7 @@ export function parseCompareResult(task: Task | null): CompareResult | null {
   if (!task?.result_json) return null
   try {
     const r = JSON.parse(task.result_json)
-    return r && r.kind === 'compare' ? (r as CompareResult) : null
+    return r && r.kind === 'mongocompare' ? (r as CompareResult) : null
   } catch {
     return null
   }
@@ -170,7 +170,7 @@ export function parseCompareResult(task: Task | null): CompareResult | null {
 // config_json never leaves the backend (it holds credentials). Tasks without
 // a kind (stale cached responses) fall back to migration rendering.
 export function isCompareTask(task: Task | null | undefined): boolean {
-  return task?.kind === 'compare'
+  return task?.kind === 'mongocompare'
 }
 
 export const apiClient = {
@@ -204,7 +204,7 @@ export const apiClient = {
     api.post<Task>('/tasks', req),
 
   createCompareTask: (req: CompareTaskSpec) =>
-    api.post<Task>('/compare/tasks', req),
+    api.post<Task>('/mongocompare/tasks', req),
 
   listTasks: () =>
     api.get<Task[]>('/tasks'),

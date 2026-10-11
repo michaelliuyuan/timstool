@@ -69,7 +69,7 @@ func TestCompareTaskEndToEndLive(t *testing.T) {
 		"target": {"uri": %q, "database": %q},
 		"buckets": 8
 	}`, seedURI, srcDB, seedURI, dstDB)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/compare/tasks", bytes.NewReader([]byte(body)))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/mongocompare/tasks", bytes.NewReader([]byte(body)))
 	rec := httptest.NewRecorder()
 	s.handleCreateCompareTask(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -84,8 +84,8 @@ func TestCompareTaskEndToEndLive(t *testing.T) {
 	}
 	// seq=90-4: creation response must already carry the server-derived kind
 	// (DTO contract; the frontend discriminates on it, not on config_json).
-	if task.Kind != "compare" {
-		t.Fatalf("create response kind=%q, want compare", task.Kind)
+	if task.Kind != "mongocompare" {
+		t.Fatalf("create response kind=%q, want mongocompare", task.Kind)
 	}
 
 	srec := startTaskChi(t, s, task.ID)
