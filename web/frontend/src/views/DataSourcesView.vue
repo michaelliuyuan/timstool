@@ -7,10 +7,16 @@ import PageHeader from '../components/PageHeader.vue'
 import { useDataSources } from '../composables/useDataSources'
 import { useSourceSchema } from '../composables/useSourceSchema'
 import type { FieldSpec } from '../composables/sourceTypes'
+import {
+  dataSourceTypeOptions, dataSourceTypeLabel, dataSourceTagType, dataSourceFormFields,
+} from '../composables/dataSourceTypes'
 
 // F-02 数据源管理: list + create/edit (schema-driven form) + test + delete.
 // Passwords are write-only: create sends it, update keeps it when left blank,
 // and no response ever echoes it back (has_password only).
+// M7 ③: type labels / card colours / the tidb target-side form come from the
+// datasource-domain registry (composables/dataSourceTypes.ts); postgres /
+// mysql / mongodb field sets still come from the /sources registry.
 
 const { datasources, load } = useDataSources()
 const { load: loadSources, getSource } = useSourceSchema()
@@ -19,29 +25,11 @@ onMounted(async () => {
   await Promise.all([load(true), loadSources()])
 })
 
-const typeOptions = [
-  { value: 'postgres', label: 'PostgreSQL' },
-  { value: 'mysql', label: 'MySQL' },
-  { value: 'tidb', label: 'TiDB（目标端）' },
-  { value: 'mongodb', label: 'MongoDB（对比）' },
-]
-const typeLabels: Record<string, string> = { postgres: 'PostgreSQL', mysql: 'MySQL', tidb: 'TiDB', mongodb: 'MongoDB' }
-
-// tidb is not a migration *source* adapter, so it has no FieldSpec meta —
-// its form is defined here (target-side fields only).
-const tidbFields: FieldSpec[] = [
-  { key: 'host', label: '主机地址', type: 'text', required: true, default: 'localhost', placeholder: 'localhost', group: 'common' },
-  { key: 'port', label: '端口', type: 'number', required: true, default: 4000, group: 'common' },
-  { key: 'user', label: '用户名', type: 'text', required: true, default: 'root', group: 'common' },
-  { key: 'password', label: '密码', type: 'password', group: 'common' },
-  { key: 'database', label: '数据库名', type: 'text', required: true, group: 'common' },
-  { key: 'pd_addr', label: 'PD 地址', type: 'text', placeholder: 'host:2379', help: '可选。PD 地址，主要用于 Lightning 物理导入；SQL 端口经代理时务必填真实 PD 端口，留空则导入时按 主机:2379 推断', group: 'common' },
-  { key: 'status_port', label: '状态端口', type: 'number', placeholder: '10080', help: '可选。TiDB 状态端口（默认 10080），主要用于 Lightning 导入与连通探测；留空表示未设置', group: 'common' },
-]
+// which kinds exist and how they render: dataSourceTypeSpecs (single module)
+const typeOptions = dataSourceTypeOptions()
 
 function fieldsFor(type: string): FieldSpec[] {
-  if (type === 'tidb') return tidbFields
-  return getSource(type)?.fields || []
+  return dataSourceFormFields(type, getSource(type)?.fields)
 }
 
 // ---- dialog state ----
@@ -193,8 +181,8 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
       <div v-else class="ds-grid">
         <div v-for="d in sorted" :key="d.id" class="ds-card">
           <div class="ds-card-head">
-            <el-tag :type="d.type === 'tidb' ? 'warning' : d.type === 'mysql' ? 'info' : d.type === 'mongodb' ? 'primary' : 'success'" effect="plain" size="small">
-              {{ typeLabels[d.type] || d.type }}
+            <el-tag :type="dataSourceTagType(d.type)" effect="plain" size="small">
+              {{ dataSourceTypeLabel(d.type) }}
             </el-tag>
             <span class="ds-card-name" :title="d.name">{{ d.name }}</span>
           </div>

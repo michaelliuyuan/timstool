@@ -35,6 +35,8 @@ export interface FieldSpec {
 export interface SourceMeta {
   name: string
   displayName: string
+  /** compact table-header label ("PG", "MySQL") — registry single truth, do not derive it by branching on the type string (describe.go ShortName) */
+  shortName?: string
   implemented: boolean
   defaultPort: number
   fields: FieldSpec[]

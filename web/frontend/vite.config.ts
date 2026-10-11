@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vitest/config'
 import vue from '@vitejs/plugin-vue'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -41,5 +41,10 @@ export default defineConfig({
         inlineDynamicImports: true,
       },
     },
+  },
+  // M7: mount-level component tests (jsdom). Plain `vite build` ignores this
+  // field; only vitest reads it. No globals — specs keep explicit imports.
+  test: {
+    environment: 'jsdom',
   },
 })

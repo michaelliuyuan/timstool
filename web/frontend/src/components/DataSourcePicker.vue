@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted } from 'vue'
 import { useDataSources } from '../composables/useDataSources'
+import { dataSourceTypeLabel } from '../composables/dataSourceTypes'
 
 // F-02 DataSourcePicker: dropdown of saved datasources (server-side
 // credentials) + a "手动填写" collapse entry (D5). v-model is the datasource
 // id; '' means manual entry (the parent renders its usual connection form).
+// M7 ③: the type label comes from the datasource-domain registry (single
+// module, shared with DataSourcesView) instead of a local map.
 const props = defineProps<{
   modelValue: string
   /** Restrict the list to these datasource types (e.g. ['tidb']). */
@@ -19,8 +22,6 @@ onMounted(() => { load() })
 const options = computed(() => byType(props.types))
 const isManual = computed(() => props.modelValue === '')
 const selectedName = computed(() => get(props.modelValue)?.name || '')
-
-const typeLabels: Record<string, string> = { postgres: 'PostgreSQL', mysql: 'MySQL', tidb: 'TiDB', mongodb: 'MongoDB' }
 
 function onSelect(val: string | undefined) {
   // '' option = "手动填写"
@@ -37,10 +38,10 @@ function onSelect(val: string | undefined) {
       @change="onSelect"
     >
       <el-option value="" label="手动填写" />
-      <el-option v-for="d in options" :key="d.id" :value="d.id" :label="`${d.name}（${typeLabels[d.type] || d.type}）`">
+      <el-option v-for="d in options" :key="d.id" :value="d.id" :label="`${d.name}（${dataSourceTypeLabel(d.type)}）`">
         <span>{{ d.name }}</span>
         <span class="ds-picker-meta">
-          {{ typeLabels[d.type] || d.type }}
+          {{ dataSourceTypeLabel(d.type) }}
           <template v-if="d.fields?.host"> · {{ d.fields.host }}<template v-if="d.fields.port">:{{ d.fields.port }}</template><template v-if="d.fields.database">/{{ d.fields.database }}</template></template>
         </span>
       </el-option>

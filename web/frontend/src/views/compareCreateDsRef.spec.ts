@@ -13,6 +13,8 @@ const pickerSrc = () =>
   readFileSync(resolve(__dirname, '../components/DataSourcePicker.vue'), 'utf8')
 const apiSrc = () =>
   readFileSync(resolve(__dirname, '../api/index.ts'), 'utf8')
+const registrySrc = () =>
+  readFileSync(resolve(__dirname, '../composables/dataSourceTypes.ts'), 'utf8')
 
 describe('CompareCreateView datasource reference (M6)', () => {
   it('both sides carry a DataSourcePicker restricted to mongodb', () => {
@@ -42,8 +44,12 @@ describe('CompareCreateView datasource reference (M6)', () => {
     expect(src).toContain(`if (model.tls) ep.tls = true`)
   })
 
-  it('picker labels know mongodb', () => {
-    expect(pickerSrc()).toContain(`mongodb: 'MongoDB'`)
+  it('picker labels come from the datasource registry, which knows mongodb', () => {
+    // M7 ③: the picker's local label map moved to the datasource-domain
+    // registry; the picker itself must hold no per-type knowledge.
+    expect(pickerSrc()).toContain(`dataSourceTypeLabel(d.type)`)
+    expect(pickerSrc()).not.toContain(`mongodb:`)
+    expect(registrySrc()).toContain(`shortLabel: 'MongoDB'`)
   })
 
   it('CompareEndpoint DTO carries tls + datasource_id', () => {
