@@ -13,6 +13,11 @@ const router = createRouter({
       component: () => import('../views/WizardView.vue'),
     },
     {
+      path: '/compare/new',
+      name: 'CompareCreate',
+      component: () => import('../views/CompareCreateView.vue'),
+    },
+    {
       path: '/tasks',
       name: 'TaskList',
       component: () => import('../views/TaskListView.vue'),

@@ -10,7 +10,8 @@ export interface Task {
   id: string
   name: string
   status: 'created' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled'
-  config_json: string
+  /** Server-derived discriminator ("compare" | "migration"); config_json never leaves the backend. */
+  kind?: 'compare' | 'migration'
   phase: string
   progress: number
   tables_total: number
@@ -101,6 +102,7 @@ export interface CreateTaskRequest {
   opts: {
     parallel: number
     batch_size: number
+    temp_dir?: string
     tables: string[]
     exclude_tables: string[]
     use_lightning: boolean
@@ -114,6 +116,61 @@ export interface CreateTaskRequest {
     checksum_chunk_size: number
     checksum_parallel: number
   }
+}
+
+// MongoDB compare task (M3 API face, snake_case per task-API convention).
+// One source database vs one target database (v1 semantics); uri OR discrete
+// fields per side (discrete wins server-side; passwords never round-trip the
+// API — the server stores ConfigJSON with json:"-").
+export interface CompareEndpoint {
+  uri?: string
+  host?: string
+  port?: number
+  user?: string
+  password?: string
+  auth_db?: string
+  database: string
+}
+
+export interface CompareTaskSpec {
+  source: CompareEndpoint
+  target: CompareEndpoint
+  buckets?: number
+  parallel_colls?: number
+  parallel_buckets?: number
+  batch_size?: number
+  levels?: string[]
+}
+
+// Compare result (the kind discriminator inside result_json of finished
+// compare tasks).
+export interface CompareResult {
+  kind: 'compare'
+  overall: 'equal' | 'diff' | 'error' | 'ttl_skip'
+  counts: { equal: number; diff: number; error: number; ttl_skip: number }
+  duration_sec: number
+  summary_path: string
+  diff_dir: string
+}
+
+// parseCompareResult returns the compare payload when the task is a compare
+// task with a result (single JSON.parse of result_json; null otherwise).
+export function parseCompareResult(task: Task | null): CompareResult | null {
+  if (!task?.result_json) return null
+  try {
+    const r = JSON.parse(task.result_json)
+    return r && r.kind === 'compare' ? (r as CompareResult) : null
+  } catch {
+    return null
+  }
+}
+
+// isCompareTask discriminates task kinds on the wire contract: the server
+// derives an explicit `kind` field on every task response (DTO), while
+// config_json never leaves the backend (it holds credentials). Tasks without
+// a kind (stale cached responses) fall back to migration rendering.
+export function isCompareTask(task: Task | null | undefined): boolean {
+  return task?.kind === 'compare'
 }
 
 export const apiClient = {
@@ -146,14 +203,20 @@ export const apiClient = {
   createTask: (req: CreateTaskRequest) =>
     api.post<Task>('/tasks', req),
 
+  createCompareTask: (req: CompareTaskSpec) =>
+    api.post<Task>('/compare/tasks', req),
+
   listTasks: () =>
     api.get<Task[]>('/tasks'),
 
   getTask: (id: string) =>
     api.get<Task>(`/tasks/${id}`),
 
-  startTask: (id: string) =>
-    api.post(`/tasks/${id}/start`),
+  // opts.resume=true continues a compare task from engine checkpoints
+  // (fresh start wipes the compare OutDir server-side). Migration tasks
+  // ignore the body — safe to pass for both kinds.
+  startTask: (id: string, opts?: { resume?: boolean }) =>
+    api.post(`/tasks/${id}/start`, { resume: opts?.resume ?? false }),
 
   pauseTask: (id: string) =>
     api.post(`/tasks/${id}/pause`),

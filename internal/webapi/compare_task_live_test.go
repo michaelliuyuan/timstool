@@ -75,9 +75,17 @@ func TestCompareTaskEndToEndLive(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
 	}
-	var task store.Task
+	var task struct {
+		ID   string `json:"id"`
+		Kind string `json:"kind"`
+	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &task); err != nil || task.ID == "" {
 		t.Fatalf("create response: err=%v body=%s", err, rec.Body.String())
+	}
+	// seq=90-4: creation response must already carry the server-derived kind
+	// (DTO contract; the frontend discriminates on it, not on config_json).
+	if task.Kind != "compare" {
+		t.Fatalf("create response kind=%q, want compare", task.Kind)
 	}
 
 	srec := startTaskChi(t, s, task.ID)

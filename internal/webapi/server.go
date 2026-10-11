@@ -517,7 +517,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeJSON(w, http.StatusCreated, task)
+	s.writeJSON(w, http.StatusCreated, newTaskView(task))
 }
 
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
@@ -529,7 +529,11 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	if tasks == nil {
 		tasks = []*store.Task{}
 	}
-	s.writeJSON(w, http.StatusOK, tasks)
+	views := make([]*taskView, len(tasks))
+	for i, t := range tasks {
+		views[i] = newTaskView(t)
+	}
+	s.writeJSON(w, http.StatusOK, views)
 }
 
 func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
@@ -543,7 +547,7 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
-	s.writeJSON(w, http.StatusOK, task)
+	s.writeJSON(w, http.StatusOK, newTaskView(task))
 }
 
 func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
@@ -855,7 +859,7 @@ func (s *Server) handleTaskProgress(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
-	s.writeJSON(w, http.StatusOK, task)
+	s.writeJSON(w, http.StatusOK, newTaskView(task))
 }
 
 func (s *Server) handleTaskReport(w http.ResponseWriter, r *http.Request) {

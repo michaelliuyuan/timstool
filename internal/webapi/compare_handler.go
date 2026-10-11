@@ -175,7 +175,7 @@ func (s *Server) handleCreateCompareTask(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, http.StatusInternalServerError, "failed to create task: "+err.Error())
 		return
 	}
-	s.writeJSON(w, http.StatusCreated, task)
+	s.writeJSON(w, http.StatusCreated, newTaskView(task))
 }
 
 // startCompareTask is the compare branch of task start/resume. A fresh start

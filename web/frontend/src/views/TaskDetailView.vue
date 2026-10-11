@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import apiClient from '../api'
 import type { Task, TaskLogEntry, PhaseInfo } from '../api'
+import { isCompareTask, parseCompareResult } from '../api'
 
 const route = useRoute()
 const router = useRouter()
@@ -12,6 +13,19 @@ const task = ref<Task | null>(null)
 const loading = ref(true)
 const ws = ref<WebSocket | null>(null)
 const wsProgress = ref<any>(null)
+
+// Compare tasks (M4): type-aware degradation — migration stats/phases/report
+// are meaningless for compare; a compare-specific result card renders instead.
+const isCompare = computed(() => isCompareTask(task.value))
+const compareResult = computed(() => parseCompareResult(task.value))
+const bucketsDone = ref<number | null>(null)
+
+const overallMeta: Record<string, { type: string; label: string }> = {
+  equal: { type: 'success', label: '一致 (equal)' },
+  diff: { type: 'warning', label: '存在差异 (diff)' },
+  error: { type: 'danger', label: '对比出错 (error)' },
+  ttl_skip: { type: 'info', label: 'TTL 跳过 (ttl_skip)' },
+}
 
 const logDrawerVisible = ref(false)
 const logs = ref<TaskLogEntry[]>([])
@@ -25,6 +39,7 @@ const activePhaseTab = ref('overview')
 const phaseData = ref<PhaseInfo[]>([])
 
 async function fetchPhases() {
+  if (isCompare.value) return // compare has no migration phase timeline
   try {
     const { data } = await apiClient.getTaskPhases(taskId)
     phaseData.value = data.phases || []
@@ -150,6 +165,8 @@ function connectWS() {
         if (data.rows_done !== undefined) task.value.rows_done = data.rows_done
         if (data.rows_total !== undefined) task.value.rows_total = data.rows_total
         if (data.status) task.value.status = data.status
+        // compare heartbeat: completed collection checkpoints so far
+        if (data.buckets_done !== undefined) bucketsDone.value = data.buckets_done
       }
     } catch {}
   }
@@ -178,6 +195,19 @@ async function action(actionName: string) {
   try {
     await (apiClient as any)[`${actionName}Task`](taskId)
     ElMessage.success('操作成功')
+    await fetchTask()
+  } catch (e: any) {
+    ElMessage.error(e.response?.data?.error || '操作失败')
+  }
+}
+
+// Compare restart paths (M4): fresh start wipes the compare OutDir
+// server-side; resume=true continues from engine checkpoints. Shown for
+// compare tasks outside created/running (the create flow already starts).
+async function restartCompare(resume: boolean) {
+  try {
+    await apiClient.startTask(taskId, { resume })
+    ElMessage.success(resume ? '已从断点续跑对比' : '已重新开始对比')
     await fetchTask()
   } catch (e: any) {
     ElMessage.error(e.response?.data?.error || '操作失败')
@@ -284,35 +314,90 @@ function logLevelClass(level: string): string {
     <template v-if="task">
       <!-- Status Overview -->
       <el-card style="margin-bottom: 20px;">
-        <el-row :gutter="20">
-          <el-col :span="4">
-            <el-statistic title="阶段" :value="phaseMap[task.phase] || task.phase || '-'" />
-          </el-col>
-          <el-col :span="4">
-            <el-statistic title="表进度" :value="`${task.tables_done}/${task.tables_total}`" />
-          </el-col>
-          <el-col :span="4">
-            <el-statistic title="行数" :value="task.rows_done.toLocaleString()" />
-            <div style="font-size: 12px; color: #999;">/ {{ task.rows_total.toLocaleString() }}</div>
-          </el-col>
-          <el-col :span="4">
-            <el-statistic title="吞吐量" :value="rowsPerSec.toLocaleString()" suffix="rows/s" />
-          </el-col>
-          <el-col :span="4">
-            <el-statistic title="耗时" :value="elapsed" />
-          </el-col>
-          <el-col :span="4">
-            <el-statistic title="总进度" :value="progressPercent" suffix="%" />
-          </el-col>
+        <template v-if="!isCompare">
+          <el-row :gutter="20">
+            <el-col :span="4">
+              <el-statistic title="阶段" :value="phaseMap[task.phase] || task.phase || '-'" />
+            </el-col>
+            <el-col :span="4">
+              <el-statistic title="表进度" :value="`${task.tables_done}/${task.tables_total}`" />
+            </el-col>
+            <el-col :span="4">
+              <el-statistic title="行数" :value="task.rows_done.toLocaleString()" />
+              <div style="font-size: 12px; color: #999;">/ {{ task.rows_total.toLocaleString() }}</div>
+            </el-col>
+            <el-col :span="4">
+              <el-statistic title="吞吐量" :value="rowsPerSec.toLocaleString()" suffix="rows/s" />
+            </el-col>
+            <el-col :span="4">
+              <el-statistic title="耗时" :value="elapsed" />
+            </el-col>
+            <el-col :span="4">
+              <el-statistic title="总进度" :value="progressPercent" suffix="%" />
+            </el-col>
+          </el-row>
+          <el-progress :percentage="progressPercent" :stroke-width="20" style="margin-top: 16px;"
+            :status="task.status === 'completed' ? 'success' : task.status === 'failed' ? 'exception' : undefined" />
+        </template>
+        <template v-else>
+          <el-row :gutter="20">
+            <el-col :span="6">
+              <el-statistic title="阶段" :value="task.phase === 'compare' ? '对比中' : (task.phase || '-')" />
+            </el-col>
+            <el-col :span="6">
+              <el-statistic title="已完成集合" :value="bucketsDone ?? task.tables_done" />
+              <div style="font-size: 12px; color: #999;">总数在结束时确定</div>
+            </el-col>
+            <el-col :span="6">
+              <el-statistic title="耗时" :value="elapsed" />
+            </el-col>
+            <el-col :span="6">
+              <el-statistic title="总体结果" :value="compareResult ? (overallMeta[compareResult.overall]?.label || compareResult.overall) : (task.status === 'running' ? '对比中' : '-')" />
+            </el-col>
+          </el-row>
+          <el-progress :percentage="compareResult ? 100 : 0" :stroke-width="20" style="margin-top: 16px;"
+            :indeterminate="task.status === 'running'"
+            :status="task.status === 'completed' ? (compareResult?.overall === 'equal' ? 'success' : 'warning') : task.status === 'failed' ? 'exception' : undefined" />
+        </template>
+      </el-card>
+
+      <!-- Compare result card (M4): counts + artifact paths, option A -->
+      <el-card v-if="isCompare && compareResult" style="margin-bottom: 20px;">
+        <template #header>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span>对比结果</span>
+            <el-tag :type="(overallMeta[compareResult.overall]?.type || 'info') as any">
+              {{ overallMeta[compareResult.overall]?.label || compareResult.overall }}
+            </el-tag>
+          </div>
+        </template>
+        <el-row :gutter="20" style="margin-bottom: 8px;">
+          <el-col :span="6"><el-statistic title="一致集合" :value="compareResult.counts?.equal ?? 0" /></el-col>
+          <el-col :span="6"><el-statistic title="差异集合" :value="compareResult.counts?.diff ?? 0" /></el-col>
+          <el-col :span="6"><el-statistic title="出错集合" :value="compareResult.counts?.error ?? 0" /></el-col>
+          <el-col :span="6"><el-statistic title="TTL 跳过" :value="compareResult.counts?.ttl_skip ?? 0" /></el-col>
         </el-row>
-        <el-progress :percentage="progressPercent" :stroke-width="20" style="margin-top: 16px;"
-          :status="task.status === 'completed' ? 'success' : task.status === 'failed' ? 'exception' : undefined" />
+        <el-descriptions :column="1" border size="small" style="margin-top: 12px;">
+          <el-descriptions-item label="对比耗时">{{ compareResult.duration_sec?.toFixed(2) ?? '-' }} 秒</el-descriptions-item>
+          <el-descriptions-item label="结果摘要 (summary.json)">
+            <el-text type="info" style="font-family: monospace;">{{ compareResult.summary_path }}</el-text>
+          </el-descriptions-item>
+          <el-descriptions-item label="差异明细目录 (diff)">
+            <el-text type="info" style="font-family: monospace;">{{ compareResult.diff_dir }}</el-text>
+          </el-descriptions-item>
+        </el-descriptions>
       </el-card>
 
       <!-- Actions -->
       <el-card style="margin-bottom: 20px;">
         <template #header>操作</template>
         <el-space>
+          <el-button v-if="isCompare && task.status !== 'created' && task.status !== 'running'" type="primary" @click="restartCompare(false)">
+            <el-icon><VideoPlay /></el-icon> 重新对比
+          </el-button>
+          <el-button v-if="isCompare && task.status !== 'created' && task.status !== 'running'" plain @click="restartCompare(true)">
+            <el-icon><RefreshRight /></el-icon> 断点续跑
+          </el-button>
           <el-button v-if="task.status === 'running'" type="warning" @click="action('pause')">
             <el-icon><VideoPause /></el-icon> 暂停
           </el-button>
@@ -322,7 +407,7 @@ function logLevelClass(level: string): string {
           <el-button v-if="task.status === 'running' || task.status === 'paused'" type="danger" @click="cancelTask">
             <el-icon><CircleClose /></el-icon> 取消
           </el-button>
-          <el-button v-if="task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'" @click="downloadReport">
+          <el-button v-if="!isCompare && (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled')" @click="downloadReport">
             <el-icon><Download /></el-icon> 下载报告
           </el-button>
           <el-button v-if="task.status !== 'running'" type="danger" plain @click="deleteTask">
@@ -334,8 +419,8 @@ function logLevelClass(level: string): string {
         </el-space>
       </el-card>
 
-      <!-- Phase Timeline -->
-      <el-card style="margin-bottom: 20px;">
+      <!-- Phase Timeline (migration only; compare tasks have no phases) -->
+      <el-card v-if="!isCompare" style="margin-bottom: 20px;">
         <template #header>迁移阶段</template>
         <el-tabs v-model="activePhaseTab">
           <el-tab-pane label="阶段概览" name="overview">

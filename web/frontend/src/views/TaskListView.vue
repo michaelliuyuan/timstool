@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import apiClient from '../api'
 import type { Task } from '../api'
+import { isCompareTask } from '../api'
 
 const router = useRouter()
 const tasks = ref<Task[]>([])
@@ -47,14 +48,24 @@ onUnmounted(() => {
   <div style="max-width: 1200px; margin: 0 auto;">
     <div style="display: flex; justify-content: space-between; margin-bottom: 20px;">
       <h2>任务监控</h2>
-      <el-button type="primary" @click="router.push('/wizard')">
-        <el-icon><Plus /></el-icon> 新建迁移
-      </el-button>
+      <div style="display: flex; gap: 12px;">
+        <el-button type="primary" @click="router.push('/wizard')">
+          <el-icon><Plus /></el-icon> 新建迁移
+        </el-button>
+        <el-button type="success" plain @click="router.push('/compare/new')">
+          <el-icon><Switch /></el-icon> MongoDB 对比
+        </el-button>
+      </div>
     </div>
 
     <el-card v-loading="loading">
       <el-table :data="tasks" style="width: 100%;" @row-click="(row: Task) => goToTask(row.id)" cursor: pointer>
-        <el-table-column prop="name" label="任务名称" min-width="180" />
+        <el-table-column prop="name" label="任务名称" min-width="180">
+          <template #default="{ row }">
+            <span>{{ row.name }}</span>
+            <el-tag v-if="isCompareTask(row)" size="small" type="warning" style="margin-left: 6px;">对比</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="状态" width="120">
           <template #default="{ row }">
             <el-tag :type="(statusMap[row.status]?.type || 'info') as any">
@@ -67,15 +78,16 @@ onUnmounted(() => {
         </el-table-column>
         <el-table-column label="进度" width="200">
           <template #default="{ row }">
-            <el-progress :percentage="Math.round(row.progress * 100)" :stroke-width="14"
+            <el-progress v-if="isCompareTask(row) && row.status === 'running'" :percentage="0" :indeterminate="true" :stroke-width="14" />
+            <el-progress v-else :percentage="Math.round(row.progress * 100)" :stroke-width="14"
               :status="row.status === 'completed' ? 'success' : row.status === 'failed' ? 'exception' : undefined" />
           </template>
         </el-table-column>
         <el-table-column label="表进度" width="120">
-          <template #default="{ row }">{{ row.tables_done }}/{{ row.tables_total }}</template>
+          <template #default="{ row }">{{ isCompareTask(row) ? '-' : `${row.tables_done}/${row.tables_total}` }}</template>
         </el-table-column>
         <el-table-column label="行数" width="140">
-          <template #default="{ row }">{{ row.rows_done?.toLocaleString() || 0 }}</template>
+          <template #default="{ row }">{{ isCompareTask(row) ? '-' : (row.rows_done?.toLocaleString() || 0) }}</template>
         </el-table-column>
         <el-table-column label="创建时间" width="180">
           <template #default="{ row }">{{ new Date(row.created_at).toLocaleString() }}</template>

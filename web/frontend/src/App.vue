@@ -36,6 +36,10 @@ onMounted(async () => {
           <el-icon><Connection /></el-icon>
           <span>新建迁移</span>
         </el-menu-item>
+        <el-menu-item index="/compare/new">
+          <el-icon><Switch /></el-icon>
+          <span>MongoDB 对比</span>
+        </el-menu-item>
         <el-menu-item index="/tasks">
           <el-icon><Monitor /></el-icon>
           <span>任务监控</span>
