@@ -2,8 +2,10 @@
 import { ref, reactive, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { ArrowLeft } from '@element-plus/icons-vue'
 import apiClient from '../api'
 import type { CompareTaskSpec } from '../api'
+import PageHeader from '../components/PageHeader.vue'
 import ConnectionForm from '../components/ConnectionForm.vue'
 import DataSourcePicker from '../components/DataSourcePicker.vue'
 import { useSourceSchema } from '../composables/useSourceSchema'
@@ -128,10 +130,17 @@ async function submit() {
 </script>
 
 <template>
-  <div style="max-width: 900px; margin: 0 auto;">
-    <el-page-header @back="router.push('/tasks')" style="margin-bottom: 20px;">
-      <template #content>新建 MongoDB 对比任务</template>
-    </el-page-header>
+  <div class="tims-page">
+    <PageHeader
+      title="新建 MongoDB 对比任务"
+      subtitle="配置两端 MongoDB 连接与对比级别，生成对比任务"
+    >
+      <template #actions>
+        <el-button @click="router.push('/tasks')">
+          <el-icon style="margin-right: 4px;"><ArrowLeft /></el-icon>返回任务列表
+        </el-button>
+      </template>
+    </PageHeader>
 
     <el-alert
       type="info"
