@@ -55,6 +55,7 @@ POST /api/v1/tasks/{id}/cancel         # 取消（再启动 = 全新对比）
 2. **undefined vs null**：按 canonical-bson-spec v1 修订移除（现代驱动不产 undefined）。
 3. **跨实现字节一致为 non-goal**：canonical 串的跨语言（Go/js）字节一致不承诺；一致性以「同型同值 ⇔ 同串」的注入性与 Go 版本内稳定性为准。
 4. **v1 单库对单库**：全实例对比与库表映射留待后续版本。
+5. **版本下限 MongoDB 4.4+（wire 9）**：mongo-driver v2 的硬性握手下限；更老实例（如 wire 4 的 3.x）连接即报 `wire version ... requires at least 9`。双版本支持（v2 现代 + v1 legacy 自适应）为 M5 待立项项，落地后本条改写为双支持矩阵。
 
 ## 运维备忘
 
