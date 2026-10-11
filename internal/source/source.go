@@ -88,3 +88,62 @@ type Source interface {
 	IncrementalCapture() (IncrementalCapture, error)
 	Dialect() Dialect
 }
+
+// Connector is the minimal connection-lifecycle capability shared by every
+// source regardless of purpose (migration source or compare endpoint). It is
+// the connect/close subset of Source, extracted so that non-migration
+// consumers (e.g. the MongoDB compare flow) can depend on the small interface
+// instead of the full migration-oriented Source.
+type Connector interface {
+	Connect(ctx context.Context) error
+	Close() error
+}
+
+// MetaBrowser browses server metadata for connection/data-source UIs: the
+// database → collection tree with counts, sizes and indexes. Implemented by
+// adapters whose backend has a browsable namespace (mongodb in M1); SQL
+// sources keep their SchemaReader flow and do not implement it.
+type MetaBrowser interface {
+	// ListDatabases returns the databases visible to the connected user.
+	ListDatabases(ctx context.Context) ([]DatabaseInfo, error)
+	// ListCollections returns the collections of one database with document
+	// counts, storage sizes and index summaries.
+	ListCollections(ctx context.Context, database string) ([]CollectionInfo, error)
+}
+
+// DatabaseInfo describes one database on the server. Sizes are -1 when the
+// server did not report them.
+type DatabaseInfo struct {
+	Name       string `json:"name"`
+	SizeOnDisk int64  `json:"size_on_disk"`
+	Empty      bool   `json:"empty"`
+}
+
+// IndexKey is one field of an index key with its direction. Order is the raw
+// BSON direction value: numeric (1/-1) for ascending/descending, a string for
+// special index types ("2dsphere", "text", ...).
+type IndexKey struct {
+	Field string `json:"field"`
+	Order any    `json:"order"`
+}
+
+// IndexInfo summarizes one collection index. ExpireAfterSeconds is non-nil
+// only for TTL indexes — the compare engine uses it to skip data comparison
+// on TTL collections (their contents expire by design).
+type IndexInfo struct {
+	Name               string     `json:"name"`
+	Keys               []IndexKey `json:"keys,omitempty"`
+	Unique             bool       `json:"unique,omitempty"`
+	ExpireAfterSeconds *int32     `json:"expire_after_seconds,omitempty"`
+}
+
+// CollectionInfo describes one collection (or view) of a database. Count and
+// sizes are -1 when unavailable (e.g. views, or insufficient privileges).
+type CollectionInfo struct {
+	Name           string      `json:"name"`
+	Type           string      `json:"type"` // "collection" | "view" | "timeseries"
+	Count          int64       `json:"count"`
+	StorageSize    int64       `json:"storage_size"`
+	TotalIndexSize int64       `json:"total_index_size"`
+	Indexes        []IndexInfo `json:"indexes,omitempty"`
+}

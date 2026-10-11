@@ -5,9 +5,10 @@ import (
 	"testing"
 
 	"github.com/michaelliuyuan/timstool/internal/source"
-	// Trigger adapter init() so postgres/mysql RegisterMeta runs alongside the
-	// stubs (which live in package source). The real binary imports these via
-	// main; this test must do the same to see all sources.
+	// Trigger adapter init() so postgres/mysql/mongodb RegisterMeta runs
+	// alongside the stubs (which live in package source). The real binary
+	// imports these via main; this test must do the same to see all sources.
+	_ "github.com/michaelliuyuan/timstool/internal/source/mongo"
 	_ "github.com/michaelliuyuan/timstool/internal/source/mysql"
 	_ "github.com/michaelliuyuan/timstool/internal/source/postgres"
 )
@@ -61,5 +62,31 @@ func TestDescribeUnknown(t *testing.T) {
 	_, err := source.Describe("definitely-not-a-source")
 	if err == nil || !strings.Contains(err.Error(), "unknown source") {
 		t.Fatalf("Describe(unknown) err = %v, want unknown-source error", err)
+	}
+}
+
+// TestDescribeMongoDBCompare: the mongodb adapter is implemented and
+// Compare-capable with migration capabilities off (M1 of the mongo-compare
+// track) — the compare module's source picker filters on Capabilities.Compare.
+func TestDescribeMongoDBCompare(t *testing.T) {
+	m, err := source.Describe("mongodb")
+	if err != nil {
+		t.Fatalf("Describe(mongodb) err = %v", err)
+	}
+	if !m.Implemented || m.DefaultPort != 27017 || !m.Capabilities.Compare {
+		t.Errorf("mongodb meta = %+v, want Implemented/27017/Compare=true", m)
+	}
+	if m.Capabilities.Schema || m.Capabilities.Data || m.Capabilities.CDC {
+		t.Errorf("mongodb capabilities = %+v, want Schema/Data/CDC=false (M1)", m.Capabilities)
+	}
+	// The form must carry the connection fields the M1 brief requires.
+	keys := map[string]bool{}
+	for _, f := range m.Fields {
+		keys[f.Key] = true
+	}
+	for _, k := range []string{"host", "port", "user", "password", "authDb", "tls"} {
+		if !keys[k] {
+			t.Errorf("mongodb form missing field %q", k)
+		}
 	}
 }

@@ -31,9 +31,12 @@ type Option struct {
 
 // Capabilities declares what a source adapter can do.
 type Capabilities struct {
-	Schema bool `json:"schema"` // can read schema
-	Data   bool `json:"data"`   // can full-export data
-	CDC    bool `json:"cdc"`     // can incremental (PG=true; MySQL CDC deferred)
+	Schema  bool `json:"schema"`  // can read schema
+	Data    bool `json:"data"`    // can full-export data
+	CDC     bool `json:"cdc"`     // can incremental (PG=true; MySQL CDC deferred)
+	Compare bool `json:"compare"` // usable as an A↔B compare endpoint (mongodb=true);
+	// the compare module's source selector filters on this instead of a
+	// hard-coded type list
 }
 
 // SourceMeta is a source's complete connection description. It drives both the

@@ -135,6 +135,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 		r.Get("/sources/{type}/config-schema", s.handleSourceConfigSchema)
 		r.Post("/sources/{type}/test", s.handleSourceTest)
 		r.Post("/sources/tables", s.handleSourceTables)
+		r.Post("/sources/meta", s.handleSourceMeta)
 		r.Post("/test-connection", s.handleTestConnectionMulti)
 		r.Post("/config/test-connection", s.handleTestConnection)
 		r.Post("/config/list-tables", s.handleListTables)

@@ -202,6 +202,100 @@ func (s *Server) handleSourceTables(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"tables": tables, "count": len(tables)})
 }
 
+// browseSourceRequest is the {source, fields, database} body for the
+// hierarchical metadata browse (source.MetaBrowser capability, mongodb M1).
+type browseSourceRequest struct {
+	Source   string         `json:"source"`
+	Fields   map[string]any `json:"fields"`
+	Database string         `json:"database"`
+}
+
+// handleSourceMeta browses a source's metadata via the optional
+// source.MetaBrowser capability: databases (database empty) → collections
+// with counts and index summaries (database given). Sources without the
+// capability get a friendly 400. Purely additive — it does not touch any
+// migration-oriented handler (arbitration seq=12 rule 1).
+func (s *Server) handleSourceMeta(w http.ResponseWriter, r *http.Request) {
+	var req browseSourceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	srcType := req.Source
+	if srcType == "" {
+		srcType = "postgres"
+	}
+	meta, err := source.Describe(srcType)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("unknown source %q", srcType))
+		return
+	}
+	if !meta.Implemented {
+		s.writeError(w, http.StatusBadRequest, meta.NotImplMsg)
+		return
+	}
+
+	cfg := source.SourceConfig{
+		Kind:     srcType,
+		Host:     stringField(req.Fields, "host"),
+		User:     stringField(req.Fields, "user"),
+		Password: stringField(req.Fields, "password"),
+		Database: req.Database,
+		Schema:   stringField(req.Fields, "schema"),
+		Options:  stringifyMap(req.Fields),
+	}
+	if port := stringField(req.Fields, "port"); port != "" {
+		fmt.Sscanf(port, "%d", &cfg.Port)
+	}
+
+	src, err := source.Open(srcType, cfg)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "open source: "+err.Error())
+		return
+	}
+	defer src.Close()
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	if err := src.Connect(ctx); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "connect: "+err.Error())
+		return
+	}
+
+	browser, ok := src.(source.MetaBrowser)
+	if !ok {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("source %q does not support metadata browsing", srcType))
+		return
+	}
+
+	if req.Database == "" {
+		dbs, err := browser.ListDatabases(ctx)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, "browse: "+err.Error())
+			return
+		}
+		s.writeJSON(w, http.StatusOK, map[string]interface{}{
+			"source":  srcType,
+			"level":   "databases",
+			"entries": dbs,
+			"count":   len(dbs),
+		})
+		return
+	}
+	colls, err := browser.ListCollections(ctx, req.Database)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "browse: "+err.Error())
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"source":   srcType,
+		"database": req.Database,
+		"level":    "collections",
+		"entries":  colls,
+		"count":    len(colls),
+	})
+}
+
 // stringField reads a string-valued field from the loose JSON map (numbers
 // arrive as float64).
 func stringField(fields map[string]any, key string) string {
