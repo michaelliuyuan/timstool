@@ -137,17 +137,20 @@ func CompareClients(ctx context.Context, src, dst mongoconn.Client, cfg Config) 
 		return nil, fmt.Errorf("list databases: %w", err)
 	}
 	var all []CollectionResult
+	var skippedViews []string
 	for _, d := range dbs {
 		if d.Name == "admin" || d.Name == "config" || d.Name == "local" {
 			continue
 		}
-		rows, err := compareDB(ctx, src, dst, d.Name, d.Name, c)
+		rows, skipped, err := compareDB(ctx, src, dst, d.Name, d.Name, c)
 		if err != nil {
 			return nil, err
 		}
 		all = append(all, rows...)
+		skippedViews = append(skippedViews, skipped...)
 	}
 	finalize(s, all)
+	recordSkippedViews(s, skippedViews)
 	writeSummary(c, s)
 	return s, nil
 }
@@ -161,13 +164,22 @@ func CompareDatabases(ctx context.Context, src, dst mongoconn.Client, srcDB, dst
 	if err := prepOutDir(c); err != nil {
 		return nil, err
 	}
-	rows, err := compareDB(ctx, src, dst, srcDB, dstDB, c)
+	rows, skipped, err := compareDB(ctx, src, dst, srcDB, dstDB, c)
 	if err != nil {
 		return nil, err
 	}
 	finalize(s, rows)
+	recordSkippedViews(s, skipped)
 	writeSummary(c, s)
 	return s, nil
+}
+
+// recordSkippedViews notes filtered views in Summary.Stats (MC-9 A2) without
+// touching the four-state counts shape.
+func recordSkippedViews(s *Summary, skipped []string) {
+	if len(skipped) > 0 {
+		s.Stats["skipped_views"] = skipped
+	}
 }
 
 func newSummary(c Config) *Summary {
@@ -217,20 +229,43 @@ func finalize(s *Summary, rows []CollectionResult) {
 	s.DurationSec = time.Since(s.StartedAt).Seconds()
 }
 
-// compareDB enumerates srcDB's non-system collections and compares each one
-// against the same-named collection in dstDB.
-func compareDB(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB string, c Config) ([]CollectionResult, error) {
-	names, err := src.ListCollectionNames(ctx, srcDB)
+// compareDB enumerates srcDB's non-system collections (views filtered per
+// MC-9 A2) and compares each one against the same-named collection in
+// dstDB. The target's name+type list is fetched ONCE per database and
+// shared by every collection's schema check (MC-9 C4: kills the O(N²)
+// per-collection listCollections storm). Skipped views are reported back
+// for Summary.Stats (skipped_views) — they deliberately do not enter the
+// four-state counts.
+func compareDB(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB string, c Config) ([]CollectionResult, []string, error) {
+	srcList, err := src.ListCollectionNameTypes(ctx, srcDB)
 	if err != nil {
-		return nil, fmt.Errorf("list collections %s: %w", srcDB, err)
+		return nil, nil, fmt.Errorf("list collections %s: %w", srcDB, err)
+	}
+	var dstNames map[string]bool
+	if c.has(LevelSchema) {
+		dstList, err := dst.ListCollectionNameTypes(ctx, dstDB)
+		if err != nil {
+			return nil, nil, fmt.Errorf("list collections %s: %w", dstDB, err)
+		}
+		dstNames = make(map[string]bool, len(dstList))
+		for _, ct := range dstList {
+			dstNames[ct.Name] = true
+		}
 	}
 	type task struct{ db, coll string }
 	var tasks []task
-	for _, name := range names {
-		if strings.HasPrefix(name, "system.") {
+	var skippedViews []string
+	for _, ct := range srcList {
+		if strings.HasPrefix(ct.Name, "system.") {
 			continue
 		}
-		tasks = append(tasks, task{srcDB, name})
+		// View filter (MC-9 A2): only collections carry comparable data
+		// (empty type = collection, the M1 guard inside IsCollection).
+		if !ct.IsCollection() {
+			skippedViews = append(skippedViews, srcDB+"."+ct.Name)
+			continue
+		}
+		tasks = append(tasks, task{srcDB, ct.Name})
 	}
 
 	results := make([]CollectionResult, len(tasks))
@@ -242,11 +277,11 @@ func compareDB(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB stri
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			results[i] = compareCollection(ctx, src, dst, t.db, dstDB, t.coll, c)
+			results[i] = compareCollection(ctx, src, dst, t.db, dstDB, t.coll, dstNames, c)
 		}(i, t)
 	}
 	wg.Wait()
-	return results, nil
+	return results, skippedViews, nil
 }
 
 // AlgoVersion stamps the canon semantics/format a checkpoint was produced
@@ -312,8 +347,10 @@ func (cp *checkpoint) save(cfg Config, db, coll string) {
 
 // compareCollection compares one collection: src/srcDB against dst/dstDB.
 // Works through the version-adaptive connection (M5) — both driver paths
-// produce the same neutral index/count/cursor surfaces.
-func compareCollection(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB, coll string, cfg Config) CollectionResult {
+// produce the same neutral index/count/cursor surfaces. dstNames is the
+// per-db shared target listing (schema existence, MC-9 C4); nil skips the
+// schema check (levels without schema).
+func compareCollection(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB, coll string, dstNames map[string]bool, cfg Config) CollectionResult {
 	var r CollectionResult
 	r.DB, r.Coll, r.Overall = srcDB, coll, OverallEqual
 	sc := src.Collection(srcDB, coll)
@@ -326,21 +363,10 @@ func compareCollection(ctx context.Context, src, dst mongoconn.Client, srcDB, ds
 		}
 	}()
 
-	// Schema: existence on target.
+	// Schema: existence on target (per-db shared listing — one
+	// listCollections per database, not per collection; MC-9 C4).
 	if cfg.has(LevelSchema) {
-		names, err := dst.ListCollectionNames(ctx, dstDB)
-		if err != nil {
-			r.Overall, r.Checks.Error = OverallError, err.Error()
-			return r
-		}
-		found := false
-		for _, n := range names {
-			if n == coll {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !dstNames[coll] {
 			r.Overall = OverallDiff
 			r.Checks.Schema = map[string]any{"diff": []string{"missing-in-target"}}
 			return r
@@ -378,7 +404,13 @@ func compareCollection(ctx context.Context, src, dst mongoconn.Client, srcDB, ds
 		}
 	}
 	if hasTTL {
-		r.Overall = OverallTTLSkip
+		// MC-9 A1: the TTL data-skip must not mask an already-detected
+		// index-level diff — ttl_skip is only reachable from equal. The
+		// Skipped="ttl" marker stays either way (it explains WHY the data
+		// levels are absent, not the overall verdict).
+		if r.Overall == OverallEqual {
+			r.Overall = OverallTTLSkip
+		}
 		r.Checks.Skipped = "ttl"
 		return r
 	}

@@ -246,6 +246,29 @@ func (c *v1Client) ListCollectionNames(ctx context.Context, database string) ([]
 	return names, nil
 }
 
+// ListCollectionNameTypes is the v1-bridge twin of the v2 name+type listing
+// (MC-9 A2): nameOnly listCollections, name/type decoded off the raw wire
+// bytes by the v2 bson package (single-point bridge).
+func (c *v1Client) ListCollectionNameTypes(ctx context.Context, database string) ([]CollType, error) {
+	var res struct {
+		Cursor struct {
+			FirstBatch []struct {
+				Name string `bson:"name"`
+				Type string `bson:"type"`
+			} `bson:"firstBatch"`
+		} `bson:"cursor"`
+	}
+	cmd := v1bson.D{{Key: "listCollections", Value: 1}, {Key: "nameOnly", Value: true}}
+	if err := c.runDecode(ctx, database, cmd, &res); err != nil {
+		return nil, fmt.Errorf("listCollections(%s): %w", database, err)
+	}
+	out := make([]CollType, 0, len(res.Cursor.FirstBatch))
+	for _, s := range res.Cursor.FirstBatch {
+		out = append(out, CollType{Name: s.Name, Type: s.Type})
+	}
+	return out, nil
+}
+
 // --- v1 Coll ---
 
 type v1Coll struct{ coll *v1mongo.Collection }

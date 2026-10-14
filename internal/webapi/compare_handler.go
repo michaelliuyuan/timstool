@@ -170,6 +170,43 @@ func parseCompareTask(cfgJSON string) (*compareTaskSpec, bool) {
 	return &env.Compare, true
 }
 
+// validateCompareParams enforces the MC-9 C4 boundaries: buckets 1..4096,
+// parallel_colls 1..32, parallel_buckets 1..32, batch_size 100..100000
+// (0 = unset → engine default), and levels containing "diff" without "hash"
+// is an explicit rejection (diff drills into mismatched hash buckets —
+// without the hash level it can never fire and would silently pass as
+// "compared").
+func validateCompareParams(spec *compareTaskSpec) error {
+	for _, c := range []struct {
+		name string
+		v    int
+		min  int
+		max  int
+	}{
+		{"buckets", spec.Buckets, 1, 4096},
+		{"parallel_colls", spec.ParallelColls, 1, 32},
+		{"parallel_buckets", spec.ParallelBuckets, 1, 32},
+		{"batch_size", spec.BatchSize, 100, 100000},
+	} {
+		if c.v != 0 && (c.v < c.min || c.v > c.max) {
+			return fmt.Errorf("%s must be %d..%d (0 = default)", c.name, c.min, c.max)
+		}
+	}
+	hasHash, hasDiff := false, false
+	for _, l := range spec.Levels {
+		switch l {
+		case string(mongocompare.LevelHash):
+			hasHash = true
+		case string(mongocompare.LevelDiff):
+			hasDiff = true
+		}
+	}
+	if hasDiff && !hasHash {
+		return fmt.Errorf(`levels containing "diff" must also contain "hash"`)
+	}
+	return nil
+}
+
 // handleCreateCompareTask creates a standalone mongodb compare task.
 // Route: POST /api/v1/mongocompare/tasks (registered next to POST /tasks).
 func (s *Server) handleCreateCompareTask(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +248,10 @@ func (s *Server) handleCreateCompareTask(w http.ResponseWriter, r *http.Request)
 			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown level %q", l))
 			return
 		}
+	}
+	if err := validateCompareParams(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	task := &store.Task{

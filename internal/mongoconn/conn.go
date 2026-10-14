@@ -36,6 +36,20 @@ type bsonD = bson.D
 // MinWireV2 is the wire floor of the v2 driver path (MongoDB 4.4+).
 const MinWireV2 = 9
 
+// CollType is one collection's name and listCollections type ("collection",
+// "view", ...). An empty Type means the server/driver did not report one and
+// — per the M1 guard — must be treated as a collection by consumers.
+type CollType struct {
+	Name string
+	Type string
+}
+
+// IsCollection reports whether the entry carries comparable data: views
+// ("view", timeseries-buckets companions, ...) do not. An empty Type is a
+// collection per the M1 guard (servers/drivers that omit the field never
+// lose their collections).
+func (ct CollType) IsCollection() bool { return browsableType(ct.Type) }
+
 // Client is the unified connection surface: compare engine (Collection and
 // the listing primitives), meta browser (ListDatabases/ListCollections with
 // full detail) and connection test (Ping/Version) all sit on it.
@@ -52,6 +66,10 @@ type Client interface {
 	// ListCollectionNames lists just the names (engine's existence checks;
 	// cheaper than the full browse).
 	ListCollectionNames(ctx context.Context, database string) ([]string, error)
+	// ListCollectionNameTypes lists name+type pairs via the nameOnly
+	// listing (engine's view filter + per-db existence checks — MC-9 A2:
+	// one round trip per database instead of one per collection).
+	ListCollectionNameTypes(ctx context.Context, database string) ([]CollType, error)
 	// Collection returns the ops handle for one collection.
 	Collection(database, coll string) Coll
 	// Driver reports which path is serving: "v2" or "v1" (diagnostics/logs —

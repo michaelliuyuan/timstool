@@ -45,7 +45,9 @@ POST /api/v1/tasks/{id}/cancel         # 取消（再启动 = 全新对比）
 ## 语义与边界
 
 - **resume 前提**：checkpoint 复用假设两次运行间数据未变。桶边界 canonical 串与重算计划不一致时该桶自动重算（数据漂移防护）；同一边界内的数据变更会被正常检出为 diff。取消/失败后重新 start 默认全新对比（产物目录清空）；断点续跑显式走 `start {"resume":true}` 或 pause→resume。
-- **ttl_skip**：含 TTL 索引的集合跳过数据层对比（仅比较索引层）——TTL 后台删除会让哈希永不相等，js 参考实现同语义。
+- **ttl_skip**：含 TTL 索引的集合跳过数据层对比（仅比较索引层）——TTL 后台删除会让哈希永不相等，js 参考实现同语义。**TTL + 索引差异语义（MC-9）**：ttl_skip 只能从 equal 降级而来；若索引层已检出差异，该集合判 **diff**（不被 TTL 跳过掩盖），`checks.skipped="ttl"` 标记仍保留（说明数据层为何缺席）。仅目标端有 TTL 索引时，该索引本身即索引差异（missing-in-source），且源端无 TTL 故数据层照常执行。
+- **视图过滤（MC-9）**：对比按 `listCollections` 的 type 过滤，仅 `type="collection"` 参与对比；视图（view）不参与（两边视图定义/数据口径不可比）。**空 type 视为 collection**（旧服务端/驱动不回报 type 时的 M1 守卫，绝不静默丢集合）。被跳过的视图记入 `summary.json` 的 `stats.skipped_views` 名单（`db.view` 形式），不进入 counts 四态计数。
+- **参数校验边界（MC-9）**：`buckets` 1..4096（缺省 64）、`parallel_colls` 1..32（缺省 4）、`parallel_buckets` 1..32（缺省 4）、`batch_size` 100..100000（缺省 1000）；`0` 表示未设置走缺省，非 0 越界一律 400 拒绝。`levels` 含 `diff` 但不含 `hash` 显式拒绝（400）：diff 只对哈希失配桶下钻，无 hash 层时 diff 永不触发，静默接受会伪装成"已对比"。
 - **系统命名空间**：`system.*` 集合与 admin/config/local 库跳过。层次说明：MongoDB 的系统对象过滤在**对比引擎层**完成，MySQL/PG 的系统库过滤在**源适配层**完成——层次不同，用户可见行为一致（系统对象不参与对比）。
 - **三态 + ttl_skip**：overall ∈ {equal, diff, error, ttl_skip}；任一集合 diff 即整体 diff，无 diff 但有集合 error 即整体 error。
 

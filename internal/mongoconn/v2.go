@@ -171,6 +171,28 @@ func (c *v2Client) ListCollectionNames(ctx context.Context, database string) ([]
 	return names, nil
 }
 
+// ListCollectionNameTypes is the MC-9 A2 lightweight listing: nameOnly
+// cursor decoding just name+type (same round trip as ListCollectionNames,
+// with the type the engine's view filter needs).
+func (c *v2Client) ListCollectionNameTypes(ctx context.Context, database string) ([]CollType, error) {
+	cur, err := c.client.Database(database).ListCollections(ctx, bson.D{}, v2options.ListCollections().SetNameOnly(true))
+	if err != nil {
+		return nil, fmt.Errorf("listCollections(%s): %w", database, err)
+	}
+	var specs []struct {
+		Name string `bson:"name"`
+		Type string `bson:"type"`
+	}
+	if err := cur.All(ctx, &specs); err != nil {
+		return nil, err
+	}
+	out := make([]CollType, 0, len(specs))
+	for _, s := range specs {
+		out = append(out, CollType{Name: s.Name, Type: s.Type})
+	}
+	return out, nil
+}
+
 // fillStats fills Count/StorageSize/TotalIndexSize via collStats; on failure
 // it degrades to an estimated count with -1 sizes (browse detail, never
 // fatal — the M1 contract).

@@ -90,11 +90,53 @@ func TestHandleCreateCompareTaskValidation(t *testing.T) {
 		{"missing target", `{"source":{"uri":"mongodb://s"}}`},
 		{"missing source db", `{"source":{"uri":"mongodb://s"},"target":{"uri":"mongodb://t"}}`},
 		{"bad level", `{"source":{"uri":"mongodb://s","database":"a"},"levels":["nope"]}`},
+		// MC-9 C4 parameter boundaries (0 = default passes; out-of-range 400s).
+		{"buckets over max", `{"source":{"uri":"mongodb://s","database":"a"},"buckets":4097}`},
+		{"buckets under min", `{"source":{"uri":"mongodb://s","database":"a"},"buckets":-1}`},
+		{"parallel_colls over", `{"source":{"uri":"mongodb://s","database":"a"},"parallel_colls":33}`},
+		{"parallel_buckets over", `{"source":{"uri":"mongodb://s","database":"a"},"parallel_buckets":0,"parallel_colls":64}`},
+		{"batch_size under", `{"source":{"uri":"mongodb://s","database":"a"},"batch_size":50}`},
+		{"batch_size over", `{"source":{"uri":"mongodb://s","database":"a"},"batch_size":100001}`},
+		{"diff without hash", `{"source":{"uri":"mongodb://s","database":"a"},"levels":["schema","index","count","diff"]}`},
 	}
 	for _, c := range cases {
 		rec := postCompareSpec(t, s, c.body)
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: status=%d want 400, body=%s", c.name, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// TestValidateCompareParamsBoundaries (MC-9 C4): the exact edges pass and
+// everything one step past them rejects; 0 means default everywhere.
+func TestValidateCompareParamsBoundaries(t *testing.T) {
+	valid := []compareTaskSpec{
+		{Buckets: 1}, {Buckets: 4096},
+		{ParallelColls: 1}, {ParallelColls: 32},
+		{ParallelBuckets: 1}, {ParallelBuckets: 32},
+		{BatchSize: 100}, {BatchSize: 100000},
+		{Levels: []string{"schema", "hash", "diff"}},
+		{Levels: []string{"schema"}}, // diff absent: no hash requirement
+	}
+	for i := range valid {
+		if err := validateCompareParams(&valid[i]); err != nil {
+			t.Errorf("valid spec %d rejected: %v (%+v)", i, err, valid[i])
+		}
+	}
+	invalid := []compareTaskSpec{
+		{Buckets: 0 - 1, BatchSize: 1000}, // avoid zero-default collisions
+		{Buckets: 4097},
+		{ParallelColls: 33},
+		{ParallelColls: -2},
+		{ParallelBuckets: 99},
+		{BatchSize: 99},
+		{BatchSize: 100001},
+		{Levels: []string{"diff"}},
+		{Levels: []string{"schema", "diff"}},
+	}
+	for i := range invalid {
+		if err := validateCompareParams(&invalid[i]); err == nil {
+			t.Errorf("invalid spec %d accepted: %+v", i, invalid[i])
 		}
 	}
 }
