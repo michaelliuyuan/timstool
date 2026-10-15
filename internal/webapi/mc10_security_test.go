@@ -72,6 +72,8 @@ func TestMC10CompareCreateGate(t *testing.T) {
 	if rec := mc10Post(s, "/api/v1/mongocompare/tasks", mc10ValidSpec, testAuthToken); rec.Code != http.StatusCreated {
 		t.Fatalf("correct token: %d %s, want 201", rec.Code, rec.Body.String())
 	}
+	// success outcome also lands in the compare trail.
+	assertAuditLine(t, dir, "mc-ops.jsonl", `"action":"mongocompare.create"`, `"result":"success"`)
 
 	// trail separation: compare ops never touch the CDC audit file.
 	if _, err := os.Stat(filepath.Join(dir, "audit", "cdc-ops.jsonl")); !os.IsNotExist(err) {
@@ -187,13 +189,96 @@ func TestMC10LegacyParamRevalidation(t *testing.T) {
 	}
 }
 
+// R3 lifecycle decision table (seq262/263 定稿): pause/resume/cancel/delete
+// compare rows — 403 (unset) / 401 (missing, wrong) / 200 (correct), driven
+// through the shared handlers. start's full row set lives above; the resume
+// 200 cell spawns a run against an unreachable URI (fails fast, polled out).
+func TestMC10LifecycleGateDecisionTable(t *testing.T) {
+	s, st, _ := mc10BareServer(t)
+	mc10SeedTask(t, st, "gpause", mc10CompareCfg, store.TaskStatusRunning)
+	mc10SeedTask(t, st, "gresume", mc10CompareCfg, store.TaskStatusPaused)
+	mc10SeedTask(t, st, "gcancel", mc10CompareCfg, store.TaskStatusCreated)
+	mc10SeedTask(t, st, "gdelete", mc10CompareCfg, store.TaskStatusCreated)
+
+	ops := []struct {
+		name, id, method string
+	}{
+		{"pause", "gpause", http.MethodPost},
+		{"resume", "gresume", http.MethodPost},
+		{"cancel", "gcancel", http.MethodPost},
+		{"delete", "gdelete", http.MethodDelete},
+	}
+	byName := map[string]func(token string) *httptest.ResponseRecorder{
+		"pause": func(token string) *httptest.ResponseRecorder {
+			return driveRouter(s, http.MethodPost, "/api/v1/tasks/gpause/pause", "gpause", token)
+		},
+		"resume": func(token string) *httptest.ResponseRecorder {
+			return driveRouter(s, http.MethodPost, "/api/v1/tasks/gresume/resume", "gresume", token)
+		},
+		"cancel": func(token string) *httptest.ResponseRecorder {
+			return driveRouter(s, http.MethodPost, "/api/v1/tasks/gcancel/cancel", "gcancel", token)
+		},
+		"delete": func(token string) *httptest.ResponseRecorder {
+			return driveRouter(s, http.MethodDelete, "/api/v1/tasks/gdelete", "gdelete", token)
+		},
+	}
+
+	// unset token: fail-closed 403 everywhere.
+	for _, op := range ops {
+		if rec := byName[op.name](""); rec.Code != http.StatusForbidden {
+			t.Fatalf("%s unset token: %d %s, want 403", op.name, rec.Code, rec.Body.String())
+		}
+	}
+	s.SetSecurityToken(testAuthToken)
+	for _, bad := range []string{"", "wrong-token"} {
+		for _, op := range ops {
+			if rec := byName[op.name](bad); rec.Code != http.StatusUnauthorized {
+				t.Fatalf("%s token=%q: %d, want 401", op.name, bad, rec.Code)
+			}
+		}
+	}
+	for _, op := range ops {
+		if rec := byName[op.name](testAuthToken); rec.Code != http.StatusOK {
+			t.Fatalf("%s correct token: %d %s, want 200", op.name, rec.Code, rec.Body.String())
+		}
+	}
+	// the resume 200 spawned a compare run on an unreachable URI — wait out
+	// the async terminal write so cleanup never races it.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		task, _ := st.GetTask("gresume")
+		if task == nil || task.Status != store.TaskStatusRunning {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// driveRouter drives one lifecycle op through the real router with a
+// chi-populated {taskID} and an optional token header.
+func driveRouter(s *Server, method, path, taskID, token string) *httptest.ResponseRecorder {
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("taskID", taskID)
+	req := httptest.NewRequest(method, path, nil)
+	if token != "" {
+		req.Header.Set("X-Auth-Token", token)
+	}
+	req = req.WithContext(context.WithValue(context.Background(), chi.RouteCtxKey, rctx))
+	rec := httptest.NewRecorder()
+	s.router.ServeHTTP(rec, req)
+	return rec
+}
+
 // R3 regression anchor: migration tasks on the SAME lifecycle routes stay
-// un-gated (no token configured, no header → the ops still succeed).
-// start/resume migration parity is anchored by the F-08/F-10 suites, which
-// drive those handlers without a token header and expect 200.
+// un-gated (no token configured, no header → the ops still succeed), and
+// the compare READ endpoints stay open (CDC precedent). start/resume
+// migration parity is anchored by the F-08/F-10 suites, which drive those
+// handlers without a token header and expect 200.
 func TestMC10MigrationLifecycleUngated(t *testing.T) {
 	s, st, _ := mc10BareServer(t)
 	mc10SeedTask(t, st, "migmig", `{"source":{"host":"a"},"migration":{"parallel":4}}`, store.TaskStatusRunning)
+	mc10SeedTask(t, st, "migcan", `{"source":{"host":"a"},"migration":{"parallel":4}}`, store.TaskStatusCreated)
+	mc10SeedTask(t, st, "mcread", mc10CompareCfg, store.TaskStatusCompleted)
 
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("taskID", "migmig")
@@ -203,6 +288,16 @@ func TestMC10MigrationLifecycleUngated(t *testing.T) {
 	s.handlePauseTask(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("migration pause: %d %s, want 200 (ungated)", rec.Code, rec.Body.String())
+	}
+
+	rctxC := chi.NewRouteContext()
+	rctxC.URLParams.Add("taskID", "migcan")
+	reqC := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/migcan/cancel", nil).
+		WithContext(context.WithValue(context.Background(), chi.RouteCtxKey, rctxC))
+	recC := httptest.NewRecorder()
+	s.handleCancelTask(recC, reqC)
+	if recC.Code != http.StatusOK {
+		t.Fatalf("migration cancel: %d %s, want 200 (ungated)", recC.Code, recC.Body.String())
 	}
 
 	rctx2 := chi.NewRouteContext()
