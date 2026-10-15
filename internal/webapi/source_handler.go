@@ -305,10 +305,15 @@ func (s *Server) handleSourceMeta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// MC-11: a datasource_id folds the stored entry in as the connection
-	// base; explicit request fields keep winning (explicit-wins, mirroring
-	// resolveCompareRef). Field keys share the mongoMeta registry shape
-	// (camelCase authDb/tls), so stringifyMap feeds Options unchanged and
-	// dialConfig (source.go:74-78) reads authDb/tls without loss.
+	// base. Identity fields (host/port/user/password) are rejected on this
+	// path — R3 security adjudication: the fold carries stored credentials
+	// and must never let a caller redirect them. Remaining explicit fields
+	// still win (intentional explicit-wins; do NOT fold this into
+	// resolveCompareRef's skip-empty semantics — the browse probe has no
+	// DTO round-trip asymmetry to guard). Field keys share the mongoMeta
+	// registry shape (camelCase authDb/tls), so stringifyMap feeds Options
+	// unchanged and dialConfig (source.go:74-78) reads authDb/tls without
+	// loss.
 	fields := req.Fields
 	if req.DatasourceID != "" {
 		entry, err := s.resolveDataSourceRef(req.DatasourceID)
@@ -319,6 +324,17 @@ func (s *Server) handleSourceMeta(w http.ResponseWriter, r *http.Request) {
 		if entry.Type != "mongodb" {
 			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("datasource %q is %q, metadata browsing requires a mongodb datasource", req.DatasourceID, entry.Type))
 			return
+		}
+		// Identity fields pick the destination (host/port) or ride the
+		// handshake (user/password) — overriding them here would relay
+		// the stored credentials to a caller-chosen host. Presence alone
+		// is a 400, regardless of value; the manual fields path (caller
+		// supplies its own credentials) is unchanged.
+		for _, k := range []string{"host", "port", "user", "password"} {
+			if _, ok := req.Fields[k]; ok {
+				s.writeError(w, http.StatusBadRequest, fmt.Sprintf("field %q conflicts with datasource %q (identity fields cannot be overridden)", k, req.DatasourceID))
+				return
+			}
 		}
 		merged := make(map[string]any, len(entry.Fields)+len(req.Fields))
 		for k, v := range entry.Fields {

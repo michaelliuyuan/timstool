@@ -60,11 +60,38 @@ func TestSourceMetaDatasourceFold400s(t *testing.T) {
 	}
 }
 
+// TestSourceMetaDatasourceIdentityGate400s pins the R3 security gate: on
+// the datasource_id path, any identity field (host/port/user/password —
+// destination pickers and handshake riders alike) is a 400 naming the
+// offending field, so a caller can never redirect stored credentials.
+// Presence alone triggers the gate, regardless of value.
+func TestSourceMetaDatasourceIdentityGate400s(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	w, req := doReq("POST", "/api/v1/datasources", `{"name":"m-ident","type":"mongodb","fields":{"host":"h"}}`)
+	s.handleCreateDataSource(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create mongo ds: %d %s", w.Code, w.Body.String())
+	}
+	id := dsBody(t, w)["id"].(string)
+
+	for _, field := range []string{"host", "port", "user", "password"} {
+		body := fmt.Sprintf(`{"datasource_id":%q,"fields":{%q:"x"},"database":""}`, id, field)
+		w, req = doReq("POST", "/api/v1/sources/meta", body)
+		s.handleSourceMeta(w, req)
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "identity fields cannot be overridden") || !strings.Contains(w.Body.String(), field) {
+			t.Fatalf("identity gate %s: %d %s", field, w.Code, w.Body.String())
+		}
+	}
+}
+
 // TestSourceMetaDatasourceFoldLive is the env-gated dial proof (standing
 // smoke mongod): a datasource whose fields point at TIMSTOOL_MONGO_SMOKE
 // lists databases through the fold, the response carries exactly the four
-// browse keys (no field/credential echo), and the collections level routes
-// the database alongside the fold.
+// browse keys (no field/credential echo), the collections level routes
+// the database alongside the fold, and the manual fields path (no
+// datasource_id, caller-supplied host/port) still dials and lists —
+// R3 changed nothing for it (zero-change anchor).
 func TestSourceMetaDatasourceFoldLive(t *testing.T) {
 	addr := smokeAddrForLive(t)
 	host, port, err := net.SplitHostPort(addr)
@@ -108,5 +135,13 @@ func TestSourceMetaDatasourceFoldLive(t *testing.T) {
 	s.handleSourceMeta(w, req)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"level":"collections"`) {
 		t.Fatalf("meta collections: %d %s", w.Code, w.Body.String())
+	}
+
+	// Manual fields path (no datasource_id): caller-supplied host/port
+	// dial and list exactly as before the R3 gate — zero behavior change.
+	w, req = doReq("POST", "/api/v1/sources/meta", fmt.Sprintf(`{"source":"mongodb","fields":{"host":%q,"port":%s},"database":""}`, host, port))
+	s.handleSourceMeta(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"level":"databases"`) || !strings.Contains(w.Body.String(), "admin") {
+		t.Fatalf("manual fields path regressed: %d %s", w.Code, w.Body.String())
 	}
 }
