@@ -76,6 +76,16 @@ func NormalizeKind(kind string) (string, error) {
 	return kind, nil
 }
 
+// IsMongoDB reports whether the (normalized) kind is mongodb — the
+// registry home for kind truths (five-pin #3; R4 ruling seq 320): the
+// datasource-ref folds and their input gates call this predicate instead
+// of bare string compares, so the frozen-baseline type-branch guard only
+// ever decreases.
+func IsMongoDB(kind string) bool {
+	k, err := NormalizeKind(kind)
+	return err == nil && k == "mongodb"
+}
+
 // Capable reports whether the (normalized) source kind has the capability bit
 // set. It is the single truth for UI greying and backend 400 double-guarding;
 // callers must not branch on the raw type string themselves.

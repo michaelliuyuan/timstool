@@ -321,7 +321,7 @@ func (s *Server) handleSourceMeta(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if entry.Type != "mongodb" {
+		if !source.IsMongoDB(entry.Type) {
 			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("datasource %q is %q, metadata browsing requires a mongodb datasource", req.DatasourceID, entry.Type))
 			return
 		}
@@ -356,7 +356,7 @@ func (s *Server) handleSourceMeta(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	if req.DatasourceID != "" && srcType != "mongodb" {
+	if req.DatasourceID != "" && !source.IsMongoDB(srcType) {
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("source %q conflicts with datasource %q (mongodb)", srcType, req.DatasourceID))
 		return
 	}

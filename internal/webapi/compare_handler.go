@@ -40,6 +40,7 @@ import (
 
 	"github.com/michaelliuyuan/timstool/internal/mongocompare"
 	"github.com/michaelliuyuan/timstool/internal/mongoconn"
+	"github.com/michaelliuyuan/timstool/internal/source"
 	"github.com/michaelliuyuan/timstool/internal/store"
 )
 
@@ -97,7 +98,7 @@ func (s *Server) resolveCompareRef(e *compareEndpoint) error {
 	if err != nil {
 		return fmt.Errorf("datasource %q: %v", e.DatasourceID, err)
 	}
-	if entry.Type != "mongodb" {
+	if !source.IsMongoDB(entry.Type) {
 		return fmt.Errorf("datasource %q is %q, compare requires a mongodb datasource", e.DatasourceID, entry.Type)
 	}
 	if e.Host == "" {

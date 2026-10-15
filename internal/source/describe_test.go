@@ -13,6 +13,21 @@ import (
 	_ "github.com/michaelliuyuan/timstool/internal/source/postgres"
 )
 
+// TestIsMongoDB: the R4 kind predicate — mongodb yes; the ""→postgres
+// default, other kinds, unknown kinds, and case variants all no (exact
+// registry-key match; never an error, and call sites never hold a bare
+// type compare).
+func TestIsMongoDB(t *testing.T) {
+	if !source.IsMongoDB("mongodb") {
+		t.Error(`IsMongoDB("mongodb") = false, want true`)
+	}
+	for _, no := range []string{"", "postgres", "mysql", "tidb", "MongoDB", "nosuch"} {
+		if source.IsMongoDB(no) {
+			t.Errorf("IsMongoDB(%q) = true, want false", no)
+		}
+	}
+}
+
 // TestDescribeAllIncludesAllSources: DescribeAll lists every source incl. stubs,
 // without opening any connection (doc §4/§10.1).
 func TestDescribeAllIncludesAllSources(t *testing.T) {
