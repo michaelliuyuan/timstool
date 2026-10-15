@@ -447,6 +447,14 @@ export interface CompareOptions {
 export const apiClient = {
   health: () => api.get('/health'),
 
+  // MC-12 P2: token liveness probe for the FE token dialog. POSTs the SAME
+  // gated path every destructive op rides (403 fail-closed / unified 401);
+  // the candidate token is stored tentatively BEFORE the call so the
+  // request interceptor injects it — a 200 {"status":"ok"} confirms the
+  // candidate is the live snapshot, anything else rejects without burning
+  // a real create/stop action.
+  verifySecurityToken: () => api.post<{ status: string }>('/security/verify'),
+
   getSources: () => api.get<{ sources: SourceMeta[] }>('/sources'),
 
   // Multi-source table listing via the adapter's SchemaReader (#t79). PG keeps

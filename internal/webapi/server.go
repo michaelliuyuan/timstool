@@ -315,6 +315,10 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 			// MC-10 C5: creation sits behind the token gate (same snapshot
 			// and 403/401 semantics as the CDC routes; reads stay open).
 			r.Post("/mongocompare/tasks", s.requireCompareOpToken("mongocompare.create", s.handleCreateCompareTask))
+			// MC-12 P2: token liveness probe for the FE token dialog — same gate,
+			// same audit trail, zero new 401 semantics; the dialog verifies a
+			// candidate BEFORE burning a real create/stop action.
+			r.Post("/security/verify", s.requireSecurityOpToken("security.verify", s.handleSecurityVerify))
 			r.Get("/tasks", s.handleListTasks)
 			r.Route("/tasks/{taskID}", func(r chi.Router) {
 				r.Get("/", s.handleGetTask)

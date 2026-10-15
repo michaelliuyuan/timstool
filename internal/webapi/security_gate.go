@@ -164,6 +164,23 @@ func (s *Server) requireCompareOpToken(action string, h http.HandlerFunc) http.H
 	return s.requireOpToken(auditFileMongoCompare, action, h)
 }
 
+// requireSecurityOpToken gates one security-plane endpoint (MC-12 P2):
+// same token snapshot and 403/401 semantics as every other gated surface.
+// The audit line lands in the CDC trail — the security core's historical
+// home (the weak-token entropy advisory writes there too).
+func (s *Server) requireSecurityOpToken(action string, h http.HandlerFunc) http.HandlerFunc {
+	return s.requireOpToken(auditFileCDC, action, h)
+}
+
+// handleSecurityVerify answers the FE token dialog's liveness probe
+// (MC-12 P2). It is reached only PAST the gate, so a 200 {"status":"ok"}
+// doubles as the dialog's "store the token" signal; the deny path is 100%
+// the gate's own — byte-identical 401 for a missing OR wrong token, no
+// token-existence oracle (adversarial seq349 constraint ②).
+func (s *Server) handleSecurityVerify(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 // requireOpToken gates one gated endpoint: 403 while no token is
 // configured (fail-closed + remediation hint), 401 on a missing/wrong
 // token (FE opens the token prompt on exactly this code). Every outcome —
