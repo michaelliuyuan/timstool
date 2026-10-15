@@ -8,6 +8,7 @@ import type { CompareTaskSpec } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import ConnectionForm from '../components/ConnectionForm.vue'
 import DataSourcePicker from '../components/DataSourcePicker.vue'
+import DbBrowseSelect from '../components/DbBrowseSelect.vue'
 import { useSourceSchema } from '../composables/useSourceSchema'
 import { promptForToken } from '../composables/useAuthTokenGate'
 
@@ -166,7 +167,13 @@ async function submit(retriedAuth = false) {
           <ConnectionForm :meta="mongoMeta" :model="srcModel" />
         </template>
         <el-form-item label="数据库名" required>
-          <el-input v-model="srcDb" placeholder="例如 orders" style="max-width: 320px;" />
+          <!-- MC-11: browse+single-select fill, dual-track with manual entry.
+               Referenced datasource → datasource_id fold server-side; manual
+               fields ride the plain {source, fields} shape. -->
+          <DbBrowseSelect
+            v-model="srcDb"
+            :payload="() => (srcRef ? { datasource_id: srcRef } : { fields: { ...srcModel } })"
+          />
         </el-form-item>
         <el-form-item>
           <el-button :loading="testing.src" @click="testSide('src')">
@@ -191,7 +198,12 @@ async function submit(retriedAuth = false) {
           <el-checkbox v-model="tgtSameAsSrc">目标数据库名与源端相同</el-checkbox>
         </el-form-item>
         <el-form-item v-if="!tgtSameAsSrc" label="目标数据库名" required>
-          <el-input v-model="tgtDb" placeholder="留空默认与源端相同" style="max-width: 320px;" />
+          <!-- MC-11 symmetric browse on the target side (only when the name
+               differs from the source). -->
+          <DbBrowseSelect
+            v-model="tgtDb"
+            :payload="() => (tgtRef ? { datasource_id: tgtRef } : { fields: { ...tgtModel } })"
+          />
         </el-form-item>
         <el-form-item>
           <el-button :loading="testing.tgt" @click="testSide('tgt')">

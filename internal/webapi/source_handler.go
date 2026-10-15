@@ -284,10 +284,13 @@ func (s *Server) handleSourceTables(w http.ResponseWriter, r *http.Request) {
 
 // browseSourceRequest is the {source, fields, database} body for the
 // hierarchical metadata browse (source.MetaBrowser capability, mongodb M1).
+// DatasourceID (MC-11) optionally folds a stored mongodb datasource entry in
+// as the connection base — the browser never sees the stored credentials.
 type browseSourceRequest struct {
-	Source   string         `json:"source"`
-	Fields   map[string]any `json:"fields"`
-	Database string         `json:"database"`
+	Source       string         `json:"source"`
+	Fields       map[string]any `json:"fields"`
+	Database     string         `json:"database"`
+	DatasourceID string         `json:"datasource_id,omitempty"`
 }
 
 // handleSourceMeta browses a source's metadata via the optional
@@ -301,12 +304,44 @@ func (s *Server) handleSourceMeta(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	// MC-11: a datasource_id folds the stored entry in as the connection
+	// base; explicit request fields keep winning (explicit-wins, mirroring
+	// resolveCompareRef). Field keys share the mongoMeta registry shape
+	// (camelCase authDb/tls), so stringifyMap feeds Options unchanged and
+	// dialConfig (source.go:74-78) reads authDb/tls without loss.
+	fields := req.Fields
+	if req.DatasourceID != "" {
+		entry, err := s.resolveDataSourceRef(req.DatasourceID)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if entry.Type != "mongodb" {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("datasource %q is %q, metadata browsing requires a mongodb datasource", req.DatasourceID, entry.Type))
+			return
+		}
+		merged := make(map[string]any, len(entry.Fields)+len(req.Fields))
+		for k, v := range entry.Fields {
+			merged[k] = v
+		}
+		for k, v := range req.Fields {
+			merged[k] = v
+		}
+		fields = merged
+		if strings.TrimSpace(req.Source) == "" {
+			req.Source = entry.Type
+		}
+	}
 	// MS-01 pattern (ruling seq 82): the ""→postgres default and unknown-kind
 	// rejection both live in NormalizeKind — handlers must not branch on the
 	// raw type string (A3 frozen-baseline guard).
 	srcType, err := source.NormalizeKind(req.Source)
 	if err != nil {
 		s.writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if req.DatasourceID != "" && srcType != "mongodb" {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("source %q conflicts with datasource %q (mongodb)", srcType, req.DatasourceID))
 		return
 	}
 	meta, err := source.Describe(srcType)
@@ -321,14 +356,14 @@ func (s *Server) handleSourceMeta(w http.ResponseWriter, r *http.Request) {
 
 	cfg := source.SourceConfig{
 		Kind:     srcType,
-		Host:     stringField(req.Fields, "host"),
-		User:     stringField(req.Fields, "user"),
-		Password: stringField(req.Fields, "password"),
+		Host:     stringField(fields, "host"),
+		User:     stringField(fields, "user"),
+		Password: stringField(fields, "password"),
 		Database: req.Database,
-		Schema:   stringField(req.Fields, "schema"),
-		Options:  stringifyMap(req.Fields),
+		Schema:   stringField(fields, "schema"),
+		Options:  stringifyMap(fields),
 	}
-	if port := stringField(req.Fields, "port"); port != "" {
+	if port := stringField(fields, "port"); port != "" {
 		fmt.Sscanf(port, "%d", &cfg.Port)
 	}
 

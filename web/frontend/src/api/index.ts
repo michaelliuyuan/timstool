@@ -457,6 +457,16 @@ export const apiClient = {
       { source, fields },
     ),
 
+  // MC-11: browse a mongodb source's database list via /sources/meta
+  // (database empty → databases). datasource_id folds the stored profile
+  // server-side (credentials never travel back); manual fields ride the
+  // plain {source, fields} shape. Entries carry name/size only.
+  browseSourceDatabases: (payload: { datasource_id?: string; source?: string; fields?: Record<string, any> }) =>
+    api.post<{ source: string; level: string; entries: { name: string; size_on_disk?: number; empty?: boolean }[]; count: number }>(
+      '/sources/meta',
+      { source: 'mongodb', database: '', ...payload },
+    ),
+
   // Multi-source connection test (doc §6.2): {source, fields} → {success,...}.
   // source defaults to postgres server-side (backward compat).
   testSourceConnection: (source: string, fields: Record<string, any>) =>
