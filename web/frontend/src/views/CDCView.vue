@@ -323,12 +323,15 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import apiClient, { setAuthToken } from '../api'
+import apiClient from '../api'
 import DataPipelineStrip from '../components/DataPipelineStrip.vue'
 import SparkLine from '../components/SparkLine.vue'
 import PageHeader from '../components/PageHeader.vue'
 import SyncCompareCard from '../components/SyncCompareCard.vue'
 import { useDataSources } from '../composables/useDataSources'
+// MC-10 C5: the 401 token-prompt flow moved to the shared composable
+// (mongocompare surfaces consume the same gate); behavior is unchanged.
+import { promptForToken } from '../composables/useAuthTokenGate'
 
 // Mirrors the web API contract (docs/cdc-web-monitoring-contract.md, #t48 B).
 interface CDCStatus {
@@ -853,32 +856,6 @@ const control = ref<CDCControl | null>(null)
 const busy = ref(false)
 const controlMsg = ref('')
 const controlError = ref(false)
-
-// MS-11f 笔① d: 401 → token prompt. Single-flight flag guarantees no
-// stacked dialogs; each gated op carries a retriedAuth flag so a wrong
-// token prompts EXACTLY once per user action — the second 401 surfaces as
-// an error line instead of another dialog (MS-11c toast lesson, seq83 #4).
-let tokenPromptOpen = false
-
-async function promptForToken(): Promise<boolean> {
-  if (tokenPromptOpen) return false
-  tokenPromptOpen = true
-  try {
-    const { value } = await ElMessageBox.prompt(
-      '该操作需要管理令牌（对应服务端 config.yaml 的 security.token）：',
-      '身份验证',
-      { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消', inputType: 'password' },
-    )
-    const token = (value || '').trim()
-    if (!token) return false
-    setAuthToken(token)
-    return true
-  } catch {
-    return false
-  } finally {
-    tokenPromptOpen = false
-  }
-}
 
 const controlState = computed(() => control.value?.state || 'stopped')
 const isActive = computed(() => ['running', 'starting', 'adopted'].includes(controlState.value))

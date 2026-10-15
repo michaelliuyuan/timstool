@@ -7,6 +7,9 @@ import { resolve } from 'node:path'
 
 const apiSrc = () => readFileSync(resolve(__dirname, '../api/index.ts'), 'utf8')
 const viewSrc = () => readFileSync(resolve(__dirname, 'CDCView.vue'), 'utf8')
+// MC-10 C5: the prompt flow moved to the shared composable — the
+// single-flight contract anchors there now (CDCView consumes it).
+const gateSrc = () => readFileSync(resolve(__dirname, '../composables/useAuthTokenGate.ts'), 'utf8')
 
 describe('api client token plane (MS-11f)', () => {
   it('injects X-Auth-Token from sessionStorage on every request', () => {
@@ -30,9 +33,13 @@ describe('api client token plane (MS-11f)', () => {
 describe('CDCView 401 token prompt (MS-11f 笔① d)', () => {
   it('one prompt per user action: single-flight flag + retriedAuth depth guard', () => {
     const src = viewSrc()
+    const gate = gateSrc()
     // single-flight: concurrent 401s share one dialog (no stacking)
-    expect(src).toContain(`let tokenPromptOpen = false`)
-    expect(src).toContain(`if (tokenPromptOpen) return false`)
+    expect(gate).toContain(`let tokenPromptOpen = false`)
+    expect(gate).toContain(`if (tokenPromptOpen) return false`)
+    // CDCView consumes the shared flow, not a local copy
+    expect(src).toContain(`from '../composables/useAuthTokenGate'`)
+    expect(src).not.toContain(`async function promptForToken`)
     // depth guard: the retry re-enters the op with retriedAuth=true; a second
     // 401 falls through to the error line, never a second dialog
     expect(src).toContain(`e.response?.status === 401 && !retriedAuth && await promptForToken()`)

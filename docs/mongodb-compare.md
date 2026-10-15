@@ -31,6 +31,7 @@ POST /api/v1/tasks/{id}/cancel         # 取消（再启动 = 全新对比）
 - 每端可给 `uri`（完整连接串，转义由调用方负责）**或**离散字段 `host/port/user/password/auth_db`（服务端结构化构建凭证，口令含 `@ : / %` 等特殊字符安全）；两者同时给出时离散字段优先。
 - `target.database` 省略时默认与源端同名；v1 语义为**单库对单库**（两端库名可不同）。
 - 凭证存储与迁移任务同面：ConfigJSON 落库、API 序列化 `json:"-"` 不回显。
+- **鉴权（MC-10）**：写操作端点在令牌门后——`POST /mongocompare/tasks`（创建）与 compare 类任务的 `start/pause/resume/cancel/delete`（按 ConfigJSON 的 kind 判别后插门，任何状态写之前）。语义与 CDC 门逐字一致：请求头 `X-Auth-Token` 对 **config.yaml `security.token` 的启动时快照**做恒时比较；服务端未配 token = 403 fail-closed（全部拒绝），token 缺失/错误 = 401（前端弹一次令牌框后重试）。读端点（GET list/get/report/progress/logs）沿 CDC 先例保持开放。同一路由上的**迁移类任务不受门**（回归锚）。审计：compare 写操作逐条落 `<dataDir>/audit/mc-ops.jsonl`（action 前缀 `mongocompare.create/start/pause/resume/cancel/delete`，含 denied 尝试；内存环与 CDC 共享，写失败降级语义同 CDC）；CDC 审计文件 `cdc-ops.jsonl` 不受影响。
 
 ## 结果与产物
 
@@ -48,8 +49,11 @@ POST /api/v1/tasks/{id}/cancel         # 取消（再启动 = 全新对比）
 - **ttl_skip**：含 TTL 索引的集合跳过数据层对比（仅比较索引层）——TTL 后台删除会让哈希永不相等，js 参考实现同语义。**TTL + 索引差异语义（MC-9）**：ttl_skip 只能从 equal 降级而来；若索引层已检出差异，该集合判 **diff**（不被 TTL 跳过掩盖），`checks.skipped="ttl"` 标记仍保留（说明数据层为何缺席）。仅目标端有 TTL 索引时，该索引本身即索引差异（missing-in-source），且源端无 TTL 故数据层照常执行。
 - **视图过滤（MC-9）**：对比按 `listCollections` 的 type 过滤，仅 `type="collection"` 参与对比；视图（view）不参与（两边视图定义/数据口径不可比）。**空 type 视为 collection**（旧服务端/驱动不回报 type 时的 M1 守卫，绝不静默丢集合）。被跳过的视图记入 `summary.json` 的 `stats.skipped_views` 名单（`db.view` 形式），不进入 counts 四态计数。
 - **参数校验边界（MC-9）**：`buckets` 1..4096（缺省 64）、`parallel_colls` 1..32（缺省 4）、`parallel_buckets` 1..32（缺省 4）、`batch_size` 100..100000（缺省 1000）；`0` 表示未设置走缺省，非 0 越界一律 400 拒绝。`levels` 含 `diff` 但不含 `hash` 显式拒绝（400）：diff 只对哈希失配桶下钻，无 hash 层时 diff 永不触发，静默接受会伪装成"已对比"。
+- **双向存在性（MC-10）**：schema 级开启时存在性检查是**双向**的——源端有、目标端无 → `missing-in-target`（既有语义）；**目标端有、源端无的集合** → 合成结果行 `{overall: diff, checks.schema: {"diff": ["missing-in-source"]}}`（迁移校验场景目标端多出集合同样是问题）。该行走 counts 四态的 `diff`（计数与整体 overall 自然翻 diff，四态形状不变），`db` 字段为目标端库名（集合实际所在侧）。对称过滤：`system.*` 与视图（view）在两侧同样排除——目标端多出的 **view 不报告**（与源端侧视图过滤对称；视图不参与对比）；schema 级关闭时不枚举目标端，双向检查整体不生效。
+- **dst 同名视图修正（MC-10）**：目标端集合存在性只认 `type="collection"` 的条目——目标端**同名 view 不再能蒙混过存在性检查**（此前目标端只有同名 view 时源集合会被误判为存在）。
 - **系统命名空间**：`system.*` 集合与 admin/config/local 库跳过。层次说明：MongoDB 的系统对象过滤在**对比引擎层**完成，MySQL/PG 的系统库过滤在**源适配层**完成——层次不同，用户可见行为一致（系统对象不参与对比）。
 - **三态 + ttl_skip**：overall ∈ {equal, diff, error, ttl_skip}；任一集合 diff 即整体 diff，无 diff 但有集合 error 即整体 error。
+- **存量任务参数复验（MC-10）**：`start`/`resume` 在写 Running 状态**之前**对存量任务存储的参数复跑 MC-9 边界校验——边界收紧前创建的老任务若带越界参数（如 `buckets=4097`），启动/恢复显式拒绝（400 带边界文案，任务状态零突变），**不做静默钳制**（fail-loud：让调用方看见并重建任务，避免带着越界参数跑出误导性结果）。
 
 ## 限制与声明（记录性）
 

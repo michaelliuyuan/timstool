@@ -236,12 +236,29 @@ func finalize(s *Summary, rows []CollectionResult) {
 // per-collection listCollections storm). Skipped views are reported back
 // for Summary.Stats (skipped_views) — they deliberately do not enter the
 // four-state counts.
+//
+// MC-10 B1 (bidirectional existence, schema level only): dst-only
+// COLLECTIONS — present on the target, absent on the source — surface as
+// synthetic rows {Overall=diff, Checks.Schema=["missing-in-source"]} so a
+// migration-verification run reports extra target collections too. dstNames
+// counts only real collections (a same-named target VIEW no longer masks a
+// missing target collection); dst-only views are not reported (symmetric
+// with the source-side view filter) and system.* stays excluded on both
+// sides.
 func compareDB(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB string, c Config) ([]CollectionResult, []string, error) {
 	srcList, err := src.ListCollectionNameTypes(ctx, srcDB)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list collections %s: %w", srcDB, err)
 	}
+	srcColls := make(map[string]bool, len(srcList))
+	for _, ct := range srcList {
+		if strings.HasPrefix(ct.Name, "system.") || !ct.IsCollection() {
+			continue
+		}
+		srcColls[ct.Name] = true
+	}
 	var dstNames map[string]bool
+	var dstOnly []CollectionResult
 	if c.has(LevelSchema) {
 		dstList, err := dst.ListCollectionNameTypes(ctx, dstDB)
 		if err != nil {
@@ -249,7 +266,16 @@ func compareDB(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB stri
 		}
 		dstNames = make(map[string]bool, len(dstList))
 		for _, ct := range dstList {
+			if strings.HasPrefix(ct.Name, "system.") || !ct.IsCollection() {
+				continue
+			}
 			dstNames[ct.Name] = true
+			if !srcColls[ct.Name] {
+				var row CollectionResult
+				row.DB, row.Coll, row.Overall = dstDB, ct.Name, OverallDiff
+				row.Checks.Schema = map[string]any{"diff": []string{"missing-in-source"}}
+				dstOnly = append(dstOnly, row)
+			}
 		}
 	}
 	type task struct{ db, coll string }
@@ -281,6 +307,9 @@ func compareDB(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB stri
 		}(i, t)
 	}
 	wg.Wait()
+	if len(dstOnly) > 0 {
+		results = append(results, dstOnly...)
+	}
 	return results, skippedViews, nil
 }
 

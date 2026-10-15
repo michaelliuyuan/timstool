@@ -273,6 +273,81 @@ func (s *Server) handleCreateCompareTask(w http.ResponseWriter, r *http.Request)
 	s.writeJSON(w, http.StatusCreated, newTaskEnvelope(task))
 }
 
+// handleStartCompareTask is the token-gated compare branch of
+// handleStartTask (MC-10 ①③): the gate has already run by the time this
+// handler is invoked. Stored params are re-validated BEFORE any state
+// write — a legacy task created before the C4 boundaries fails loud here
+// (explicit 400, zero status mutation) instead of silently running with
+// out-of-range knobs.
+func (s *Server) handleStartCompareTask(taskID string, spec *compareTaskSpec) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var startBody struct {
+			Resume bool `json:"resume"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&startBody)
+		if err := validateCompareParams(spec); err != nil {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning); err != nil {
+			s.writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		_ = s.store.ResetTaskForRerun(taskID)
+		s.logCollector.RemoveBuffer(taskID)
+		ctx, cancel := context.WithCancel(context.Background())
+		s.runningTasks[taskID] = cancel
+		s.startCompareTask(ctx, taskID, spec, startBody.Resume)
+		s.writeJSON(w, http.StatusOK, map[string]string{"status": "started", "task_id": taskID})
+	}
+}
+
+// handleResumeCompareTask is the token-gated compare branch of
+// handleResumeTask (MC-10 ①③): checkpoint-continuation resume with the
+// same pre-write param re-validation as start.
+func (s *Server) handleResumeCompareTask(taskID string, spec *compareTaskSpec) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := validateCompareParams(spec); err != nil {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning)
+		ctx, cancel := context.WithCancel(context.Background())
+		s.runningTasks[taskID] = cancel
+		s.startCompareTask(ctx, taskID, spec, true)
+		s.writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
+	}
+}
+
+// handlePauseCompareTask / handleCancelCompareTask / handleDeleteCompareTask
+// are the token-gated compare branches of the shared lifecycle handlers
+// (MC-10 ①): kind-gated wrappers around the exact migration-path bodies, so
+// compare and migration semantics stay byte-identical behind the gate.
+func (s *Server) handlePauseCompareTask(taskID string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		s.store.UpdateTaskStatus(taskID, store.TaskStatusPaused)
+		s.writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
+	}
+}
+
+func (s *Server) handleCancelCompareTask(taskID string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if cancel := s.runningCancel(taskID); cancel != nil {
+			cancel()
+		} else {
+			s.store.UpdateTaskStatus(taskID, store.TaskStatusCancelled)
+		}
+		s.writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
+	}
+}
+
+func (s *Server) handleDeleteCompareTask(taskID string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		s.store.DeleteTask(taskID)
+		s.writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	}
+}
+
 // startCompareTask is the compare branch of task start/resume. A fresh start
 // wipes the task's OutDir (retry wants a clean compare); resume=true keeps
 // engine checkpoints for continuation (review ruling seq=68).

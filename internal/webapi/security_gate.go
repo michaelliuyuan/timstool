@@ -142,18 +142,40 @@ func peerIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// requireCDCOpToken gates one destructive CDC endpoint: 403 while no token
-// is configured (fail-closed + remediation hint), 401 on a missing/wrong
-// token (FE opens the token prompt on exactly this code). Every outcome —
-// denied, error, success — leaves an audit line.
+// Audit trail files (MC-10 ①): CDC ops keep their historical file
+// byte-identically; mongocompare ops get their own trail. The in-memory
+// ring is SHARED — one ring observes every gated surface.
+const (
+	auditFileCDC          = "cdc-ops.jsonl"
+	auditFileMongoCompare = "mc-ops.jsonl"
+)
+
+// requireCDCOpToken gates one destructive CDC endpoint. MC-10 ①: the gate
+// core is shared with the mongocompare lifecycle gate (requireOpToken);
+// CDC behavior — semantics and audit file — is unchanged.
 func (s *Server) requireCDCOpToken(action string, h http.HandlerFunc) http.HandlerFunc {
+	return s.requireOpToken(auditFileCDC, action, h)
+}
+
+// requireCompareOpToken gates one destructive mongocompare endpoint with
+// the same token snapshot and 403/401 semantics as the CDC gate, writing
+// its audit trail to mc-ops.jsonl (MC-10 C5).
+func (s *Server) requireCompareOpToken(action string, h http.HandlerFunc) http.HandlerFunc {
+	return s.requireOpToken(auditFileMongoCompare, action, h)
+}
+
+// requireOpToken gates one gated endpoint: 403 while no token is
+// configured (fail-closed + remediation hint), 401 on a missing/wrong
+// token (FE opens the token prompt on exactly this code). Every outcome —
+// denied, error, success — leaves an audit line in the named file.
+func (s *Server) requireOpToken(auditFile, action string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		e := auditEntry{
 			IP: peerIP(r), Method: r.Method, Endpoint: r.URL.Path, Action: action,
 		}
 		if s.authToken == "" {
 			e.Result, e.Detail = "denied", "security.token 未配置（fail-closed 全拒）"
-			s.appendAudit(e)
+			s.appendAuditFile(auditFile, e)
 			s.writeJSON(w, http.StatusForbidden, map[string]string{
 				"error": "服务端未配置 security.token：破坏性操作已全部拒绝。请在 config.yaml 设置 security.token 后重启 web 再操作。",
 			})
@@ -161,7 +183,7 @@ func (s *Server) requireCDCOpToken(action string, h http.HandlerFunc) http.Handl
 		}
 		if !s.tokenMatches(r.Header.Get("X-Auth-Token")) {
 			e.Result, e.Detail = "denied", "X-Auth-Token 缺失或错误"
-			s.appendAudit(e)
+			s.appendAuditFile(auditFile, e)
 			s.writeJSON(w, http.StatusUnauthorized, map[string]string{
 				"error": "unauthorized：X-Auth-Token 缺失或错误。",
 			})
@@ -175,16 +197,23 @@ func (s *Server) requireCDCOpToken(action string, h http.HandlerFunc) http.Handl
 		} else {
 			e.Result = "success"
 		}
-		s.appendAudit(e)
+		s.appendAuditFile(auditFile, e)
 	}
 }
 
-// appendAudit records one entry: always into the in-memory ring (the
-// anomaly checker's source AND the fallback when the disk trail fails), and
-// durably into <dataDir>/audit/cdc-ops.jsonl with one retry. A persist
-// failure must neither brick the operation nor stay silent (ruling seq85
-// #3): ERROR log + alarm, record survives in the ring.
+// appendAudit records one entry into the CDC trail (MS-11f semantics,
+// unchanged by MC-10): the shared in-memory ring plus
+// <dataDir>/audit/cdc-ops.jsonl.
 func (s *Server) appendAudit(e auditEntry) {
+	s.appendAuditFile(auditFileCDC, e)
+}
+
+// appendAuditFile records one entry: always into the shared in-memory ring
+// (the anomaly checker's source AND the fallback when the disk trail
+// fails), and durably into <dataDir>/audit/<auditFile> with one retry. A
+// persist failure must neither brick the operation nor stay silent
+// (ruling seq85 #3): ERROR log + alarm, record survives in the ring.
+func (s *Server) appendAuditFile(auditFile string, e auditEntry) {
 	e.TS = time.Now()
 	s.auditMu.Lock()
 	s.auditRing = append(s.auditRing, e)
@@ -208,7 +237,7 @@ func (s *Server) appendAudit(e auditEntry) {
 	if err != nil {
 		return
 	}
-	f := filepath.Join(s.dataDir, "audit", "cdc-ops.jsonl")
+	f := filepath.Join(s.dataDir, "audit", auditFile)
 	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
 		s.alarmAuditWriteFailure(f, err)
 		return

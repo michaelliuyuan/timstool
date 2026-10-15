@@ -312,7 +312,9 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 			r.Post("/tasks", s.handleCreateTask)
 			// MongoDB↔MongoDB consistency compare (M3): own task namespace,
 			// prefixed to stay clear of the /compare MySQL domain below.
-			r.Post("/mongocompare/tasks", s.handleCreateCompareTask)
+			// MC-10 C5: creation sits behind the token gate (same snapshot
+			// and 403/401 semantics as the CDC routes; reads stay open).
+			r.Post("/mongocompare/tasks", s.requireCompareOpToken("mongocompare.create", s.handleCreateCompareTask))
 			r.Get("/tasks", s.handleListTasks)
 			r.Route("/tasks/{taskID}", func(r chi.Router) {
 				r.Get("/", s.handleGetTask)
@@ -1450,22 +1452,12 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 	// MongoDB compare tasks (M3) run their own pipeline; branch before the
 	// migration config parse so the migration path stays untouched. The start
 	// body may carry {"resume": true} to continue from engine checkpoints;
-	// default is a clean run (OutDir wiped).
+	// default is a clean run (OutDir wiped). MC-10: the compare branch sits
+	// behind the token gate (kind-gated: migration tasks on the same route
+	// stay un-gated), and stored params are re-validated before any state
+	// write (③ — legacy out-of-range tasks fail loud).
 	if spec, ok := parseCompareTask(task.ConfigJSON); ok {
-		var startBody struct {
-			Resume bool `json:"resume"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&startBody)
-		if err := s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning); err != nil {
-			s.writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		_ = s.store.ResetTaskForRerun(taskID)
-		s.logCollector.RemoveBuffer(taskID)
-		ctx, cancel := context.WithCancel(context.Background())
-		s.runningTasks[taskID] = cancel
-		s.startCompareTask(ctx, taskID, spec, startBody.Resume)
-		s.writeJSON(w, http.StatusOK, map[string]string{"status": "started", "task_id": taskID})
+		s.requireCompareOpToken("mongocompare.start", s.handleStartCompareTask(taskID, spec))(w, r)
 		return
 	}
 
@@ -1942,6 +1934,12 @@ func (s *Server) handlePauseTask(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusConflict, "task is not running")
 		return
 	}
+	// MC-10 ①: compare tasks pause behind the token gate (kind-gated; the
+	// migration pause below stays un-gated).
+	if _, ok := parseCompareTask(task.ConfigJSON); ok {
+		s.requireCompareOpToken("mongocompare.pause", s.handlePauseCompareTask(taskID))(w, r)
+		return
+	}
 	s.store.UpdateTaskStatus(taskID, store.TaskStatusPaused)
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
 }
@@ -1959,13 +1957,10 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// MongoDB compare tasks (M3): resume through the compare pipeline with
-	// engine checkpoints intact (OutDir not wiped).
+	// engine checkpoints intact (OutDir not wiped). MC-10: token gate + ③
+	// param re-validation before the Running write.
 	if spec, ok := parseCompareTask(task.ConfigJSON); ok {
-		s.store.UpdateTaskStatus(taskID, store.TaskStatusRunning)
-		ctx, cancel := context.WithCancel(context.Background())
-		s.runningTasks[taskID] = cancel
-		s.startCompareTask(ctx, taskID, spec, true)
-		s.writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
+		s.requireCompareOpToken("mongocompare.resume", s.handleResumeCompareTask(taskID, spec))(w, r)
 		return
 	}
 
@@ -2015,6 +2010,14 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskID")
+	// MC-10 ①: compare tasks cancel behind the token gate — kind is read
+	// BEFORE any state write; migration tasks keep the ungated path.
+	if task, _ := s.store.GetTask(taskID); task != nil {
+		if _, ok := parseCompareTask(task.ConfigJSON); ok {
+			s.requireCompareOpToken("mongocompare.cancel", s.handleCancelCompareTask(taskID))(w, r)
+			return
+		}
+	}
 	// F-08 v2 ruling: pure cancel keeps the entry — the OWNING run's
 	// cancel branch writes Cancelled and its defer cleans up. Only when
 	// there is no live run (paused/finished/never started) does the
@@ -2109,6 +2112,12 @@ func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if task.Status == store.TaskStatusRunning {
 		s.writeError(w, http.StatusConflict, "cannot delete running task, cancel first")
+		return
+	}
+	// MC-10 ①: compare tasks delete behind the token gate (kind-gated; the
+	// migration delete below stays un-gated).
+	if _, ok := parseCompareTask(task.ConfigJSON); ok {
+		s.requireCompareOpToken("mongocompare.delete", s.handleDeleteCompareTask(taskID))(w, r)
 		return
 	}
 	s.store.DeleteTask(taskID)
