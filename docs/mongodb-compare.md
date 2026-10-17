@@ -8,7 +8,7 @@ MongoDB↔MongoDB 一致性对比：对源端与目标端的数据库逐集合�
 
 ## 使用（Web）
 
-导航「MongoDB 对比」→ 填写源端/目标端连接（表单字段由 `/api/v1/sources` 元数据驱动）与数据库名 → 可选高级参数 → 创建并启动。任务详情页实时显示已完成集合心跳，结束后展示总体结果（equal/diff/error/ttl_skip）、四象限计数与产物路径。
+导航「MongoDB 对比」→ 填写源端/目标端连接（表单字段由 `/api/v1/sources` 元数据驱动）与数据库名 → 可选高级参数 → 创建并启动。任务详情页实时显示已完成集合心跳，结束后展示总体结果（equal/diff/error/ttl_skip）、四象限计数与产物路径；终态（已完成/失败）提供「下载对比报告」（HTML 详细报告）与「下载 JSON」（summary.json 原样工件）双按钮（MC-14）。
 
 ## 使用（API）
 
@@ -26,6 +26,9 @@ POST /api/v1/tasks/{id}/start  {"resume": true}   # 从引擎 checkpoint 断点�
 POST /api/v1/tasks/{id}/pause          # 暂停（对比中断点续跑入口）
 POST /api/v1/tasks/{id}/resume         # 恢复（等同 resume=true）
 POST /api/v1/tasks/{id}/cancel         # 取消（再启动 = 全新对比）
+
+GET  /api/v1/tasks/{id}/report                  # MC-14：HTML 对比报告（附件下载）
+GET  /api/v1/tasks/{id}/report?format=json      # MC-14：summary.json 原样字节（附件下载）
 ```
 
 - 每端可给 `uri`（完整连接串，转义由调用方负责）**或**离散字段 `host/port/user/password/auth_db`（服务端结构化构建凭证，口令含 `@ : / %` 等特殊字符安全）；两者同时给出时离散字段优先。
@@ -41,7 +44,7 @@ POST /api/v1/tasks/{id}/cancel         # 取消（再启动 = 全新对比）
 - `diff/<db>__<coll>.ndjson`：字段级差异明细（modified/missing-in-target/missing-in-source + 叶子路径）
 - `.checkpoints/*.json`：桶级 checkpoint（含边界 canonical 串与 `algo_version`）
 
-产物目录：`<dataDir>/compare/<taskID>/`。v1 不提供下载端点，按 `summary_path`/`diff_dir` 路径取用（服务端文件）。
+产物目录：`<dataDir>/compare/<taskID>/`。下载走任务报告端点（MC-14）：`GET /tasks/{id}/report` 按 ConfigJSON kind 分流——compare 任务渲染 HTML 详细报告（横幅任务/两端库映射/耗时 + 四态汇总 + 逐集合五级明细表 + 失配桶下钻，失配桶每集合最多列 20 个；样式沿 reporter.ReportCSS 报告族；动态字段全量 HTML 转义，凭证与 URI 串永不渲染）；`format=json` 原样回传 `summary.json` 字节（attachment `compare-summary-<id>.json`）。summary.json 缺失（未跑完/连接期失败/重跑清空）= 404 并指明原因。迁移任务的 `/report` 行为零变化（回归锚）；该端点为只读，沿 MC-10 读开放口径不加令牌门。
 
 ## 语义与边界
 

@@ -2154,6 +2154,14 @@ func (s *Server) handleTaskReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// MC-14: mongocompare tasks render their own report family from the
+	// engine-written summary.json; migration configs never parse as compare
+	// envelopes, so the legacy path below is byte-identical for them.
+	if spec, ok := parseCompareTask(task.ConfigJSON); ok {
+		s.handleCompareTaskReport(w, r, task, spec)
+		return
+	}
+
 	format := r.URL.Query().Get("format")
 	switch format {
 	case "html":
