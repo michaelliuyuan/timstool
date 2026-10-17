@@ -25,7 +25,14 @@ import (
 // a fabricated summary.json under <dataDir>/compare/<id>/.
 func mcReportFixture(t *testing.T, s *Server, sum *mongocompare.Summary) string {
 	t.Helper()
-	task := &store.Task{ID: "mc14rep", Name: "MC-14 fixture"}
+	return mcReportFixtureNamed(t, s, sum, "MC-14 fixture")
+}
+
+// mcReportFixtureNamed is mcReportFixture with an explicit task name (MC-15:
+// the banner renders the 任务名 cell only for non-empty names).
+func mcReportFixtureNamed(t *testing.T, s *Server, sum *mongocompare.Summary, name string) string {
+	t.Helper()
+	task := &store.Task{ID: "mc14rep", Name: name}
 	env := compareTaskEnvelope{Kind: compareTaskKind, Compare: compareTaskSpec{
 		Source:  compareEndpoint{Host: "src.example", Port: 27017, Database: "shop"},
 		Target:  compareEndpoint{Host: "dst.example", Port: 27018, Database: "shop2"},
@@ -123,16 +130,22 @@ func TestCompareReport_HTML(t *testing.T) {
 		t.Errorf("content-disposition=%q", cd)
 	}
 	body := rec.Body.String()
-	// Family + banner anchors.
+	// Family + banner anchors (MC-15: migration-report-style split cells).
 	for _, want := range []string{
 		"MongoDB 对比报告",
-		"mc14rep",
-		"src.example:27017/shop", "dst.example:27018/shop2", // endpoint labels
+		`<div>任务 ID <span class="num">mc14rep</span></div>`,
+		`<div>任务名 <span>MC-14 fixture</span></div>`,
+		`<div>源端 <span>src.example:27017/shop</span></div>`, // one cell per endpoint
+		`<div>目标端 <span>dst.example:27018/shop2</span></div>`,
 		"62.50s",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("html missing %q", want)
 		}
+	}
+	// The pre-MC-15 composite "源端 … → 目标端 …" single cell must be gone.
+	if strings.Contains(body, "→ 目标端") {
+		t.Error("banner must not render the composite 源端 → 目标端 cell")
 	}
 	// Four-state counts + per-collection rows.
 	for _, want := range []string{
@@ -164,6 +177,44 @@ func TestCompareReport_HTML(t *testing.T) {
 	rec2 := mcReportGet(t, s, id, "")
 	if rec2.Code != http.StatusOK || !strings.Contains(rec2.Body.String(), "MongoDB 对比报告") {
 		t.Errorf("default format must render html: %d", rec2.Code)
+	}
+}
+
+// TestCompareReport_EmptyNameNoNameCell (MC-15): an unnamed task renders the
+// 任务 ID cell but no empty 任务名 cell.
+func TestCompareReport_EmptyNameNoNameCell(t *testing.T) {
+	s, _ := newTestServer(t)
+	id := mcReportFixtureNamed(t, s, mcReportSummary(), "")
+
+	rec := mcReportGet(t, s, id, "html")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `<div>任务 ID <span class="num">mc14rep</span></div>`) {
+		t.Error("任务 ID cell missing for unnamed task")
+	}
+	if strings.Contains(body, "任务名") {
+		t.Error("empty task name must not render a 任务名 cell")
+	}
+}
+
+// TestCompareReport_TaskNameXSSAnchor (MC-15): the attacker-controllable task
+// name reaches the banner 任务名 cell and must stay escaped.
+func TestCompareReport_TaskNameXSSAnchor(t *testing.T) {
+	s, _ := newTestServer(t)
+	id := mcReportFixtureNamed(t, s, mcReportSummary(), `<script>alert(3)</script>`)
+
+	rec := mcReportGet(t, s, id, "html")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "<script>alert(3)</script>") {
+		t.Error("unescaped task name rendered into banner")
+	}
+	if !strings.Contains(body, `<div>任务名 <span>&lt;script&gt;alert(3)&lt;/script&gt;</span></div>`) {
+		t.Error("escaped task name cell missing")
 	}
 }
 

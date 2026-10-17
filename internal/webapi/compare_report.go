@@ -239,10 +239,13 @@ func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongo
 	sb.WriteString(mcHTMLEsc(sum.FinishedAt.Format("2006-01-02 15:04:05")))
 	sb.WriteString(`</div>
 <div class="meta">`)
-	fmt.Fprintf(&sb, `<div>任务 <span>%s</span>（%s）</div>`, mcHTMLEsc(task.ID), mcHTMLEsc(task.Name))
+	fmt.Fprintf(&sb, `<div>任务 ID <span class="num">%s</span></div>`, mcHTMLEsc(task.ID))
+	if task.Name != "" {
+		fmt.Fprintf(&sb, `<div>任务名 <span>%s</span></div>`, mcHTMLEsc(task.Name))
+	}
 	if spec != nil {
-		fmt.Fprintf(&sb, `<div>源端 <span>%s</span> → 目标端 <span>%s</span></div>`,
-			mcHTMLEsc(compareEndpointLabel(spec.Source)), mcHTMLEsc(compareEndpointLabel(spec.Target)))
+		fmt.Fprintf(&sb, `<div>源端 <span>%s</span></div>`, mcHTMLEsc(compareEndpointLabel(spec.Source)))
+		fmt.Fprintf(&sb, `<div>目标端 <span>%s</span></div>`, mcHTMLEsc(compareEndpointLabel(spec.Target)))
 	}
 	fmt.Fprintf(&sb, `<div>耗时 <span class="num">%.2fs</span></div>`, sum.DurationSec)
 	sb.WriteString(`</div></div>`)
