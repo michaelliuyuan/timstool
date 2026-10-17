@@ -179,7 +179,7 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
   bottom: 8px;
   width: 3px;
   border-radius: 0 3px 3px 0;
-  background: var(--tims-brand);
+  background: var(--tims-teal); /* 激活态随主操作色，红色仅保留危险语义 */
 }
 .tims-nav-label { font-size: 12px; letter-spacing: 0.2px; line-height: 1.3; text-align: center; }
 

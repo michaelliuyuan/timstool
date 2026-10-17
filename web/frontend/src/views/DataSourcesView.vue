@@ -286,14 +286,8 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
   margin-left: 0;
 }
 
-.row-del {
-  color: var(--el-color-danger);
-}
-
-.el-dropdown-menu__item.row-del:hover,
-.el-dropdown-menu__item.row-del:focus {
-  color: var(--el-color-danger);
-}
+/* row-del（下拉删除项）的危险色由 design-tokens.css 全局声明：
+   下拉菜单 teleport 到 body，此处 scoped 规则无法命中。 */
 
 /* MS-11i pen3: responsive card grid */
 .ds-grid {

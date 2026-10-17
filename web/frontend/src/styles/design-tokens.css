@@ -1,6 +1,8 @@
 ﻿/* ============================================================
    TiMS Design Tokens — V2.2 UI revamp
-   墨蓝 #0C1222 · 工作区 #F6F7FB · 品牌红 #E13C3C · 数据青 #0FA3A3
+   墨蓝 #0C1222 · 工作区 #F6F7FB · 品牌红 #CC3030（识别+危险） · 数据青 #0D8484（主操作）
+   色彩语义：主操作/进行中/强调 = 数据青；删除/失败/错误 = 品牌红；
+   品牌红仅保留 logo 识别与危险语义，不再作为主操作色。
    ============================================================ */
 
 /* --- Self-hosted fonts (offline-safe, ~91KB) --- */
@@ -40,9 +42,9 @@
   --tims-ink-3: #1c2742;      /* 墨蓝 hover */
   --tims-work: #f6f7fb;       /* 工作区底 */
   --tims-card: #ffffff;       /* 卡片底 */
-  --tims-brand: #cc3030;      /* 品牌红 #t2 对比度二轮：白字 5.21 */
+  --tims-brand: #cc3030;      /* 品牌红：logo 识别 + 危险/失败语义专用（白字 5.21） */
   --tims-brand-soft: rgba(225, 60, 60, 0.09);
-  --tims-teal: #0d8484;       /* 数据青 #t2 对比度二轮：白字 4.52 */
+  --tims-teal: #0d8484;       /* 数据青：主操作色（白字 4.52） #t2 对比度二轮 */
   --tims-teal-soft: rgba(13, 132, 132, 0.10); /* #t2 色相跟随 */
   --tims-amber: #d97e00;      /* 琥珀：warn */
   --tims-amber-soft: rgba(217, 126, 0, 0.10);
@@ -80,14 +82,16 @@
   --tims-tag-manual-text: #7a4300;  /* #t2 ⚠️-1 需手动档深琥珀（比 warning 深一档区分，on #fff = 7.98） */
   --tims-ok-text: #2e7d0a;          /* on #f6ffed = 5.04 / on #fff = 5.18 */
 
-  /* --- Element Plus re-skin --- */
-  --el-color-primary: var(--tims-brand);
-  --el-color-primary-light-3: #d03333; /* #t2 对比度二轮：悬停白字 5.00 */
-  --el-color-primary-light-5: #f19c9c;
-  --el-color-primary-light-7: #f8cfcf;
-  --el-color-primary-light-8: #fbe2e2;
-  --el-color-primary-light-9: #fdf1f1;
-  --el-color-primary-dark-2: #b43030;
+  /* --- Element Plus re-skin ---
+     主操作 = 数据青（teal）；危险 = 品牌红（brand）。
+     两套色阶均按 #t2 对比度二轮调校值落位，EP 默认 #f56c6c 系粉色不再泄入。 */
+  --el-color-primary: var(--tims-teal);
+  --el-color-primary-light-3: #0c8282; /* 悬停白字 4.63 */
+  --el-color-primary-light-5: #86cfcf;
+  --el-color-primary-light-7: #bde7e7;
+  --el-color-primary-light-8: #dbf1f1;
+  --el-color-primary-light-9: #eef8f8;
+  --el-color-primary-dark-2: #0b8282;
   --el-color-success: var(--tims-teal);
   --el-color-success-light-3: #0c8282; /* #t2 对比度二轮：悬停白字 4.63 */
   --el-color-success-light-5: #86cfcf;
@@ -98,6 +102,12 @@
   --el-color-warning: var(--tims-amber);
   --el-color-warning-light-9: #faf1e3;
   --el-color-danger: var(--tims-brand);
+  --el-color-danger-light-3: #d03333; /* #t2 对比度二轮：悬停白字 5.00 */
+  --el-color-danger-light-5: #f19c9c;
+  --el-color-danger-light-7: #f8cfcf;
+  --el-color-danger-light-8: #fbe2e2;
+  --el-color-danger-light-9: #fdf1f1;
+  --el-color-danger-dark-2: #b43030;
   --el-color-info: #6b7280;
   /* Placeholder / 未激活步骤标题等浅灰文字统一加深一档：
      #a8abb2(2.30:1) → #6b7280(4.83:1，AA) */
@@ -122,7 +132,7 @@ html, body, #app { height: 100%; }
 .el-tag.el-tag--warning:not(.el-tag--dark) { --el-tag-text-color: var(--tims-tag-warning-text); }
 .el-tag.el-tag--danger:not(.el-tag--dark) { --el-tag-text-color: var(--tims-tag-danger-text); }
 .el-tag.el-tag--error:not(.el-tag--dark) { --el-tag-text-color: var(--tims-tag-danger-text); }
-.el-tag.el-tag--primary:not(.el-tag--dark) { --el-tag-text-color: var(--tims-tag-danger-text); } /* primary = 品牌红 */
+.el-tag.el-tag--primary:not(.el-tag--dark) { --el-tag-text-color: var(--tims-tag-success-text); } /* primary = 数据青 */
 .el-tag.el-tag--info:not(.el-tag--dark) { --el-tag-text-color: var(--tims-tag-info-text); }
 
 /* --- Button sizing: inline ops 24px / primary 32px（link 型默认高度不足 24） --- */
@@ -160,11 +170,23 @@ body {
 }
 .el-card__header { font-weight: 600; }
 
-/* Focus visibility (a11y) */
+/* Focus visibility (a11y) — 焦点环随主操作色（数据青），与危险红区分 */
 :focus-visible {
-  outline: 2px solid var(--tims-brand);
+  outline: 2px solid var(--tims-teal);
   outline-offset: 2px;
   border-radius: 4px;
+}
+
+/* --- Dropdown destructive item（删除等）---
+   下拉菜单 teleport 到 body，视图内 scoped 样式无法命中，必须全局声明。
+   视图侧只需给 <el-dropdown-item> 加 class="row-del"。 */
+.el-dropdown-menu__item.row-del:not(.is-disabled) {
+  color: var(--el-color-danger);
+}
+.el-dropdown-menu__item.row-del:not(.is-disabled):hover,
+.el-dropdown-menu__item.row-del:not(.is-disabled):focus {
+  background-color: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
 }
 
 /* --- Shared utilities --- */

@@ -84,7 +84,7 @@ const active = ref<string[]>([])
   font-weight: 600;
 }
 .cmp-table th.is-here {
-  color: var(--tims-brand);
+  color: var(--tims-teal); /* 当前页定位标记：随主操作色，非错误态 */
 }
 .here-mark {
   font-weight: 400;

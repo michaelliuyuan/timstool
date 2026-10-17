@@ -767,7 +767,7 @@ function prevStep() {
           <el-divider>增量同步衔接</el-divider>
           <el-form-item>
             <template #label>
-              <span style="color: var(--tims-brand); font-weight: 600;">全量+增量衔接</span>
+              <span style="color: var(--tims-teal); font-weight: 600;">全量+增量衔接</span>
             </template>
             <div class="chain-emphasis" style="width: 100%;">
               <el-switch v-model="form.opts.cdc_chain" :disabled="!cdcChainCapable" />
@@ -903,15 +903,15 @@ function prevStep() {
   margin-top: 4px;
 }
 
-/* Step bar: brand-red repaint + check pop on finish */
-:deep(.el-step__head.is-process) { color: var(--tims-brand); border-color: var(--tims-brand); }
+/* Step bar: 进行态随主操作色（数据青）+ check pop on finish */
+:deep(.el-step__head.is-process) { color: var(--tims-teal); border-color: var(--tims-teal); }
 :deep(.el-step__head.is-process .el-step__icon) {
-  background: var(--tims-brand);
+  background: var(--tims-teal);
   color: #fff;
-  border-color: var(--tims-brand);
-  box-shadow: 0 0 0 4px var(--tims-brand-soft);
+  border-color: var(--tims-teal);
+  box-shadow: 0 0 0 4px var(--tims-teal-soft);
 }
-:deep(.el-step__title.is-process) { color: var(--tims-brand); font-weight: 600; }
+:deep(.el-step__title.is-process) { color: var(--tims-teal); font-weight: 600; }
 /* #t2 对比度二轮：完成态步骤改深青文字色 */
 :deep(.el-step__head.is-finish) { color: var(--tims-tag-success-text); border-color: var(--tims-tag-success-text); }
 :deep(.el-step__title.is-finish) { color: var(--tims-tag-success-text); }
@@ -924,11 +924,11 @@ function prevStep() {
   100% { transform: scale(1); }
 }
 
-/* Chain option: brand emphasis while the wizard is on the options step */
+/* Chain option: 主操作色强调 while the wizard is on the options step */
 :deep(.chain-emphasis) {
-  border: 1px solid rgba(225, 60, 60, 0.35);
+  border: 1px solid rgba(13, 132, 132, 0.35);
   border-radius: var(--tims-radius-s);
   padding: 10px 12px;
-  background: var(--tims-brand-soft);
+  background: var(--tims-teal-soft);
 }
 </style>

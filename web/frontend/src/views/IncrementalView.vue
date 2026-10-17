@@ -1257,9 +1257,8 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
   margin-left: 0;
 }
 
-.row-del {
-  color: var(--el-color-danger);
-}
+/* row-del（下拉删除项）的危险色由 design-tokens.css 全局声明：
+   下拉菜单 teleport 到 body，此处 scoped 规则无法命中。 */
 
 .tbl-tags {
   display: flex;
@@ -1308,11 +1307,6 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
 
 .tbl-dot.is-failed {
   background: var(--el-color-danger);
-}
-
-.el-dropdown-menu__item.row-del:hover,
-.el-dropdown-menu__item.row-del:focus {
-  color: var(--el-color-danger);
 }
 
 .wm-hint {
