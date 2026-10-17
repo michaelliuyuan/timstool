@@ -553,8 +553,10 @@ export const apiClient = {
   getTaskProgress: (id: string) =>
     api.get<Task>(`/tasks/${id}/progress`),
 
+  // MC-14: text for both faces — the json face serves the verbatim engine
+  // artifact (summary.json bytes) and must download byte-identical.
   getTaskReport: (id: string, format?: string) =>
-    api.get(`/tasks/${id}/report`, { params: { format }, responseType: format === 'json' ? 'json' : 'text' }),
+    api.get(`/tasks/${id}/report`, { params: { format }, responseType: 'text' }),
 
   getTaskLogs: (id: string) =>
     api.get<TaskLogsResponse>(`/tasks/${id}/logs`),

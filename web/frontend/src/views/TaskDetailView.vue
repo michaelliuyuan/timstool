@@ -320,6 +320,17 @@ async function deleteTask(retriedAuth = false) {
   }
 }
 
+// MC-14: report downloads for both families — compare tasks render the
+// detailed HTML report server-side; the error body may arrive as raw text
+// (responseType text), so extract .error defensively.
+function reportDownloadError(e: any) {
+  let msg = e?.response?.data?.error
+  if (!msg && typeof e?.response?.data === 'string') {
+    try { msg = JSON.parse(e.response.data).error } catch { msg = e.response.data }
+  }
+  ElMessage.error(`报告下载失败: ${msg || e.message}`)
+}
+
 async function downloadReport() {
   try {
     const { data } = await apiClient.getTaskReport(taskId, 'html')
@@ -327,11 +338,28 @@ async function downloadReport() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `report-${taskId}.html`
+    a.download = isCompare.value ? `compare-report-${taskId}.html` : `report-${taskId}.html`
     a.click()
     URL.revokeObjectURL(url)
   } catch (e: any) {
-    ElMessage.error(`报告下载失败: ${e.response?.data?.error || e.message}`)
+    reportDownloadError(e)
+  }
+}
+
+// MC-14: verbatim summary.json download for finished compare tasks (the
+// byte-identical engine artifact carries the full five-level detail).
+async function downloadCompareSummary() {
+  try {
+    const { data } = await apiClient.getTaskReport(taskId, 'json')
+    const blob = new Blob([data], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `compare-summary-${taskId}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  } catch (e: any) {
+    reportDownloadError(e)
   }
 }
 
@@ -500,6 +528,15 @@ function logLevelClass(level: string): string {
           </el-button>
           <el-button v-if="!isCompare && (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled')" @click="downloadReport">
             <el-icon><Download /></el-icon> 下载报告
+          </el-button>
+          <!-- MC-14: compare tasks download their own report family (summary
+               exists only for completed/failed — cancelled runs have none and
+               would 404). -->
+          <el-button v-if="isCompare && (task.status === 'completed' || task.status === 'failed')" type="primary" plain @click="downloadReport">
+            <el-icon><Download /></el-icon> 下载对比报告
+          </el-button>
+          <el-button v-if="isCompare && (task.status === 'completed' || task.status === 'failed')" @click="downloadCompareSummary">
+            <el-icon><Download /></el-icon> 下载 JSON
           </el-button>
           <el-button v-if="task.status !== 'running'" type="danger" plain @click="deleteTask()">
             <el-icon><Delete /></el-icon> 删除任务
