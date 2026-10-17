@@ -21,7 +21,10 @@ describe('CompareCreateView 401 token prompt (MC-10 C5)', () => {
   it('the create→start flow carries the one-shot retry path', () => {
     const src = createSrc()
     expect(src).toContain(`async function submit(retriedAuth = false)`)
-    expect(src).toContain(`e.response?.status === 401 && !retriedAuth && await promptForToken()`)
+    // MC-13: the 401 gate is MouseEvent-proof — a bare @click="submit" passes
+    // the event as a truthy first arg and used to skip the prompt entirely.
+    expect(src).toContain(`e.response?.status === 401 && retriedAuth !== true && await promptForToken()`)
+    expect(src).toContain(`@click="submit()"`)
     expect(src).toContain(`return submit(true)`)
     // 403 (server token unset) surfaces as the plain error line — no prompt
     expect(src).not.toContain(`status === 403`)
@@ -40,8 +43,15 @@ describe('TaskDetailView lifecycle actions (MC-10 C5)', () => {
     ]) {
       expect(src).toContain(anchor)
     }
-    const branches = src.split(`e.response?.status === 401 && !retriedAuth && await promptForToken()`).length - 1
-    expect(branches).toBe(4)
+    // MC-13: cancel/delete are template-bound, so they carry the
+    // MouseEvent-proof guard + explicit no-arg call; action/restartCompare
+    // ride explicit param chains and keep the plain default-flag form.
+    const plainForm = src.split(`e.response?.status === 401 && !retriedAuth && await promptForToken()`).length - 1
+    const hardened = src.split(`e.response?.status === 401 && retriedAuth !== true && await promptForToken()`).length - 1
+    expect(plainForm).toBe(2)
+    expect(hardened).toBe(2)
+    expect(src).toContain(`@click="cancelTask()"`)
+    expect(src).toContain(`@click="deleteTask()"`)
   })
 
   it('403 surfaces as a plain error line — no prompt can fix a server-side gap', () => {

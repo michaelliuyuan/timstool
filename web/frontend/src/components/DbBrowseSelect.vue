@@ -92,14 +92,18 @@ async function fetchDbs() {
 </script>
 
 <template>
-  <div>
-    <el-input
-      :model-value="modelValue"
-      placeholder="例如 orders"
-      style="max-width: 320px; vertical-align: middle;"
-      @update:model-value="emit('update:modelValue', $event)"
-    />
-    <el-button :loading="loading" style="margin-left: 8px;" @click="fetchDbs">获取数据库列表</el-button>
+  <!-- MC-13 工单1 A案：根列钉宽 460（输入 ~320 + gap 8 + 按钮 ~130），首行
+       flex 同行永不换行；卡片与行宽 100% + border-box，三缘对齐不再漂。 -->
+  <div class="db-browse">
+    <div class="db-browse-row">
+      <el-input
+        :model-value="modelValue"
+        placeholder="例如 orders"
+        class="db-browse-input"
+        @update:model-value="emit('update:modelValue', $event)"
+      />
+      <el-button :loading="loading" @click="fetchDbs">获取数据库列表</el-button>
+    </div>
     <div v-if="dbs" data-testid="mc11-db-list" class="db-card">
       <div class="db-card-head">
         <el-tag size="small" type="info" effect="plain">{{ countText }}</el-tag>
@@ -142,13 +146,34 @@ async function fetchDbs() {
 </template>
 
 <style scoped>
+.db-browse {
+  width: 460px;
+  max-width: 100%;
+}
+.db-browse-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.db-browse-row > .el-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.db-browse-row > .el-button {
+  flex: 0 0 auto;
+}
 .db-card {
   margin-top: 8px;
-  max-width: 400px;
+  width: 100%;
+  box-sizing: border-box;
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 8px;
   padding: 8px 10px;
   background: var(--el-fill-color-lighter);
+}
+.db-card > :deep(.el-scrollbar) {
+  width: 100%;
+  box-sizing: border-box;
 }
 .db-card-head {
   display: flex;
@@ -157,15 +182,20 @@ async function fetchDbs() {
 }
 .db-filter {
   margin-top: 6px;
+  width: 100%;
+  box-sizing: border-box;
 }
 .db-radio-group {
   display: flex;
   flex-direction: column;
   gap: 4px;
   margin-top: 6px;
+  width: 100%;
+  box-sizing: border-box;
 }
 .db-row {
   width: 100%;
+  box-sizing: border-box;
   height: auto;
   margin-right: 0;
   padding: 4px 8px;

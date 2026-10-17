@@ -126,7 +126,7 @@ async function submit(retriedAuth = false) {
     ElMessage.success('对比任务已创建并启动')
     router.push(`/tasks/${data.id}`)
   } catch (e: any) {
-    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
+    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
       return submit(true)
     }
     ElMessage.error(e.response?.data?.error || '创建对比任务失败')
@@ -250,7 +250,7 @@ async function submit(retriedAuth = false) {
 
     <div style="display: flex; justify-content: flex-end; gap: 12px;">
       <el-button @click="router.push('/tasks')">取消</el-button>
-      <el-button type="primary" :loading="creating" @click="submit">创建并启动对比</el-button>
+      <el-button type="primary" :loading="creating" @click="submit()">创建并启动对比</el-button>
     </div>
   </div>
 </template>

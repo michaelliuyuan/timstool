@@ -240,9 +240,9 @@ describe('CDCView conn tab layout (MS-11h)', () => {
     const src = viewSrc()
     expect(src).toContain(`<div class="conn-actions" v-if="!editingConn">`)
     expect(src).toContain(`<el-button type="primary" @click="startEditConn">编辑连接</el-button>`)
-    expect(src).toContain(`@click="importConn" :disabled="busy || isActive"`)
+    expect(src).toContain(`@click="importConn()" :disabled="busy || isActive"`)
     expect(src).toContain(`<el-divider direction="vertical" />`)
-    expect(src).toContain(`@click="importFromDS"`)
+    expect(src).toContain(`@click="importFromDS()"`)
     // the old two stacked action rows are gone
     expect(src).not.toContain(`class="control-actions ds-import"`)
   })
@@ -255,7 +255,7 @@ describe('CDCView conn tab layout (MS-11h)', () => {
     // keep-stored-password semantics preserved in-place
     expect(src).toContain(`placeholder="留空保持不变"`)
     // save/cancel row carries the message line
-    expect(src).toContain(`@click="saveConn" :disabled="savingConn"`)
+    expect(src).toContain(`@click="saveConn()" :disabled="savingConn"`)
     expect(src).toContain(`@click="editingConn = false"`)
     // the old separate form classes are gone (usage forms; the MS-11h CSS
     // comment may name them historiographically)

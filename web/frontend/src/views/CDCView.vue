@@ -223,7 +223,7 @@
 
           <div class="conn-actions" v-if="!editingConn">
             <el-button type="primary" @click="startEditConn">编辑连接</el-button>
-            <el-button @click="importConn" :disabled="busy || isActive">从最近迁移任务导入</el-button>
+            <el-button @click="importConn()" :disabled="busy || isActive">从最近迁移任务导入</el-button>
             <el-divider direction="vertical" />
             <span class="ds-import-label">从数据源导入：</span>
             <el-select v-model="dsSourceRef" class="ds-import-select" placeholder="源端数据源" size="small">
@@ -235,13 +235,13 @@
               <el-option label="目标端（TiDB 数据源）" value="" />
               <el-option v-for="d in dsByType(['tidb'])" :key="d.id" :value="d.id" :label="d.name" />
             </el-select>
-            <el-button size="small" @click="importFromDS" :disabled="busy || isActive || !dsSourceRef || !dsTargetRef || importingDS" :loading="importingDS">
+            <el-button size="small" @click="importFromDS()" :disabled="busy || isActive || !dsSourceRef || !dsTargetRef || importingDS" :loading="importingDS">
               {{ importingDS ? '导入中…' : '导入' }}
             </el-button>
           </div>
 
           <div class="conn-actions" v-if="editingConn">
-            <el-button type="success" @click="saveConn" :disabled="savingConn" :loading="savingConn">{{ savingConn ? '保存中…' : '保存' }}</el-button>
+            <el-button type="success" @click="saveConn()" :disabled="savingConn" :loading="savingConn">{{ savingConn ? '保存中…' : '保存' }}</el-button>
             <el-button type="danger" plain @click="editingConn = false">取消</el-button>
             <span v-if="connMsg" class="control-msg" :class="{ error: connError }">{{ connMsg }}</span>
           </div>
@@ -311,7 +311,7 @@
             <span v-if="precheck.checkpoint.exists" class="resume-cp">checkpoint 文件 <code class="resume-file">{{ precheck.checkpoint.file }}</code> · 更新于 {{ precheck.checkpoint.updated_at ? new Date(precheck.checkpoint.updated_at).toLocaleString() : '-' }}</span>
           </div>
           <div class="control-actions" style="margin-top: 8px;" v-if="precheck.checkpoint.exists && !isActive">
-            <el-button type="danger" plain size="small" @click="resetCheckpoint">重置断点（危险）</el-button>
+            <el-button type="danger" plain size="small" @click="resetCheckpoint()">重置断点（危险）</el-button>
           </div>
         </el-card>
       </el-tab-pane>
@@ -553,7 +553,7 @@ async function saveConn(retriedAuth = false) {
     await loadConnConfig()
     await runPrecheck()
   } catch (e: any) {
-    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
+    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
       savingConn.value = false
       return saveConn(true)
     }
@@ -576,7 +576,7 @@ async function importConn(retriedAuth = false) {
     await loadConnConfig()
     await runPrecheck()
   } catch (e: any) {
-    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
+    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
       return importConn(true)
     }
     connError.value = true
@@ -605,7 +605,7 @@ async function importFromDS(retriedAuth = false) {
     await loadConnConfig()
     await runPrecheck()
   } catch (e: any) {
-    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
+    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
       importingDS.value = false
       return importFromDS(true)
     }
@@ -721,7 +721,7 @@ async function resetCheckpoint(retriedAuth = false) {
     ElMessage.success(j.message || '已重置')
     await runPrecheck()
   } catch (e: any) {
-    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
+    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
       return resetCheckpoint(true)
     }
     ElMessage.error(e.response?.data?.error || e.message || '重置失败')

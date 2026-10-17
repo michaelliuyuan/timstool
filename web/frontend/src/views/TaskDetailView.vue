@@ -297,7 +297,7 @@ async function cancelTask(retriedAuth = false) {
     ElMessage.success('任务已取消')
     await fetchTask()
   } catch (e: any) {
-    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
+    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
       return cancelTask(true)
     }
     ElMessage.error('取消失败')
@@ -313,7 +313,7 @@ async function deleteTask(retriedAuth = false) {
     ElMessage.success('任务已删除')
     router.push('/tasks')
   } catch (e: any) {
-    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
+    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
       return deleteTask(true)
     }
     ElMessage.error(e.response?.data?.error || '删除失败')
@@ -495,13 +495,13 @@ function logLevelClass(level: string): string {
           <el-button v-if="task.status === 'paused'" type="success" @click="action('resume')">
             <el-icon><VideoPlay /></el-icon> 恢复
           </el-button>
-          <el-button v-if="task.status === 'running' || task.status === 'paused'" type="danger" @click="cancelTask">
+          <el-button v-if="task.status === 'running' || task.status === 'paused'" type="danger" @click="cancelTask()">
             <el-icon><CircleClose /></el-icon> 取消
           </el-button>
           <el-button v-if="!isCompare && (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled')" @click="downloadReport">
             <el-icon><Download /></el-icon> 下载报告
           </el-button>
-          <el-button v-if="task.status !== 'running'" type="danger" plain @click="deleteTask">
+          <el-button v-if="task.status !== 'running'" type="danger" plain @click="deleteTask()">
             <el-icon><Delete /></el-icon> 删除任务
           </el-button>
           <el-button v-if="task.status !== 'created'" type="primary" plain @click="openLogs">

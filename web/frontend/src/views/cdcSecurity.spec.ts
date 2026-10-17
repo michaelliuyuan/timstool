@@ -59,9 +59,17 @@ describe('CDCView 401 token prompt (MS-11f 笔① d)', () => {
     ]) {
       expect(src).toContain(anchor)
     }
-    // and each one's catch wires the same 401 branch
-    const branches = src.split(`e.response?.status === 401 && !retriedAuth && await promptForToken()`).length - 1
-    expect(branches).toBe(6)
+    // MC-13: the four template-bound ops (save/import×2/reset) carry the
+    // MouseEvent-proof guard + explicit no-arg calls; callCDC and
+    // executeNoPKFix ride explicit param chains and keep the plain form.
+    const plainForm = src.split(`e.response?.status === 401 && !retriedAuth && await promptForToken()`).length - 1
+    const hardened = src.split(`e.response?.status === 401 && retriedAuth !== true && await promptForToken()`).length - 1
+    expect(plainForm).toBe(2)
+    expect(hardened).toBe(4)
+    expect(src).toContain(`@click="saveConn()"`)
+    expect(src).toContain(`@click="importConn()"`)
+    expect(src).toContain(`@click="importFromDS()"`)
+    expect(src).toContain(`@click="resetCheckpoint()"`)
   })
 
   it('403 surfaces as a plain error line — no prompt can fix a server-side gap', () => {
