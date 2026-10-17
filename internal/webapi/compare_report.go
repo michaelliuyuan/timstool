@@ -42,7 +42,8 @@ func loadCompareSummary(path string) (*mongocompare.Summary, error) {
 // handleCompareTaskReport is the mongocompare branch of handleTaskReport.
 // format=json serves the verbatim summary.json bytes (byte-identical to the
 // engine artifact); html (default) renders the detailed report. A missing
-// summary.json (never-run, connect-failed, or wiped rerun) is a 404 with a
+// summary.json (never-run, connect-failed, wiped rerun, or a failed artifact
+// write — MC-15: engine write failures now fail the task) is a 404 with a
 // message that names the cause — never a half-empty report. An UNREADABLE
 // summary (corrupt artifact) is a 500 — the file exists, so "not produced"
 // would misattribute the cause (adversarial review MC-14 Level-2).
@@ -69,11 +70,13 @@ func (s *Server) handleCompareTaskReport(w http.ResponseWriter, r *http.Request,
 	w.Write([]byte(renderCompareReportHTML(task, spec, sum)))
 }
 
-// writeCompareSummaryError maps missing → 404 (cause named) and every other
-// read/decode failure → 500 (the artifact exists but is unreadable).
+// writeCompareSummaryError maps missing → 404 (cause named — MC-15: the
+// closed cause set now includes the write-failure branch, matching the
+// engine's fail-loud writeSummary) and every other read/decode failure → 500
+// (the artifact exists but is unreadable).
 func (s *Server) writeCompareSummaryError(w http.ResponseWriter, err error) {
 	if os.IsNotExist(err) {
-		s.writeError(w, http.StatusNotFound, "compare summary not found — the task has not produced summary.json (unfinished, failed before compare, or wiped by a rerun)")
+		s.writeError(w, http.StatusNotFound, "compare summary not found — the task has not produced summary.json (unfinished, failed before compare, wiped by a rerun, or the summary write failed — see the task error)")
 		return
 	}
 	s.writeError(w, http.StatusInternalServerError, "read compare summary: "+err.Error())

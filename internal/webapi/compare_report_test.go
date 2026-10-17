@@ -241,8 +241,8 @@ func TestCompareReport_JSON(t *testing.T) {
 }
 
 // TestCompareReport_NoSummary404: a compare task without summary.json (never
-// ran, failed at connect, or wiped by rerun) 404s on both formats with a
-// message naming the cause — never an empty report.
+// ran, failed at connect, wiped by rerun, or the artifact write failed) 404s
+// on both formats with a message naming the causes — never an empty report.
 func TestCompareReport_NoSummary404(t *testing.T) {
 	s, _ := newTestServer(t)
 	id := mcReportFixture(t, s, nil)
@@ -253,6 +253,11 @@ func TestCompareReport_NoSummary404(t *testing.T) {
 		}
 		if !strings.Contains(rec.Body.String(), "summary.json") {
 			t.Errorf("format=%s error must name the missing artifact: %s", f, rec.Body.String())
+		}
+		// MC-15 (adversarial MC-14 Level-2 pair): the cause set must include
+		// the write-failure branch, not just the pre-run causes.
+		if !strings.Contains(rec.Body.String(), "summary write failed") {
+			t.Errorf("format=%s error must name the write-failure cause: %s", f, rec.Body.String())
 		}
 	}
 }
