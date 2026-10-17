@@ -282,9 +282,54 @@ func TestCompareReport_CorruptSummary500(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "read compare summary") {
 		t.Errorf("html error must name the read failure: %s", rec.Body.String())
 	}
+	// MC-15 (adversarial MC-14 Level-2 #2): the 500 body must not echo the
+	// raw *fs.PathError — it carries the server-side absolute path.
+	if strings.Contains(rec.Body.String(), s.dataDir) || strings.Contains(rec.Body.String(), filepath.Join("compare", id, "summary.json")) {
+		t.Errorf("html error leaks server-side path: %s", rec.Body.String())
+	}
 	rec = mcReportGet(t, s, id, "json")
 	if rec.Code != http.StatusOK || rec.Body.String() != "{truncated" {
 		t.Errorf("json status=%d body=%q want 200 verbatim bytes", rec.Code, rec.Body.String())
+	}
+}
+
+// TestMC15ResumeDropsStaleSummary (adversarial MC-14 Level-2 #1): a resume
+// keeps engine checkpoints and diff artifacts but drops the previous run's
+// summary.json — mid-run /report 404s on both formats instead of serving
+// the stale previous round; a fresh start still wipes the whole dir.
+func TestMC15ResumeDropsStaleSummary(t *testing.T) {
+	s, _ := newTestServer(t)
+	id := mcReportFixture(t, s, mcReportSummary()) // writes summary.json
+
+	dir := filepath.Join(s.dataDir, "compare", id)
+	if err := os.MkdirAll(filepath.Join(dir, ".checkpoints"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ckpt := filepath.Join(dir, ".checkpoints", "shop.users.json")
+	if err := os.WriteFile(ckpt, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s.resetCompareArtifacts(id, true)
+
+	if _, err := os.Stat(filepath.Join(dir, "summary.json")); !os.IsNotExist(err) {
+		t.Fatalf("resume must drop the stale summary.json, stat err=%v", err)
+	}
+	if _, err := os.Stat(ckpt); err != nil {
+		t.Fatalf("resume must keep engine checkpoints: %v", err)
+	}
+	// Mid-run /report (task running, new round not finalized): 404 with the
+	// cause named — never the previous round's summary.
+	for _, f := range []string{"html", "json"} {
+		if rec := mcReportGet(t, s, id, f); rec.Code != http.StatusNotFound {
+			t.Errorf("post-resume format=%s status=%d want 404", f, rec.Code)
+		}
+	}
+
+	// Fresh start (resume=false) still wipes the whole dir.
+	s.resetCompareArtifacts(id, false)
+	if _, err := os.Stat(ckpt); !os.IsNotExist(err) {
+		t.Fatalf("fresh start must wipe OutDir, stat err=%v", err)
 	}
 }
 

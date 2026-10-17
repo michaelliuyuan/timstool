@@ -24,6 +24,7 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/common/reporter"
 	"github.com/michaelliuyuan/timstool/internal/mongocompare"
 	"github.com/michaelliuyuan/timstool/internal/store"
+	"go.uber.org/zap"
 )
 
 // loadCompareSummary reads and decodes the engine-written summary.json.
@@ -52,7 +53,7 @@ func (s *Server) handleCompareTaskReport(w http.ResponseWriter, r *http.Request,
 	if r.URL.Query().Get("format") == "json" {
 		b, err := os.ReadFile(summaryPath)
 		if err != nil {
-			s.writeCompareSummaryError(w, err)
+			s.writeCompareSummaryError(w, task.ID, err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -62,7 +63,7 @@ func (s *Server) handleCompareTaskReport(w http.ResponseWriter, r *http.Request,
 	}
 	sum, err := loadCompareSummary(summaryPath)
 	if err != nil {
-		s.writeCompareSummaryError(w, err)
+		s.writeCompareSummaryError(w, task.ID, err)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -72,14 +73,18 @@ func (s *Server) handleCompareTaskReport(w http.ResponseWriter, r *http.Request,
 
 // writeCompareSummaryError maps missing → 404 (cause named — MC-15: the
 // closed cause set now includes the write-failure branch, matching the
-// engine's fail-loud writeSummary) and every other read/decode failure → 500
-// (the artifact exists but is unreadable).
-func (s *Server) writeCompareSummaryError(w http.ResponseWriter, err error) {
+// engine's fail-loud writeSummary) and every other read/decode failure →
+// 500. The 500 body stays generic (adversarial MC-14 Level-2 #2, fixed in
+// MC-15: the raw *fs.PathError carries the server-side absolute path, which
+// no client should be able to probe); the original error goes to the
+// server-side log instead.
+func (s *Server) writeCompareSummaryError(w http.ResponseWriter, taskID string, err error) {
 	if os.IsNotExist(err) {
 		s.writeError(w, http.StatusNotFound, "compare summary not found — the task has not produced summary.json (unfinished, failed before compare, wiped by a rerun, or the summary write failed — see the task error)")
 		return
 	}
-	s.writeError(w, http.StatusInternalServerError, "read compare summary: "+err.Error())
+	zap.L().Warn("read compare summary failed", zap.String("task", taskID), zap.Error(err))
+	s.writeError(w, http.StatusInternalServerError, "read compare summary failed — summary.json exists but is unreadable (corrupt artifact); cause logged server-side")
 }
 
 // compareOverallMeta maps the engine's four overall states onto the report

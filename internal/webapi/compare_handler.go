@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"github.com/michaelliuyuan/timstool/internal/mongocompare"
 	"github.com/michaelliuyuan/timstool/internal/mongoconn"
@@ -349,14 +350,30 @@ func (s *Server) handleDeleteCompareTask(taskID string) http.HandlerFunc {
 	}
 }
 
-// startCompareTask is the compare branch of task start/resume. A fresh start
-// wipes the task's OutDir (retry wants a clean compare); resume=true keeps
-// engine checkpoints for continuation (review ruling seq=68).
+// startCompareTask is the compare branch of task start/resume: it resets the
+// task's compare artifacts (see resetCompareArtifacts) and spawns the run.
 func (s *Server) startCompareTask(ctx context.Context, taskID string, spec *compareTaskSpec, resume bool) {
-	if !resume {
-		_ = os.RemoveAll(filepath.Join(s.dataDir, "compare", taskID))
-	}
+	s.resetCompareArtifacts(taskID, resume)
 	go s.runMongoCompare(ctx, taskID, spec, resume)
+}
+
+// resetCompareArtifacts prepares the task's compare OutDir for a run. A
+// fresh start wipes the whole dir (retry wants a clean compare); a resume
+// keeps engine checkpoints and diff artifacts for continuation (review
+// ruling seq=68) but drops the previous run's summary.json — the report is
+// a final-state artifact, so a mid-run /report 404s instead of serving the
+// stale previous round (adversarial MC-14 Level-2 #1, fixed in MC-15). A
+// failed drop (AV lock, disk error) is logged and carried — the run itself
+// still overwrites the summary at finalize.
+func (s *Server) resetCompareArtifacts(taskID string, resume bool) {
+	dir := filepath.Join(s.dataDir, "compare", taskID)
+	if !resume {
+		_ = os.RemoveAll(dir)
+		return
+	}
+	if err := os.Remove(filepath.Join(dir, "summary.json")); err != nil && !os.IsNotExist(err) {
+		zap.L().Warn("failed to drop stale compare summary on resume", zap.String("task", taskID), zap.Error(err))
+	}
 }
 
 func (s *Server) runMongoCompare(ctx context.Context, taskID string, spec *compareTaskSpec, resume bool) {
