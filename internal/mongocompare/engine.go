@@ -151,7 +151,9 @@ func CompareClients(ctx context.Context, src, dst mongoconn.Client, cfg Config) 
 	}
 	finalize(s, all)
 	recordSkippedViews(s, skippedViews)
-	writeSummary(c, s)
+	if err := writeSummary(c, s); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -170,7 +172,9 @@ func CompareDatabases(ctx context.Context, src, dst mongoconn.Client, srcDB, dst
 	}
 	finalize(s, rows)
 	recordSkippedViews(s, skipped)
-	writeSummary(c, s)
+	if err := writeSummary(c, s); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -198,19 +202,41 @@ func prepOutDir(c Config) error {
 	return os.MkdirAll(filepath.Join(c.OutDir, ".checkpoints"), 0o755)
 }
 
-func writeSummary(c Config, s *Summary) {
+// writeSummary persists the summary.json artifact. MC-15 (adversarial MC-14
+// Level-2 pair): the fixed tmp name is replaced by os.CreateTemp (no
+// collisions) and write/rename failures propagate — a task whose artifact
+// write failed must fail loudly instead of completing silently with a 404
+// report (or a stale summary from a previous run).
+func writeSummary(c Config, s *Summary) error {
 	if c.OutDir == "" {
-		return
+		return nil
 	}
-	b, _ := json.MarshalIndent(s, "", "  ")
+	b, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal summary: %w", err)
+	}
 	// Atomic write (temp + rename, reporter.SaveJSON pattern): a concurrent
 	// report download (format=json serves the file verbatim) must never read
 	// a half-written artifact (adversarial review MC-14 Level-2).
-	tmp := filepath.Join(c.OutDir, "summary.json.tmp")
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return
+	tmp, err := os.CreateTemp(c.OutDir, "summary-*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("create summary temp file: %w", err)
 	}
-	_ = os.Rename(tmp, filepath.Join(c.OutDir, "summary.json"))
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("write summary: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("close summary temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, filepath.Join(c.OutDir, "summary.json")); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("rename summary: %w", err)
+	}
+	return nil
 }
 
 func finalize(s *Summary, rows []CollectionResult) {
