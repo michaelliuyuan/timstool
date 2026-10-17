@@ -146,11 +146,34 @@ html, body, #app { height: 100%; }
 .el-segmented__item, .el-segmented__item-selected { border-radius: calc(var(--el-border-radius-small) - 2px); }
 .el-progress__text { font-size: var(--tims-font-md) !important; }
 
-/* #t2 对比度二轮：禁用态按钮标准化（EP 皮肤禁用实心 success/danger 钮白字仅 1.77） */
+/* #UX-2 禁用态按钮中性灰归一（两路，均仅 .is-disabled 命中，启用态零触碰）：
+   ① solid 彩钮走 --el-button-disabled-* 变量组——EP 2.14 由 .el-button--danger 等
+     (0,2,0) 注入 danger-light-5 底+白字（实测 2.11），本文件后置覆盖同名变量组；
+   ② plain/text/link 彩钮 EP 以字面量规则 (0,3,0)+伪类硬编码浅彩三件套，
+     需等特异性镜像覆盖（text/link 底色被 EP !important 保持透明，仅归一字/框）。 */
 .el-button.is-disabled {
   --el-button-text-color: var(--el-text-color-placeholder);
   --el-button-bg-color: var(--el-fill-color-light);
   --el-button-border-color: var(--el-border-color-light);
+  --el-button-disabled-text-color: var(--el-text-color-placeholder);
+  --el-button-disabled-bg-color: var(--el-fill-color-light);
+  --el-button-disabled-border-color: var(--el-border-color-light);
+}
+.el-button.is-plain.is-disabled,
+.el-button.is-plain.is-disabled:hover,
+.el-button.is-plain.is-disabled:focus,
+.el-button.is-plain.is-disabled:active,
+.el-button.is-text.is-disabled,
+.el-button.is-text.is-disabled:hover,
+.el-button.is-text.is-disabled:focus,
+.el-button.is-text.is-disabled:active,
+.el-button.is-link.is-disabled,
+.el-button.is-link.is-disabled:hover,
+.el-button.is-link.is-disabled:focus,
+.el-button.is-link.is-disabled:active {
+  color: var(--el-text-color-placeholder);
+  background-color: var(--el-fill-color-light);
+  border-color: var(--el-border-color-light);
 }
 
 body {
@@ -172,6 +195,16 @@ body {
 
 /* Focus visibility (a11y) — 焦点环随主操作色（数据青），与危险红区分 */
 :focus-visible {
+  outline: 2px solid var(--tims-teal);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* #UX-4 缺口补（te 22:05 回单：/wizard 第 10 步 el-input 内层无键盘焦点环）：
+   EP dist 以 `.el-input__inner{outline:none}`(0,1,0) + `.el-input__inner:focus{outline:none}`(0,2,0)
+   掐灭上方全局 :focus-visible(0,1,0) 青环——此处等特异性 (0,2,0) 后置覆写恢复；
+   :focus-visible 仅键盘态命中，鼠标 :focus 仍由 EP 原规则接管，零形态影响。 */
+.el-input__inner:focus-visible {
   outline: 2px solid var(--tims-teal);
   outline-offset: 2px;
   border-radius: 4px;
