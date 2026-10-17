@@ -203,7 +203,14 @@ func writeSummary(c Config, s *Summary) {
 		return
 	}
 	b, _ := json.MarshalIndent(s, "", "  ")
-	_ = os.WriteFile(filepath.Join(c.OutDir, "summary.json"), b, 0o644)
+	// Atomic write (temp + rename, reporter.SaveJSON pattern): a concurrent
+	// report download (format=json serves the file verbatim) must never read
+	// a half-written artifact (adversarial review MC-14 Level-2).
+	tmp := filepath.Join(c.OutDir, "summary.json.tmp")
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, filepath.Join(c.OutDir, "summary.json"))
 }
 
 func finalize(s *Summary, rows []CollectionResult) {

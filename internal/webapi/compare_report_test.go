@@ -206,6 +206,32 @@ func TestCompareReport_NoSummary404(t *testing.T) {
 	}
 }
 
+// TestCompareReport_CorruptSummary500 (adversarial MC-14 Level-2): an
+// existing but undecodable summary.json is a server-side artifact problem —
+// the html face 500s (never a "not produced" 404 misattributing the cause),
+// while the json face still serves the verbatim bytes (原样回传 contract:
+// byte-identity holds regardless of decodability).
+func TestCompareReport_CorruptSummary500(t *testing.T) {
+	s, _ := newTestServer(t)
+	sum := mcReportSummary()
+	id := mcReportFixture(t, s, sum)
+	dir := filepath.Join(s.dataDir, "compare", id)
+	if err := os.WriteFile(filepath.Join(dir, "summary.json"), []byte("{truncated"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := mcReportGet(t, s, id, "html")
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("html status=%d want 500 (corrupt artifact ≠ missing artifact)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "read compare summary") {
+		t.Errorf("html error must name the read failure: %s", rec.Body.String())
+	}
+	rec = mcReportGet(t, s, id, "json")
+	if rec.Code != http.StatusOK || rec.Body.String() != "{truncated" {
+		t.Errorf("json status=%d body=%q want 200 verbatim bytes", rec.Code, rec.Body.String())
+	}
+}
+
 // TestCompareReport_MigrationRegressionAnchor: a migration config must keep
 // rendering the migration report (the compare branch must stay invisible to
 // legacy tasks — same red line as parseCompareTask).

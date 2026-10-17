@@ -44,7 +44,7 @@ GET  /api/v1/tasks/{id}/report?format=json      # MC-14：summary.json 原样字
 - `diff/<db>__<coll>.ndjson`：字段级差异明细（modified/missing-in-target/missing-in-source + 叶子路径）
 - `.checkpoints/*.json`：桶级 checkpoint（含边界 canonical 串与 `algo_version`）
 
-产物目录：`<dataDir>/compare/<taskID>/`。下载走任务报告端点（MC-14）：`GET /tasks/{id}/report` 按 ConfigJSON kind 分流——compare 任务渲染 HTML 详细报告（横幅任务/两端库映射/耗时 + 四态汇总 + 逐集合五级明细表 + 失配桶下钻，失配桶每集合最多列 20 个；样式沿 reporter.ReportCSS 报告族；动态字段全量 HTML 转义，凭证与 URI 串永不渲染）；`format=json` 原样回传 `summary.json` 字节（attachment `compare-summary-<id>.json`）。summary.json 缺失（未跑完/连接期失败/重跑清空）= 404 并指明原因。迁移任务的 `/report` 行为零变化（回归锚）；该端点为只读，沿 MC-10 读开放口径不加令牌门。
+产物目录：`<dataDir>/compare/<taskID>/`。下载走任务报告端点（MC-14）：`GET /tasks/{id}/report` 按 ConfigJSON kind 分流——compare 任务渲染 HTML 详细报告（横幅任务/两端库映射/耗时 + 四态汇总 + 逐集合五级明细表 + 失配桶下钻，失配桶每集合最多列 20 个；样式沿 reporter.ReportCSS 报告族；动态字段全量 HTML 转义，凭证与 URI 串永不渲染）；`format=json` 原样回传 `summary.json` 字节（attachment `compare-summary-<id>.json`；引擎侧 temp+rename 原子落盘）。summary.json 缺失（未跑完/连接期失败/重跑清空）= 404 并指明原因；已存在但不可读（损坏）= 500。迁移任务的 `/report` 行为零变化（回归锚）；该端点为只读，沿 MC-10 读开放口径不加令牌门。
 
 ## 语义与边界
 

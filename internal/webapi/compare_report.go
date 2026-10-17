@@ -43,13 +43,15 @@ func loadCompareSummary(path string) (*mongocompare.Summary, error) {
 // format=json serves the verbatim summary.json bytes (byte-identical to the
 // engine artifact); html (default) renders the detailed report. A missing
 // summary.json (never-run, connect-failed, or wiped rerun) is a 404 with a
-// message that names the cause — never a half-empty report.
+// message that names the cause — never a half-empty report. An UNREADABLE
+// summary (corrupt artifact) is a 500 — the file exists, so "not produced"
+// would misattribute the cause (adversarial review MC-14 Level-2).
 func (s *Server) handleCompareTaskReport(w http.ResponseWriter, r *http.Request, task *store.Task, spec *compareTaskSpec) {
 	summaryPath := filepath.Join(s.dataDir, "compare", task.ID, "summary.json")
 	if r.URL.Query().Get("format") == "json" {
 		b, err := os.ReadFile(summaryPath)
 		if err != nil {
-			s.writeError(w, http.StatusNotFound, "compare summary not found — the task has not produced summary.json (unfinished, failed before compare, or wiped by a rerun)")
+			s.writeCompareSummaryError(w, err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -59,12 +61,22 @@ func (s *Server) handleCompareTaskReport(w http.ResponseWriter, r *http.Request,
 	}
 	sum, err := loadCompareSummary(summaryPath)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "compare summary not found — the task has not produced summary.json (unfinished, failed before compare, or wiped by a rerun)")
+		s.writeCompareSummaryError(w, err)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-report-%s.html", task.ID))
 	w.Write([]byte(renderCompareReportHTML(task, spec, sum)))
+}
+
+// writeCompareSummaryError maps missing → 404 (cause named) and every other
+// read/decode failure → 500 (the artifact exists but is unreadable).
+func (s *Server) writeCompareSummaryError(w http.ResponseWriter, err error) {
+	if os.IsNotExist(err) {
+		s.writeError(w, http.StatusNotFound, "compare summary not found — the task has not produced summary.json (unfinished, failed before compare, or wiped by a rerun)")
+		return
+	}
+	s.writeError(w, http.StatusInternalServerError, "read compare summary: "+err.Error())
 }
 
 // compareOverallMeta maps the engine's four overall states onto the report
@@ -336,11 +348,11 @@ func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongo
 		}
 		if len(mism) > 0 {
 			sb.WriteString(`<div class="bucket-list">`)
-			cap := len(mism)
-			if cap > 20 {
-				cap = 20
+			limit := len(mism)
+			if limit > 20 {
+				limit = 20
 			}
-			for _, b := range mism[:cap] {
+			for _, b := range mism[:limit] {
 				fmt.Fprintf(&sb, `<div>桶 <span class="num">#%d</span>：源 <span class="num">%d</span> / 目标 <span class="num">%d</span></div>`, b.Bucket, b.SrcCount, b.DstCount)
 			}
 			if len(mism) > 20 {
