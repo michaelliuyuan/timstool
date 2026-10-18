@@ -499,10 +499,10 @@ function logLevelClass(level: string): string {
         <el-descriptions :column="1" border size="small" style="margin-top: 12px;">
           <el-descriptions-item label="对比耗时">{{ compareResult.duration_sec?.toFixed(2) ?? '-' }} 秒</el-descriptions-item>
           <el-descriptions-item label="结果摘要 (summary.json)">
-            <el-text type="info" style="font-family: monospace;">{{ compareResult.summary_path }}</el-text>
+            <el-text type="info" class="tims-mono">{{ compareResult.summary_path }}</el-text>
           </el-descriptions-item>
           <el-descriptions-item label="差异明细目录 (diff)">
-            <el-text type="info" style="font-family: monospace;">{{ compareResult.diff_dir }}</el-text>
+            <el-text type="info" class="tims-mono">{{ compareResult.diff_dir }}</el-text>
           </el-descriptions-item>
         </el-descriptions>
       </el-card>

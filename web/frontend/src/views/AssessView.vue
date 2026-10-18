@@ -403,7 +403,7 @@ function copyDDL() {
 
     <!-- DDL Dialog -->
     <el-dialog v-model="ddlDialogVisible" :title="ddlDialogTitle" width="700px">
-      <el-input type="textarea" :model-value="ddlDialogContent" :rows="18" readonly style="font-family: monospace;" />
+      <el-input type="textarea" :model-value="ddlDialogContent" :rows="18" readonly style="font-family: var(--tims-font-mono);" />
       <template #footer>
         <el-button @click="copyDDL">复制</el-button>
         <el-button @click="ddlDialogVisible = false">关闭</el-button>

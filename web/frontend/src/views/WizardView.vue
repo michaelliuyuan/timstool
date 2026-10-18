@@ -199,11 +199,16 @@ const compareModes = [
   { value: 'checksum', label: '\uD83D\uDFE1 校验', color: '#e6a23c', desc: '行数+分块Hash' },
 ]
 
+// #10① 必填项口径统一为「请填写<label>」（与 ConnectionForm 动态规则、
+// 数据源页「请填写主机地址」一致）；目标端补齐端口/用户名/密码三项 required。
 const rules: FormRules = {
-  'source.host': [{ required: true, message: '请输入源数据库地址', trigger: 'blur' }],
-  'source.database': [{ required: true, message: '请输入源数据库名', trigger: 'blur' }],
-  'target.host': [{ required: true, message: '请输入目标数据库地址', trigger: 'blur' }],
-  'target.database': [{ required: true, message: '请输入目标数据库名', trigger: 'blur' }],
+  'source.host': [{ required: true, message: '请填写主机地址', trigger: 'blur' }],
+  'source.database': [{ required: true, message: '请填写数据库名', trigger: 'blur' }],
+  'target.host': [{ required: true, message: '请填写主机地址', trigger: 'blur' }],
+  'target.port': [{ required: true, message: '请填写端口', trigger: 'blur' }],
+  'target.user': [{ required: true, message: '请填写用户名', trigger: 'blur' }],
+  'target.password': [{ required: true, message: '请填写密码', trigger: 'blur' }],
+  'target.database': [{ required: true, message: '请填写数据库名', trigger: 'blur' }],
 }
 
 // Switch source: reconcile the model to the new source's fields (drops stale
@@ -487,14 +492,18 @@ async function nextStep() {
   // exempt (server-side credentials); the green-light gates below still
   // enforce a successful connection test in both modes.
   if (activeStep.value === 0) {
-    const fields = sourceRef.value ? [] : ['source.host', 'source.database']
+    // #10①：逐项校验本步全部 required 字段（源端字段集来自 /sources 注册表的
+    // required 标记，覆盖主机/端口/用户名/密码/数据库名；空列表 = 数据源引用模式）。
+    const fields = sourceRef.value
+      ? []
+      : (currentMeta.value?.fields || []).filter(f => f.required).map(f => `source.${f.key}`)
     if (!(await validateFields(fields))) {
       ElMessage.warning('请完整填写源数据库连接信息（必填项不能为空）')
       return
     }
   }
   if (activeStep.value === 1) {
-    const fields = targetRef.value ? [] : ['target.host', 'target.database']
+    const fields = targetRef.value ? [] : ['target.host', 'target.port', 'target.user', 'target.password', 'target.database']
     if (!(await validateFields(fields))) {
       ElMessage.warning('请完整填写目标数据库连接信息（必填项不能为空）')
       return
@@ -612,13 +621,13 @@ function prevStep() {
           <el-form-item label="主机地址" prop="target.host">
             <el-input v-model="form.target.host" />
           </el-form-item>
-          <el-form-item label="端口">
+          <el-form-item label="端口" prop="target.port">
             <el-input-number v-model="form.target.port" :min="1" :max="65535" />
           </el-form-item>
-          <el-form-item label="用户名">
+          <el-form-item label="用户名" prop="target.user">
             <el-input v-model="form.target.user" />
           </el-form-item>
-          <el-form-item label="密码">
+          <el-form-item label="密码" prop="target.password">
             <el-input v-model="form.target.password" type="password" show-password />
           </el-form-item>
           <el-form-item label="数据库名" prop="target.database">

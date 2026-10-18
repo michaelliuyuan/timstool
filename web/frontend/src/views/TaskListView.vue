@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import apiClient from '../api'
@@ -42,6 +42,20 @@ function goToTask(id: string) {
   router.push(`/tasks/${id}`)
 }
 
+// #9 大表 client-side 分页：数据仍全量加载（5s 轮询/行点击语义不变），
+// 仅前端切片渲染。默认 20 行/页，可选 10/20/50，总数展示。
+const page = ref(1)
+const pageSize = ref(20)
+const pagedTasks = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return tasks.value.slice(start, start + pageSize.value)
+})
+// 5s 轮询刷新后行数可能收缩（任务转历史）：钳制当前页，避免落在空页。
+watch(() => tasks.value.length, (len) => {
+  const maxPage = Math.max(1, Math.ceil(len / pageSize.value))
+  if (page.value > maxPage) page.value = maxPage
+})
+
 let timer: any = null
 onMounted(() => {
   fetchTasks()
@@ -70,7 +84,7 @@ onUnmounted(() => {
            the single empty face (previously the built-in "暂无数据" row and the
            el-empty + CTA stacked as two empty messages). -->
       <div v-if="tasks.length > 0" class="tims-table-scroll">
-        <el-table :data="tasks" style="width: 100%;" @row-click="(row: Task) => goToTask(row.id)">
+        <el-table :data="pagedTasks" style="width: 100%;" @row-click="(row: Task) => goToTask(row.id)">
           <el-table-column prop="name" label="任务名称" min-width="180">
             <template #default="{ row }">
               <span>{{ row.name }}</span>
@@ -105,6 +119,16 @@ onUnmounted(() => {
           </el-table-column>
         </el-table>
       </div>
+      <!-- #9 client-side 分页（layout 含 total 总数展示；pageSize 可选 10/20/50） -->
+      <el-pagination
+        v-if="tasks.length > 0"
+        v-model:current-page="page"
+        v-model:page-size="pageSize"
+        :page-sizes="[10, 20, 50]"
+        :total="tasks.length"
+        layout="total, sizes, prev, pager, next"
+        style="margin-top: 12px; justify-content: flex-end;"
+      />
 
       <el-empty v-if="!loading && tasks.length === 0" description="暂无任务">
         <el-button type="primary" @click="router.push('/wizard')">创建第一个迁移任务</el-button>

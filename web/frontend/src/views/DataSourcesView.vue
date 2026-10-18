@@ -201,7 +201,9 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
             <span v-else class="ds-dim">未测试</span>
           </div>
           <div class="ds-card-actions">
-            <el-button size="small" :loading="testingId === d.id" @click="testDS(d)">测试连接</el-button>
+            <!-- #5 secondary 按钮规范：测试连接统一 EP default 形（32px/14px，字色走
+                 --el-text-color-regular → --tims-text），废除 24px/12px small 档。 -->
+            <el-button :loading="testingId === d.id" @click="testDS(d)">测试连接</el-button>
             <el-dropdown trigger="click" @command="(command: string) => onRowCommand(command, d)">
               <el-button size="small" link>更多<el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
               <template #dropdown>
@@ -265,7 +267,7 @@ const sorted = computed(() => datasources.value.slice().sort((a, b) => a.name.lo
 
 <style scoped>
 .ds-mono {
-  font-family: var(--tims-mono, 'JetBrains Mono', Consolas, monospace);
+  font-family: var(--tims-font-mono);
   font-size: var(--tims-font-xs);
 }
 .ds-dim { color: var(--tims-text-2, #6b7280); font-size: var(--tims-font-xs); margin-left: 6px; }

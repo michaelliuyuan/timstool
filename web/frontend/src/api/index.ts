@@ -43,6 +43,11 @@ api.interceptors.request.use((config) => {
 // just wait on a connection the server has already cut.
 const LONG_TIMEOUT = 120000
 
+// #10② 连接测试反馈上限：主机黑洞/网络挂起时 axios 默认 30s 才报错（静默
+// loading 半分钟）。测试类端点统一压到 3.5s —— 失败/超时 ≤3.5s 必出错误提示
+// （各调用方 catch 分支已有 ElMessage.error）；正常成功路径不受影响。
+const TEST_TIMEOUT = 3500
+
 export interface Task {
   id: string
   name: string
@@ -481,6 +486,7 @@ export const apiClient = {
     api.post<{ source: string; success: boolean; message: string; version?: string }>(
       '/test-connection',
       { source, fields },
+      { timeout: TEST_TIMEOUT },
     ),
 
   // Same endpoint, datasource-ref flavour (server-side credentials).
@@ -488,10 +494,11 @@ export const apiClient = {
     api.post<{ source: string; success: boolean; message: string; version?: string }>(
       '/test-connection',
       { source_ref: sourceRef },
+      { timeout: TEST_TIMEOUT },
     ),
 
   testConnection: (req: ConnectionTestRequest) =>
-    api.post<ConnectionTestResult>('/config/test-connection', req),
+    api.post<ConnectionTestResult>('/config/test-connection', req, { timeout: TEST_TIMEOUT }),
 
   listTables: (req: ConnectionTestRequest) =>
     api.post<{ tables: { name: string; row_estimate: number }[]; count: number }>('/config/list-tables', { ...req, type: 'source' }),
@@ -607,7 +614,7 @@ export const apiClient = {
     api.delete<{ success: boolean }>(`/datasources/${id}`),
 
   testDataSource: (id: string) =>
-    api.post<DataSourceTestResult>(`/datasources/${id}/test`),
+    api.post<DataSourceTestResult>(`/datasources/${id}/test`, undefined, { timeout: TEST_TIMEOUT }),
 
   // Table listing by datasource ref (passwords stay server-side). PG-only
   // endpoint (reltuples estimates); non-PG refs must use getRefTablesMulti.

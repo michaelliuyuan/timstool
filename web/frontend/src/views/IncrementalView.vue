@@ -1204,7 +1204,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
 
 .log-ts {
   color: var(--tims-text-2);
-  font-family: monospace;
+  font-family: var(--tims-font-mono); /* #7 等宽收敛 JetBrains Mono（TiMS Mono 自托管档） */
   white-space: nowrap;
 }
 
@@ -1220,7 +1220,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
 .log-sql {
   display: block;
   width: 100%;
-  font-family: monospace;
+  font-family: var(--tims-font-mono); /* #7 等宽收敛 */
   font-size: 11px;
   color: var(--el-color-primary);
   background: var(--el-fill-color-light);

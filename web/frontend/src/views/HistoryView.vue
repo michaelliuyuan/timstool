@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import apiClient from '../api'
@@ -28,6 +28,19 @@ async function fetchHistory() {
     loading.value = false
   }
 }
+
+// #9 大表 client-side 分页：数据仍全量加载，仅前端切片渲染。
+const page = ref(1)
+const pageSize = ref(20)
+const pagedTasks = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return tasks.value.slice(start, start + pageSize.value)
+})
+// 删除/刷新后行数收缩时钳制当前页，避免落在空页。
+watch(() => tasks.value.length, (len) => {
+  const maxPage = Math.max(1, Math.ceil(len / pageSize.value))
+  if (page.value > maxPage) page.value = maxPage
+})
 
 async function deleteTask(id: string) {
   try {
@@ -72,7 +85,7 @@ onMounted(fetchHistory)
     <PageHeader title="迁移历史" />
     <el-card v-loading="loading">
       <div v-if="tasks.length > 0" class="tims-table-scroll">
-        <el-table :data="tasks" style="width: 100%;">
+        <el-table :data="pagedTasks" style="width: 100%;">
           <el-table-column prop="name" label="任务名称" min-width="200" />
           <el-table-column label="状态" width="120">
             <template #default="{ row }">
@@ -107,6 +120,17 @@ onMounted(fetchHistory)
           </el-table-column>
         </el-table>
       </div>
+      <!-- #9 client-side 分页（总数展示；pageSize 可选 10/20/50） -->
+      <el-pagination
+        v-if="tasks.length > 0"
+        v-model:current-page="page"
+        v-model:page-size="pageSize"
+        :page-sizes="[10, 20, 50]"
+        :total="tasks.length"
+        layout="total, sizes, prev, pager, next"
+        style="margin-top: 12px; justify-content: flex-end;"
+      />
+
       <el-empty v-if="!loading && tasks.length === 0" description="暂无历史记录" />
     </el-card>
   </div>

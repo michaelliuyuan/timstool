@@ -160,8 +160,13 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
   gap: 4px;
   padding: 10px 4px 8px;
+  /* #8 侧栏导航等高：长标签（MongoDB 对比 / CDC 实时同步 / 时间戳水位补齐）
+     在 88px 侧栏内必然折为两行（71px），nowrap 会溢出侧栏宽，故取「全员
+     min-height 对齐两行档」方案——短标签项垂直居中撑到同高，文案零改动。 */
+  min-height: 71px;
   border: none;
   border-radius: var(--tims-radius-s);
   background: transparent;
@@ -240,7 +245,8 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
 /* --- Responsive: collapse to icon rail, tighter workspace --- */
 @media (max-width: 900px) {
   .tims-sidenav { width: 60px; }
-  .tims-nav-item { padding: 10px 0; }
+  /* #8 等高仅限带标签的宽侧栏；窄栏图标轨无折行，min-height 解除。 */
+  .tims-nav-item { padding: 10px 0; min-height: 0; }
   .tims-nav-label { display: none; }
   .tims-topbar-title { display: none; }
   .tims-workspace { padding: 14px; }
