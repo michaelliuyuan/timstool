@@ -243,7 +243,7 @@ async function submit(retriedAuth = false) {
           <span class="adv-hint">留空 = 全部级别；hash 依赖前置级别，建议保持默认</span>
         </el-form-item>
       </el-form>
-      <div v-else style="color: #909399; font-size: 13px;">
+      <div v-else style="color: #909399; font-size: 12px;"> <!-- #13 说明文字归 xs 档 -->
         使用引擎默认参数（64 桶 / 4+4 并行 / 批 1000 / 全部级别）
       </div>
     </el-card>

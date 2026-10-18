@@ -1154,7 +1154,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
   align-items: center;
   justify-content: center;
   font-weight: 600;
-  font-size: 13px;
+  font-size: var(--tims-font-xs); /* #13 徽标数字归 xs 档 */
 }
 .inc-conn-badge {
   font-size: var(--tims-font-sm);
@@ -1221,7 +1221,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
   display: block;
   width: 100%;
   font-family: var(--tims-font-mono); /* #7 等宽收敛 */
-  font-size: 11px;
+  font-size: var(--tims-font-xs); /* #13 11px 提升 to-xs 档（12px 为最小合法档） */
   color: var(--el-color-primary);
   background: var(--el-fill-color-light);
   border-radius: 4px;

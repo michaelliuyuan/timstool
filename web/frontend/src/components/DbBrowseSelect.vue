@@ -154,6 +154,7 @@ async function fetchDbs() {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap; /* #16 窄视口「获取数据库列表」按钮溢出：允许换行（桌面本就单行，零扰） */
 }
 .db-browse-row > .el-input {
   flex: 1 1 auto;

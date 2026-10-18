@@ -188,9 +188,43 @@ body {
 /* #7 字体栈统一：EP dist 未给 .el-button / .el-input__inner 等原生控件设
    font-family（仅 3 处 inherit），UA 默认（Windows 上按钮/输入框 Arial 系）
    直染即巡检所报「每页 36~389 处 Arial 回退」的真根因。继承 reset 一处收口，
-   --el-font-family 覆盖（:root）与 body 正文栈自此同源生效。 */
+   --el-font-family 覆盖（:root）与 body 正文栈自此同源生效。
+   #13 字号梯度收敛：同批扩展——checkbox/radio/select 的隐藏原生 input 无任何
+   EP 字号规则，UA 默认 13.3333px 构成走查所报 13.33 计算带真源；font-size
+   继承同块收口，归入正文 14px 档（EP 已声明字号处类选择器优先级更高，不受扰）。 */
 button, input, optgroup, select, textarea {
   font-family: inherit;
+  font-size: inherit;
+}
+
+/* #16 375px 溢出收敛：窄视口下表单动作区（el-form-item__content 默认 nowrap）
+   允许换行、按钮不超容器；label 改纵排（默认左占位会把 content 挤塌到 0）。
+   仅 ≤480px 生效，桌面布局零扰。 */
+@media (max-width: 480px) {
+  .el-form-item { display: block; }
+  .el-form-item__label {
+    display: flex;
+    justify-content: flex-start;
+    width: auto !important;
+  }
+  .el-form-item__content {
+    flex-wrap: wrap;
+    margin-left: 0 !important;
+    width: 100%;
+    min-width: 0; /* #16 content 无 min-width:0 时定宽子件顶破容器 */
+  }
+  .el-form-item__content > .el-button { max-width: 100%; }
+  /* #16 定宽控件（350/300px input、150px input-number spinner）窄视口钳宽 */
+  .el-input, .el-input-number, .el-select, .el-date-editor {
+    max-width: 100%;
+  }
+}
+
+/* #16 adversarial 面⑤回单（fixer seq=96 修正案）：固定宽 el-dialog（560/700/880px）
+   假绿——全局钳宽，视口 <912px 防溢、≥912px 时 100vw-32 ≥ 880 恒不触发（桌面构造性
+   零扰）；max-width 钳制天然优先于 EP 内联 width，无需 !important */
+.el-dialog {
+  max-width: calc(100vw - 32px);
 }
 
 /* --- Global card look (EP cards adopt tokens) --- */

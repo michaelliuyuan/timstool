@@ -1014,7 +1014,7 @@ onUnmounted(() => {
 .status-indicator { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .status-dot { width: 12px; height: 12px; border-radius: 50%; background: #d9d9d9; flex: none; }
 .status-dot.active { background: #fff; animation: pulse 2s infinite; }
-.status-text { font-size: 18px; font-weight: 600; }
+.status-text { font-size: var(--tims-font-xl); font-weight: 600; } /* #13 hero 状态主标题归一 22px xl 档 */
 .hero-restarts { background: rgba(255, 255, 255, 0.18); padding: 1px 8px; border-radius: 10px; }
 .status-meta { font-size: var(--tims-font-sm); opacity: 0.85; }
 .hero-summary { display: flex; gap: 16px; margin-top: 4px; }
@@ -1095,13 +1095,13 @@ code { background: #f0f0f0; padding: 2px 8px; border-radius: 4px; font-size: var
 .conn-cards { display: grid; grid-template-columns: 1fr 32px 1fr; gap: 0 12px; align-items: stretch; margin: 12px 0 4px; }
 .conn-side { border: 1px solid var(--el-border-color-light, #e4e7ed); border-radius: 8px; padding: 10px 14px 12px; background: var(--el-fill-color-extra-light, #fafbfc); }
 .conn-side-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px dashed var(--el-border-color-lighter, #ebeef5); }
-.conn-side-title { font-weight: 600; font-size: 13px; }
+.conn-side-title { font-weight: 600; font-size: var(--tims-font-sm); } /* #13 标题类 13px → 14px sm 档 */
 .conn-side-type { font-size: var(--tims-font-xs, 12px); color: var(--tims-text-2, #909399); border: 1px solid var(--el-border-color-light, #e4e7ed); border-radius: 4px; padding: 0 6px; line-height: 18px; }
 .conn-field { display: grid; grid-template-columns: 56px 1fr; gap: 8px; align-items: center; padding: 3px 0; font-size: 12px; min-height: 28px; }
 .conn-field > span { color: var(--tims-text-2, #909399); }
 .conn-field-num { width: 100%; }
 .conn-nopwd { color: #cf1322; }
-.conn-flow { display: flex; align-items: center; justify-content: center; color: var(--tims-text-2, #909399); font-size: 18px; }
+.conn-flow { display: flex; align-items: center; justify-content: center; color: var(--tims-text-2, #909399); font-size: var(--tims-font-md); } /* #13 图标字符 18px → 16px md 档 */
 .conn-params { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .conn-param { display: inline-flex; align-items: baseline; gap: 6px; border: 1px solid var(--el-border-color-light, #e4e7ed); border-radius: 6px; padding: 3px 10px; font-size: 12px; background: var(--el-bg-color, #fff); }
 .conn-param-k { color: var(--tims-text-2, #909399); }
@@ -1136,7 +1136,7 @@ code { background: #f0f0f0; padding: 2px 8px; border-radius: 4px; font-size: var
 .nopk-chips { display: flex; flex-wrap: wrap; gap: 6px; padding-left: 26px; }
 /* P4: resume block — position chip (mono), DDL notice line, checkpoint line */
 /* P1 巡检修复 #7 圆角/字号 + #9：#389e0d(3.37:1) → AA 绿 */
-.resume-box { margin-top: 12px; padding: 10px 12px; background: #f6ffed; border: 1px solid #b7eb8f; border-radius: var(--tims-radius-s); font-size: var(--tims-font-sm); color: var(--tims-ok-text); display: flex; flex-direction: column; gap: 4px; }
+.resume-box { margin-top: 12px; padding: 10px 12px; background: #f6ffed; border: 1px solid #b7eb8f; border-radius: var(--tims-radius); font-size: var(--tims-font-sm); color: var(--tims-ok-text); display: flex; flex-direction: column; gap: 4px; } /* #15 面板圆角归一 12px 卡片档 */
 .resume-main { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .resume-pos { font-family: var(--tims-font-mono); font-size: 12px; background: var(--el-bg-color, #fff); border: 1px solid #b7eb8f; border-radius: 4px; padding: 0 6px; color: var(--tims-text); }
 .resume-ddl { font-size: var(--tims-font-sm); color: var(--tims-tag-warning-text); }

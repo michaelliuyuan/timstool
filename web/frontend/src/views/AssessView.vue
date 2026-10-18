@@ -306,7 +306,7 @@ function copyDDL() {
           background: `linear-gradient(135deg, ${scoreColor}, ${scoreColor}dd)`,
           padding: '32px', textAlign: 'center', color: '#fff', borderRadius: '8px'
         }">
-          <div style="font-size: 56px; font-weight: 900; line-height: 1;">{{ report.score.toFixed(1) }}</div>
+          <div style="font-size: 22px; font-weight: 900; line-height: 1;">{{ report.score.toFixed(1) }}</div> <!-- #13 评分 hero 数字 56px → 22px xl 档（xl=大数值展示档，全站唯一 >22 源内字号归一） -->
           <div style="font-size: 16px; margin-top: 8px; opacity: 0.9;">总体兼容性评分</div>
           <div style="margin-top: 10px;">
             <span :style="{
@@ -322,7 +322,7 @@ function copyDDL() {
         <el-col :span="6" v-for="(key, idx) in ['compatible', 'convertible', 'manual_needed', 'incompatible']" :key="key">
           <el-card shadow="never" :body-style="{ textAlign: 'center', padding: '20px' }">
             <!-- #t2 P1(adversarial ⚠️-1)：原 #52c41a/#faad14/#fa8c16/#f5222d 白底 2.27/1.90/2.38/4.08 连大字 3:1 都不达标，换 AA 档（映射=fixer 提案 seq 23 + positive 数值背书 seq 24） -->
-            <div :style="{ fontSize: '32px', fontWeight: 700, color: ['var(--tims-tag-success-text)', 'var(--tims-tag-warning-text)', 'var(--tims-tag-manual-text)', 'var(--tims-tag-danger-text)'][idx] }">
+            <div :style="{ fontSize: '22px', fontWeight: 700, color: ['var(--tims-tag-success-text)', 'var(--tims-tag-warning-text)', 'var(--tims-tag-manual-text)', 'var(--tims-tag-danger-text)'][idx] }"> <!-- #13 概览大数字 32px → 22px xl 档（大数值展示档归一） -->
               {{ report.summary[key] || 0 }}
             </div>
             <div style="font-size: var(--tims-font-sm); color: var(--tims-text-2); margin-top: 4px;">

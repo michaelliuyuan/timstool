@@ -608,14 +608,14 @@ body{font-family:'Inter','HarmonyOS Sans SC','MiSans','Segoe UI','PingFang SC','
 .container{max-width:1200px;margin:0 auto;padding:24px}
 .num{font-family:'JetBrains Mono','Cascadia Mono',Consolas,ui-monospace,monospace;font-weight:500}
 .banner{background:linear-gradient(135deg,#0C1222,#223052);border-radius:12px;padding:28px 32px;color:#EEF1F8;margin-bottom:20px;box-shadow:0 2px 4px rgba(12,18,34,.06),0 10px 28px rgba(12,18,34,.10)}
-.banner h1{font-size:24px;font-weight:600}
-.banner .sub{font-size:13px;opacity:.75;margin-top:6px}
-.banner .overall{float:right;font-size:15px;font-weight:600;padding:4px 16px;border-radius:999px;background:rgba(255,255,255,.16)}
+.banner h1{font-size:22px;font-weight:600} /* #13 xl 档 */
+.banner .sub{font-size:12px;opacity:.75;margin-top:6px} /* #13 xs 档 */
+.banner .overall{float:right;font-size:14px;font-weight:600;padding:4px 16px;border-radius:999px;background:rgba(255,255,255,.16)} /* #13 sm 档 */
 .card{background:#FFF;border:1px solid #E6E8F0;border-radius:12px;padding:24px;margin-bottom:20px;box-shadow:0 1px 2px rgba(12,18,34,.04),0 4px 14px rgba(12,18,34,.06)}
-.card h2{font-size:18px;margin-bottom:16px;color:#0C1222;border-bottom:1px solid #E6E8F0;padding-bottom:8px}
+.card h2{font-size:16px;margin-bottom:16px;color:#0C1222;border-bottom:1px solid #E6E8F0;padding-bottom:8px} /* #13 md 档 */
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:16px;margin-bottom:12px}
 .stat{text-align:center;padding:14px 18px;background:#FFF;border:1px solid #E6E8F0;border-radius:12px;box-shadow:0 1px 2px rgba(12,18,34,.04),0 4px 14px rgba(12,18,34,.06)}
-.stat .value{font-family:'JetBrains Mono','Cascadia Mono',Consolas,ui-monospace,monospace;font-weight:500;font-size:26px;line-height:1.15;color:#0C1222}
+.stat .value{font-family:'JetBrains Mono','Cascadia Mono',Consolas,ui-monospace,monospace;font-weight:500;font-size:22px;line-height:1.15;color:#0C1222} /* #13 KPI 数字归一 xl 档 */
 .stat .label{font-size:12px;color:#6B7280;margin-top:4px;letter-spacing:.4px}
 .info-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #E6E8F0}
 .info-row:last-child{border-bottom:none}
@@ -709,8 +709,10 @@ onUnmounted(() => {
       </template>
 
       <el-form label-width="120px" :disabled="!optionsLoaded" v-loading="!optionsLoaded">
-        <el-row :gutter="24">
-          <el-col :span="12">
+        <el-row :gutter="24" class="compare-conn-grid">
+          <!-- #16 375px 溢出：:xs=24 让源/目标双列 <768px 堆叠（「测试 TiDB 连接」按钮
+               右缘溢出 7px 横滚的根因是 span=12 固定 50% 列宽），≥768px 桌面双列不变 -->
+          <el-col :span="12" :xs="24">
             <el-divider content-position="left">源数据库</el-divider>
             <el-form-item label="数据源">
               <DataSourcePicker v-model="sourceRef" :types="comparePickerTypes" />
@@ -733,7 +735,7 @@ onUnmounted(() => {
             </el-form-item>
           </el-col>
 
-          <el-col :span="12">
+          <el-col :span="12" :xs="24">
             <el-divider content-position="left">目标数据库（TiDB）</el-divider>
             <el-form-item label="数据源">
               <DataSourcePicker v-model="targetRef" :types="['tidb']" />
@@ -965,6 +967,14 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* #16 窄视口（≤768px）源/目标两列堆叠为单列：375px 下 el-col-12 各仅 ~135px，
+   表单控件与「测试连接」按钮被裁切；桌面双列布局不受扰 */
+@media (max-width: 768px) {
+  .compare-conn-grid :deep(.el-col) {
+    max-width: 100%;
+    flex: 0 0 100%;
+  }
+}
 .tims-gauge-row {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
