@@ -346,6 +346,31 @@ func TestDataCompareReport_StatusClassEscaped(t *testing.T) {
 	}
 }
 
+// TestDataCompareReport_TableLayoutCSSAnchor (MC-18): the four layout rules
+// that keep the 表详情 table readable — headers/number cells/badges never
+// wrap, long text cells break inside tokens — must stay in the rendered
+// style block (compare_data_report.go local style, ReportCSS untouched).
+func TestDataCompareReport_TableLayoutCSSAnchor(t *testing.T) {
+	s, _ := newTestServer(t)
+	id := dcTaskFixture(t, s, dcReport(), nil)
+
+	rec := dcReportGet(t, s, id, "html")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, rule := range []string{
+		"th { white-space: nowrap; }",
+		"td.num { white-space: nowrap; }",
+		".badge { white-space: nowrap; }",
+		"td:not(.num) { overflow-wrap: anywhere; }",
+	} {
+		if !strings.Contains(body, rule) {
+			t.Errorf("layout rule missing from style block: %q", rule)
+		}
+	}
+}
+
 // TestDataCompareReport_CredentialsNeverRender: the fixture's task.json
 // carries distinctive usernames (passwords are redacted on persist); the
 // rendered report must contain neither (compareEndpointLabel policy — the

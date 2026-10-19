@@ -121,6 +121,10 @@ func renderDataCompareReportHTML(task *CompareTask, rpt *reporter.Report) string
 .header .meta { margin-top: 16px; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 4px 24px; font-size: 13px; }
 .header .meta div { color: #97A0B5; }
 .header .meta span { color: #EEF1F8; font-weight: 500; }
+th { white-space: nowrap; }
+td.num { white-space: nowrap; }
+.badge { white-space: nowrap; }
+td:not(.num) { overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
