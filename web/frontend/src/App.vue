@@ -144,7 +144,21 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
 .tims-logo-ti { color: var(--tims-brand); }
 .tims-logo-ms { color: var(--tims-text-inv); }
 
-.tims-nav { display: flex; flex-direction: column; gap: 4px; padding: 0 10px; }
+.tims-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 10px;
+  /* MC-19 A：侧栏内滚动兜底——高度不足时 nav 自身内滚（shell 100vh+overflow:hidden
+      锁页滚，被裁项原本完全不可达）；内容不溢出时零视觉差。 */
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--tims-border-ink) transparent;
+}
+.tims-nav::-webkit-scrollbar { width: 4px; }
+.tims-nav::-webkit-scrollbar-thumb { background: var(--tims-border-ink); border-radius: 2px; }
 .tims-nav-group {
   margin-top: 10px;
   padding: 2px 0 4px;
@@ -250,5 +264,20 @@ const isActive = (path: string) => route.path === path || route.path.startsWith(
   .tims-nav-label { display: none; }
   .tims-topbar-title { display: none; }
   .tims-workspace { padding: 14px; }
+}
+
+/* --- MC-19 B：高度自适应分档（宽轨 >900px 专用；页面放大=视口高收缩，
+     既有响应式只看宽度，恰落盲区。压缩优先全量直显，极限档回落 A 滚动）--- */
+@media (max-height: 880px) and (min-width: 901px) {
+  .tims-logo { padding: 4px 0 10px; }
+  .tims-nav { gap: 3px; }
+  .tims-nav-group { margin-top: 6px; }
+  .tims-nav-item { min-height: 58px; padding: 7px 4px 6px; gap: 3px; }
+  .tims-nav-label { line-height: 1.2; }
+}
+@media (max-height: 680px) and (min-width: 901px) {
+  .tims-logo { font-size: 20px; padding: 2px 0 8px; }
+  .tims-nav { gap: 2px; }
+  .tims-nav-item { min-height: 50px; padding: 5px 4px 4px; gap: 2px; }
 }
 </style>
