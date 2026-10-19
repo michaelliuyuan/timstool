@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -88,6 +89,26 @@ type compareState struct {
 
 func (s *Server) compareDir(id string) string {
 	return filepath.Join(s.dataDir, "compare", id)
+}
+
+// compareIDRe is the {compareID} allow-list (MC-17 ⑥a): server-generated
+// ids are uuid.New().String()[:8] — exactly eight lowercase hex chars.
+// compareIDRe gates every /compare/tasks/{compareID} route BEFORE the id
+// reaches the filesystem (compareDir/loadCompareTask/os.RemoveAll), closing
+// the path-traversal surface (..%2F, %5C, overlong, uppercase all 404).
+var compareIDRe = regexp.MustCompile(`^[0-9a-f]{8}$`)
+
+// requireValidCompareID is the front gate middleware for the
+// /compare/tasks/{compareID} subrouter: a non-conforming id is a 404 that
+// never touches disk — indistinguishable from an unknown-but-well-formed id.
+func (s *Server) requireValidCompareID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !compareIDRe.MatchString(chi.URLParam(r, "compareID")) {
+			s.writeError(w, http.StatusNotFound, "compare task not found")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // recoverStaleCompares marks any on-disk compare task still in "running"
@@ -650,6 +671,11 @@ func (s *Server) handleListCompares(w http.ResponseWriter, r *http.Request) {
 		if err != nil || t == nil {
 			continue
 		}
+		// MC-17 ⑥b: the list face carries no usernames — the FE renders
+		// host:port/database only (verified: no consumer of source.user/
+		// target.user on this route). The detail/report faces are unchanged.
+		t.Source.User = ""
+		t.Target.User = ""
 		tasks = append(tasks, t)
 	}
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].CreatedAt.After(tasks[j].CreatedAt) })

@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Standalone compare tasks (鐙珛鏁版嵁姣斿): creation validation, persistence
+// Standalone compare tasks (独立数据比对): creation validation, persistence
 // with password redaction, list/get/report roundtrip, concurrency 409, and
 // delete rules. Handlers are invoked directly (same pattern as the migration
 // options tests); the actual validation run needs live DBs and is covered by
@@ -260,13 +260,15 @@ func TestCompareTask_ConcurrentRejected(t *testing.T) {
 func TestCompareTask_ListGetReportDelete(t *testing.T) {
 	s, _ := newTestServer(t)
 
-	// Seed a finished compare task + report on disk directly.
-	dir := s.compareDir("cmpabcd")
+	// Seed a finished compare task + report on disk directly. The id must
+	// satisfy the MC-17 ⑥a allow-list (^[0-9a-f]{8}$) — these calls go
+	// through the real router, which 404s non-conforming ids before disk.
+	dir := s.compareDir("a1b2c3d4")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().Format(time.RFC3339)
-	taskJSON := `{"id":"cmpabcd","name":"seed","status":"completed",
+	taskJSON := `{"id":"a1b2c3d4","name":"seed","status":"completed",
 		"source":{"host":"s","database":"d"},"target":{"host":"t","database":"d"},
 		"mode":"quick","tables_done":3,"tables_total":3,
 		"created_at":"` + now + `"}`
@@ -288,12 +290,12 @@ func TestCompareTask_ListGetReportDelete(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
 		t.Fatalf("decode list: %v", err)
 	}
-	if len(list) != 1 || list[0].ID != "cmpabcd" || list[0].TablesTotal != 3 {
+	if len(list) != 1 || list[0].ID != "a1b2c3d4" || list[0].TablesTotal != 3 {
 		t.Fatalf("unexpected list: %+v", list)
 	}
 
 	// Get detail.
-	w, req = doReq("GET", compareURL("cmpabcd"), "")
+	w, req = doReq("GET", compareURL("a1b2c3d4"), "")
 	s.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("get status = %d", w.Code)
@@ -301,7 +303,7 @@ func TestCompareTask_ListGetReportDelete(t *testing.T) {
 
 	// Report raw roundtrip (MC-16: explicit format=json — the no-param
 	// default is now the server-rendered html family report).
-	w, req = doReq("GET", compareURL("cmpabcd")+"/report?format=json", "")
+	w, req = doReq("GET", compareURL("a1b2c3d4")+"/report?format=json", "")
 	s.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"overall_status":"pass"`) {
 		t.Fatalf("report status=%d body=%s", w.Code, w.Body.String())
@@ -315,7 +317,7 @@ func TestCompareTask_ListGetReportDelete(t *testing.T) {
 	}
 
 	// Delete: not running → allowed and removed.
-	w, req = doReq("DELETE", compareURL("cmpabcd"), "")
+	w, req = doReq("DELETE", compareURL("a1b2c3d4"), "")
 	s.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("delete status = %d", w.Code)
@@ -325,9 +327,9 @@ func TestCompareTask_ListGetReportDelete(t *testing.T) {
 	}
 
 	// Delete while running → 409.
-	s.compare.runningID = "cmpabcd"
+	s.compare.runningID = "a1b2c3d4"
 	defer func() { s.compare.runningID = "" }()
-	w, req = doReq("DELETE", compareURL("cmpabcd"), "")
+	w, req = doReq("DELETE", compareURL("a1b2c3d4"), "")
 	s.router.ServeHTTP(w, req)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 for running delete, got %d", w.Code)

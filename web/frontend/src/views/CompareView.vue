@@ -585,7 +585,18 @@ async function downloadReport() {
     const { data } = await apiClient.getCompareReport(t.id, 'html')
     downloadBlob(data, 'text/html;charset=utf-8', `compare-report-${t.id}.html`)
   } catch (e: any) {
-    ElMessage.error(`下载报告失败：${e?.response?.data?.error || e.message}`)
+    // MC-17 ③: the html face is responseType 'text', so an error body that
+    // the server wrote as JSON arrives as a raw string — parse it for the
+    // cause (404 dual-cause wording etc.); non-JSON text falls back to
+    // e.message instead of leaking "undefined".
+    const raw = e?.response?.data
+    let cause = e?.message
+    if (typeof raw === 'string' && raw) {
+      try { cause = JSON.parse(raw)?.error || cause } catch { /* non-JSON body */ }
+    } else if (raw?.error) {
+      cause = String(raw.error)
+    }
+    ElMessage.error(`下载报告失败：${cause}`)
   }
 }
 

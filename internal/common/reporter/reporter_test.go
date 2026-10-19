@@ -138,3 +138,22 @@ func TestHTMLShowsDashForMissingTableDuration(t *testing.T) {
 		t.Error("a real duration must still render verbatim")
 	}
 }
+
+// TestHTMLStatusClassEscaped (MC-17 ①): the overview badge's class attribute
+// interpolates r.Status — a status value carrying quotes must never break
+// out of the attribute. Engine-written reports only carry the four
+// constants, but the same ToHTML renders hand-loaded artifacts (the MC-16
+// compare renderer twin anchor lives in webapi).
+func TestHTMLStatusClassEscaped(t *testing.T) {
+	r := NewReport("data")
+	r.AddTableReport(TableReport{TableName: "users", Status: StatusPass, SourceRows: 1, TargetRows: 1})
+	r.Finish(StatusPass, "")
+	r.Status = Status(`x" onload="alert(1)`)
+	html := r.ToHTML()
+	if strings.Contains(html, `overall-x" onload="alert(1)`) {
+		t.Error("unescaped statusClass rendered into class attribute")
+	}
+	if !strings.Contains(html, `overall-x&quot; onload=&quot;alert(1)`) {
+		t.Error("escaped statusClass missing")
+	}
+}

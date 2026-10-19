@@ -5,7 +5,7 @@
 // - CSV 导出按钮原样保留（回归锚）。
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
-import ElementPlus from 'element-plus'
+import ElementPlus, { ElMessage } from 'element-plus'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
@@ -158,5 +158,59 @@ describe('CompareView report download (MC-16)', () => {
     expect(slice).toContain("format === 'html'")
     expect(slice).toContain("responseType: 'text'")
     expect(slice).toContain("params: { format }")
+  })
+
+  // MC-17 ④: format is required — the MC-16 default flip means a
+  // parameterless call would fetch HTML into a JSON-typed consumer.
+  it('api client signature requires the format argument (MC-17)', () => {
+    const src = apiSrc()
+    const i = src.indexOf('getCompareReport')
+    const slice = src.slice(i, i + 400)
+    expect(slice).toContain("(id: string, format: 'html' | 'json')")
+    expect(slice).not.toContain('format?:')
+  })
+
+  // MC-17 ③: the html face is responseType 'text' — the server's JSON error
+  // body arrives as a raw string; the catch must surface the server cause
+  // (404 dual-cause wording) instead of falling through to "undefined".
+  it('download failure surfaces the server cause from a text error body (MC-17)', async () => {
+    const msgSpy = vi.spyOn(ElMessage, 'error').mockImplementation(() => ({}) as never)
+    const w = await openReportPanel()
+    mockGetCompareReport.mockRejectedValueOnce({
+      response: {
+        status: 404,
+        data: '{"error":"compare report not found — the task has not produced report.json (unfinished, failed before the compare completed, or the artifact was cleared)"}',
+      },
+      message: 'Request failed with status code 404',
+    })
+    const dlBtn = w.findAll('button').find(b => b.text().includes('下载报告'))
+    if (!dlBtn) throw new Error('下载报告 button not rendered')
+    await dlBtn.trigger('click')
+    await flushPromises()
+    const shown = msgSpy.mock.calls.map(c => String(c[0])).join('\n')
+    expect(shown).toContain('unfinished')
+    expect(shown).not.toContain('undefined')
+    msgSpy.mockRestore()
+    w.unmount()
+  })
+
+  // MC-17 ③ companion: a NON-JSON text body must fall back to e.message —
+  // never a JSON.parse crash and never "undefined".
+  it('a non-JSON text error body falls back to e.message (MC-17)', async () => {
+    const msgSpy = vi.spyOn(ElMessage, 'error').mockImplementation(() => ({}) as never)
+    const w = await openReportPanel()
+    mockGetCompareReport.mockRejectedValueOnce({
+      response: { status: 502, data: '<html>bad gateway' },
+      message: 'Request failed with status code 502',
+    })
+    const dlBtn = w.findAll('button').find(b => b.text().includes('下载报告'))
+    if (!dlBtn) throw new Error('下载报告 button not rendered')
+    await dlBtn.trigger('click')
+    await flushPromises()
+    const shown = msgSpy.mock.calls.map(c => String(c[0])).join('\n')
+    expect(shown).toContain('Request failed with status code 502')
+    expect(shown).not.toContain('undefined')
+    msgSpy.mockRestore()
+    w.unmount()
   })
 })

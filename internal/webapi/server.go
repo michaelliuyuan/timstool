@@ -341,6 +341,10 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 			r.Put("/compare/options", s.handlePutCompareOptions)
 			r.Get("/compare/tasks", s.handleListCompares)
 			r.Route("/compare/tasks/{compareID}", func(r chi.Router) {
+				// MC-17 ⑥a: every {compareID} route passes the allow-list
+				// gate first (^[0-9a-f]{8}$; non-conforming ids 404 before
+				// any filesystem touch).
+				r.Use(s.requireValidCompareID)
 				r.Get("/", s.handleGetCompare)
 				r.Get("/report", s.handleCompareReport)
 				r.Post("/cancel", s.handleCancelCompare)

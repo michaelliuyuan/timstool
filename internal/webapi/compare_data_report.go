@@ -66,7 +66,9 @@ func dcSamplePercent(ratio float64) string {
 // watermark task's Mode IS its filter's base algorithm (#t3 create-side
 // mapping); Watermark != nil therefore renders 水位过滤 · <base 中文>. The
 // sample ratio derives exactly like buildCompareRunParams (<= 0 rides the
-// 0.01 fallback) so the label states what the engine actually sampled.
+// 0.01 fallback, then the F-12 read-side clamp caps a stale persisted
+// ratio above 1 at 1 — render-only, no run-side warn log) so the label
+// states what the engine actually sampled.
 func dcModeLabel(task *CompareTask) string {
 	base := task.Mode
 	if task.Watermark != nil && task.Watermark.BaseMode != "" {
@@ -80,6 +82,9 @@ func dcModeLabel(task *CompareTask) string {
 		ratio := task.SampleRatio
 		if ratio <= 0 {
 			ratio = 0.01
+		}
+		if ratio > 1 {
+			ratio = 1
 		}
 		label = fmt.Sprintf("采样（比例 %s%%）", dcSamplePercent(ratio))
 	case "checksum":
@@ -139,10 +144,12 @@ func renderDataCompareReportHTML(task *CompareTask, rpt *reporter.Report) string
 	sb.WriteString(`</div></div>`)
 
 	// Overview card (reporter.ToHTML 概览): status + duration + table/row
-	// totals, then the summary line when the engine wrote one.
+	// totals, then the summary line when the engine wrote one. statusClass
+	// interpolates rpt.Status into an attribute — escaped like every other
+	// dynamic string (MC-17 ①; reporter.ToHTML fixed in the same batch).
 	statusClass := "overall-" + string(rpt.Status)
 	sb.WriteString(`<div class="card"><h2>概览</h2><div class="stats">`)
-	fmt.Fprintf(&sb, `<div class="stat"><div class="value %s">%s</div><div class="label">状态</div></div>`, statusClass, mcHTMLEsc(dcStatusCN(string(rpt.Status))))
+	fmt.Fprintf(&sb, `<div class="stat"><div class="value %s">%s</div><div class="label">状态</div></div>`, mcHTMLEsc(statusClass), mcHTMLEsc(dcStatusCN(string(rpt.Status))))
 	fmt.Fprintf(&sb, `<div class="stat"><div class="value">%s</div><div class="label">耗时</div></div>`, mcHTMLEsc(rpt.Duration))
 	fmt.Fprintf(&sb, `<div class="stat"><div class="value">%d</div><div class="label">总表数</div></div>`, rpt.Stats.TotalTables)
 	fmt.Fprintf(&sb, `<div class="stat"><div class="value">%d</div><div class="label">源端行数</div></div>`, rpt.Stats.TotalSourceRows)

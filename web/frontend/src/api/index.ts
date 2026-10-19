@@ -585,7 +585,10 @@ export const apiClient = {
   // served as text (attachment download); 'json' serves the verbatim
   // report.json artifact. Callers that want the typed report MUST pass
   // 'json' explicitly (no param defaults to html server-side).
-  getCompareReport: (id: string, format?: string) =>
+  // MC-17 ④: format is required — the server default flipped to the html
+  // family face in MC-16, so a parameterless call would fetch HTML into a
+  // JSON-typed consumer. Both call sites pass it explicitly.
+  getCompareReport: (id: string, format: 'html' | 'json') =>
     format === 'html'
       ? api.get(`/compare/tasks/${id}/report`, { params: { format: 'html' }, responseType: 'text' })
       : api.get<CompareReport>(`/compare/tasks/${id}/report`, { params: { format } }),

@@ -11,6 +11,10 @@
 *.css text eol=lf
 *.html text eol=lf
 *.svg text eol=lf
+# MC-17 ⑤ (MS-11k gap): *.vue joins the LF pin — a CRLF checkout breaks the
+# source-text vitest anchors (the MC-16 gate pen4a false-red on CDCView.vue)
+# even though every embed-relevant face was already pinned.
+*.vue text eol=lf
 # embedded as-is by //go:embed (internal/lightning/embed.go): must stay
 # byte-exact blob. CRLF smudge (+1B "\r") both drifts the build AND breaks
 # the "placeholder\n" sentinel (HasEmbedded false-positive). binary macro

@@ -261,6 +261,8 @@ func TestDataCompareReport_ModeLabels(t *testing.T) {
 		{"quick", CompareTask{Mode: "quick"}, "快速（行数）"},
 		{"sample", CompareTask{Mode: "sample", SampleRatio: 0.015}, "采样（比例 1.5%）"},
 		{"sample default ratio", CompareTask{Mode: "sample"}, "采样（比例 1%）"},
+		{"sample stale >1 clamped", CompareTask{Mode: "sample", SampleRatio: 1.5}, "采样（比例 100%）"},
+		{"sample stale huge clamped", CompareTask{Mode: "sample", SampleRatio: 150}, "采样（比例 100%）"},
 		{"checksum", CompareTask{Mode: "checksum"}, "校验和"},
 		{"watermark checksum base", CompareTask{Mode: "checksum", Watermark: &config.WatermarkFilter{Column: "updated_at", Value: "v", Op: "<=", BaseMode: "checksum"}}, "水位过滤 · 校验和（基础模式）"},
 		{"watermark quick base", CompareTask{Mode: "quick", Watermark: &config.WatermarkFilter{Column: "updated_at", Value: "v", Op: "<=", BaseMode: "quick"}}, "水位过滤 · 快速（行数）（基础模式）"},
@@ -316,6 +318,31 @@ func TestDataCompareReport_XSSAnchor(t *testing.T) {
 	}
 	if !strings.Contains(body, "&lt;script&gt;alert(1)&lt;/script&gt;") {
 		t.Error("escaped table name missing")
+	}
+}
+
+// TestDataCompareReport_StatusClassEscaped (MC-17 ①): the overview badge's
+// class attribute interpolates rpt.Status — a status value carrying quotes
+// must never break out of the attribute. The persisted report.json is
+// engine-written, but a corrupt/hand-edited artifact reaches the same
+// renderer, so the class string escapes like every other dynamic string
+// (reporter.ToHTML twin anchor lives in reporter_test.go).
+func TestDataCompareReport_StatusClassEscaped(t *testing.T) {
+	s, _ := newTestServer(t)
+	rpt := dcReport()
+	rpt.Status = reporter.Status(`x" onload="alert(1)`)
+	id := dcTaskFixture(t, s, rpt, nil)
+
+	rec := dcReportGet(t, s, id, "html")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `overall-x" onload="alert(1)`) {
+		t.Error("unescaped statusClass rendered into class attribute")
+	}
+	if !strings.Contains(body, `overall-x&quot; onload=&quot;alert(1)`) {
+		t.Error("escaped statusClass missing")
 	}
 }
 

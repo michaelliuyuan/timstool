@@ -262,9 +262,11 @@ func (r *Report) ToHTML() string {
 	}
 	sb.WriteString(`</div>`)
 
+	// statusClass interpolates r.Status into an attribute — escaped like
+	// every other dynamic string (MC-17 ①; same fix as the MC-16 renderer).
 	statusClass := "overall-" + string(r.Status)
 	sb.WriteString(`<div class="card"><h2>概览</h2><div class="stats">`)
-	sb.WriteString(fmt.Sprintf(`<div class="stat"><div class="value %s">%s</div><div class="label">状态</div></div>`, statusClass, htmlEsc(statusCN(string(r.Status)))))
+	sb.WriteString(fmt.Sprintf(`<div class="stat"><div class="value %s">%s</div><div class="label">状态</div></div>`, htmlEsc(statusClass), htmlEsc(statusCN(string(r.Status)))))
 	sb.WriteString(fmt.Sprintf(`<div class="stat"><div class="value">%s</div><div class="label">耗时</div></div>`, htmlEsc(r.Duration)))
 	sb.WriteString(fmt.Sprintf(`<div class="stat"><div class="value">%d</div><div class="label">总表数</div></div>`, r.Stats.TotalTables))
 	sb.WriteString(fmt.Sprintf(`<div class="stat"><div class="value">%d</div><div class="label">源端行数</div></div>`, r.Stats.TotalSourceRows))
