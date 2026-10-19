@@ -574,7 +574,7 @@ GET    /api/v1/sources/tables/{table}/columns  # 列出表列（类型可比较�
 POST   /api/v1/compare/tasks                   # 创建并启动比对任务（源/目标连接 + 模式 + 表清单）
 GET    /api/v1/compare/tasks                   # 比对历史列表
 GET    /api/v1/compare/tasks/{compareID}       # 比对任务详情（状态、表进度、当前表）
-GET    /api/v1/compare/tasks/{compareID}/report  # 比对报告（表级 pass/fail、行数、差异行数）
+GET    /api/v1/compare/tasks/{compareID}/report  # 比对报告（默认 HTML 家族报告附件；?format=json 原样 report.json 字节）
 POST   /api/v1/compare/tasks/{compareID}/cancel  # 取消进行中的比对
 DELETE /api/v1/compare/tasks/{compareID}       # 删除比对记录
 GET    /api/v1/compare/options                 # 读取已保存的连接配置（密码恒为空）

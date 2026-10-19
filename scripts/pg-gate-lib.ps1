@@ -524,7 +524,7 @@ function Invoke-FaceCompare {
     $c = Invoke-GateApi -Method Post -Path '/compare/tasks' -Body $body
     $done = Wait-CompareDone -CompareId $c.id
     if ($done.status -ne 'completed') { throw "checksum compare failed: $($done.error)" }
-    $report = Invoke-GateApi -Method Get -Path "/compare/tasks/$($c.id)/report"
+    $report = Invoke-GateApi -Method Get -Path "/compare/tasks/$($c.id)/report?format=json"
     if ($report.overall_status -ne 'pass') { throw "checksum compare overall=$($report.overall_status), expected pass" }
 
     # watermark-filtered compare (#t3 face): <= now() keeps every row -> still diff=0
@@ -535,7 +535,7 @@ function Invoke-FaceCompare {
     $c2 = Invoke-GateApi -Method Post -Path '/compare/tasks' -Body $body
     $done2 = Wait-CompareDone -CompareId $c2.id
     if ($done2.status -ne 'completed') { throw "watermark compare failed: $($done2.error)" }
-    $report2 = Invoke-GateApi -Method Get -Path "/compare/tasks/$($c2.id)/report"
+    $report2 = Invoke-GateApi -Method Get -Path "/compare/tasks/$($c2.id)/report?format=json"
     if ($report2.overall_status -ne 'pass') { throw "watermark compare overall=$($report2.overall_status), expected pass" }
     Write-Host "  [compare] checksum diff=0 + watermark(created_at <= max) diff=0, overall=pass x2"
 }
@@ -649,7 +649,7 @@ function Invoke-FaceIncremental {
     }
     $idemDone = Wait-CompareDone -CompareId $idem.id
     if ($idemDone.status -ne 'completed') { throw "idempotency quick compare failed: $($idemDone.error)" }
-    $idemRep = Invoke-GateApi -Method Get -Path "/compare/tasks/$($idem.id)/report"
+    $idemRep = Invoke-GateApi -Method Get -Path "/compare/tasks/$($idem.id)/report?format=json"
     if ($idemRep.overall_status -ne 'pass') { throw "idempotency row-count anchor: quick compare overall=$($idemRep.overall_status)" }
 
     # 4) interrupt/resume: new rows + hard service kill mid-run, restart, re-run
@@ -696,7 +696,7 @@ function Invoke-FaceIncremental {
     }
     $done = Wait-CompareDone -CompareId $cmp.id
     if ($done.status -ne 'completed') { throw "post-incremental parity compare failed: $($done.error)" }
-    $rep = Invoke-GateApi -Method Get -Path "/compare/tasks/$($cmp.id)/report"
+    $rep = Invoke-GateApi -Method Get -Path "/compare/tasks/$($cmp.id)/report?format=json"
     if ($rep.overall_status -ne 'pass') { throw "post-incremental parity overall=$($rep.overall_status): resume lost or duplicated rows" }
     # resume double-condition (ruling seq 117-2): total = full expectation AND
     # zero diff (no duplicate keys, no missed rows) - per table, explicit.
@@ -735,7 +735,7 @@ function Invoke-FaceIncremental {
         mode = 'checksum'; concurrency = 4; tables = @('pggate_orders')
     }
     $ckDone = Wait-CompareDone -CompareId $ck.id
-    $ckRep = Invoke-GateApi -Method Get -Path "/compare/tasks/$($ck.id)/report"
+    $ckRep = Invoke-GateApi -Method Get -Path "/compare/tasks/$($ck.id)/report?format=json"
     # exact-count anchor, TiDB side: the checksum count phase reads exact
     # per-table rows (unlike quick's estimates).
     foreach ($tbl in $ckRep.tables) {
@@ -801,7 +801,7 @@ function Invoke-FaceCdc {
         }
         $d = Wait-CompareDone -CompareId $cmp.id
         if ($d.status -eq 'completed') {
-            $r = Invoke-GateApi -Method Get -Path "/compare/tasks/$($cmp.id)/report"
+            $r = Invoke-GateApi -Method Get -Path "/compare/tasks/$($cmp.id)/report?format=json"
             if ($r.overall_status -eq 'pass') { $applied = $true; break }
         }
         Start-Sleep -Seconds 2

@@ -678,16 +678,62 @@ func (s *Server) handleGetCompare(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, t)
 }
 
+// handleCompareReport serves the standalone compare report in the two
+// family faces (MC-16): format=json serves the verbatim report.json bytes
+// (byte-identical to the engine artifact, attachment compare-report-{id}
+// .json); html (the default) renders the family report (attachment
+// compare-report-{id}.html). A missing task.json is a 404 "task not found";
+// a missing report.json is a 404 that names the causes — never a half-empty
+// report; a report.json that exists but will not decode is a 500 with a
+// generic body (no server-side paths — the raw *fs.PathError carries the
+// absolute path; the original error goes to the server log). MC-14/15
+// policy, applied to the standalone compare namespace.
 func (s *Server) handleCompareReport(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "compareID")
-	data, err := os.ReadFile(filepath.Join(s.compareDir(id), "report.json"))
-	if err != nil {
-		s.writeError(w, http.StatusNotFound, "compare report not found")
+	task, err := s.loadCompareTask(id)
+	if err != nil || task == nil {
+		s.writeError(w, http.StatusNotFound, "compare task not found")
 		return
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write(data)
+	reportPath := filepath.Join(s.compareDir(id), "report.json")
+	if r.URL.Query().Get("format") == "json" {
+		b, err := os.ReadFile(reportPath)
+		if err != nil {
+			s.writeCompareReportError(w, id, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-report-%s.json", id))
+		w.Write(b)
+		return
+	}
+	b, err := os.ReadFile(reportPath)
+	if err != nil {
+		s.writeCompareReportError(w, id, err)
+		return
+	}
+	var rpt reporter.Report
+	if err := json.Unmarshal(b, &rpt); err != nil {
+		zap.L().Warn("decode compare report.json failed", zap.String("task", id), zap.Error(err))
+		s.writeError(w, http.StatusInternalServerError, "read compare report failed — report.json exists but is unreadable (corrupt artifact); cause logged server-side")
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-report-%s.html", id))
+	w.Write([]byte(renderDataCompareReportHTML(task, &rpt)))
+}
+
+// writeCompareReportError maps a missing report.json → 404 with the cause
+// set named (unfinished / failed before the compare completed / cleared)
+// and every other read failure → 500 with a generic body (the original
+// error goes to the server-side log instead — MC-14/15 policy).
+func (s *Server) writeCompareReportError(w http.ResponseWriter, taskID string, err error) {
+	if os.IsNotExist(err) {
+		s.writeError(w, http.StatusNotFound, "compare report not found — the task has not produced report.json (unfinished, failed before the compare completed, or the artifact was cleared)")
+		return
+	}
+	zap.L().Warn("read compare report failed", zap.String("task", taskID), zap.Error(err))
+	s.writeError(w, http.StatusInternalServerError, "read compare report failed — report.json exists but is unreadable; cause logged server-side")
 }
 
 func (s *Server) handleCancelCompare(w http.ResponseWriter, r *http.Request) {

@@ -581,8 +581,14 @@ export const apiClient = {
   getCompare: (id: string) =>
     api.get<CompareTask>(`/compare/tasks/${id}`),
 
-  getCompareReport: (id: string) =>
-    api.get<CompareReport>(`/compare/tasks/${id}/report`),
+  // MC-16: format param — 'html' (server default) is the family report face
+  // served as text (attachment download); 'json' serves the verbatim
+  // report.json artifact. Callers that want the typed report MUST pass
+  // 'json' explicitly (no param defaults to html server-side).
+  getCompareReport: (id: string, format?: string) =>
+    format === 'html'
+      ? api.get(`/compare/tasks/${id}/report`, { params: { format: 'html' }, responseType: 'text' })
+      : api.get<CompareReport>(`/compare/tasks/${id}/report`, { params: { format } }),
 
   cancelCompare: (id: string) =>
     api.post(`/compare/tasks/${id}/cancel`),

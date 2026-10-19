@@ -299,8 +299,9 @@ func TestCompareTask_ListGetReportDelete(t *testing.T) {
 		t.Fatalf("get status = %d", w.Code)
 	}
 
-	// Report raw roundtrip.
-	w, req = doReq("GET", compareURL("cmpabcd")+"/report", "")
+	// Report raw roundtrip (MC-16: explicit format=json — the no-param
+	// default is now the server-rendered html family report).
+	w, req = doReq("GET", compareURL("cmpabcd")+"/report?format=json", "")
 	s.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"overall_status":"pass"`) {
 		t.Fatalf("report status=%d body=%s", w.Code, w.Body.String())
