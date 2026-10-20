@@ -329,9 +329,6 @@ import SparkLine from '../components/SparkLine.vue'
 import PageHeader from '../components/PageHeader.vue'
 import SyncCompareCard from '../components/SyncCompareCard.vue'
 import { useDataSources } from '../composables/useDataSources'
-// MC-10 C5: the 401 token-prompt flow moved to the shared composable
-// (mongocompare surfaces consume the same gate); behavior is unchanged.
-import { promptForToken } from '../composables/useAuthTokenGate'
 
 // Mirrors the web API contract (docs/cdc-web-monitoring-contract.md, #t48 B).
 interface CDCStatus {
@@ -537,7 +534,7 @@ function startEditConn() {
   connMsg.value = ''
 }
 
-async function saveConn(retriedAuth = false) {
+async function saveConn() {
   savingConn.value = true
   connMsg.value = ''
   connError.value = false
@@ -553,10 +550,6 @@ async function saveConn(retriedAuth = false) {
     await loadConnConfig()
     await runPrecheck()
   } catch (e: any) {
-    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
-      savingConn.value = false
-      return saveConn(true)
-    }
     connError.value = true
     connMsg.value = e.response?.data?.error || e.message || '保存失败'
   } finally {
@@ -564,7 +557,7 @@ async function saveConn(retriedAuth = false) {
   }
 }
 
-async function importConn(retriedAuth = false) {
+async function importConn() {
   try {
     await ElMessageBox.confirm('确认把最近一次成功迁移任务的源/目标连接导入 config.yaml？当前 CDC 使用的连接将被覆盖（cdc 配置段不变）。', '确认', { type: 'warning' })
   } catch { return }
@@ -576,9 +569,6 @@ async function importConn(retriedAuth = false) {
     await loadConnConfig()
     await runPrecheck()
   } catch (e: any) {
-    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
-      return importConn(true)
-    }
     connError.value = true
     connMsg.value = e.response?.data?.error || e.message || '导入失败'
   }
@@ -591,7 +581,7 @@ const dsSourceRef = ref('')
 const dsTargetRef = ref('')
 const importingDS = ref(false)
 
-async function importFromDS(retriedAuth = false) {
+async function importFromDS() {
   if (!dsSourceRef.value || !dsTargetRef.value) return
   try {
     await ElMessageBox.confirm('确认把所选数据源的连接写入 config.yaml？当前 CDC 使用的连接将被覆盖（cdc 配置段不变）。', '确认', { type: 'warning' })
@@ -605,10 +595,6 @@ async function importFromDS(retriedAuth = false) {
     await loadConnConfig()
     await runPrecheck()
   } catch (e: any) {
-    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
-      importingDS.value = false
-      return importFromDS(true)
-    }
     connError.value = true
     connMsg.value = e.response?.data?.error || e.message || '导入失败'
   } finally {
@@ -681,7 +667,7 @@ async function openNoPKFix() {
   await executeNoPKFix(tables)
 }
 
-async function executeNoPKFix(tables: string[], retriedAuth = false) {
+async function executeNoPKFix(tables: string[]) {
   noPKBusy.value = true
   try {
     const { data: j } = await apiClient.runReplicaIdentity(tables)
@@ -696,16 +682,13 @@ async function executeNoPKFix(tables: string[], retriedAuth = false) {
     )
     if (j.ok || (j.results || []).some((x: any) => x.ok)) await runPrecheck()
   } catch (e: any) {
-    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
-      return executeNoPKFix(tables, true)
-    }
     ElMessage.error('执行失败：' + (e.response?.data?.error || e.message))
   } finally {
     noPKBusy.value = false
   }
 }
 
-async function resetCheckpoint(retriedAuth = false) {
+async function resetCheckpoint() {
   let answer: string
   try {
     const { value } = await ElMessageBox.prompt(
@@ -721,9 +704,6 @@ async function resetCheckpoint(retriedAuth = false) {
     ElMessage.success(j.message || '已重置')
     await runPrecheck()
   } catch (e: any) {
-    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
-      return resetCheckpoint(true)
-    }
     ElMessage.error(e.response?.data?.error || e.message || '重置失败')
   }
 }
@@ -879,7 +859,7 @@ const hasPositionInfo = computed(() =>
   !!(checkpoint.value?.lsn || status.value.slot || status.value.publication || status.value.pid ||
     (slotView.value?.slot?.exists)))
 
-async function callCDC(action: 'start' | 'stop', retriedAuth = false) {
+async function callCDC(action: 'start' | 'stop') {
   busy.value = true
   controlMsg.value = ''
   controlError.value = false
@@ -893,13 +873,6 @@ async function callCDC(action: 'start' | 'stop', retriedAuth = false) {
     }
     await refresh()
   } catch (e: any) {
-    // MS-11f: 401 → one token prompt + retry; a 403 (server token unset)
-    // falls through as a plain error line — no browser prompt can fix a
-    // server-side config gap.
-    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
-      busy.value = false
-      return callCDC(action, true)
-    }
     controlError.value = true
     controlMsg.value = e.response?.data?.error || e.response?.data?.message || e.message || '请求失败'
   } finally {

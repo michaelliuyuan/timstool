@@ -5,10 +5,6 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import apiClient from '../api'
 import type { Task, TaskLogEntry, PhaseInfo } from '../api'
 import { isCompareTask, parseCompareResult } from '../api'
-// MC-10 C5: compare-task lifecycle actions sit behind the token gate; a
-// 401 opens the shared prompt once, then retries (migration tasks never
-// 401 — the retry path is inert for them).
-import { promptForToken } from '../composables/useAuthTokenGate'
 
 const route = useRoute()
 const router = useRouter()
@@ -259,15 +255,12 @@ onUnmounted(() => {
   if (logWs.value) logWs.value.close()
 })
 
-async function action(actionName: string, retriedAuth = false) {
+async function action(actionName: string) {
   try {
     await (apiClient as any)[`${actionName}Task`](taskId)
     ElMessage.success('操作成功')
     await fetchTask()
   } catch (e: any) {
-    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
-      return action(actionName, true)
-    }
     ElMessage.error(e.response?.data?.error || '操作失败')
   }
 }
@@ -275,20 +268,17 @@ async function action(actionName: string, retriedAuth = false) {
 // Compare restart paths (M4): fresh start wipes the compare OutDir
 // server-side; resume=true continues from engine checkpoints. Shown for
 // compare tasks outside created/running (the create flow already starts).
-async function restartCompare(resume: boolean, retriedAuth = false) {
+async function restartCompare(resume: boolean) {
   try {
     await apiClient.startTask(taskId, { resume })
     ElMessage.success(resume ? '已从断点续跑对比' : '已重新开始对比')
     await fetchTask()
   } catch (e: any) {
-    if (e.response?.status === 401 && !retriedAuth && await promptForToken()) {
-      return restartCompare(resume, true)
-    }
     ElMessage.error(e.response?.data?.error || '操作失败')
   }
 }
 
-async function cancelTask(retriedAuth = false) {
+async function cancelTask() {
   try {
     await ElMessageBox.confirm('确认取消该迁移任务？进行中的同步将中断。', '确认', { type: 'warning' })
   } catch { return }
@@ -297,14 +287,11 @@ async function cancelTask(retriedAuth = false) {
     ElMessage.success('任务已取消')
     await fetchTask()
   } catch (e: any) {
-    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
-      return cancelTask(true)
-    }
     ElMessage.error('取消失败')
   }
 }
 
-async function deleteTask(retriedAuth = false) {
+async function deleteTask() {
   try {
     await ElMessageBox.confirm('确认删除该任务？删除后不可恢复。', '确认', { type: 'warning' })
   } catch { return }
@@ -313,9 +300,6 @@ async function deleteTask(retriedAuth = false) {
     ElMessage.success('任务已删除')
     router.push('/tasks')
   } catch (e: any) {
-    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
-      return deleteTask(true)
-    }
     ElMessage.error(e.response?.data?.error || '删除失败')
   }
 }

@@ -99,11 +99,6 @@ type Server struct {
 	logCollector *LogCollector
 	logCores     map[string]*TaskLogCore
 
-	// authToken is the STARTUP SNAPSHOT of config security.token (MS-11f
-	// 笔①): "" = fail-closed (all destructive CDC ops 403). Snapshot
-	// semantics — runtime config edits never affect the running gate.
-	authToken string
-
 	// audit trail (MS-11f 笔①): in-memory ring (backstop + anomaly-checker
 	// source) and the timestamp of the last SUCCESSFUL audited stop.
 	auditMu         sync.Mutex
@@ -270,7 +265,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Auth-Token"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
@@ -312,13 +307,8 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 			r.Post("/tasks", s.handleCreateTask)
 			// MongoDB↔MongoDB consistency compare (M3): own task namespace,
 			// prefixed to stay clear of the /compare MySQL domain below.
-			// MC-10 C5: creation sits behind the token gate (same snapshot
-			// and 403/401 semantics as the CDC routes; reads stay open).
-			r.Post("/mongocompare/tasks", s.requireCompareOpToken("mongocompare.create", s.handleCreateCompareTask))
-			// MC-12 P2: token liveness probe for the FE token dialog — same gate,
-			// same audit trail, zero new 401 semantics; the dialog verifies a
-			// candidate BEFORE burning a real create/stop action.
-			r.Post("/security/verify", s.requireSecurityOpToken("security.verify", s.handleSecurityVerify))
+			// MC-10 C5: creation is audited (auditCompareOp); reads stay open.
+			r.Post("/mongocompare/tasks", s.auditCompareOp("mongocompare.create", s.handleCreateCompareTask))
 			r.Get("/tasks", s.handleListTasks)
 			r.Route("/tasks/{taskID}", func(r chi.Router) {
 				r.Get("/", s.handleGetTask)
@@ -351,21 +341,20 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 				r.Delete("/", s.handleDeleteCompare)
 			})
 			// CDC endpoints (#t48 B: read CDC process status file). The six
-			// destructive routes go through the MS-11f token gate (snapshot
-			// of security.token; fail-closed 403 when unset, 401 on a
-			// missing/wrong token); reads stay open per the ticket.
+			// destructive routes are audited (MS-11f audit trail); reads
+			// stay open per the ticket.
 			r.Get("/cdc/status", s.handleCDCStatus)
 			r.Get("/cdc/stats", s.handleCDCStats)
 			r.Get("/cdc/checkpoint", s.handleCDCCheckpoint)
-			r.Post("/cdc/start", s.requireCDCOpToken("cdc.start", s.handleCDCStart))
-			r.Post("/cdc/stop", s.requireCDCOpToken("cdc.stop", s.handleCDCStop))
+			r.Post("/cdc/start", s.auditCDCOp("cdc.start", s.handleCDCStart))
+			r.Post("/cdc/stop", s.auditCDCOp("cdc.stop", s.handleCDCStop))
 			// CDC connection config + precheck + resume inspection (A1/A2/A3)
 			r.Get("/cdc/config", s.handleGetCDCConfig)
-			r.Put("/cdc/config", s.requireCDCOpToken("cdc.config.put", s.handlePutCDCConfig))
-			r.Post("/cdc/config/import", s.requireCDCOpToken("cdc.config.import", s.handleImportCDCConfig))
-			r.Post("/cdc/config/import-from-datasource", s.requireCDCOpToken("cdc.config.import_from_datasource", s.handleImportCDCFromDataSource))
+			r.Put("/cdc/config", s.auditCDCOp("cdc.config.put", s.handlePutCDCConfig))
+			r.Post("/cdc/config/import", s.auditCDCOp("cdc.config.import", s.handleImportCDCConfig))
+			r.Post("/cdc/config/import-from-datasource", s.auditCDCOp("cdc.config.import_from_datasource", s.handleImportCDCFromDataSource))
 			r.Get("/cdc/slot", s.handleCDCSlot)
-			r.Post("/cdc/checkpoint/reset", s.requireCDCOpToken("cdc.checkpoint.reset", s.handleCDCResetCheckpoint))
+			r.Post("/cdc/checkpoint/reset", s.auditCDCOp("cdc.checkpoint.reset", s.handleCDCResetCheckpoint))
 			// Timestamp-watermark incremental sync (F-04): pull-based table
 			// granularity jobs, manual trigger only, PostgreSQL sources only.
 			r.Get("/incremental/jobs", s.handleListIncrementalJobs)
@@ -393,7 +382,7 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 			r.Post("/ddl-export/schemas", s.handleDDLSchemas)
 			r.Post("/ddl-export", s.handleDDLExport)
 			r.Get("/cdc/precheck", s.handleCDCPrecheck)
-			r.Post("/cdc/replica-identity", s.requireCDCOpToken("cdc.replica_identity", s.handleCDCReplicaIdentity))
+			r.Post("/cdc/replica-identity", s.auditCDCOp("cdc.replica_identity", s.handleCDCReplicaIdentity))
 		})
 	})
 
@@ -1465,7 +1454,7 @@ func (s *Server) handleStartTask(w http.ResponseWriter, r *http.Request) {
 	// stay un-gated), and stored params are re-validated before any state
 	// write (③ — legacy out-of-range tasks fail loud).
 	if spec, ok := parseCompareTask(task.ConfigJSON); ok {
-		s.requireCompareOpToken("mongocompare.start", s.handleStartCompareTask(taskID, spec))(w, r)
+		s.auditCompareOp("mongocompare.start", s.handleStartCompareTask(taskID, spec))(w, r)
 		return
 	}
 
@@ -1945,7 +1934,7 @@ func (s *Server) handlePauseTask(w http.ResponseWriter, r *http.Request) {
 	// MC-10 ①: compare tasks pause behind the token gate (kind-gated; the
 	// migration pause below stays un-gated).
 	if _, ok := parseCompareTask(task.ConfigJSON); ok {
-		s.requireCompareOpToken("mongocompare.pause", s.handlePauseCompareTask(taskID))(w, r)
+		s.auditCompareOp("mongocompare.pause", s.handlePauseCompareTask(taskID))(w, r)
 		return
 	}
 	s.store.UpdateTaskStatus(taskID, store.TaskStatusPaused)
@@ -1968,7 +1957,7 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 	// engine checkpoints intact (OutDir not wiped). MC-10: token gate + ③
 	// param re-validation before the Running write.
 	if spec, ok := parseCompareTask(task.ConfigJSON); ok {
-		s.requireCompareOpToken("mongocompare.resume", s.handleResumeCompareTask(taskID, spec))(w, r)
+		s.auditCompareOp("mongocompare.resume", s.handleResumeCompareTask(taskID, spec))(w, r)
 		return
 	}
 
@@ -2022,7 +2011,7 @@ func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 	// BEFORE any state write; migration tasks keep the ungated path.
 	if task, _ := s.store.GetTask(taskID); task != nil {
 		if _, ok := parseCompareTask(task.ConfigJSON); ok {
-			s.requireCompareOpToken("mongocompare.cancel", s.handleCancelCompareTask(taskID))(w, r)
+			s.auditCompareOp("mongocompare.cancel", s.handleCancelCompareTask(taskID))(w, r)
 			return
 		}
 	}
@@ -2125,7 +2114,7 @@ func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 	// MC-10 ①: compare tasks delete behind the token gate (kind-gated; the
 	// migration delete below stays un-gated).
 	if _, ok := parseCompareTask(task.ConfigJSON); ok {
-		s.requireCompareOpToken("mongocompare.delete", s.handleDeleteCompareTask(taskID))(w, r)
+		s.auditCompareOp("mongocompare.delete", s.handleDeleteCompareTask(taskID))(w, r)
 		return
 	}
 	s.store.DeleteTask(taskID)

@@ -131,15 +131,11 @@ func TestMongoCompareRoutesDispatch(t *testing.T) {
 	}
 	defer st.Close()
 	s := NewServer(st, "127.0.0.1", 0, t.TempDir(), embed.FS{}, nil, "", time.Minute)
-	// MC-10 C5: the mongocompare create route sits behind the token gate —
-	// drive it the way an authorized client does.
-	s.SetSecurityToken(testAuthToken)
 
 	body := `{"source":{"host":"localhost","database":"d1"},"target":{"host":"localhost","database":"d2"}}`
 
 	// New prefixed route dispatches to the compare handler end to end.
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/mongocompare/tasks", strings.NewReader(body))
-	req.Header.Set("X-Auth-Token", testAuthToken)
 	rec := httptest.NewRecorder()
 	s.router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {

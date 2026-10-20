@@ -34,7 +34,7 @@ GET  /api/v1/tasks/{id}/report?format=json      # MC-14：summary.json 原样字
 - 每端可给 `uri`（完整连接串，转义由调用方负责）**或**离散字段 `host/port/user/password/auth_db`（服务端结构化构建凭证，口令含 `@ : / %` 等特殊字符安全）；两者同时给出时离散字段优先。
 - `target.database` 省略时默认与源端同名；v1 语义为**单库对单库**（两端库名可不同）。
 - 凭证存储与迁移任务同面：ConfigJSON 落库、API 序列化 `json:"-"` 不回显。
-- **鉴权（MC-10）**：写操作端点在令牌门后——`POST /mongocompare/tasks`（创建）与 compare 类任务的 `start/pause/resume/cancel/delete`（按 ConfigJSON 的 kind 判别后插门，任何状态写之前）。语义与 CDC 门逐字一致：请求头 `X-Auth-Token` 对 **config.yaml `security.token` 的启动时快照**做恒时比较；服务端未配 token = 403 fail-closed（全部拒绝），token 缺失/错误 = 401（前端弹一次令牌框后重试）。读端点（GET list/get/report/progress/logs）沿 CDC 先例保持开放。同一路由上的**迁移类任务不受门**（回归锚）。审计：compare 写操作逐条落 `<dataDir>/audit/mc-ops.jsonl`（action 前缀 `mongocompare.create/start/pause/resume/cancel/delete`，含 denied 尝试；内存环与 CDC 共享，写失败降级语义同 CDC）；CDC 审计文件 `cdc-ops.jsonl` 不受影响。
+- **鉴权（MC-10，已移除）**：写操作端点（`POST /mongocompare/tasks` 创建与 compare 类任务的 `start/pause/resume/cancel/delete`）不再做令牌校验，直接放行。审计保留：compare 写操作逐条落 `<dataDir>/audit/mc-ops.jsonl`（action 前缀 `mongocompare.create/start/pause/resume/cancel/delete`；内存环与 CDC 共享，写失败降级语义同 CDC）；CDC 审计文件 `cdc-ops.jsonl` 不受影响。
 
 ## 结果与产物
 

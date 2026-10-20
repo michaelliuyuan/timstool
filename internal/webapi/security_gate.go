@@ -1,22 +1,17 @@
 package webapi
 
-// MS-11f 笔① security core (P0): destructive-endpoint token gate + operation
-// audit trail + anomaly-stop alarm. The incident being root-fixed: an
-// external IP POSTed /cdc/stop unauthenticated and CDC sat silent-dead for 2h.
+// MS-11f 笔① observability core: destructive-endpoint operation audit trail
+// + anomaly-stop alarm (the token gate was removed — the tool is
+// internal-use; ops now run ungated but stay fully audited).
 //
-// Three planes:
-//   1. gate — seven destructive routes require X-Auth-Token == the STARTUP
-//      SNAPSHOT of config security.token (a mid-run config.yaml edit never
-//      affects the running gate; changing the token requires a web restart).
-//      Unset token = fail-closed 403; missing/wrong token = 401 (the FE uses
-//      the distinction: 403 shows a hint, 401 opens the token prompt).
-//   2. audit — every gated request leaves a JSONL line (ts/ip/method/
-//      endpoint/action/result/detail), DENIED attempts included. IP is the
-//      direct peer RemoteAddr (ruling seq83 #2: XFF is forgeable while the
-//      listener is 0.0.0.0 direct). An audit write failure never bricks
-//      operations: retry once, then ERROR alarm + proceed with the record
-//      kept in the in-memory ring (ruling seq85 #3).
-//   3. alarm — a checker observes CDC liveness; a running→stopped transition
+// Two planes:
+//   1. audit — every destructive request leaves a JSONL line (ts/ip/method/
+//      endpoint/action/result). IP is the direct peer RemoteAddr (ruling
+//      seq83 #2: XFF is forgeable while the listener is 0.0.0.0 direct). An
+//      audit write failure never bricks operations: retry once, then ERROR
+//      alarm + proceed with the record kept in the in-memory ring (ruling
+//      seq85 #3).
+//   2. alarm — a checker observes CDC liveness; a running→stopped transition
 //      with NO successful stop audit newer than the last running observation
 //      raises exactly one ERROR alarm (transition-edge semantics, ruling
 //      seq83 #3). Deliberately independent of the watchdog: the incident
@@ -24,8 +19,6 @@ package webapi
 //      !desired early-return would skip exactly that case.
 
 import (
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -64,63 +57,6 @@ const (
 	alarmRingCap = 20  // /cdc/status .alarms ring
 )
 
-// SetSecurityToken wires the startup snapshot of security.token (called once
-// from cmd/web). Snapshot semantics: later config.yaml edits do not affect
-// the running gate — PUT /cdc/config cannot touch the security section and a
-// hand edit needs a web restart. A weak token (short / pure digits) warns
-// and audits but never refuses startup (ruling seq85 #2: fail-loud).
-func (s *Server) SetSecurityToken(token string) {
-	s.authToken = token
-	if token == "" {
-		zap.L().Warn("security.token 未配置：破坏性端点将全部拒绝（fail-closed）。请在 config.yaml 的 security.token 配置后重启 web。")
-		return
-	}
-	if reason := weakTokenReason(token); reason != "" {
-		msg := "security.token 弱令牌（" + reason + "）：公网暴露面下可被暴力尝试，建议 ≥16 字符且字母数字混合。"
-		zap.L().Warn(msg)
-		s.appendAudit(auditEntry{
-			IP: "localhost", Method: "-", Endpoint: "-",
-			Action: "security.token_entropy", Result: "warn", Detail: msg,
-		})
-	}
-}
-
-// weakTokenReason returns the advisory reason when the token is brute-force
-// susceptible (ruling seq85 #2), or "". Byte length is deliberate: the gate
-// compares raw bytes.
-func weakTokenReason(token string) string {
-	if len(token) < 16 {
-		return "长度不足 16 字符"
-	}
-	if isAllDigits(token) {
-		return "纯数字"
-	}
-	return ""
-}
-
-func isAllDigits(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
-	}
-	return len(s) > 0
-}
-
-// tokenMatches compares the presented header against the startup snapshot in
-// constant time. Both sides are SHA-256 hashed FIRST so a candidate of the
-// wrong length cannot be separated by an early return — every comparison,
-// equal length or not, costs one hash + one 32-byte compare (adversarial
-// seq84 #1, ruling seq85 #1).
-func (s *Server) tokenMatches(presented string) bool {
-	if s.authToken == "" {
-		return false // unset gate: nobody passes
-	}
-	have := sha256.Sum256([]byte(s.authToken))
-	got := sha256.Sum256([]byte(presented))
-	return subtle.ConstantTimeCompare(have[:], got[:]) == 1
-}
-
 // statusRecorder captures the handler's response code for the audit trail.
 type statusRecorder struct {
 	http.ResponseWriter
@@ -150,61 +86,25 @@ const (
 	auditFileMongoCompare = "mc-ops.jsonl"
 )
 
-// requireCDCOpToken gates one destructive CDC endpoint. MC-10 ①: the gate
-// core is shared with the mongocompare lifecycle gate (requireOpToken);
+// auditCDCOp records one destructive CDC endpoint invocation. MC-10 ①: the
+// audit core is shared with the mongocompare lifecycle wrapper (auditOp);
 // CDC behavior — semantics and audit file — is unchanged.
-func (s *Server) requireCDCOpToken(action string, h http.HandlerFunc) http.HandlerFunc {
-	return s.requireOpToken(auditFileCDC, action, h)
+func (s *Server) auditCDCOp(action string, h http.HandlerFunc) http.HandlerFunc {
+	return s.auditOp(auditFileCDC, action, h)
 }
 
-// requireCompareOpToken gates one destructive mongocompare endpoint with
-// the same token snapshot and 403/401 semantics as the CDC gate, writing
-// its audit trail to mc-ops.jsonl (MC-10 C5).
-func (s *Server) requireCompareOpToken(action string, h http.HandlerFunc) http.HandlerFunc {
-	return s.requireOpToken(auditFileMongoCompare, action, h)
+// auditCompareOp records one destructive mongocompare endpoint invocation,
+// writing its audit trail to mc-ops.jsonl (MC-10 C5).
+func (s *Server) auditCompareOp(action string, h http.HandlerFunc) http.HandlerFunc {
+	return s.auditOp(auditFileMongoCompare, action, h)
 }
 
-// requireSecurityOpToken gates one security-plane endpoint (MC-12 P2):
-// same token snapshot and 403/401 semantics as every other gated surface.
-// The audit line lands in the CDC trail — the security core's historical
-// home (the weak-token entropy advisory writes there too).
-func (s *Server) requireSecurityOpToken(action string, h http.HandlerFunc) http.HandlerFunc {
-	return s.requireOpToken(auditFileCDC, action, h)
-}
-
-// handleSecurityVerify answers the FE token dialog's liveness probe
-// (MC-12 P2). It is reached only PAST the gate, so a 200 {"status":"ok"}
-// doubles as the dialog's "store the token" signal; the deny path is 100%
-// the gate's own — byte-identical 401 for a missing OR wrong token, no
-// token-existence oracle (adversarial seq349 constraint ②).
-func (s *Server) handleSecurityVerify(w http.ResponseWriter, r *http.Request) {
-	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-// requireOpToken gates one gated endpoint: 403 while no token is
-// configured (fail-closed + remediation hint), 401 on a missing/wrong
-// token (FE opens the token prompt on exactly this code). Every outcome —
-// denied, error, success — leaves an audit line in the named file.
-func (s *Server) requireOpToken(auditFile, action string, h http.HandlerFunc) http.HandlerFunc {
+// auditOp wraps one destructive endpoint with the operation audit trail:
+// every outcome — error, success — leaves an audit line in the named file.
+func (s *Server) auditOp(auditFile, action string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		e := auditEntry{
 			IP: peerIP(r), Method: r.Method, Endpoint: r.URL.Path, Action: action,
-		}
-		if s.authToken == "" {
-			e.Result, e.Detail = "denied", "security.token 未配置（fail-closed 全拒）"
-			s.appendAuditFile(auditFile, e)
-			s.writeJSON(w, http.StatusForbidden, map[string]string{
-				"error": "服务端未配置 security.token：破坏性操作已全部拒绝。请在 config.yaml 设置 security.token 后重启 web 再操作。",
-			})
-			return
-		}
-		if !s.tokenMatches(r.Header.Get("X-Auth-Token")) {
-			e.Result, e.Detail = "denied", "X-Auth-Token 缺失或错误"
-			s.appendAuditFile(auditFile, e)
-			s.writeJSON(w, http.StatusUnauthorized, map[string]string{
-				"error": "unauthorized：X-Auth-Token 缺失或错误。",
-			})
-			return
 		}
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		h(rec, r)

@@ -1,83 +1,42 @@
-// MS-11f 笔① FE 锚：token 拦截器（sessionStorage 不落 localStorage）、
-// 401 单框重试（每动作至多一框，二次 401 直显错误）、403 只显提示不弹框、
-// 异常宕停告警行渲染（最新在前）。断言形=源文本精确匹配（禁页面盲扫）。
+// MS-11f 笔① FE 锚（令牌门移除后）：认证平面已整体下线 —— api 层不再有
+// X-Auth-Token 拦截器/会话存储，视图不再有 401 弹框重试路径；异常宕停
+// 告警行渲染（最新在前）继续保留。断言形=源文本精确匹配（禁页面盲扫）。
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const apiSrc = () => readFileSync(resolve(__dirname, '../api/index.ts'), 'utf8')
 const viewSrc = () => readFileSync(resolve(__dirname, 'CDCView.vue'), 'utf8')
-// MC-10 C5: the prompt flow moved to the shared composable — the
-// single-flight contract anchors there now (CDCView consumes it).
-const gateSrc = () => readFileSync(resolve(__dirname, '../composables/useAuthTokenGate.ts'), 'utf8')
+const createSrc = () => readFileSync(resolve(__dirname, 'CompareCreateView.vue'), 'utf8')
+const detailSrc = () => readFileSync(resolve(__dirname, 'TaskDetailView.vue'), 'utf8')
 
-describe('api client token plane (MS-11f)', () => {
-  it('injects X-Auth-Token from sessionStorage on every request', () => {
+describe('api client auth plane removed', () => {
+  it('no token header, no session storage, no verify probe', () => {
     const src = apiSrc()
-    expect(src).toContain(`const AUTH_TOKEN_HEADER = 'X-Auth-Token'`)
-    expect(src).toContain(`api.interceptors.request.use((config) => {`)
-    expect(src).toContain(`if (token) config.headers[AUTH_TOKEN_HEADER] = token`)
-  })
-
-  it('stores the token in sessionStorage — never the persistent web-store API', () => {
-    const src = apiSrc()
-    expect(src).toContain(`sessionStorage.setItem(AUTH_TOKEN_KEY, token)`)
-    expect(src).toContain(`sessionStorage.removeItem(AUTH_TOKEN_KEY)`)
-    // the token must die with the tab: no persistent-store reads/writes
-    expect(src).not.toContain(`localStorage.setItem`)
-    expect(src).not.toContain(`localStorage.getItem`)
-    expect(src).not.toContain(`localStorage.removeItem`)
+    expect(src).not.toContain(`X-Auth-Token`)
+    expect(src).not.toContain(`sessionStorage`)
+    expect(src).not.toContain(`verifySecurityToken`)
+    expect(src).not.toContain(`/security/verify`)
+    expect(src).not.toContain(`api.interceptors.request.use`)
   })
 })
 
-describe('CDCView 401 token prompt (MS-11f 笔① d)', () => {
-  it('one prompt per user action: single-flight flag + retriedAuth depth guard', () => {
+describe('views carry no token-prompt flow', () => {
+  it('CDCView: no composable import, no 401 retry branches', () => {
     const src = viewSrc()
-    const gate = gateSrc()
-    // single-flight: concurrent 401s share one dialog (no stacking)
-    expect(gate).toContain(`let tokenPromptOpen = false`)
-    expect(gate).toContain(`if (tokenPromptOpen) return false`)
-    // CDCView consumes the shared flow, not a local copy
-    expect(src).toContain(`from '../composables/useAuthTokenGate'`)
-    expect(src).not.toContain(`async function promptForToken`)
-    // depth guard: the retry re-enters the op with retriedAuth=true; a second
-    // 401 falls through to the error line, never a second dialog
-    expect(src).toContain(`e.response?.status === 401 && !retriedAuth && await promptForToken()`)
-    expect(src).toContain(`return callCDC(action, true)`)
+    expect(src).not.toContain(`useAuthTokenGate`)
+    expect(src).not.toContain(`promptForToken`)
+    expect(src).not.toContain(`retriedAuth`)
+    expect(src).not.toContain(`status === 401`)
   })
 
-  it('every gated op carries the 401 retry path', () => {
-    const src = viewSrc()
-    // start/stop, PUT config, both imports, checkpoint reset, replica-identity — seven faces
-    for (const anchor of [
-      `async function callCDC(action: 'start' | 'stop', retriedAuth = false)`,
-      `async function saveConn(retriedAuth = false)`,
-      `async function importConn(retriedAuth = false)`,
-      `async function importFromDS(retriedAuth = false)`,
-      `async function resetCheckpoint(retriedAuth = false)`,
-      `async function executeNoPKFix(tables: string[], retriedAuth = false)`,
-    ]) {
-      expect(src).toContain(anchor)
+  it('CompareCreateView / TaskDetailView: same', () => {
+    for (const src of [createSrc(), detailSrc()]) {
+      expect(src).not.toContain(`useAuthTokenGate`)
+      expect(src).not.toContain(`promptForToken`)
+      expect(src).not.toContain(`retriedAuth`)
+      expect(src).not.toContain(`status === 401`)
     }
-    // MC-13: the four template-bound ops (save/import×2/reset) carry the
-    // MouseEvent-proof guard + explicit no-arg calls; callCDC and
-    // executeNoPKFix ride explicit param chains and keep the plain form.
-    const plainForm = src.split(`e.response?.status === 401 && !retriedAuth && await promptForToken()`).length - 1
-    const hardened = src.split(`e.response?.status === 401 && retriedAuth !== true && await promptForToken()`).length - 1
-    expect(plainForm).toBe(2)
-    expect(hardened).toBe(4)
-    expect(src).toContain(`@click="saveConn()"`)
-    expect(src).toContain(`@click="importConn()"`)
-    expect(src).toContain(`@click="importFromDS()"`)
-    expect(src).toContain(`@click="resetCheckpoint()"`)
-  })
-
-  it('403 surfaces as a plain error line — no prompt can fix a server-side gap', () => {
-    const src = viewSrc()
-    // the error extraction reads the server's error field (403 remediation
-    // wording lands verbatim); no 403-specific prompt branch exists
-    expect(src).toContain(`e.response?.data?.error || e.response?.data?.message || e.message || '请求失败'`)
-    expect(src).not.toContain(`status === 403`)
   })
 })
 

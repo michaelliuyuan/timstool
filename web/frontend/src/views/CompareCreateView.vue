@@ -10,7 +10,6 @@ import ConnectionForm from '../components/ConnectionForm.vue'
 import DataSourcePicker from '../components/DataSourcePicker.vue'
 import DbBrowseSelect from '../components/DbBrowseSelect.vue'
 import { useSourceSchema } from '../composables/useSourceSchema'
-import { promptForToken } from '../composables/useAuthTokenGate'
 
 // MongoDB compare task creation (M4): schema-driven forms for both sides
 // (the /sources metadata is the single source of truth — no hard-coded
@@ -98,9 +97,7 @@ function endpointOf(side: 'src' | 'tgt'): CompareTaskSpec['source'] {
   return ep
 }
 
-// MC-10 C5: create + start sit behind the mongocompare token gate; a 401
-// opens the shared token prompt exactly once, then retries the flow.
-async function submit(retriedAuth = false) {
+async function submit() {
   if (!srcDb.value) {
     ElMessage.warning('请填写源端数据库名')
     return
@@ -126,9 +123,6 @@ async function submit(retriedAuth = false) {
     ElMessage.success('对比任务已创建并启动')
     router.push(`/tasks/${data.id}`)
   } catch (e: any) {
-    if (e.response?.status === 401 && retriedAuth !== true && await promptForToken()) {
-      return submit(true)
-    }
     ElMessage.error(e.response?.data?.error || '创建对比任务失败')
   } finally {
     creating.value = false

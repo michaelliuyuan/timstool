@@ -32,8 +32,8 @@ func TestAnomalyAlarmSeededByAuditedStart(t *testing.T) {
 		t.Fatalf("precondition: checker has observed nothing yet")
 	}
 
-	// operator start through the gated route ⇒ success audit lands ⇒ seed
-	w, req := doReqToken("POST", "/api/v1/cdc/start", "", testAuthToken)
+	// operator start through the audited route ⇒ success audit lands ⇒ seed
+	w, req := doReq("POST", "/api/v1/cdc/start", "")
 	s.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("audited start failed: %d %s", w.Code, w.Body.String())

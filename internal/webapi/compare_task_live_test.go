@@ -136,15 +136,11 @@ func TestCompareTaskEndToEndLive(t *testing.T) {
 }
 
 // startTaskChi invokes handleStartTask with a chi-populated {taskID} param.
-// MC-10: compare starts sit behind the inline token gate — drive it the way
-// an authorized client does (snapshot token + X-Auth-Token header).
 func startTaskChi(t *testing.T, s *Server, taskID string) *httptest.ResponseRecorder {
 	t.Helper()
-	s.SetSecurityToken(testAuthToken)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("taskID", taskID)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/"+taskID+"/start", nil)
-	req.Header.Set("X-Auth-Token", testAuthToken)
 	req = req.WithContext(context.WithValue(context.Background(), chi.RouteCtxKey, rctx))
 	rec := httptest.NewRecorder()
 	s.handleStartTask(rec, req)

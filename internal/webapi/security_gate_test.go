@@ -1,15 +1,14 @@
 package webapi
 
-// MS-11f 笔① anchors: destructive-endpoint token gate (three states),
-// zero-echo, audit trail structure, anomaly-stop alarm (trigger /
-// no-trigger / no-repeat), weak-token entropy advisory, CORS header.
+// MS-11f 笔① anchors (post gate removal): destructive endpoints run
+// ungated, audit trail structure, anomaly-stop alarm (trigger /
+// no-trigger / no-repeat).
 
 import (
 	"bufio"
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,84 +18,29 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/cdc"
 )
 
-func doReqToken(method, path, body, token string) (*httptest.ResponseRecorder, *http.Request) {
-	req := httptest.NewRequest(method, path, strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("X-Auth-Token", token)
-	}
-	return httptest.NewRecorder(), req
-}
-
-// Gate three states through the real router: unset = 403 fail-closed with a
-// remediation hint; wrong/missing = 401; matching = handler runs.
-func TestSecurityGateThreeStates(t *testing.T) {
+// Destructive endpoints run ungated: POST /cdc/stop with no token at all
+// reaches the handler (supervisor nil => 200 "not wired").
+func TestDestructiveRoutesUngated(t *testing.T) {
 	s, _ := newTestServer(t)
-	s.SetSecurityToken("") // unset: fail-closed
 
-	w, req := doReqToken("POST", "/api/v1/cdc/stop", "", "")
-	s.router.ServeHTTP(w, req)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("unset token: %d (want 403): %s", w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), "security.token") {
-		t.Fatalf("403 must carry the remediation hint: %s", w.Body.String())
-	}
-
-	s.SetSecurityToken("gate-token-0123456789")
-	w, req = doReqToken("POST", "/api/v1/cdc/stop", "", "wrong-token-value")
-	s.router.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("wrong token: %d (want 401): %s", w.Code, w.Body.String())
-	}
-
-	w, req = doReqToken("POST", "/api/v1/cdc/stop", "", "")
-	s.router.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("missing token: %d (want 401): %s", w.Code, w.Body.String())
-	}
-
-	// supervisor nil => handleCDCStop answers 200 "not wired" — proves the
-	// gate passed through to the handler on a matching token.
-	w, req = doReqToken("POST", "/api/v1/cdc/stop", "", "gate-token-0123456789")
+	w, req := doReq("POST", "/api/v1/cdc/stop", "")
 	s.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
-		t.Fatalf("matching token: %d (want 200): %s", w.Code, w.Body.String())
+		t.Fatalf("POST /cdc/stop without token: %d (want 200): %s", w.Code, w.Body.String())
 	}
 }
 
-// MS-11f 笔② 增补件 (adversarial P2, seq95 ruling): the seventh CDC write
-// endpoint POST /cdc/replica-identity is gated too — same three states, with
-// the 200 face driven through the real handler (config + fake executor).
-func TestSecurityGateReplicaIdentitySeventhRoute(t *testing.T) {
+// POST /cdc/replica-identity through the real handler (config + fake
+// executor), no token: 200 ok:true.
+func TestReplicaIdentityRouteUngated(t *testing.T) {
 	s, _, _ := newCDCServer(t)
 	s.replicaIdentityExec = &fakeReplicaExec{canAlter: map[string]bool{"public.a": true}}
 	body := `{"confirm":"ALTER","tables":["a"]}`
 
-	s.SetSecurityToken("") // unset: fail-closed
-	w, req := doReqToken("POST", "/api/v1/cdc/replica-identity", body, "")
-	s.router.ServeHTTP(w, req)
-	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "security.token") {
-		t.Fatalf("unset token: %d (want 403+hint): %s", w.Code, w.Body.String())
-	}
-
-	s.SetSecurityToken("gate-token-0123456789")
-	w, req = doReqToken("POST", "/api/v1/cdc/replica-identity", body, "wrong-token-value")
-	s.router.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("wrong token: %d (want 401): %s", w.Code, w.Body.String())
-	}
-	w, req = doReqToken("POST", "/api/v1/cdc/replica-identity", body, "")
-	s.router.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("missing token: %d (want 401): %s", w.Code, w.Body.String())
-	}
-
-	// matching token reaches the handler: fake executor alters public.a => 200 ok
-	w, req = doReqToken("POST", "/api/v1/cdc/replica-identity", body, "gate-token-0123456789")
+	w, req := doReq("POST", "/api/v1/cdc/replica-identity", body)
 	s.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"ok":true`) {
-		t.Fatalf("matching token: %d (want 200 ok:true): %s", w.Code, w.Body.String())
+		t.Fatalf("replica-identity without token: %d (want 200 ok:true): %s", w.Code, w.Body.String())
 	}
 }
 
@@ -104,60 +48,25 @@ func TestSecurityGateReplicaIdentitySeventhRoute(t *testing.T) {
 // answers 200 with no token at all.
 func TestSecurityGateReadsStayOpen(t *testing.T) {
 	s, _ := newTestServer(t)
-	s.SetSecurityToken("gate-token-0123456789")
-	w, req := doReqToken("GET", "/api/v1/cdc/status", "", "")
+	w, req := doReq("GET", "/api/v1/cdc/status", "")
 	s.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("GET /cdc/status without token: %d (want 200)", w.Code)
 	}
 }
 
-// Zero-echo (ruling seq83 #1): the token value must never appear in any
-// response body — 401/403 faces, /cdc/status (with alarms), GET /cdc/config
-// against a config.yaml that carries security.token.
-func TestSecurityTokenZeroEcho(t *testing.T) {
-	s, _, cfgFile := newCDCServer(t)
-	const secret = "zero-echo-secret-0123456789"
-	s.SetSecurityToken(secret)
-
-	faces := func() []string {
-		w1, r1 := doReqToken("POST", "/api/v1/cdc/stop", "", "wrong")
-		s.router.ServeHTTP(w1, r1)
-		w2, r2 := doReqToken("GET", "/api/v1/cdc/status", "", "")
-		s.router.ServeHTTP(w2, r2)
-		w3, r3 := doReqToken("GET", "/api/v1/cdc/config", "", "")
-		s.router.ServeHTTP(w3, r3)
-		return []string{w1.Body.String(), w2.Body.String(), w3.Body.String()}
-	}()
-	// seed an alarm so the .alarms face is exercised too
-	s.pushAlarm("测试告警行")
-	for _, body := range faces {
-		if strings.Contains(body, secret) {
-			t.Fatalf("token value echoed in response: %.200s", body)
-		}
-	}
-	// config.yaml itself carries the token; GET /cdc/config must not leak it
-	// (the summary struct has no security face at all).
-	if err := os.WriteFile(cfgFile, []byte("source:\n  host: a\n  port: 1\ntarget:\n  host: b\n  port: 2\nsecurity:\n  token: "+secret+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	w, req := doReqToken("GET", "/api/v1/cdc/config", "", "")
-	s.router.ServeHTTP(w, req)
-	if strings.Contains(w.Body.String(), secret) {
-		t.Fatalf("GET /cdc/config leaked security.token: %s", w.Body.String())
-	}
-}
-
-// Audit structure: denied and success both leave a JSONL line with the full
-// field set; the direct peer IP is recorded; a successful stop advances
+// Audit structure: every audited op leaves a JSONL line with the full field
+// set; the direct peer IP is recorded; a successful stop advances
 // lastStopAuditAt.
 func TestAuditTrailStructure(t *testing.T) {
 	s, _ := newTestServer(t)
-	s.SetSecurityToken("audit-token-0123456789")
 
-	w, req := doReqToken("POST", "/api/v1/cdc/stop", "", "nope")
+	w, req := doReq("POST", "/api/v1/cdc/stop", "")
 	s.router.ServeHTTP(w, req)
-	w, req = doReqToken("POST", "/api/v1/cdc/stop", "", "audit-token-0123456789")
+	if w.Code != http.StatusOK {
+		t.Fatalf("stop failed: %d %s", w.Code, w.Body.String())
+	}
+	w, req = doReq("POST", "/api/v1/cdc/stop", "")
 	s.router.ServeHTTP(w, req)
 
 	f, err := os.Open(filepath.Join(s.dataDir, "audit", "cdc-ops.jsonl"))
@@ -175,55 +84,21 @@ func TestAuditTrailStructure(t *testing.T) {
 		entries = append(entries, e)
 	}
 	if len(entries) != 2 {
-		t.Fatalf("audit entries = %d (want 2: denied + success)", len(entries))
+		t.Fatalf("audit entries = %d (want 2)", len(entries))
 	}
-	denied, ok := entries[0], entries[1]
-	if denied.Result != "denied" || denied.Action != "cdc.stop" {
-		t.Fatalf("denied entry wrong: %+v", denied)
+	first := entries[0]
+	if first.Result != "success" || first.Action != "cdc.stop" {
+		t.Fatalf("success entry wrong: %+v", first)
 	}
-	if denied.IP == "" || denied.Method != "POST" || denied.Endpoint != "/api/v1/cdc/stop" {
-		t.Fatalf("denied entry fields missing: %+v", denied)
+	if first.IP == "" || first.Method != "POST" || first.Endpoint != "/api/v1/cdc/stop" {
+		t.Fatalf("entry fields missing: %+v", first)
 	}
-	if denied.TS.IsZero() {
-		t.Fatalf("denied entry has no timestamp")
+	if first.TS.IsZero() {
+		t.Fatalf("entry has no timestamp")
 	}
-	if ok.Result != "success" {
-		t.Fatalf("success entry wrong: %+v", ok)
-	}
-	if ts := s.lastStopAuditTime(); ts.IsZero() || ts.Before(denied.TS) {
+	if ts := s.lastStopAuditTime(); ts.IsZero() || ts.Before(first.TS) {
 		t.Fatalf("lastStopAuditAt must advance on a successful stop: %v", ts)
 	}
-}
-
-// Entropy advisory (ruling seq85 #2): weak tokens WARN + audit, never refuse;
-// strong tokens record nothing.
-func TestWeakTokenEntropyAdvisory(t *testing.T) {
-	s, _ := newTestServer(t)
-	s.SetSecurityToken("short")
-	if !hasWarnAudit(s, "security.token_entropy") {
-		t.Fatalf("short token must leave an entropy warn audit line")
-	}
-	s2, _ := newTestServer(t)
-	s2.SetSecurityToken("12345678901234567890")
-	if !hasWarnAudit(s2, "security.token_entropy") {
-		t.Fatalf("pure-digit token must leave an entropy warn audit line")
-	}
-	s3, _ := newTestServer(t)
-	s3.SetSecurityToken("strong-token-0123456789")
-	if hasWarnAudit(s3, "security.token_entropy") {
-		t.Fatalf("strong token must not warn")
-	}
-}
-
-func hasWarnAudit(s *Server, action string) bool {
-	s.auditMu.Lock()
-	defer s.auditMu.Unlock()
-	for _, e := range s.auditRing {
-		if e.Action == action && e.Result == "warn" {
-			return true
-		}
-	}
-	return false
 }
 
 // stubCDCProvider pins the status-file view the anomaly checker reads.
@@ -292,8 +167,8 @@ func TestAnomalyAlarmSilentWhenStopIsAudited(t *testing.T) {
 	c := newCDCAnomalyChecker(s, time.Hour, nil)
 	c.check() // running observed
 
-	// operator stop through the gated route ⇒ success audit lands
-	w, req := doReqToken("POST", "/api/v1/cdc/stop", "", testAuthToken)
+	// operator stop through the audited route ⇒ success audit lands
+	w, req := doReq("POST", "/api/v1/cdc/stop", "")
 	s.router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("audited stop failed: %d %s", w.Code, w.Body.String())
@@ -439,7 +314,7 @@ func TestCDCStatusSurfacesAlarms(t *testing.T) {
 	s, _ := newTestServer(t)
 	s.cdcEnabled = true // the disabled branch answers before the alarms face
 	s.pushAlarm("行一")
-	w, req := doReqToken("GET", "/api/v1/cdc/status", "", "")
+	w, req := doReq("GET", "/api/v1/cdc/status", "")
 	s.router.ServeHTTP(w, req)
 	var resp struct {
 		Alarms []CDCAlarm `json:"alarms"`
@@ -449,47 +324,5 @@ func TestCDCStatusSurfacesAlarms(t *testing.T) {
 	}
 	if len(resp.Alarms) != 1 || resp.Alarms[0].Message != "行一" {
 		t.Fatalf("alarms face: %+v", resp.Alarms)
-	}
-}
-
-// CORS form anchor: the preflight allow-list must include X-Auth-Token or
-// the browser rejects the header before the gate ever sees it.
-func TestCORSAllowsAuthTokenHeader(t *testing.T) {
-	src := srcOf(t, "server.go")
-	if !strings.Contains(src, `"X-Auth-Token"`) {
-		t.Fatalf("AllowedHeaders must include X-Auth-Token")
-	}
-}
-
-// tokenMatches shape: exact match passes; wrong value, wrong length and
-// unicode variants fail (constant-time form is pinned by the hash-then-
-// compare source anchor below).
-func TestTokenMatches(t *testing.T) {
-	s := &Server{authToken: "abcdef0123456789"}
-	if !s.tokenMatches("abcdef0123456789") {
-		t.Fatalf("exact match must pass")
-	}
-	for _, bad := range []string{"", "abcdef012345678", "abcdef0123456789x", "ABCDEF0123456789"} {
-		if s.tokenMatches(bad) {
-			t.Fatalf("mismatch %q must fail", bad)
-		}
-	}
-	empty := &Server{}
-	if empty.tokenMatches("") || empty.tokenMatches("anything") {
-		t.Fatalf("unset gate: nobody passes")
-	}
-}
-
-// Form anchor: the compare must hash BOTH sides first (flattening length)
-// and then constant-time compare — a plain subtle.ConstantTimeCompare on the
-// raw strings still short-circuits on length (adversarial seq84 #1).
-func TestTokenCompareHashesBothSides(t *testing.T) {
-	src := srcOf(t, "security_gate.go")
-	i := strings.Index(src, "func (s *Server) tokenMatches")
-	body := src[i:]
-	for _, anchor := range []string{"sha256.Sum256([]byte(s.authToken))", "sha256.Sum256([]byte(presented))", "subtle.ConstantTimeCompare"} {
-		if !strings.Contains(body, anchor) {
-			t.Fatalf("tokenMatches missing form anchor: %s", anchor)
-		}
 	}
 }
