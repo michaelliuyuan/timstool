@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/common/reporter"
 )
 
 // #t3 watermark compare anchors: filter-group normalization/defaults,
@@ -115,5 +116,36 @@ func TestCompareOptionsWatermarkMerge(t *testing.T) {
 	s.handlePutCompareOptions(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("invalid group must 400, got %d", w.Code)
+	}
+}
+
+// A4: runtime per-table skip — a watermark run whose column was unusable on
+// EVERY table (all StatusSkip) is an explicit task failure with the
+// dedicated message, never a misleading "completed"; a mixed report (≥1
+// non-skip) is NOT all-skipped.
+func TestCompareAllTablesSkipped(t *testing.T) {
+	if compareAllTablesSkipped(nil) {
+		t.Fatal("nil report must not read as all-skipped")
+	}
+	rpt := reporter.NewReport("data")
+	if compareAllTablesSkipped(rpt) {
+		t.Fatal("empty report must not read as all-skipped")
+	}
+	rpt.AddTableReport(reporter.TableReport{TableName: "a", Status: reporter.StatusSkip})
+	rpt.AddTableReport(reporter.TableReport{TableName: "b", Status: reporter.StatusSkip})
+	if !compareAllTablesSkipped(rpt) {
+		t.Fatal("all-skip report must be detected")
+	}
+	rpt.AddTableReport(reporter.TableReport{TableName: "c", Status: reporter.StatusPass})
+	if compareAllTablesSkipped(rpt) {
+		t.Fatal("mixed report (pass present) must NOT be all-skipped")
+	}
+	// Non-skip statuses all break the all-skip reading.
+	rpt.Tables = []reporter.TableReport{
+		{TableName: "a", Status: reporter.StatusSkip},
+		{TableName: "b", Status: reporter.StatusFail},
+	}
+	if compareAllTablesSkipped(rpt) {
+		t.Fatal("fail table must NOT count as skipped")
 	}
 }

@@ -676,9 +676,13 @@ export const apiClient = {
 
   // FEAT-WM-AUTO: rank unified watermark column candidates by scoring the
   // whole source schema's catalog (coverage/name/type/index/DEFAULT now()).
-  suggestWatermark: (ref: string) =>
+  // Optional tables subset (compare page): candidates are scored over
+  // exactly that selection and requested-but-absent tables come back as
+  // missing_tables (absent/empty tables = whole-schema behavior).
+  suggestWatermark: (ref: string, tables?: string[]) =>
     api.post<{
       total_tables: number
+      missing_tables?: string[]
       candidates: {
         column: string
         score: number
@@ -691,7 +695,7 @@ export const apiClient = {
         reasons: string[]
         warnings: string[]
       }[]
-    }>('/incremental/suggest-watermark', { source_ref: ref }, { timeout: LONG_TIMEOUT }),
+    }>('/incremental/suggest-watermark', { source_ref: ref, tables: tables || undefined }, { timeout: LONG_TIMEOUT }),
 
   // Compatibility assessment (S1-UI-08): body is { source_ref } or the inline
   // PG form; format 'html' returns the report as text instead of JSON.

@@ -18,13 +18,20 @@ func NewCollector(db *sql.DB) *Collector {
 	return &Collector{db: db}
 }
 
-func (c *Collector) CollectTables(ctx context.Context, schema string, excludeTables []string) ([]TableInfo, error) {
-	query := `
-		SELECT table_name
-		FROM information_schema.tables
-		WHERE table_schema = $1 AND table_type = 'BASE TABLE'
-		ORDER BY table_name
+// collectTablesSQL is the schema-collector table universe (/sources/tables
+// PG path), aligned to the watermark suggest catalog (wmCatalogSQL) and
+// /config/list-tables: partition children are excluded so all three faces
+// share ONE table universe (relkind r/p AND NOT relispartition).
+const collectTablesSQL = `
+		SELECT c.relname
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+		ORDER BY c.relname
 	`
+
+func (c *Collector) CollectTables(ctx context.Context, schema string, excludeTables []string) ([]TableInfo, error) {
+	query := collectTablesSQL
 	rows, err := c.db.QueryContext(ctx, query, schema)
 	if err != nil {
 		return nil, fmt.Errorf("query tables: %w", err)

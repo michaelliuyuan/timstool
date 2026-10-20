@@ -72,53 +72,102 @@ const wmBaseModes = [
   { value: 'sample', label: '采样' },
   { value: 'checksum', label: '校验（推荐）' },
 ]
-const wmCommonColumns = ref<{ name: string; data_type: string; indexed: boolean }[]>([])
+// ---- #wm-candidates: suggest 式 Top-N 候选水位列 ----
+// The compare page now rides the SAME suggest scorer as the watermark
+// module (coverage/name/type/index scoring over the SELECTED tables), with
+// allow-create as the manual-entry fallback and missing/unmatched tables
+// disclosed explicitly — the strict columns-batch intersection is gone.
+interface WmSuggestCandidate {
+  column: string
+  score: number
+  coverage: number
+  indexed_ratio: number
+  default_now_ratio: number
+  type_histogram: Record<string, number>
+  matched_tables: string[]
+  unmatched_tables: string[]
+  reasons: string[]
+  warnings: string[]
+}
+const wmCandidates = ref<WmSuggestCandidate[]>([])
+const wmMissingTables = ref<string[]>([])
+const wmSuggestTotal = ref(0)
 const wmLoadingCols = ref(false)
+
+// The candidate matching the current column pick (undefined for a
+// hand-typed name — those keep the value-shape inference path).
+const activeWmCandidate = computed(() => wmCandidates.value.find(c => c.column === wmConfig.column))
+
+// Dominant comparable type (type_histogram max key) drives the value
+// control kind; null when no candidate is active.
+const wmDominantType = computed<string>(() => {
+  const h = activeWmCandidate.value?.type_histogram || {}
+  let best = ''
+  let n = -1
+  for (const [k, v] of Object.entries(h)) {
+    if (v > n) { n = v; best = k }
+  }
+  return best
+})
+
+// Disclosure states (error 显式披露): all-missing is a hard error; a
+// partial missing set is a warning; no candidates over existing tables
+// points at manual entry — never the old misleading empty-intersection
+// wording.
+const wmAllMissing = computed(() =>
+  wmMissingTables.value.length > 0 && wmMissingTables.value.length >= selectedTables.value.length)
+const wmNoCandidates = computed(() =>
+  wmCandidates.value.length === 0 && !wmAllMissing.value)
 
 async function loadWmColumns() {
   if (!sourceRef.value) {
-    ElMessage.warning('手填连接模式下请直接输入水位列名（运行期会逐表校验）')
+    ElMessage.warning('手填连接模式下请直接输入水位列名（运行期缺列表将逐表跳过）')
     return
   }
   if (selectedTables.value.length === 0) {
-    ElMessage.warning('请先选择表，再获取共用水位列')
+    ElMessage.warning('请先选择表，再获取候选水位列')
     return
   }
   wmLoadingCols.value = true
   try {
-    const { data } = await apiClient.columnsBatch(sourceRef.value, selectedTables.value)
-    let inter: Map<string, { data_type: string; indexed: boolean }> | null = null
-    for (const t of (data.tables || [])) {
-      if (t.error) continue
-      const m = new Map<string, { data_type: string; indexed: boolean }>()
-      for (const c of (t.columns || [])) if (c.comparable) m.set(c.name, { data_type: c.data_type, indexed: c.indexed })
-      if (inter === null) inter = m
-      else for (const k of [...inter.keys()]) if (!m.has(k)) inter.delete(k)
+    const { data } = await apiClient.suggestWatermark(sourceRef.value, selectedTables.value)
+    wmCandidates.value = (data.candidates || []) as WmSuggestCandidate[]
+    wmMissingTables.value = data.missing_tables || []
+    wmSuggestTotal.value = data.total_tables || 0
+    if (wmAllMissing.value) {
+      ElMessage.error('所选表在源库均不存在，无法获取候选水位列')
+    } else {
+      if (wmMissingTables.value.length > 0) {
+        ElMessage.warning(`以下 ${wmMissingTables.value.length} 张表在源库不存在，已排除：${wmMissingTables.value.join('、')}`)
+      }
+      if (wmNoCandidates.value) {
+        ElMessage.warning('所选表均无可比类型列，请手输列名或调整表选择')
+      }
     }
-    wmCommonColumns.value = inter ? [...inter.entries()].map(([name, v]) => ({ name, ...v })) : []
-    if (wmCommonColumns.value.length === 0) {
-      ElMessage.warning('所选表没有可比类型的共用水位列（交集为空），请手输列名或调整表选择')
+    // Preselect the Top-1 candidate only when nothing is picked yet — an
+    // existing (possibly hand-typed) column is never overwritten.
+    if (!wmConfig.column && wmCandidates.value.length > 0) {
+      wmConfig.column = wmCandidates.value[0].column
     }
   } catch (e: any) {
-    ElMessage.error(`获取共用水位列失败: ${e.response?.data?.error || e.message}`)
+    ElMessage.error(`获取候选水位列失败: ${e.response?.data?.error || e.message}`)
   } finally {
     wmLoadingCols.value = false
   }
 }
 
-const wmSelectedCol = computed(() => wmCommonColumns.value.find(c => c.name === wmConfig.column))
 const wmKind = computed<'datetime' | 'date' | 'int' | 'text'>(() => {
-  const dt = wmSelectedCol.value?.data_type || ''
-  if (dt.includes('timestamp')) return 'datetime'
-  if (dt === 'date') return 'date'
-  if (dt === 'integer' || dt === 'bigint') return 'int'
+  const t = wmDominantType.value
+  if (t === 'timestamptz' || t === 'timestamp' || t === 'datetime') return 'datetime'
+  if (t === 'date') return 'date'
+  if (t === 'bigint' || t === 'integer') return 'int'
   return 'text'
 })
-const wmIsTimestamptz = computed(() => (wmSelectedCol.value?.data_type || '').includes('time zone'))
+const wmIsTimestamptz = computed(() => wmDominantType.value === 'timestamptz')
 
-// 手填模式（无 columns-batch 元数据）时按值形态推断控件。
+// 手填模式（未命中候选、无元数据）时按值形态推断控件。
 const wmKindInferred = computed(() => {
-  if (wmSelectedCol.value) return wmKind.value
+  if (activeWmCandidate.value) return wmKind.value
   if (/^\d+$/.test(wmConfig.value)) return 'int'
   if (/^\d{4}-\d{2}-\d{2}$/.test(wmConfig.value)) return 'date'
   if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(wmConfig.value)) return 'datetime'
@@ -500,6 +549,10 @@ function statusText(s: string) {
 function tableStatusTag(s: string) {
   return { pass: 'success', fail: 'danger', warn: 'warning', skip: 'info' }[s] || 'info'
 }
+// skip 显示为独立的灰色「跳过」标签（含原因披露），绝不与 fail 混同。
+function tableStatusText(s: string) {
+  return { pass: '通过', fail: '失败', warn: '警告', skip: '跳过' }[s] || s
+}
 
 // Diff-count heat scale: 0 → teal, small → amber, large → brand red.
 function diffHeat(n: number | undefined): string {
@@ -723,12 +776,12 @@ onUnmounted(() => {
           <el-form-item label="水位列">
             <div style="width: 100%;">
               <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-                <el-select v-if="wmCommonColumns.length" v-model="wmConfig.column" filterable placeholder="所选表共有可比列" style="width: 300px;">
-                  <el-option v-for="c in wmCommonColumns" :key="c.name" :value="c.name"
-                             :label="`${c.name}（${c.data_type}${c.indexed ? '' : ' · 无索引'}）`" />
+                <el-select v-model="wmConfig.column" filterable allow-create default-first-option clearable
+                           placeholder="候选列（先获取）或手输列名" style="width: 300px;">
+                  <el-option v-for="c in wmCandidates" :key="c.column" :value="c.column"
+                             :label="`${c.column}（覆盖 ${c.matched_tables.length}/${wmSuggestTotal || selectedTables.length} · ${c.score.toFixed(0)} 分）`" />
                 </el-select>
-                <el-input v-else v-model="wmConfig.column" placeholder="水位列名（如 updated_at）" style="width: 300px;" />
-                <el-button size="small" :loading="wmLoadingCols" :disabled="!sourceRef" @click="loadWmColumns">获取共用水位列</el-button>
+                <el-button size="small" :loading="wmLoadingCols" :disabled="!sourceRef" @click="loadWmColumns">获取候选水位列</el-button>
                 <el-select v-model="wmConfig.op" style="width: 90px;">
                   <el-option value="<=" label="≤（含边界）" />
                   <el-option value="<" label="<（严格）" />
@@ -739,10 +792,26 @@ onUnmounted(() => {
                                 value-format="YYYY-MM-DD" placeholder="水位值 YYYY-MM-DD" style="width: 230px;" />
                 <el-input v-else v-model="wmConfig.value" placeholder="水位值" style="width: 230px;" />
               </div>
+              <el-alert v-if="wmAllMissing" type="error" :closable="false" style="margin-top: 6px;"
+                        :title="`所选 ${wmMissingTables.length} 张表在源库均不存在，无法获取候选水位列，请核对表选择或数据源`" />
+              <template v-else>
+                <el-alert v-if="wmMissingTables.length" type="warning" :closable="false" style="margin-top: 6px;"
+                          :title="`以下 ${wmMissingTables.length} 张表在源库不存在，已排除：${wmMissingTables.join('、')}`" />
+                <el-alert v-if="wmNoCandidates" type="warning" :closable="false" style="margin-top: 6px;"
+                          title="所选表均无可比类型列，请手输列名或调整表选择" />
+              </template>
+              <div v-if="activeWmCandidate" style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-top: 6px;">
+                覆盖 {{ activeWmCandidate.matched_tables.length }}/{{ wmSuggestTotal || selectedTables.length }} 张表（{{ (activeWmCandidate.coverage * 100).toFixed(0) }}%）
+                <span v-if="activeWmCandidate.warnings?.length" style="color: var(--tims-tag-warning-text);">；{{ activeWmCandidate.warnings[0] }}</span>
+                <el-tooltip v-if="activeWmCandidate.unmatched_tables?.length" placement="top">
+                  <template #content>{{ activeWmCandidate.unmatched_tables.join('、') }}</template>
+                  <span style="color: var(--tims-tag-warning-text); cursor: help;">；缺该列 {{ activeWmCandidate.unmatched_tables.length }} 张表（悬停查看，运行期将逐表跳过）</span>
+                </el-tooltip>
+              </div>
               <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-top: 6px;">
                 两端按同一条件过滤后比对，消除「源端持续写入+同步滞后」的永久差异假象；NULL 水位行两端一致排除。
+                运行期缺列或类型不符的表将逐表跳过（报告中标记 skip，不再计为失败）。
                 <span v-if="wmIsTimestamptz" style="color: var(--tims-tag-warning-text);">timestamptz 列请输入 UTC 时间。</span>
-                <span v-if="wmSelectedCol && !wmSelectedCol.indexed" style="color: var(--tims-tag-warning-text);">该列无索引，过滤可能全表扫描。</span>
               </div>
             </div>
           </el-form-item>
@@ -837,7 +906,7 @@ onUnmounted(() => {
           <el-table-column prop="table_name" label="表名" min-width="140" />
           <el-table-column label="状态" width="90">
             <template #default="{ row }">
-              <el-tag :type="tableStatusTag(row.status)" size="small">{{ row.status }}</el-tag>
+              <el-tag :type="tableStatusTag(row.status)" size="small">{{ tableStatusText(row.status) }}</el-tag>
             </template>
           </el-table-column>
           <el-table-column prop="source_rows" label="源行数" width="110" align="right" class-name="tims-num-col" />
@@ -848,7 +917,9 @@ onUnmounted(() => {
             </template>
           </el-table-column>
           <el-table-column prop="duration" label="耗时" width="90" class-name="hide-sm" />
-          <el-table-column prop="error" label="错误/建议" min-width="200" show-overflow-tooltip />
+          <el-table-column label="错误/建议" min-width="200" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.error ? row.error : row.suggestion }}</template>
+          </el-table-column>
           </el-table>
         </div>
       </template>

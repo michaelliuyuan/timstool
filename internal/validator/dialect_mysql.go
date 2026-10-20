@@ -83,7 +83,9 @@ var wmAllowedColumnTypesMySQL = map[string]bool{
 // ValidateWatermarkColumn mirrors postgresDialect.ValidateWatermarkColumn
 // with the MySQL `?`-placeholder information_schema probe and the MySQL
 // DATA_TYPE whitelist (action-a verified: DATA_TYPE returns lowercase
-// "datetime" on TiDB/MySQL wire).
+// "datetime" on TiDB/MySQL wire). The column-absent and type-not-comparable
+// branches return wmSkipf sentinel errors (same text, errors.Is ⇒
+// ErrWatermarkColumnSkip) for the runtime per-table skip.
 func (mysqlDialect) ValidateWatermarkColumn(ctx context.Context, q dialectQueryer, schema, table string, wm *config.WatermarkFilter) error {
 	var dataType string
 	err := q.QueryRowContext(ctx, `
@@ -91,13 +93,13 @@ func (mysqlDialect) ValidateWatermarkColumn(ctx context.Context, q dialectQuerye
 		WHERE table_schema = ? AND table_name = ? AND column_name = ?`,
 		schema, table, wm.Column).Scan(&dataType)
 	if err == sql.ErrNoRows {
-		return fmt.Errorf("水位列 %s 不存在于表 %s（水位过滤仅支持列存在的表参与比对）", wm.Column, table)
+		return wmSkipf("水位列 %s 不存在于表 %s（水位过滤仅支持列存在的表参与比对）", wm.Column, table)
 	}
 	if err != nil {
 		return fmt.Errorf("校验水位列: %w", err)
 	}
 	if !wmAllowedColumnTypesMySQL[dataType] {
-		return fmt.Errorf("水位列 %s 类型 %s 不在可比白名单（datetime/timestamp/date/int/bigint）", wm.Column, dataType)
+		return wmSkipf("水位列 %s 类型 %s 不在可比白名单（datetime/timestamp/date/int/bigint）", wm.Column, dataType)
 	}
 	return nil
 }

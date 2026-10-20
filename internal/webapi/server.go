@@ -755,6 +755,21 @@ func probeTiDBStatus(ctx context.Context, host string, port int) error {
 	return nil
 }
 
+// listTablesSQL is the /config/list-tables universe, aligned to the suggest
+// catalog's口径 (wmCatalogSQL): pg_class/pg_namespace with relkind IN
+// ('r','p') AND NOT relispartition — partition children (e.g. big_pt_p0)
+// are excluded so the compare page, IncrementalView (/sources/tables via
+// CollectTables) and the watermark suggest catalog share ONE table
+// universe. The row_estimate stays a correlated pg_class subquery; ordering
+// stays table_name.
+const listTablesSQL = `
+		SELECT t.relname AS table_name,
+		       (SELECT pc.reltuples::bigint FROM pg_class pc WHERE pc.oid = t.oid) AS row_estimate
+		FROM pg_class t
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE n.nspname = $1 AND t.relkind IN ('r', 'p') AND NOT t.relispartition
+		ORDER BY t.relname`
+
 func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 	var req TestConnectionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -812,12 +827,7 @@ func (s *Server) handleListTables(w http.ResponseWriter, r *http.Request) {
 	}
 	defer pgConn.Close()
 
-	rows, err := pgConn.QueryContext(r.Context(), `
-		SELECT table_name,
-		       (SELECT reltuples::bigint FROM pg_class WHERE oid = (quote_ident($1)||'.'||quote_ident(t.table_name))::regclass) AS row_estimate
-		FROM information_schema.tables t
-		WHERE table_schema = $1 AND table_type = 'BASE TABLE'
-		ORDER BY table_name`, cfg.Schema)
+	rows, err := pgConn.QueryContext(r.Context(), listTablesSQL, cfg.Schema)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "query tables: "+err.Error())
 		return

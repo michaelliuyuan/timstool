@@ -576,6 +576,21 @@ func buildCompareRunParams(task *CompareTask, reportFile string) (float64, commo
 	return sampleRatio, opts, compareCfg
 }
 
+// compareAllTablesSkipped reports whether a finished report skipped EVERY
+// table (watermark-active run whose column was unusable everywhere): the run
+// produced no comparison evidence at all, which must not read as "completed".
+func compareAllTablesSkipped(rpt *reporter.Report) bool {
+	if rpt == nil || len(rpt.Tables) == 0 {
+		return false
+	}
+	for _, t := range rpt.Tables {
+		if t.Status != reporter.StatusSkip {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 	logger := zap.L()
 	logger.Info("starting standalone comparison",
@@ -641,6 +656,13 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 	}
 	if err != nil {
 		finish(CompareStatusFailed, err.Error())
+		return
+	}
+
+	// Watermark active + every table skipped ⇒ no evidence at all — fail
+	// the task explicitly instead of a misleading "completed".
+	if task.Watermark != nil && compareAllTablesSkipped(report) {
+		finish(CompareStatusFailed, "水位列在所选表均不可用，已全部跳过")
 		return
 	}
 

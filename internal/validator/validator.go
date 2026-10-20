@@ -309,11 +309,9 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 					werr := v.srcDialect.ValidateWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), tableName, wm)
 					release()
 					if werr != nil {
-						tr = reporter.TableReport{
-							TableName: tableName,
-							Status:    reporter.StatusFail,
-							Error:     werr.Error(),
-						}
+						// Sentinel (column absent / type not comparable) ⇒
+						// per-table runtime skip; probe failures stay fails.
+						tr = wmSkipReport(tableName, werr)
 						break
 					}
 				}
@@ -424,11 +422,9 @@ func (v *Validator) validateTableUnit(ctx context.Context, pgDB *sql.DB, tidbCon
 	wm *config.WatermarkFilter, fn func(*sql.Conn) reporter.TableReport) reporter.TableReport {
 	if wm != nil {
 		if werr := v.srcDialect.ValidateWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), table, wm); werr != nil {
-			return reporter.TableReport{
-				TableName: table,
-				Status:    reporter.StatusFail,
-				Error:     werr.Error(),
-			}
+			// Sentinel (column absent / type not comparable) ⇒ per-table
+			// runtime skip; probe failures stay hard fails.
+			return wmSkipReport(table, werr)
 		}
 	}
 	return fn(tidbConn)

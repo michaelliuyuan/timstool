@@ -1,10 +1,13 @@
 package validator
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/common/reporter"
 )
 
 // #t3 watermark-compare anchors: predicate SQL shapes (parameterized,
@@ -100,5 +103,46 @@ func TestWmAllowedColumnTypes(t *testing.T) {
 		if wmAllowedColumnTypes[bad] {
 			t.Errorf("type %q must be rejected", bad)
 		}
+	}
+}
+
+// A7: sentinel wrap — the column-absent / type-not-comparable precheck
+// failures are errors.Is-detectable as ErrWatermarkColumnSkip while the
+// ORIGINAL message text stays verbatim (UI-anchored wording).
+func TestWmSkipSentinel(t *testing.T) {
+	err := wmSkipf("水位列 %s 不存在于表 %s（水位过滤仅支持列存在的表参与比对）", "updated_at", "orders")
+	if !errors.Is(err, ErrWatermarkColumnSkip) {
+		t.Fatalf("wmSkipf must satisfy errors.Is(ErrWatermarkColumnSkip): %v", err)
+	}
+	want := "水位列 updated_at 不存在于表 orders（水位过滤仅支持列存在的表参与比对）"
+	if err.Error() != want {
+		t.Fatalf("text altered: %q, want %q", err.Error(), want)
+	}
+	// An ordinary error must NOT satisfy the sentinel.
+	if errors.Is(fmt.Errorf("校验水位列: boom"), ErrWatermarkColumnSkip) {
+		t.Fatal("ordinary error must not satisfy the sentinel")
+	}
+}
+
+// A8: wmSkipReport — sentinel ⇒ StatusSkip with reason in Error and the
+// skip explained in Suggestion; ordinary error ⇒ StatusFail (unchanged).
+func TestWmSkipReportMapping(t *testing.T) {
+	skip := wmSkipReport("orders", wmSkipf("水位列 %s 类型 %s 不在可比白名单（timestamptz/timestamp/date/int/bigint）", "updated_at", "text"))
+	if skip.Status != reporter.StatusSkip {
+		t.Fatalf("sentinel status = %q, want skip", skip.Status)
+	}
+	if skip.Error == "" || skip.Suggestion == "" {
+		t.Fatalf("skip report must disclose reason and suggestion: %+v", skip)
+	}
+	if !strings.Contains(skip.Suggestion, "跳过") {
+		t.Fatalf("suggestion must explain the skip: %q", skip.Suggestion)
+	}
+
+	fail := wmSkipReport("orders", fmt.Errorf("校验水位列: connection refused"))
+	if fail.Status != reporter.StatusFail {
+		t.Fatalf("ordinary error status = %q, want fail", fail.Status)
+	}
+	if fail.Error != "校验水位列: connection refused" {
+		t.Fatalf("fail error text altered: %q", fail.Error)
 	}
 }

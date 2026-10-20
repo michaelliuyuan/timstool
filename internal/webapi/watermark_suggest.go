@@ -3,6 +3,7 @@ package webapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -257,11 +258,45 @@ func scoreWatermarkCandidates(cols []wmCatalogColumn) (total int, cands []wmSugg
 	return total, cands
 }
 
-// handleSuggestWatermark: POST /incremental/suggest-watermark {source_ref}
-// → top-5 unified watermark column candidates for the whole source schema.
+// wmFilterCatalogSubset narrows the catalog to the requested table subset
+// (compare-page Top-N flow) BEFORE scoring, so coverage/unmatched lists take
+// the SELECTED set as their denominator. Returns the kept rows plus the
+// requested-but-absent tables (sorted, for the response's missing_tables).
+// Pure function — fully unit-testable without a database. An empty tables
+// slice is a verbatim passthrough (whole-schema behavior unchanged).
+func wmFilterCatalogSubset(cols []wmCatalogColumn, tables []string) (kept []wmCatalogColumn, missing []string) {
+	if len(tables) == 0 {
+		return cols, nil
+	}
+	want := make(map[string]bool, len(tables))
+	for _, t := range tables {
+		want[t] = true
+	}
+	present := map[string]bool{}
+	kept = make([]wmCatalogColumn, 0, len(cols))
+	for _, c := range cols {
+		present[c.Table] = true
+		if want[c.Table] {
+			kept = append(kept, c)
+		}
+	}
+	for _, t := range tables {
+		if !present[t] {
+			missing = append(missing, t)
+		}
+	}
+	sort.Strings(missing)
+	return kept, missing
+}
+
+// handleSuggestWatermark: POST /incremental/suggest-watermark {source_ref, tables?}
+// → top-5 unified watermark column candidates for the whole source schema,
+// or — when the optional tables subset is present — scored over exactly that
+// selection with absent tables disclosed as missing_tables.
 func (s *Server) handleSuggestWatermark(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		SourceRef string `json:"source_ref"`
+		SourceRef string   `json:"source_ref"`
+		Tables    []string `json:"tables"` // optional subset (compare page); absent = whole schema
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid JSON body")
@@ -270,6 +305,27 @@ func (s *Server) handleSuggestWatermark(w http.ResponseWriter, r *http.Request) 
 	if req.SourceRef == "" {
 		s.writeError(w, http.StatusBadRequest, "source_ref is required")
 		return
+	}
+	// Optional table subset: identifiers, duplicates and the batch cap are
+	// vetted exactly like the columns-batch endpoint (same rules, same
+	// limit) — one shared convention, no second dialect of validation.
+	if len(req.Tables) > incColumnsBatchLimit {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("tables 数超过上限 %d", incColumnsBatchLimit))
+		return
+	}
+	if len(req.Tables) > 0 {
+		seen := map[string]bool{}
+		for _, t := range req.Tables {
+			if !incIdentifierOK(t) {
+				s.writeError(w, http.StatusBadRequest, "invalid table name: "+t)
+				return
+			}
+			if seen[t] {
+				s.writeError(w, http.StatusBadRequest, "表重复: "+t)
+				return
+			}
+			seen[t] = true
+		}
 	}
 	e, err := s.resolveDataSourceRef(req.SourceRef)
 	if err != nil {
@@ -305,12 +361,19 @@ func (s *Server) handleSuggestWatermark(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusInternalServerError, "catalog query failed: "+err.Error())
 		return
 	}
+	// Subset FIRST, scorer second: coverage/缺列表 denominators belong to
+	// the user's selection, not the whole schema.
+	cols, missing := wmFilterCatalogSubset(cols, req.Tables)
 	total, cands := scoreWatermarkCandidates(cols)
 	if cands == nil {
 		cands = []wmSuggestCandidate{}
 	}
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"total_tables": total,
 		"candidates":   cands,
-	})
+	}
+	if len(missing) > 0 {
+		resp["missing_tables"] = missing
+	}
+	s.writeJSON(w, http.StatusOK, resp)
 }

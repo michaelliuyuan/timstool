@@ -258,6 +258,112 @@ func TestSuggestWatermarkEndpointValidation(t *testing.T) {
 	}
 }
 
+// TestWMFilterCatalogSubset pins the subset narrowing contract: kept rows
+// belong to the selection only, absent tables come back sorted, and an
+// empty selection is a verbatim passthrough (whole-schema behavior).
+func TestWMFilterCatalogSubset(t *testing.T) {
+	cols := wmCols(
+		[5]string{"a", "updated_at", "timestamp with time zone", "idx", "now"},
+		[5]string{"b", "updated_at", "timestamp with time zone", "idx", "now"},
+		[5]string{"c", "id", "bigint", "idx", ""},
+	)
+	kept, missing := wmFilterCatalogSubset(cols, []string{"a", "zz", "b"})
+	if len(kept) != 2 {
+		t.Fatalf("kept = %v, want a+b rows only", kept)
+	}
+	for _, c := range kept {
+		if c.Table == "c" {
+			t.Errorf("table c leaked into subset: %+v", c)
+		}
+	}
+	if len(missing) != 1 || missing[0] != "zz" {
+		t.Errorf("missing = %v, want [zz]", missing)
+	}
+
+	// Sorted regardless of request order.
+	_, missing = wmFilterCatalogSubset(cols, []string{"zz2", "zz1"})
+	if len(missing) != 2 || missing[0] != "zz1" || missing[1] != "zz2" {
+		t.Errorf("missing must be sorted, got %v", missing)
+	}
+
+	// All-missing: kept empty, missing = the whole selection.
+	kept, missing = wmFilterCatalogSubset(cols, []string{"nope"})
+	if len(kept) != 0 || len(missing) != 1 || missing[0] != "nope" {
+		t.Errorf("all-missing: kept=%v missing=%v", kept, missing)
+	}
+
+	// Passthrough: no tables slice ⇒ same slice, no missing.
+	kept, missing = wmFilterCatalogSubset(cols, nil)
+	if len(kept) != len(cols) || missing != nil {
+		t.Errorf("passthrough broken: kept=%d missing=%v", len(kept), missing)
+	}
+}
+
+// TestWMSuggestSubsetScoringDenominator: after subset narrowing the scorer's
+// coverage/unmatched lists take the SELECTED set as denominator — a column
+// covering the whole selection must read coverage 1.0 even though the wider
+// schema lacks it.
+func TestWMSuggestSubsetScoringDenominator(t *testing.T) {
+	cols := wmCols(
+		[5]string{"a", "wm_ts", "timestamp with time zone", "idx", "now"},
+		[5]string{"b", "wm_ts", "timestamp with time zone", "idx", "now"},
+		[5]string{"c", "id", "bigint", "idx", ""},
+	)
+	// Whole schema: wm_ts covers 2/3.
+	total, cands := scoreWatermarkCandidates(cols)
+	wm := findCand(t, cands, "wm_ts")
+	if total != 3 || wm.Coverage != 2.0/3.0 {
+		t.Fatalf("whole-schema: total=%d cov=%v, want 3 and 2/3", total, wm.Coverage)
+	}
+	// Subset {a,b}: wm_ts covers 2/2 and unmatched shrinks to none.
+	kept, _ := wmFilterCatalogSubset(cols, []string{"a", "b"})
+	total, cands = scoreWatermarkCandidates(kept)
+	wm = findCand(t, cands, "wm_ts")
+	if total != 2 || wm.Coverage != 1.0 || len(wm.UnmatchedTables) != 0 {
+		t.Fatalf("subset: total=%d cov=%v unmatched=%v, want 2/1.0/none", total, wm.Coverage, wm.UnmatchedTables)
+	}
+	// id must not appear at all once its only table is filtered out.
+	for _, c := range cands {
+		if c.Column == "id" {
+			t.Errorf("id candidate leaked into {a,b} subset scoring")
+		}
+	}
+}
+
+// TestSuggestWatermarkEndpointTablesValidation: the optional tables subset
+// is vetted (identifier allow-list, duplicates, batch cap) BEFORE any
+// datasource/DB work — same rules as columns-batch, no DB needed.
+func TestSuggestWatermarkEndpointTablesValidation(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	cases := []struct {
+		name     string
+		body     string
+		wantFrag string
+	}{
+		{"bad identifier", `{"source_ref":"nope","tables":["ok","bad-name!"]}`, "invalid table name"},
+		{"duplicate", `{"source_ref":"nope","tables":["t1","t1"]}`, "表重复"},
+	}
+	for _, tc := range cases {
+		w, req := doReq("POST", "/api/v1/incremental/suggest-watermark", tc.body)
+		s.handleSuggestWatermark(w, req)
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), tc.wantFrag) {
+			t.Errorf("%s: got %d %s, want 400 containing %q", tc.name, w.Code, w.Body.String(), tc.wantFrag)
+		}
+	}
+
+	tooMany := make([]string, incColumnsBatchLimit+1)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("t%d", i)
+	}
+	b, _ := json.Marshal(map[string]interface{}{"source_ref": "nope", "tables": tooMany})
+	w, req := doReq("POST", "/api/v1/incremental/suggest-watermark", string(b))
+	s.handleSuggestWatermark(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "上限") {
+		t.Errorf("over-limit: got %d %s, want 400 上限", w.Code, w.Body.String())
+	}
+}
+
 // TestWMNameClassIDFamily anchors the adversarial 🟡4 fix: the id-family
 // check runs on the RAW name with a required separator — user_id still
 // classifies as auto-increment-ish, but guid/valid/grid/userid (normalized

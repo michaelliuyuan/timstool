@@ -1,9 +1,12 @@
 package validator
 
 import (
+	"errors"
+	"fmt"
 	"regexp"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/common/reporter"
 )
 
 // #t3 watermark compare: an OPTIONAL filter dimension overlaid on the three
@@ -44,6 +47,43 @@ func wmOp(wm *config.WatermarkFilter) string {
 		return "<"
 	}
 	return "<="
+}
+
+// ErrWatermarkColumnSkip is the package-level sentinel marking a watermark
+// column precheck failure that is per-table UNUSABLE (column absent, or its
+// type outside the comparable whitelist) rather than an infrastructure
+// error. errors.Is-detectable: the compare flow converts sentinel hits into
+// a per-table StatusSkip report (runtime skip), while probe/DB failures stay
+// ordinary errors ⇒ StatusFail.
+var ErrWatermarkColumnSkip = errors.New("watermark column unavailable")
+
+// wmSkipError carries the ORIGINAL precheck message verbatim (the wording is
+// UI-anchored) while staying errors.Is-detectable as ErrWatermarkColumnSkip
+// via the Is hook — no text is prefixed or altered.
+type wmSkipError struct{ msg string }
+
+func (e wmSkipError) Error() string        { return e.msg }
+func (e wmSkipError) Is(target error) bool { return target == ErrWatermarkColumnSkip }
+
+// wmSkipf wraps fmt.Errorf-shaped messages as a sentinel hit.
+func wmSkipf(format string, args ...interface{}) error {
+	return wmSkipError{fmt.Sprintf(format, args...)}
+}
+
+// wmSkipReport builds the TableReport for a failed watermark column precheck:
+// a sentinel hit (column missing / type not comparable) ⇒ StatusSkip with the
+// original reason disclosed in Error and the skip explained in Suggestion;
+// any other error stays a hard StatusFail.
+func wmSkipReport(table string, werr error) reporter.TableReport {
+	if errors.Is(werr, ErrWatermarkColumnSkip) {
+		return reporter.TableReport{
+			TableName:  table,
+			Status:     reporter.StatusSkip,
+			Error:      werr.Error(),
+			Suggestion: "水位列在该表不可用，已运行期跳过（可更换水位列、手输列名或调整表选择）",
+		}
+	}
+	return reporter.TableReport{TableName: table, Status: reporter.StatusFail, Error: werr.Error()}
 }
 
 // MS-03: the predicate builders (wmWherePG/wmWhereMySQL), the column-check

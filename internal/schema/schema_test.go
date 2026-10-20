@@ -42,6 +42,26 @@ func TestProgressRegistrationNames(t *testing.T) {
 }
 
 func TestMapType(t *testing.T) {
+	// Partition-child exclusion anchor (口径统一): CollectTables reads the
+	// same pg_class/pg_namespace universe as the watermark suggest catalog
+	// (wmCatalogSQL) and /config/list-tables — relkind r/p with partition
+	// children excluded, ordered by name. information_schema.tables leaks
+	// partition children (BASE TABLE), so its shape must be gone.
+	for _, guard := range []string{
+		"relkind IN ('r', 'p')",
+		"NOT c.relispartition",
+		"FROM pg_class c",
+		"JOIN pg_namespace n",
+		"ORDER BY c.relname",
+	} {
+		if !strings.Contains(collectTablesSQL, guard) {
+			t.Errorf("collectTablesSQL missing guard %q", guard)
+		}
+	}
+	if strings.Contains(collectTablesSQL, "information_schema.tables") {
+		t.Error("collectTablesSQL still reads information_schema.tables (partition children leak)")
+	}
+
 	tests := []struct {
 		pgType   PGType
 		expected string
