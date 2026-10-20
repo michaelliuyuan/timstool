@@ -51,7 +51,12 @@ func (d postgresDialect) CountExact(ctx context.Context, q dialectQueryer, schem
 
 // WmPredicateFragment relocates wmWherePG (wmfilter.go :56-58) - the $1
 // placeholder follows the PG driver; wmOp semantics stay in the main flow.
+// The half-open interval form renders `col >= $1 AND col < $2` (both bounds
+// bound as parameters, never concatenated).
 func (d postgresDialect) WmPredicateFragment(wm *config.WatermarkFilter) string {
+	if wmRange(wm) {
+		return fmt.Sprintf("%s >= $1 AND %s < $2", d.QuoteIdent(wm.Column), d.QuoteIdent(wm.Column))
+	}
 	return fmt.Sprintf("%s %s $1", d.QuoteIdent(wm.Column), wmOp(wm))
 }
 

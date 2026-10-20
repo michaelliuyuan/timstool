@@ -63,8 +63,13 @@ func (d tidbDialect) CountExact(ctx context.Context, q dialectQueryer, schema, t
 }
 
 // WmPredicateFragment relocates wmWhereMySQL (wmfilter.go :61-63) - the
-// driver "?" placeholder; wmOp semantics stay in the main flow.
+// driver "?" placeholder; wmOp semantics stay in the main flow. The
+// half-open interval form renders `col >= ? AND col < ?` (both bounds bound
+// as parameters, never concatenated).
 func (d tidbDialect) WmPredicateFragment(wm *config.WatermarkFilter) string {
+	if wmRange(wm) {
+		return fmt.Sprintf("%s >= ? AND %s < ?", d.QuoteIdent(wm.Column), d.QuoteIdent(wm.Column))
+	}
 	return fmt.Sprintf("%s %s ?", d.QuoteIdent(wm.Column), wmOp(wm))
 }
 

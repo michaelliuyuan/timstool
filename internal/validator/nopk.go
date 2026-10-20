@@ -72,7 +72,7 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 	var err error
 	if wm := v.wmFilter(); wm != nil {
 		tidbRows, err = tidbConn.QueryContext(ctx,
-			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wm.Value)
+			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
 		tidbRows, err = tidbConn.QueryContext(ctx,
 			fmt.Sprintf("SELECT * FROM %s", v.tgtDialect.QuoteIdent(table)))
@@ -409,7 +409,7 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 	var err error
 	if wm := v.wmFilter(); wm != nil {
 		tidbRows, err = tidbConn.QueryContext(ctx,
-			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wm.Value)
+			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
 		tidbRows, err = tidbConn.QueryContext(ctx,
 			fmt.Sprintf("SELECT * FROM %s", v.tgtDialect.QuoteIdent(table)))
@@ -515,7 +515,7 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 	var err error
 	if wm := v.wmFilter(); wm != nil {
 		tidbRows, err = tidbConn.QueryContext(ctx,
-			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wm.Value)
+			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
 		tidbRows, err = tidbConn.QueryContext(ctx,
 			fmt.Sprintf("SELECT * FROM %s", v.tgtDialect.QuoteIdent(table)))

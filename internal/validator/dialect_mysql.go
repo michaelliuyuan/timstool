@@ -63,8 +63,13 @@ func (d mysqlDialect) CountExact(ctx context.Context, q dialectQueryer, schema, 
 }
 
 // WmPredicateFragment mirrors tidbDialect (the `?` placeholder follows the
-// go-sql-driver); wmOp semantics stay in the main flow.
+// go-sql-driver); wmOp semantics stay in the main flow. The half-open
+// interval form renders `col >= ? AND col < ?` (both bounds bound as
+// parameters, never concatenated).
 func (d mysqlDialect) WmPredicateFragment(wm *config.WatermarkFilter) string {
+	if wmRange(wm) {
+		return fmt.Sprintf("%s >= ? AND %s < ?", d.QuoteIdent(wm.Column), d.QuoteIdent(wm.Column))
+	}
 	return fmt.Sprintf("%s %s ?", d.QuoteIdent(wm.Column), wmOp(wm))
 }
 

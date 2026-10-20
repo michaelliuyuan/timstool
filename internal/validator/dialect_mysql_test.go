@@ -122,6 +122,10 @@ func TestMySQLDialectShapes(t *testing.T) {
 	if got := d.WmPredicateFragment(wm); got != "`updated_at` <= ?" {
 		t.Fatalf("WmPredicateFragment = %q; want `updated_at` <= ?", got)
 	}
+	wmRange := &config.WatermarkFilter{Column: "updated_at", RangeStart: "2026-09-01 00:00:00", RangeEnd: "2026-10-01 00:00:00"}
+	if got := d.WmPredicateFragment(wmRange); got != "`updated_at` >= ? AND `updated_at` < ?" {
+		t.Fatalf("WmPredicateFragment range = %q; want `updated_at` >= ? AND `updated_at` < ?", got)
+	}
 	if got := d.AdjustDSN("user:pass@tcp(1.2.3.4:3306)/db"); got != "user:pass@tcp(1.2.3.4:3306)/db" {
 		t.Fatalf("AdjustDSN must be a no-op (Loc=UTC baked into BuildMySQLDSN); got %q", got)
 	}

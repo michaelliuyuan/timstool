@@ -328,8 +328,14 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 			// (SourceRows/TargetRows are already the filtered counts —
 			// validateRowCount runs first in every mode).
 			if wm != nil {
-				note := fmt.Sprintf("水位过滤 %s %s %s（源 %d 行/目标 %d 行）",
-					wm.Column, wmOp(wm), wm.Value, tr.SourceRows, tr.TargetRows)
+				var note string
+				if wmRange(wm) {
+					note = fmt.Sprintf("水位过滤 %s [%s, %s)（源 %d 行/目标 %d 行）",
+						wm.Column, wm.RangeStart, wm.RangeEnd, tr.SourceRows, tr.TargetRows)
+				} else {
+					note = fmt.Sprintf("水位过滤 %s %s %s（源 %d 行/目标 %d 行）",
+						wm.Column, wmOp(wm), wm.Value, tr.SourceRows, tr.TargetRows)
+				}
 				if tr.Suggestion == "" {
 					tr.Suggestion = note
 				} else {
@@ -444,7 +450,7 @@ func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn
 	if wm != nil {
 		err = pgDB.QueryRowContext(ctx,
 			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s WHERE %s",
-				v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wm.Value).Scan(&sourceCount)
+				v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wmArgs(wm)...).Scan(&sourceCount)
 	} else {
 		err = pgDB.QueryRowContext(ctx,
 			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table))).Scan(&sourceCount)
@@ -459,7 +465,7 @@ func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn
 	if wm != nil {
 		err = tidbConn.QueryRowContext(ctx,
 			fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s",
-				v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wm.Value).Scan(&targetCount)
+				v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...).Scan(&targetCount)
 	} else {
 		err = tidbConn.QueryRowContext(ctx,
 			fmt.Sprintf("SELECT COUNT(*) FROM %s", v.tgtDialect.QuoteIdent(table))).Scan(&targetCount)
@@ -567,7 +573,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 	if wm != nil {
 		pgQuery := fmt.Sprintf("SELECT * FROM %s.%s WHERE %s ORDER BY 1 LIMIT %d OFFSET %d",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm), sampleSize, offset)
-		pgRows, err = pgDB.QueryContext(ctx, pgQuery, wm.Value)
+		pgRows, err = pgDB.QueryContext(ctx, pgQuery, wmArgs(wm)...)
 	} else {
 		pgQuery := fmt.Sprintf("SELECT * FROM %s.%s ORDER BY 1 LIMIT %d OFFSET %d",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), sampleSize, offset)
@@ -715,7 +721,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 				v.tgtDialect.QuoteIdent(table), strings.Join(colNames, ","), strings.Join(tupleParts, ","))
 			if wm != nil {
 				tidbQuery += fmt.Sprintf(" AND %s", v.tgtDialect.WmPredicateFragment(wm))
-				tidbArgs = []interface{}{wm.Value}
+				tidbArgs = wmArgs(wm)
 			}
 		} else {
 			keyColName := pgCols[keyColIndices[0]].Name()
@@ -738,7 +744,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 				v.tgtDialect.QuoteIdent(table), v.tgtDialect.QuoteIdent(keyColName), strings.Join(whereParts, ","))
 			if wm != nil {
 				tidbQuery += fmt.Sprintf(" AND %s", v.tgtDialect.WmPredicateFragment(wm))
-				tidbArgs = []interface{}{wm.Value}
+				tidbArgs = wmArgs(wm)
 			}
 		}
 
@@ -944,7 +950,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		if wm != nil {
 			tidbQuery := fmt.Sprintf("SELECT * FROM %s WHERE %s LIMIT %d OFFSET %d",
 				v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm), sampleSize, offset)
-			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery, wm.Value)
+			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery, wmArgs(wm)...)
 		} else {
 			tidbQuery := fmt.Sprintf("SELECT * FROM %s LIMIT %d OFFSET %d",
 				v.tgtDialect.QuoteIdent(table), sampleSize, offset)
@@ -1023,7 +1029,7 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 	var err error
 	if wm := v.wmFilter(); wm != nil {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
-			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wm.Value)
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table)))
@@ -1085,7 +1091,7 @@ func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB,
 	var err error
 	if wm := v.wmFilter(); wm != nil {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
-			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wm.Value)
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table)))
@@ -1141,7 +1147,7 @@ func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, ti
 	var err error
 	if wm := v.wmFilter(); wm != nil {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
-			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wm.Value)
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table)))

@@ -31,13 +31,41 @@ var wmAllowedColumnTypes = map[string]bool{
 
 // wmFilter returns the active watermark filter, or nil when absent/incomplete
 // (a half-configured group is treated as off, matching the API's required
-// column+value pair).
+// column+value pair). A group activates in either form: the single-value
+// form (Value non-empty) or the full half-open interval form (both RangeStart
+// and RangeEnd non-empty); a half-configured interval stays off.
 func (v *Validator) wmFilter() *config.WatermarkFilter {
 	wm := v.compareCfg().Watermark
-	if wm == nil || wm.Column == "" || wm.Value == "" {
+	if wm == nil || wm.Column == "" {
 		return nil
 	}
-	return wm
+	if wm.Value != "" || (wm.RangeStart != "" && wm.RangeEnd != "") {
+		return wm
+	}
+	return nil
+}
+
+// wmRange reports whether the filter uses the half-open interval form
+// [RangeStart, RangeEnd) rather than the single-value form. Both endpoints
+// must be set (wmFilter only activates a full interval; this guard keeps the
+// query path safe for hand-built configs). Priority note for hand-written
+// YAML (which bypasses the API's mutual-exclusion check): when both forms
+// are present the full interval wins and Value is silently ignored; a half
+// interval alongside Value falls back to the single-value form.
+func wmRange(wm *config.WatermarkFilter) bool {
+	return wm != nil && wm.RangeStart != "" && wm.RangeEnd != ""
+}
+
+// wmArgs returns the bound parameters matching the active filter's predicate
+// placeholders: the single value for the single-value form, or
+// [RangeStart, RangeEnd] for the interval form (2 placeholders). Values are
+// ALWAYS bound as query parameters, never concatenated. When both forms are
+// set the full interval wins (see wmRange) and Value is silently ignored.
+func wmArgs(wm *config.WatermarkFilter) []any {
+	if wmRange(wm) {
+		return []any{wm.RangeStart, wm.RangeEnd}
+	}
+	return []any{wm.Value}
 }
 
 // wmOp returns the effective comparison operator ("<" only when explicitly

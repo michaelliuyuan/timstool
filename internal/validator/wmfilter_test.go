@@ -21,6 +21,12 @@ func wmTestFilter(op string) *config.WatermarkFilter {
 	return &config.WatermarkFilter{Column: "updated_at", Value: "2026-10-01 00:00:00", Op: op, BaseMode: "checksum"}
 }
 
+// wmTestRangeFilter builds a half-open interval [RangeStart, RangeEnd) filter
+// (the range form is mutually exclusive with Value).
+func wmTestRangeFilter() *config.WatermarkFilter {
+	return &config.WatermarkFilter{Column: "updated_at", RangeStart: "2026-09-01 00:00:00", RangeEnd: "2026-10-01 00:00:00", BaseMode: "checksum"}
+}
+
 // A1: PG predicate shape — quoted column, parameterized $1, both operators.
 func TestWmWherePG(t *testing.T) {
 	if got := (postgresDialect{}).WmPredicateFragment(wmTestFilter("")); got != `"updated_at" <= $1` {
@@ -44,8 +50,51 @@ func TestWmWhereMySQL(t *testing.T) {
 	}
 }
 
+// A2b: range predicate shapes — every dialect renders the half-open interval
+// [start, end) with BOTH bounds parameterized (PG $1/$2, MySQL/TiDB ?/?),
+// and the single-value fragment is byte-identical to the pre-range shape.
+func TestWmWhereRange(t *testing.T) {
+	pg := (postgresDialect{}).WmPredicateFragment(wmTestRangeFilter())
+	if pg != `"updated_at" >= $1 AND "updated_at" < $2` {
+		t.Fatalf("pg range predicate wrong: %s", pg)
+	}
+	if strings.Contains(pg, "2026-") || strings.Contains(pg, "09-") {
+		t.Fatalf("range bounds must NEVER be concatenated: %s", pg)
+	}
+	for _, got := range []string{
+		(mysqlDialect{}).WmPredicateFragment(wmTestRangeFilter()),
+		(tidbDialect{}).WmPredicateFragment(wmTestRangeFilter()),
+	} {
+		if got != "`updated_at` >= ? AND `updated_at` < ?" {
+			t.Fatalf("mysql/tidb range predicate wrong: %s", got)
+		}
+	}
+	// Single-value fragment unchanged (zero regression).
+	if got := (postgresDialect{}).WmPredicateFragment(wmTestFilter("")); got != `"updated_at" <= $1` {
+		t.Fatalf("pg single-value predicate regressed: %s", got)
+	}
+	if got := (tidbDialect{}).WmPredicateFragment(wmTestFilter("")); got != "`updated_at` <= ?" {
+		t.Fatalf("mysql single-value predicate regressed: %s", got)
+	}
+}
+
+// A2c: wmArgs — the bound parameters match the predicate's placeholders
+// (single-value form = [Value]; interval form = [RangeStart, RangeEnd]).
+func TestWmArgs(t *testing.T) {
+	if got := wmArgs(wmTestFilter("")); len(got) != 1 || got[0] != "2026-10-01 00:00:00" {
+		t.Fatalf("single-value args wrong: %#v", got)
+	}
+	if got := wmArgs(wmTestRangeFilter()); len(got) != 2 || got[0] != "2026-09-01 00:00:00" || got[1] != "2026-10-01 00:00:00" {
+		t.Fatalf("range args wrong: %#v", got)
+	}
+	if got := wmArgs(&config.WatermarkFilter{Column: "c"}); len(got) != 1 || got[0] != "" {
+		t.Fatalf("incomplete group args wrong: %#v", got)
+	}
+}
+
 // A3: filter activation — nil, column-less, or value-less groups are OFF
-// (zero regression for CLI / migration pipeline paths).
+// (zero regression for CLI / migration pipeline paths). A full interval
+// [RangeStart, RangeEnd) activates; a half-configured interval stays off.
 func TestWmFilterActivation(t *testing.T) {
 	v := NewValidator(config.Config{})
 	if v.wmFilter() != nil {
@@ -58,6 +107,18 @@ func TestWmFilterActivation(t *testing.T) {
 	v3 := NewValidator(config.Config{Compare: config.CompareConfig{Watermark: wmTestFilter("")}})
 	if v3.wmFilter() == nil {
 		t.Fatalf("complete group must activate")
+	}
+	v4 := NewValidator(config.Config{Compare: config.CompareConfig{Watermark: wmTestRangeFilter()}})
+	if v4.wmFilter() == nil {
+		t.Fatalf("full interval group must activate")
+	}
+	v5 := NewValidator(config.Config{Compare: config.CompareConfig{Watermark: &config.WatermarkFilter{Column: "updated_at", RangeStart: "2026-09-01 00:00:00"}}})
+	if v5.wmFilter() != nil {
+		t.Fatalf("half-configured interval (missing range_end) must be treated as off")
+	}
+	v6 := NewValidator(config.Config{Compare: config.CompareConfig{Watermark: &config.WatermarkFilter{Column: "updated_at", RangeEnd: "2026-10-01 00:00:00"}}})
+	if v6.wmFilter() != nil {
+		t.Fatalf("half-configured interval (missing range_start) must be treated as off")
 	}
 }
 

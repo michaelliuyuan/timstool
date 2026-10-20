@@ -187,7 +187,13 @@ type compareOptionsBody struct {
 // normalizeWatermarkFilter validates and canonicalizes a watermark filter
 // group (#t3): column passes the same identifier allow-list as incremental
 // table/column names; op defaults to "<="; base_mode defaults to checksum.
-// nil stays nil (filter off, zero regression).
+// nil stays nil (filter off, zero regression). The filter is EITHER the
+// single-value form (value) OR the half-open interval form
+// (range_start/range_end): mixing the two, supplying only one interval
+// endpoint, or supplying neither value form is rejected; an interval whose
+// start does not order strictly before its end is rejected (start == end
+// yields an empty half-open interval; order check only — no datetime format
+// parsing, matching the front-end-only format contract).
 func normalizeWatermarkFilter(wm *config.WatermarkFilter) (*config.WatermarkFilter, error) {
 	if wm == nil {
 		return nil, nil
@@ -195,11 +201,28 @@ func normalizeWatermarkFilter(wm *config.WatermarkFilter) (*config.WatermarkFilt
 	out := *wm
 	out.Column = strings.TrimSpace(out.Column)
 	out.Value = strings.TrimSpace(out.Value)
-	if out.Column == "" || out.Value == "" {
-		return nil, fmt.Errorf("watermark: column 与 value 必须同时提供")
+	out.RangeStart = strings.TrimSpace(out.RangeStart)
+	out.RangeEnd = strings.TrimSpace(out.RangeEnd)
+	if out.Column == "" {
+		return nil, fmt.Errorf("watermark: column 必须提供")
 	}
 	if !incIdentifierOK(out.Column) {
 		return nil, fmt.Errorf("watermark.column: 非法列名 %q", out.Column)
+	}
+	rangeMode := out.RangeStart != "" || out.RangeEnd != ""
+	singleMode := out.Value != ""
+	switch {
+	case rangeMode && singleMode:
+		return nil, fmt.Errorf("watermark: 单值 value 与区间 range_start/range_end 互斥，不能同时提供")
+	case rangeMode:
+		if out.RangeStart == "" || out.RangeEnd == "" {
+			return nil, fmt.Errorf("watermark: 区间模式必须同时提供 range_start 与 range_end")
+		}
+		if out.RangeStart >= out.RangeEnd {
+			return nil, fmt.Errorf("watermark: range_start 不能大于等于 range_end（半开区间 [start,end) 恒为空）")
+		}
+	case !singleMode:
+		return nil, fmt.Errorf("watermark: 必须提供 value 或完整的区间 range_start/range_end")
 	}
 	switch out.Op {
 	case "", "<=", "<":

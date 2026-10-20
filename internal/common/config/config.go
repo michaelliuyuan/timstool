@@ -95,12 +95,16 @@ type CompareConfig struct {
 // WatermarkFilter is the compare-side watermark filter group. Column passes
 // an identifier allow-list; Value is ALWAYS bound as a query parameter
 // (never concatenated). Timestamptz values follow the UTC input convention
-// (the PG session is forced to UTC while a filter is active).
+// (the PG session is forced to UTC while a filter is active). RangeStart +
+// RangeEnd form the half-open interval [RangeStart, RangeEnd) alternative
+// (mutually exclusive with Value; both endpoints required together).
 type WatermarkFilter struct {
-	Column   string `yaml:"column" json:"column"`
-	Value    string `yaml:"value" json:"value"`
-	Op       string `yaml:"op" json:"op"`               // "<=" (default) | "<"
-	BaseMode string `yaml:"base_mode" json:"base_mode"` // quick | sample | checksum (default checksum)
+	Column     string `yaml:"column" json:"column"`
+	Value      string `yaml:"value" json:"value"`
+	Op         string `yaml:"op" json:"op"`               // "<=" (default) | "<" (single-value form only)
+	BaseMode   string `yaml:"base_mode" json:"base_mode"` // quick | sample | checksum (default checksum)
+	RangeStart string `yaml:"range_start,omitempty" json:"range_start,omitempty"`
+	RangeEnd   string `yaml:"range_end,omitempty" json:"range_end,omitempty"`
 }
 
 type SourceConfig struct {

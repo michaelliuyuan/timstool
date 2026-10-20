@@ -47,8 +47,74 @@ func TestWatermarkNormalize(t *testing.T) {
 	}
 }
 
-// A2: create endpoint rejects invalid watermark groups pre-run (400) and
-// maps an absent mode to the filter's base_mode.
+// A1b: interval-form normalize — a full [range_start, range_end) group passes
+// (endpoints preserved, Value empty); every malformed shape is rejected
+// (single endpoint, start>=end, value+range mixed, neither value form).
+func TestWatermarkNormalizeRange(t *testing.T) {
+	out, err := normalizeWatermarkFilter(&config.WatermarkFilter{
+		Column: "updated_at", RangeStart: " 2026-09-01 00:00:00 ", RangeEnd: "2026-10-01 00:00:00",
+	})
+	if err != nil {
+		t.Fatalf("full interval must pass: %v", err)
+	}
+	if out.Value != "" || out.RangeStart != "2026-09-01 00:00:00" || out.RangeEnd != "2026-10-01 00:00:00" {
+		t.Fatalf("range fields wrong: %+v", out)
+	}
+	if out.BaseMode != "checksum" {
+		t.Fatalf("range default base_mode wrong: %q", out.BaseMode)
+	}
+
+	for i, bad := range []*config.WatermarkFilter{
+		{Column: "updated_at", RangeStart: "2026-09-01 00:00:00"},                                                                // missing range_end
+		{Column: "updated_at", RangeEnd: "2026-10-01 00:00:00"},                                                                  // missing range_start
+		{Column: "updated_at", RangeStart: "2026-10-01 00:00:00", RangeEnd: "2026-09-01 00:00:00"},                               // start > end
+		{Column: "updated_at", RangeStart: "2026-10-01 00:00:00", RangeEnd: "2026-10-01 00:00:00"},                               // start == end → empty [start,end)
+		{Column: "updated_at", RangeStart: "2026-09-01 00:00:00", RangeEnd: "2026-10-01 00:00:00", Value: "2026-10-01 00:00:00"}, // mixed
+		{Column: "updated_at", RangeStart: "2026-09-01 00:00:00", RangeEnd: "2026-10-01 00:00:00", Value: "x"},
+		{Column: "updated_at"},                       // neither value nor range
+		{Column: "updated_at", Value: "  "},          // whitespace-only value ≠ present
+		{Column: "", RangeStart: "a", RangeEnd: "b"}, // missing column
+	} {
+		if _, err := normalizeWatermarkFilter(bad); err == nil {
+			t.Errorf("range case %d: %+v must be rejected", i, bad)
+		}
+	}
+}
+
+// A1c: interval-form options round-trip — a range watermark saved via
+// PUT /compare/options persists unchanged (RangeStart/RangeEnd preserved,
+// defaults filled) and comes back through loadCompareOptions.
+func TestCompareOptionsWatermarkRangeRoundTrip(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	w, req := doReq("PUT", "/api/v1/compare/options",
+		`{"watermark":{"column":"updated_at","range_start":"2026-09-01 00:00:00","range_end":"2026-10-01 00:00:00"}}`)
+	s.handlePutCompareOptions(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("set range watermark: %d %s", w.Code, w.Body.String())
+	}
+	opts := s.loadCompareOptions()
+	if opts.Watermark == nil {
+		t.Fatalf("range watermark must be saved")
+	}
+	if opts.Watermark.RangeStart != "2026-09-01 00:00:00" || opts.Watermark.RangeEnd != "2026-10-01 00:00:00" || opts.Watermark.Value != "" {
+		t.Fatalf("saved range watermark wrong: %+v", opts.Watermark)
+	}
+	if opts.Watermark.BaseMode != "checksum" || opts.Watermark.Column != "updated_at" {
+		t.Fatalf("range defaults wrong: %+v", opts.Watermark)
+	}
+
+	// Malformed range rejected without touching the saved group.
+	w, req = doReq("PUT", "/api/v1/compare/options",
+		`{"watermark":{"column":"updated_at","range_start":"2026-10-01 00:00:00","range_end":"2026-09-01 00:00:00"}}`)
+	s.handlePutCompareOptions(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("start>end range must 400, got %d", w.Code)
+	}
+	if s.loadCompareOptions().Watermark == nil {
+		t.Fatalf("rejected range must not clobber the saved group")
+	}
+}
 func TestCompareTaskWatermarkValidation(t *testing.T) {
 	s, _ := newTestServer(t)
 	for i, body := range []string{

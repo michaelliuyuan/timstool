@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import apiClient from '../api'
 import type { CompareTask, CompareReport, CompareOptions, CreateCompareRequest } from '../api'
@@ -66,6 +66,13 @@ const wmConfig = reactive({
   column: '',
   op: '<=',
   value: '',
+  // #range: single-value vs half-open interval [range_start, range_end).
+  // range_mode is only offered for datetime/date columns (int/text stay
+  // single-value); when active, op/value are ignored and both endpoints
+  // are bound together.
+  range_mode: false,
+  range_start: '',
+  range_end: '',
 })
 const wmBaseModes = [
   { value: 'quick', label: '快速（行数）' },
@@ -174,7 +181,21 @@ const wmKindInferred = computed(() => {
   return 'text'
 })
 
+// #range: interval conditions are only offered for datetime/date columns
+// (PG timestamptz/timestamp/date; MySQL datetime/timestamp/date). int/text
+// columns stay single-value — the range toggle is hidden for them.
+const wmRangeEligible = computed(() => wmKindInferred.value === 'datetime' || wmKindInferred.value === 'date')
+
+// #range B: once the column stops being range-eligible (switched to an
+// int/text candidate, or the manual value no longer looks datetime/date) the
+// radio group is hidden — reset range_mode so the form cannot deadlock with
+// no way back to the single-value branch.
+watch(wmRangeEligible, (eligible) => {
+  if (!eligible) wmConfig.range_mode = false
+})
+
 function validateWmValue(): string {
+  if (wmConfig.range_mode) return validateWmRange()
   const v = wmConfig.value.trim()
   if (!v) return '请填写水位值'
   if (wmKindInferred.value === 'int' && !/^-?\d+$/.test(v)) return '整数水位列的值必须是整数'
@@ -182,6 +203,27 @@ function validateWmValue(): string {
   if (wmKindInferred.value === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(v)) return '日期水位格式应为 YYYY-MM-DD'
   const t = Date.parse(v.replace(' ', 'T') + (wmIsTimestamptz.value ? 'Z' : ''))
   if (!Number.isNaN(t) && t > Date.now()) return '水位值晚于当前时间，两侧可能都比不出任何行'
+  return ''
+}
+
+// #range: interval validation — both endpoints required, per-kind format
+// (datetime → YYYY-MM-DD HH:mm:ss, date → YYYY-MM-DD), and start >= end is
+// rejected (the half-open interval [start, end) is empty at start == end).
+function validateWmRange(): string {
+  const s = wmConfig.range_start.trim()
+  const e = wmConfig.range_end.trim()
+  if (!s || !e) return '区间起点与终点都必须填写'
+  if (wmKindInferred.value === 'datetime') {
+    if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) return '区间起点格式应为 YYYY-MM-DD HH:mm:ss'
+    if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(e)) return '区间终点格式应为 YYYY-MM-DD HH:mm:ss'
+  }
+  if (wmKindInferred.value === 'date') {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return '区间起点格式应为 YYYY-MM-DD'
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(e)) return '区间终点格式应为 YYYY-MM-DD'
+  }
+  const ts = Date.parse(s.replace(' ', 'T') + (wmIsTimestamptz.value ? 'Z' : ''))
+  const te = Date.parse(e.replace(' ', 'T') + (wmIsTimestamptz.value ? 'Z' : ''))
+  if (!Number.isNaN(ts) && !Number.isNaN(te) && ts >= te) return '区间起点不能晚于或等于终点（半开区间 [start, end)）'
   return ''
 }
 
@@ -332,6 +374,17 @@ function applyCompareOptions(opts: CompareOptions) {
     wmConfig.column = w.column || ''
     wmConfig.op = w.op === '<' ? '<' : '<='
     wmConfig.value = w.value || ''
+    // #range: a saved interval group restores range mode; a single-value
+    // group clears the range fields.
+    if (w.range_start && w.range_end) {
+      wmConfig.range_mode = true
+      wmConfig.range_start = w.range_start
+      wmConfig.range_end = w.range_end
+    } else {
+      wmConfig.range_mode = false
+      wmConfig.range_start = ''
+      wmConfig.range_end = ''
+    }
     form.mode = 'watermark'
   } else if (opts.mode && ['quick', 'sample', 'checksum'].includes(opts.mode)) {
     form.mode = opts.mode
@@ -372,7 +425,9 @@ async function saveCompareParams() {
       concurrency: form.concurrency,
       // present-and-null clears (partial-merge by presence)
       watermark: form.mode === 'watermark'
-        ? { column: wmConfig.column, value: wmConfig.value, op: wmConfig.op, base_mode: wmConfig.base_mode }
+        ? wmConfig.range_mode
+          ? { column: wmConfig.column, range_start: wmConfig.range_start, range_end: wmConfig.range_end, base_mode: wmConfig.base_mode }
+          : { column: wmConfig.column, value: wmConfig.value, op: wmConfig.op, base_mode: wmConfig.base_mode }
         : null,
     } as any)
   } catch {
@@ -471,7 +526,9 @@ async function startCompare() {
         starting.value = false
         return
       }
-      watermark = { column: wmConfig.column, value: wmConfig.value.trim(), op: wmConfig.op, base_mode: wmConfig.base_mode }
+      watermark = wmConfig.range_mode
+        ? { column: wmConfig.column, range_start: wmConfig.range_start.trim(), range_end: wmConfig.range_end.trim(), base_mode: wmConfig.base_mode }
+        : { column: wmConfig.column, value: wmConfig.value.trim(), op: wmConfig.op, base_mode: wmConfig.base_mode }
       mode = wmConfig.base_mode
     }
     const { data } = await apiClient.createCompare({
@@ -782,15 +839,32 @@ onUnmounted(() => {
                              :label="`${c.column}（覆盖 ${c.matched_tables.length}/${wmSuggestTotal || selectedTables.length} · ${c.score.toFixed(0)} 分）`" />
                 </el-select>
                 <el-button size="small" :loading="wmLoadingCols" :disabled="!sourceRef" @click="loadWmColumns">获取候选水位列</el-button>
-                <el-select v-model="wmConfig.op" style="width: 90px;">
-                  <el-option value="<=" label="≤（含边界）" />
-                  <el-option value="<" label="<（严格）" />
-                </el-select>
-                <el-date-picker v-if="wmKindInferred === 'datetime'" v-model="wmConfig.value" type="datetime"
-                                value-format="YYYY-MM-DD HH:mm:ss" placeholder="水位值 YYYY-MM-DD HH:mm:ss" style="width: 230px;" />
-                <el-date-picker v-else-if="wmKindInferred === 'date'" v-model="wmConfig.value" type="date"
-                                value-format="YYYY-MM-DD" placeholder="水位值 YYYY-MM-DD" style="width: 230px;" />
-                <el-input v-else v-model="wmConfig.value" placeholder="水位值" style="width: 230px;" />
+                <el-radio-group v-if="wmRangeEligible" v-model="wmConfig.range_mode" size="small">
+                  <el-radio-button :value="false">单值</el-radio-button>
+                  <el-radio-button :value="true">区间</el-radio-button>
+                </el-radio-group>
+                <template v-if="wmConfig.range_mode">
+                  <el-date-picker v-if="wmKindInferred === 'datetime'" v-model="wmConfig.range_start" type="datetime"
+                                  value-format="YYYY-MM-DD HH:mm:ss" placeholder="区间起点 YYYY-MM-DD HH:mm:ss" style="width: 230px;" />
+                  <el-date-picker v-else-if="wmKindInferred === 'date'" v-model="wmConfig.range_start" type="date"
+                                  value-format="YYYY-MM-DD" placeholder="区间起点 YYYY-MM-DD" style="width: 200px;" />
+                  <span style="color: var(--tims-text-2);">~</span>
+                  <el-date-picker v-if="wmKindInferred === 'datetime'" v-model="wmConfig.range_end" type="datetime"
+                                  value-format="YYYY-MM-DD HH:mm:ss" placeholder="区间终点（不含）" style="width: 230px;" />
+                  <el-date-picker v-else-if="wmKindInferred === 'date'" v-model="wmConfig.range_end" type="date"
+                                  value-format="YYYY-MM-DD" placeholder="区间终点（不含）" style="width: 200px;" />
+                </template>
+                <template v-else>
+                  <el-select v-model="wmConfig.op" style="width: 90px;">
+                    <el-option value="<=" label="≤（含边界）" />
+                    <el-option value="<" label="<（严格）" />
+                  </el-select>
+                  <el-date-picker v-if="wmKindInferred === 'datetime'" v-model="wmConfig.value" type="datetime"
+                                  value-format="YYYY-MM-DD HH:mm:ss" placeholder="水位值 YYYY-MM-DD HH:mm:ss" style="width: 230px;" />
+                  <el-date-picker v-else-if="wmKindInferred === 'date'" v-model="wmConfig.value" type="date"
+                                  value-format="YYYY-MM-DD" placeholder="水位值 YYYY-MM-DD" style="width: 230px;" />
+                  <el-input v-else v-model="wmConfig.value" placeholder="水位值" style="width: 230px;" />
+                </template>
               </div>
               <el-alert v-if="wmAllMissing" type="error" :closable="false" style="margin-top: 6px;"
                         :title="`所选 ${wmMissingTables.length} 张表在源库均不存在，无法获取候选水位列，请核对表选择或数据源`" />
@@ -811,6 +885,7 @@ onUnmounted(() => {
               <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-top: 6px;">
                 两端按同一条件过滤后比对，消除「源端持续写入+同步滞后」的永久差异假象；NULL 水位行两端一致排除。
                 运行期缺列或类型不符的表将逐表跳过（报告中标记 skip，不再计为失败）。
+                <span v-if="wmConfig.range_mode">区间为半开 [start, end)，终点行不包含。</span>
                 <span v-if="wmIsTimestamptz" style="color: var(--tims-tag-warning-text);">timestamptz 列请输入 UTC 时间。</span>
               </div>
             </div>

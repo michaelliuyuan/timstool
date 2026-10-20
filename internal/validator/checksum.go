@@ -212,7 +212,7 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 	if wm := v.wmFilter(); wm != nil {
 		query := fmt.Sprintf("SELECT * FROM %s.%s WHERE %s ORDER BY %s LIMIT %d OFFSET %d",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm), quoteOrderByCols(orderBy, v.srcDialect.QuoteIdent), ch.limit, ch.offset)
-		rows, err = pgDB.QueryContext(ctx, query, wm.Value)
+		rows, err = pgDB.QueryContext(ctx, query, wmArgs(wm)...)
 	} else {
 		query := fmt.Sprintf("SELECT * FROM %s.%s ORDER BY %s LIMIT %d OFFSET %d",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), quoteOrderByCols(orderBy, v.srcDialect.QuoteIdent), ch.limit, ch.offset)
@@ -297,7 +297,7 @@ func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, ta
 	if wm := v.wmFilter(); wm != nil {
 		query := fmt.Sprintf("SELECT * FROM %s WHERE %s ORDER BY %s LIMIT %d OFFSET %d",
 			v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm), quoteOrderByCols(orderBy, v.tgtDialect.QuoteIdent), ch.limit, ch.offset)
-		rows, err = conn.QueryContext(ctx, query, wm.Value)
+		rows, err = conn.QueryContext(ctx, query, wmArgs(wm)...)
 	} else {
 		query := fmt.Sprintf("SELECT * FROM %s ORDER BY %s LIMIT %d OFFSET %d",
 			v.tgtDialect.QuoteIdent(table), quoteOrderByCols(orderBy, v.tgtDialect.QuoteIdent), ch.limit, ch.offset)
