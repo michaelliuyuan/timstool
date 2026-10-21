@@ -339,6 +339,8 @@ export interface CompareTask {
   tables: string[]
   /** #t3 watermark filter group (absent = unfiltered compare). Single-value form uses value/op; interval form uses range_start/range_end (mutually exclusive). */
   watermark?: { column: string; value?: string; op?: string; base_mode: string; range_start?: string; range_end?: string }
+  /** #ignore value-comparison exclusion list (columns never compared). */
+  ignore_columns?: string[]
   tables_done: number
   tables_total: number
   current_table?: string
@@ -367,6 +369,8 @@ export interface CreateCompareRequest {
   tables: string[]
   /** #t3 optional watermark filter; when set, mode is the filter's base_mode. */
   watermark?: { column: string; value?: string; op?: string; base_mode: string; range_start?: string; range_end?: string }
+  /** #ignore value-comparison exclusion list (columns never compared). */
+  ignore_columns?: string[]
 }
 
 export interface CompareOptions {
@@ -381,6 +385,8 @@ export interface CompareOptions {
   concurrency?: number
   /** #t3 present-and-null clears the saved group (partial-merge by presence). */
   watermark?: { column: string; value?: string; op?: string; base_mode: string; range_start?: string; range_end?: string } | null
+  /** #ignore present-and-empty clears the saved list (partial-merge by presence). */
+  ignore_columns?: string[]
 }
 
 // F-02 unified datasource registry. Passwords are write-only: they are sent
@@ -418,6 +424,8 @@ export interface CompareOptions {
   parallel?: number
   /** #t4 unified total concurrency budget. */
   concurrency?: number
+  /** #ignore value-comparison exclusion list (columns never compared). */
+  ignore_columns?: string[]
 }
 
 export const apiClient = {

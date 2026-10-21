@@ -46,11 +46,12 @@ type CompareTaskRequest struct {
 	Mode              string                  `json:"mode"`       // quick | sample | checksum (= watermark.base_mode when watermark active)
 	SampleRatio       float64                 `json:"sample_ratio"`
 	ChecksumChunkSize int64                   `json:"checksum_chunk_size"`
-	ChecksumParallel  int                     `json:"checksum_parallel"`   // deprecated (#t4): kept for compat, folded into Concurrency
-	Parallel          int                     `json:"parallel"`            // deprecated (#t4): kept for compat, folded into Concurrency
-	Concurrency       int                     `json:"concurrency"`         // #t4 unified budget 1-8 (0 = derive from legacy knobs)
-	Tables            []string                `json:"tables"`              // empty = all tables
-	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"` // #t3 optional filter group
+	ChecksumParallel  int                     `json:"checksum_parallel"`        // deprecated (#t4): kept for compat, folded into Concurrency
+	Parallel          int                     `json:"parallel"`                 // deprecated (#t4): kept for compat, folded into Concurrency
+	Concurrency       int                     `json:"concurrency"`              // #t4 unified budget 1-8 (0 = derive from legacy knobs)
+	Tables            []string                `json:"tables"`                   // empty = all tables
+	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`      // #t3 optional filter group
+	IgnoreColumns     []string                `json:"ignore_columns,omitempty"` // #ignore value-comparison exclusion list
 }
 
 // CompareTask is the persisted (password-redacted) compare task state.
@@ -68,6 +69,7 @@ type CompareTask struct {
 	Concurrency       int                     `json:"concurrency"`       // #t4 unified budget (effective value, 0 = auto)
 	Tables            []string                `json:"tables"`
 	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`
+	IgnoreColumns     []string                `json:"ignore_columns,omitempty"`
 	TablesDone        int                     `json:"tables_done"`
 	TablesTotal       int                     `json:"tables_total"`
 	CurrentTable      string                  `json:"current_table,omitempty"`
@@ -178,10 +180,11 @@ type compareOptionsBody struct {
 	Mode              string                  `json:"mode"`
 	SampleRatio       float64                 `json:"sample_ratio"`
 	ChecksumChunkSize int64                   `json:"checksum_chunk_size"`
-	ChecksumParallel  int                     `json:"checksum_parallel"`   // deprecated (#t4)
-	Parallel          int                     `json:"parallel"`            // deprecated (#t4)
-	Concurrency       int                     `json:"concurrency"`         // #t4 present-and-0 clears to auto
-	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"` // present-and-null clears
+	ChecksumParallel  int                     `json:"checksum_parallel"`        // deprecated (#t4)
+	Parallel          int                     `json:"parallel"`                 // deprecated (#t4)
+	Concurrency       int                     `json:"concurrency"`              // #t4 present-and-0 clears to auto
+	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`      // present-and-null clears
+	IgnoreColumns     []string                `json:"ignore_columns,omitempty"` // #ignore present-and-empty clears
 }
 
 // normalizeWatermarkFilter validates and canonicalizes a watermark filter
@@ -241,6 +244,42 @@ func normalizeWatermarkFilter(wm *config.WatermarkFilter) (*config.WatermarkFilt
 		out.BaseMode = "checksum"
 	}
 	return &out, nil
+}
+
+// normalizeIgnoreColumns validates and canonicalizes the #ignore exclusion
+// list: entries are trimmed, empties dropped, case-insensitive duplicates
+// collapsed (first occurrence wins), every name passes the same identifier
+// allow-list as watermark.column, and the list is capped at 64 entries.
+// nil/empty stays nil (exclusion off, zero regression).
+func normalizeIgnoreColumns(cols []string) ([]string, error) {
+	if len(cols) == 0 {
+		return nil, nil
+	}
+	const maxIgnoreColumns = 64
+	out := make([]string, 0, len(cols))
+	seen := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		t := strings.TrimSpace(c)
+		if t == "" {
+			continue
+		}
+		if !incIdentifierOK(t) {
+			return nil, fmt.Errorf("ignore_columns: 非法列名 %q", t)
+		}
+		k := strings.ToLower(t)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, t)
+	}
+	if len(out) > maxIgnoreColumns {
+		return nil, fmt.Errorf("ignore_columns: 最多 %d 个列名", maxIgnoreColumns)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 func (s *Server) compareOptionsFile() string {
@@ -361,6 +400,16 @@ func (s *Server) handlePutCompareOptions(w http.ResponseWriter, r *http.Request)
 		}
 		merged.Watermark = norm
 	}
+	// #ignore: present validates + canonicalizes (present-and-empty clears);
+	// absent keeps the saved list (partial-merge by presence).
+	if _, ok := presence["ignore_columns"]; ok {
+		norm, ierr := normalizeIgnoreColumns(req.IgnoreColumns)
+		if ierr != nil {
+			s.writeError(w, http.StatusBadRequest, ierr.Error())
+			return
+		}
+		merged.IgnoreColumns = norm
+	}
 	// Passwords never survive a save, regardless of what was sent.
 	merged.Source.Password = ""
 	merged.Target.Password = ""
@@ -476,6 +525,12 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Watermark = wm
+	igCols, ierr := normalizeIgnoreColumns(req.IgnoreColumns)
+	if ierr != nil {
+		s.writeError(w, http.StatusBadRequest, ierr.Error())
+		return
+	}
+	req.IgnoreColumns = igCols
 	switch req.Mode {
 	case "":
 		// #t3: a watermark task's mode IS the filter's base algorithm.
@@ -535,6 +590,7 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 		Concurrency:       conc,
 		Tables:            req.Tables,
 		Watermark:         req.Watermark,
+		IgnoreColumns:     req.IgnoreColumns,
 		CreatedAt:         now,
 		StartedAt:         &now, // M2: set before the goroutine spawns (no data race on the response)
 	}
@@ -595,6 +651,7 @@ func buildCompareRunParams(task *CompareTask, reportFile string) (float64, commo
 		ChecksumParallel:  task.ChecksumParallel,
 		Concurrency:       task.Concurrency,
 		Watermark:         task.Watermark,
+		IgnoreColumns:     task.IgnoreColumns,
 	}
 	return sampleRatio, opts, compareCfg
 }

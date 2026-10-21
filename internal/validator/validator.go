@@ -343,6 +343,19 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 				}
 			}
 
+			// #ignore: stamp the configured exclusion list on every table
+			// report (value-comparison scope only; row scoping, counts and
+			// the alignment key are unaffected). The per-table applied/PK
+			// collisions are disclosed inside the validation functions.
+			if igList := ignoreDisplayList(v.compareCfg()); len(igList) > 0 {
+				note := "排除字段: " + strings.Join(igList, ", ")
+				if tr.Suggestion == "" {
+					tr.Suggestion = note
+				} else {
+					tr.Suggestion = note + "；" + tr.Suggestion
+				}
+			}
+
 			mu.Lock()
 			rpt.AddTableReport(tr)
 			mu.Unlock()
@@ -607,6 +620,23 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		if dt == "character" || dt == "char" || dt == "bpchar" || dt == "character varying" || dt == "varchar" || dt == "text" {
 			trimCols[i] = true
 		}
+	}
+	// ignore-column exclusion rides the same skipCols channel (PK-protected:
+	// a configured ignore column that is this table's PK stays a key).
+	var pkIgnored []string
+	if keyInfo != nil {
+		_, pkIgnored = applyIgnoreSkips(v.compareCfg(), pgCols, keyInfo.PKColumns, skipCols)
+	} else {
+		_, pkIgnored = applyIgnoreSkips(v.compareCfg(), pgCols, nil, skipCols)
+	}
+	// A table whose every column is excluded (ignore list + float/JSON skips)
+	// has no comparable columns left — skip it with a disclosure instead of
+	// comparing empty hashes (which would PASS vacuously).
+	if ignoreConfigured(v.compareCfg()) && allColumnsSkipped(pgCols, skipCols) {
+		tr.Status = reporter.StatusSkip
+		tr.Error = "无可比列（排除字段后无剩余可比列）"
+		tr = prependPKProtectedNote(tr, pkIgnored)
+		return tr
 	}
 
 	pgValues := make([]interface{}, len(pgCols))
@@ -1012,6 +1042,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		tr.Status = reporter.StatusPass
 	}
 	tr.Suggestion = fmt.Sprintf("sampled %d rows (%.1f%%), %d mismatches", len(pgData), ratio*100, mismatchCount)
+	tr = prependPKProtectedNote(tr, pkIgnored)
 	return tr
 
 }
@@ -1056,6 +1087,9 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 			strings.Contains(dt, "json") {
 			skipCols[i] = true
 		}
+	}
+	if applyIgnoreNoPK(v, skipCols, pgCols, &tr) {
+		return tr
 	}
 
 	pgValues := make([]interface{}, len(pgCols))
@@ -1117,6 +1151,9 @@ func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB,
 			skipCols[i] = true
 		}
 	}
+	if applyIgnoreNoPK(v, skipCols, pgCols, &tr) {
+		return tr
+	}
 
 	pgValues := make([]interface{}, len(pgCols))
 	pgPtrs := make([]interface{}, len(pgCols))
@@ -1172,6 +1209,9 @@ func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, ti
 		if isApproximateFloatType(dt) || strings.Contains(dt, "json") {
 			skipCols[i] = true
 		}
+	}
+	if applyIgnoreNoPK(v, skipCols, pgCols, &tr) {
+		return tr
 	}
 
 	pgValues := make([]interface{}, len(pgCols))

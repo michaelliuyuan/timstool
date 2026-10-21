@@ -79,6 +79,12 @@ const wmBaseModes = [
   { value: 'sample', label: '采样' },
   { value: 'checksum', label: '校验（推荐）' },
 ]
+// ---- #ignore: value-comparison exclusion columns ----
+// Columns that are structurally divergent on the two ends (auto-increment
+// ids, side-specific created_at/updated_at clocks) can be excluded from
+// value comparison. The list is a global multi-tag input (exact column
+// names, matched case-insensitively); absent = compare every column.
+const ignoreCols = ref<string[]>([])
 // ---- #wm-candidates: suggest 式 Top-N 候选水位列 ----
 // The compare page now rides the SAME suggest scorer as the watermark
 // module (coverage/name/type/index scoring over the SELECTED tables), with
@@ -366,6 +372,11 @@ const optionsLoaded = ref(false)
 
 function applyCompareOptions(opts: CompareOptions) {
   if (!opts) return
+  // #ignore: a saved exclusion list restores the multi-tag input (absent/
+  // empty = no exclusions).
+  if (Array.isArray(opts.ignore_columns)) {
+    ignoreCols.value = [...opts.ignore_columns]
+  }
   // Connection fields in the payload (legacy saves) are intentionally ignored.
   // #t3: a saved watermark group restores the "水位" card + its config.
   if (opts.watermark) {
@@ -429,6 +440,8 @@ async function saveCompareParams() {
           ? { column: wmConfig.column, range_start: wmConfig.range_start, range_end: wmConfig.range_end, base_mode: wmConfig.base_mode }
           : { column: wmConfig.column, value: wmConfig.value, op: wmConfig.op, base_mode: wmConfig.base_mode }
         : null,
+      // #ignore: always send the current list (empty = clear).
+      ignore_columns: ignoreCols.value,
     } as any)
   } catch {
     // Silent memory: a failed save must never disturb the running compare.
@@ -543,6 +556,8 @@ async function startCompare() {
       concurrency: form.concurrency,
       tables: selectedTables.value,
       watermark,
+      // #ignore: value-comparison exclusion list (trimmed; server dedups).
+      ignore_columns: ignoreCols.value.map((c) => c.trim()).filter((c) => c !== ''),
     })
     activeTask.value = data
     activeReport.value = null
@@ -823,6 +838,16 @@ onUnmounted(() => {
         </el-form-item>
         <el-form-item v-if="form.mode === 'checksum' || (form.mode === 'watermark' && wmConfig.base_mode === 'checksum')" label="分块大小">
           <el-input-number v-model="form.checksum_chunk_size" :min="1000" :step="10000" />
+        </el-form-item>
+        <el-form-item label="排除字段">
+          <div style="width: 100%;">
+            <el-select v-model="ignoreCols" multiple allow-create filterable default-first-option
+                       placeholder="如 created_at, updated_at（回车添加，逗号分隔）" style="width: 100%;">
+            </el-select>
+            <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-top: 6px;">
+              自增字段、自动时间戳等两端注定不一致的列可在此排除，不参与值比对（行数统计与对齐键不受影响；排除列命中某表主键时该表自动保留该列）。
+            </div>
+          </div>
         </el-form-item>
         <template v-if="form.mode === 'watermark'">
           <el-form-item label="底层算法">

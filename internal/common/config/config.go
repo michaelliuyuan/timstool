@@ -90,6 +90,17 @@ type CompareConfig struct {
 	// illusion caused by ongoing source writes + sync lag. nil = unfiltered
 	// (zero regression for CLI / migration pipeline paths).
 	Watermark *WatermarkFilter `yaml:"watermark,omitempty" json:"watermark,omitempty"`
+
+	// IgnoreColumns lists column names whose VALUES are excluded from
+	// comparison (auto-increment / auto-timestamp columns that are
+	// inherently divergent between the two sides). Semantics: exact column
+	// names (no wildcards), case-insensitive, applied symmetrically to both
+	// sides via the in-memory skip sets — row scoping (watermark, row
+	// counts, PK alignment) is untouched; a column absent from a table is a
+	// no-op for that table. A name colliding with a table's primary key is
+	// softened per table (kept comparable + disclosed in the report). nil =
+	// compare every column (zero regression).
+	IgnoreColumns []string `yaml:"ignore_columns,omitempty" json:"ignore_columns,omitempty"`
 }
 
 // WatermarkFilter is the compare-side watermark filter group. Column passes

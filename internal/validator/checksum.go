@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -65,6 +66,26 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 
 	// Detect key columns for chunking
 	keyInfo, _ := v.srcDialect.DetectTableKey(ctx, pgDB, schema, table)
+
+	// #ignore: resolve the user exclusion set once (PK collisions softened
+	// away) and thread the effective set into both chunk hashers; the
+	// protected collisions are disclosed on the table report.
+	var igProtected []string
+	igEff := map[string]bool(nil)
+	if ignoreConfigured(v.compareCfg()) {
+		var pkCols []string
+		if keyInfo != nil && keyInfo.HasPK {
+			pkCols = keyInfo.PKColumns
+		}
+		var igApplied []string
+		igApplied, igProtected = tableIgnoreColumns(v.compareCfg(), pkCols)
+		igEff = ignoreSetMap(igApplied)
+		if len(igProtected) > 0 {
+			zap.L().Info("ignore columns hit primary key, kept comparable",
+				zap.String("table", table), zap.Strings("columns", igProtected))
+		}
+	}
+
 	var orderByCols string
 	if keyInfo != nil && keyInfo.HasPK {
 		orderByCols = strings.Join(keyInfo.PKColumns, ", ")
@@ -122,6 +143,7 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	// slot (#t4).
 	var mu sync.Mutex
 	var mismatchDetails []string
+	var noComparable bool
 	var wg sync.WaitGroup
 
 	for i, chunk := range chunks {
@@ -138,16 +160,28 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 			}
 			defer release()
 
-			pgHash, err := v.computeChunkHashPG(ctx, pgDB, schema, table, orderByCols, ch)
+			pgHash, err := v.computeChunkHashPG(ctx, pgDB, schema, table, orderByCols, ch, igEff)
 			if err != nil {
+				if errors.Is(err, ErrNoComparableCols) {
+					mu.Lock()
+					noComparable = true
+					mu.Unlock()
+					return
+				}
 				mu.Lock()
 				mismatchDetails = append(mismatchDetails, fmt.Sprintf("chunk %d: %s error: %v", idx, v.srcLabel(), err))
 				mu.Unlock()
 				return
 			}
 
-			tidbHash, err := v.computeChunkHashTiDB(ctx, tidbDB, table, orderByCols, ch)
+			tidbHash, err := v.computeChunkHashTiDB(ctx, tidbDB, table, orderByCols, ch, igEff)
 			if err != nil {
+				if errors.Is(err, ErrNoComparableCols) {
+					mu.Lock()
+					noComparable = true
+					mu.Unlock()
+					return
+				}
 				mu.Lock()
 				mismatchDetails = append(mismatchDetails, fmt.Sprintf("chunk %d: TiDB error: %v", idx, err))
 				mu.Unlock()
@@ -164,6 +198,15 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	}
 	wg.Wait()
 
+	// #ignore: every comparable column excluded ⇒ no evidence ⇒ runtime
+	// skip with a warning note (never a FAIL).
+	if noComparable {
+		tr.Status = reporter.StatusSkip
+		tr.Error = "无可比列（排除字段后无剩余可比列）"
+		tr = prependPKProtectedNote(tr, igProtected)
+		return tr
+	}
+
 	if len(mismatchDetails) > 0 {
 		tr.Status = reporter.StatusFail
 		maxShow := 10
@@ -176,8 +219,11 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 		tr.Status = reporter.StatusPass
 	}
 
-	tr.Suggestion = fmt.Sprintf("checksum mode: %d chunks 脳 %d rows, %d mismatches",
+	tr.Suggestion = fmt.Sprintf("checksum mode: %d chunks × %d rows, %d mismatches",
 		numChunks, chunkSize, len(mismatchDetails))
+	if len(igProtected) > 0 {
+		tr.Suggestion = "主键列不可排除: " + strings.Join(igProtected, ", ") + "；" + tr.Suggestion
+	}
 
 	return tr
 }
@@ -205,8 +251,10 @@ func quoteOrderByCols(orderBy string, quote func(string) string) string {
 // computeChunkHashPG computes an aggregate hash for a chunk of PG rows.
 // With a watermark filter active the chunk rows are the FILTERED universe
 // (validateRowCount already counted with the same predicate, so chunk
-// boundaries derived from that count stay consistent on both sides).
-func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema, table, orderBy string, ch chunkRange) (string, error) {
+// boundaries derived from that count stay consistent on both sides). ig is
+// the PK-resolved user ignore set (nil = none): hits join the float/JSON
+// skip channel — value hashing only, chunk ordering is untouched.
+func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema, table, orderBy string, ch chunkRange, ig map[string]bool) (string, error) {
 	var rows *sql.Rows
 	var err error
 	if wm := v.wmFilter(); wm != nil {
@@ -233,10 +281,11 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 	colNames := make([]string, len(cols))
 	colIdxMap := make(map[string]int)
 	for i, c := range cols {
+		lower := strings.ToLower(c.Name())
 		colNames[i] = c.Name()
-		colIdxMap[strings.ToLower(c.Name())] = i
+		colIdxMap[lower] = i
 		dt := strings.ToLower(c.DatabaseTypeName())
-		if isApproximateFloatType(dt) || strings.Contains(dt, "json") {
+		if isApproximateFloatType(dt) || strings.Contains(dt, "json") || ig[lower] {
 			skipCols[i] = true
 		}
 	}
@@ -252,6 +301,9 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 		if !skipCols[idx] {
 			hashIdxs = append(hashIdxs, idx)
 		}
+	}
+	if len(hashIdxs) == 0 {
+		return "", ErrNoComparableCols
 	}
 
 	values := make([]interface{}, len(cols))
@@ -285,7 +337,8 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 
 // computeChunkHashTiDB computes an aggregate hash for a chunk of TiDB rows.
 // It gets its own dedicated connection with UTC timezone for parallel goroutines.
-func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, table, orderBy string, ch chunkRange) (string, error) {
+// ig mirrors the PG-side ignore set so both sides hash the same columns.
+func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, table, orderBy string, ch chunkRange, ig map[string]bool) (string, error) {
 	// Get dedicated connection with UTC timezone for this goroutine.
 	conn, err := v.getTiDBConn(ctx, tidbDB)
 	if err != nil {
@@ -317,10 +370,11 @@ func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, ta
 	colNames := make([]string, len(cols))
 	colIdxMap := make(map[string]int)
 	for i, c := range cols {
+		lower := strings.ToLower(c.Name())
 		colNames[i] = c.Name()
-		colIdxMap[strings.ToLower(c.Name())] = i
+		colIdxMap[lower] = i
 		dt := strings.ToLower(c.DatabaseTypeName())
-		if isApproximateFloatType(dt) || strings.Contains(dt, "json") {
+		if isApproximateFloatType(dt) || strings.Contains(dt, "json") || ig[lower] {
 			skipCols[i] = true
 		}
 	}
@@ -335,6 +389,9 @@ func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, ta
 		if !skipCols[idx] {
 			hashIdxs = append(hashIdxs, idx)
 		}
+	}
+	if len(hashIdxs) == 0 {
+		return "", ErrNoComparableCols
 	}
 
 	values := make([]interface{}, len(cols))
