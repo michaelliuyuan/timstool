@@ -185,25 +185,44 @@ func TestWmSkipSentinel(t *testing.T) {
 	}
 }
 
-// A8: wmSkipReport — sentinel ⇒ StatusSkip with reason in Error and the
-// skip explained in Suggestion; ordinary error ⇒ StatusFail (unchanged).
-func TestWmSkipReportMapping(t *testing.T) {
-	skip := wmSkipReport("orders", wmSkipf("水位列 %s 类型 %s 不在可比白名单（timestamptz/timestamp/date/int/bigint）", "updated_at", "text"))
-	if skip.Status != reporter.StatusSkip {
-		t.Fatalf("sentinel status = %q, want skip", skip.Status)
+// A8: Plan A gate — sentinel ⇒ fallback (reason verbatim, no report);
+// ordinary error ⇒ hard FAIL; nil error ⇒ proceed with watermark.
+func TestWmPrecheckGateMapping(t *testing.T) {
+	sentinel := wmSkipf("水位列 %s 不存在于表 %s（水位过滤仅支持列存在的表参与比对）", "updated_at", "orders")
+	fb, failRep := wmPrecheckGate("orders", sentinel)
+	if failRep != nil {
+		t.Fatalf("sentinel must not produce a fail report: %+v", *failRep)
 	}
-	if skip.Error == "" || skip.Suggestion == "" {
-		t.Fatalf("skip report must disclose reason and suggestion: %+v", skip)
-	}
-	if !strings.Contains(skip.Suggestion, "跳过") {
-		t.Fatalf("suggestion must explain the skip: %q", skip.Suggestion)
+	if fb != sentinel.Error() {
+		t.Fatalf("fallback reason must be the verbatim precheck message: %q", fb)
 	}
 
-	fail := wmSkipReport("orders", fmt.Errorf("校验水位列: connection refused"))
-	if fail.Status != reporter.StatusFail {
-		t.Fatalf("ordinary error status = %q, want fail", fail.Status)
+	_, failRep = wmPrecheckGate("orders", fmt.Errorf("校验水位列: connection refused"))
+	if failRep == nil {
+		t.Fatal("ordinary error must stay a hard fail")
 	}
-	if fail.Error != "校验水位列: connection refused" {
-		t.Fatalf("fail error text altered: %q", fail.Error)
+	if failRep.Status != reporter.StatusFail {
+		t.Fatalf("ordinary error status = %q, want fail", failRep.Status)
+	}
+	if failRep.Error != "校验水位列: connection refused" {
+		t.Fatalf("fail error text altered: %q", failRep.Error)
+	}
+
+	fb, failRep = wmPrecheckGate("orders", nil)
+	if fb != "" || failRep != nil {
+		t.Fatalf("nil error must pass through clean: %q %+v", fb, failRep)
+	}
+}
+
+// A8b: fallback note wording — the original precheck message rides verbatim
+// inside the disclosure (UI-anchored wording preserved).
+func TestWmFallbackNote(t *testing.T) {
+	reason := "水位列 updated_at 类型 text 不在可比白名单（timestamptz/timestamp/date/int/bigint）"
+	note := wmFallbackNote(reason)
+	if !strings.Contains(note, reason) {
+		t.Fatalf("note must embed the original reason verbatim: %q", note)
+	}
+	if !strings.Contains(note, "退化为全量比对") {
+		t.Fatalf("note must disclose the full-comparison fallback: %q", note)
 	}
 }

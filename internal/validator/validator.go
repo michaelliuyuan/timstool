@@ -291,14 +291,19 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 			defer wg.Done()
 
 			var tr reporter.TableReport
+			// Plan A: a sentinel precheck hit degrades THIS table to full
+			// comparison (wm=nil via ctx override); the reason is disclosed
+			// in the report. Ordinary precheck errors stay hard FAILs.
+			var wmFallback string
 			switch mode {
 			case "quick", "sample":
-				tr = v.runTableUnit(ctx, pgDB, tidbDB, sem, tableName, wm, mode, opts.SampleRatio)
+				tr, wmFallback = v.runTableUnit(ctx, pgDB, tidbDB, sem, tableName, wm, mode, opts.SampleRatio)
 			case "checksum":
 				// Watermark column precheck first (1 slot, pool-backed PG
 				// query inside the slot), then the chunked comparison which
 				// manages its own per-unit slots (count = 1 unit, each
 				// chunk = 1 unit) — no slot held across waits.
+				tableCtx := ctx
 				if wm != nil {
 					release, aerr := sem.acquire(ctx)
 					if aerr != nil {
@@ -309,13 +314,16 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 					werr := v.srcDialect.ValidateWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), tableName, wm)
 					release()
 					if werr != nil {
-						// Sentinel (column absent / type not comparable) ⇒
-						// per-table runtime skip; probe failures stay fails.
-						tr = wmSkipReport(tableName, werr)
-						break
+						fb, failRep := wmPrecheckGate(tableName, werr)
+						if failRep != nil {
+							tr = *failRep
+							break
+						}
+						wmFallback = fb
+						tableCtx = ctxWithWMFallback(ctx)
 					}
 				}
-				tr = v.validateChecksumChunked(ctx, pgDB, tidbDB, tableName, sem)
+				tr = v.validateChecksumChunked(tableCtx, pgDB, tidbDB, tableName, sem)
 			default:
 				tr = reporter.TableReport{
 					TableName: tableName,
@@ -324,18 +332,12 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 				}
 			}
 
-			// #t3: stamp the watermark scope on every table report
-			// (SourceRows/TargetRows are already the filtered counts —
-			// validateRowCount runs first in every mode).
-			if wm != nil {
-				var note string
-				if wmRange(wm) {
-					note = fmt.Sprintf("水位过滤 %s [%s, %s)（源 %d 行/目标 %d 行）",
-						wm.Column, wm.RangeStart, wm.RangeEnd, tr.SourceRows, tr.TargetRows)
-				} else {
-					note = fmt.Sprintf("水位过滤 %s %s %s（源 %d 行/目标 %d 行）",
-						wm.Column, wmOp(wm), wm.Value, tr.SourceRows, tr.TargetRows)
-				}
+			// #t3/#wm-fallback: stamp the per-table watermark disclosure —
+			// the fallback note when this table degraded to full comparison
+			// (a scope note would mislead: its counts are full-table), else
+			// the configured scope note (SourceRows/TargetRows are already
+			// the filtered counts — validateRowCount runs first in every mode).
+			if note := wmTableNote(wm, wmFallback, tr.SourceRows, tr.TargetRows); note != "" {
 				if tr.Suggestion == "" {
 					tr.Suggestion = note
 				} else {
@@ -403,50 +405,57 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 // slot is acquired first, the dedicated UTC TiDB conn + the optional
 // watermark precheck (pool-backed PG query) + the validation body all happen
 // inside the slot, then conn and slot are released. Watermark predicate
-// construction itself is untouched (#t3 paths preserved verbatim).
+// construction itself is untouched (#t3 paths preserved verbatim). The
+// second return value is the Plan A fallback reason ("" = no fallback).
 func (v *Validator) runTableUnit(ctx context.Context, pgDB, tidbDB *sql.DB, sem concSem,
-	table string, wm *config.WatermarkFilter, mode string, sampleRatio float64) reporter.TableReport {
+	table string, wm *config.WatermarkFilter, mode string, sampleRatio float64) (reporter.TableReport, string) {
 	// 1 table validation = 1 work unit: the dedicated UTC TiDB conn lives
 	// entirely inside the budget slot.
 	release, aerr := sem.acquire(ctx)
 	if aerr != nil {
 		return reporter.TableReport{TableName: table, Status: reporter.StatusFail,
-			Error: fmt.Sprintf("cancelled before start: %v", aerr)}
+			Error: fmt.Sprintf("cancelled before start: %v", aerr)}, ""
 	}
 	tidbConn, connErr := v.getTiDBConn(ctx, tidbDB)
 	if connErr != nil {
 		release()
 		return reporter.TableReport{TableName: table, Status: reporter.StatusFail,
-			Error: fmt.Sprintf("get TiDB connection: %v", connErr)}
+			Error: fmt.Sprintf("get TiDB connection: %v", connErr)}, ""
 	}
 	var tr reporter.TableReport
+	var wmFallback string
 	if mode == "quick" {
-		tr = v.validateTableUnit(ctx, pgDB, tidbConn, table, wm, func(c *sql.Conn) reporter.TableReport {
-			return v.validateRowCount(ctx, pgDB, c, table)
+		tr, wmFallback = v.validateTableUnit(ctx, pgDB, tidbConn, table, wm, func(cctx context.Context, c *sql.Conn) reporter.TableReport {
+			return v.validateRowCount(cctx, pgDB, c, table)
 		})
 	} else {
-		tr = v.validateTableUnit(ctx, pgDB, tidbConn, table, wm, func(c *sql.Conn) reporter.TableReport {
-			return v.validateSampling(ctx, pgDB, c, tidbDB, table, sampleRatio)
+		tr, wmFallback = v.validateTableUnit(ctx, pgDB, tidbConn, table, wm, func(cctx context.Context, c *sql.Conn) reporter.TableReport {
+			return v.validateSampling(cctx, pgDB, c, tidbDB, table, sampleRatio)
 		})
 	}
 	tidbConn.Close()
 	release()
-	return tr
+	return tr, wmFallback
 }
 
 // validateTableUnit runs one single-slot work unit for quick/sample modes:
 // the optional watermark column precheck (pool-backed PG query) plus the mode
 // body, all while the caller holds a budget slot and the dedicated TiDB conn.
+// Plan A: a sentinel precheck hit degrades this table to full comparison
+// (the fn body then runs with a fallback-marked ctx ⇒ wm=nil everywhere);
+// ordinary probe/DB failures stay hard fails. Second return = fallback reason.
 func (v *Validator) validateTableUnit(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string,
-	wm *config.WatermarkFilter, fn func(*sql.Conn) reporter.TableReport) reporter.TableReport {
+	wm *config.WatermarkFilter, fn func(context.Context, *sql.Conn) reporter.TableReport) (reporter.TableReport, string) {
 	if wm != nil {
 		if werr := v.srcDialect.ValidateWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), table, wm); werr != nil {
-			// Sentinel (column absent / type not comparable) ⇒ per-table
-			// runtime skip; probe failures stay hard fails.
-			return wmSkipReport(table, werr)
+			fb, failRep := wmPrecheckGate(table, werr)
+			if failRep != nil {
+				return *failRep, ""
+			}
+			return fn(ctxWithWMFallback(ctx), tidbConn), fb
 		}
 	}
-	return fn(tidbConn)
+	return fn(ctx, tidbConn), ""
 }
 
 func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string) reporter.TableReport {
@@ -459,7 +468,7 @@ func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn
 
 	var sourceCount int64
 	var err error
-	wm := v.wmFilter()
+	wm := v.wmFilterFor(ctx)
 	if wm != nil {
 		err = pgDB.QueryRowContext(ctx,
 			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s WHERE %s",
@@ -581,7 +590,7 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 
 	offset := sampleOffset(tr.SourceRows, sampleSize)
 
-	wm := v.wmFilter()
+	wm := v.wmFilterFor(ctx)
 	var pgRows *sql.Rows
 	if wm != nil {
 		pgQuery := fmt.Sprintf("SELECT * FROM %s.%s WHERE %s ORDER BY 1 LIMIT %d OFFSET %d",
@@ -1058,7 +1067,7 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 	// Sampling would cause mismatches because TiDB is also queried in full.
 	var pgRows *sql.Rows
 	var err error
-	if wm := v.wmFilter(); wm != nil {
+	if wm := v.wmFilterFor(ctx); wm != nil {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
@@ -1123,7 +1132,7 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, tr reporter.TableReport, schema string) reporter.TableReport {
 	var pgRows *sql.Rows
 	var err error
-	if wm := v.wmFilter(); wm != nil {
+	if wm := v.wmFilterFor(ctx); wm != nil {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
@@ -1182,7 +1191,7 @@ func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB,
 func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, tr reporter.TableReport, schema string) reporter.TableReport {
 	var pgRows *sql.Rows
 	var err error
-	if wm := v.wmFilter(); wm != nil {
+	if wm := v.wmFilterFor(ctx); wm != nil {
 		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {

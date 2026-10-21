@@ -70,7 +70,7 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 	// Query TiDB for the full table first so we can build a unified skip set.
 	var tidbRows *sql.Rows
 	var err error
-	if wm := v.wmFilter(); wm != nil {
+	if wm := v.wmFilterFor(ctx); wm != nil {
 		tidbRows, err = tidbConn.QueryContext(ctx,
 			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
@@ -407,7 +407,7 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 	// Query TiDB full table
 	var tidbRows *sql.Rows
 	var err error
-	if wm := v.wmFilter(); wm != nil {
+	if wm := v.wmFilterFor(ctx); wm != nil {
 		tidbRows, err = tidbConn.QueryContext(ctx,
 			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
@@ -513,7 +513,7 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 	// Query TiDB full table and assign to buckets
 	var tidbRows *sql.Rows
 	var err error
-	if wm := v.wmFilter(); wm != nil {
+	if wm := v.wmFilterFor(ctx); wm != nil {
 		tidbRows, err = tidbConn.QueryContext(ctx,
 			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {

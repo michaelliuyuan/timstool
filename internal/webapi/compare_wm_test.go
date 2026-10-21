@@ -185,10 +185,10 @@ func TestCompareOptionsWatermarkMerge(t *testing.T) {
 	}
 }
 
-// A4: runtime per-table skip — a watermark run whose column was unusable on
-// EVERY table (all StatusSkip) is an explicit task failure with the
-// dedicated message, never a misleading "completed"; a mixed report (≥1
-// non-skip) is NOT all-skipped.
+// A4: runtime per-table skip — a watermark run where EVERY table hit a
+// residual skip path (no comparable columns / all excluded; all StatusSkip)
+// is an explicit task failure, never a misleading "completed"; a mixed
+// report (≥1 non-skip) is NOT all-skipped.
 func TestCompareAllTablesSkipped(t *testing.T) {
 	if compareAllTablesSkipped(nil) {
 		t.Fatal("nil report must not read as all-skipped")

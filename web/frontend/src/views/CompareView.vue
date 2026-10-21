@@ -134,7 +134,7 @@ const wmNoCandidates = computed(() =>
 
 async function loadWmColumns() {
   if (!sourceRef.value) {
-    ElMessage.warning('手填连接模式下请直接输入水位列名（运行期缺列表将逐表跳过）')
+    ElMessage.warning('手填连接模式下请直接输入水位列名（运行期缺列表将全量比对）')
     return
   }
   if (selectedTables.value.length === 0) {
@@ -933,12 +933,12 @@ onUnmounted(() => {
                 <span v-if="activeWmCandidate.warnings?.length" style="color: var(--tims-tag-warning-text);">；{{ activeWmCandidate.warnings[0] }}</span>
                 <el-tooltip v-if="activeWmCandidate.unmatched_tables?.length" placement="top">
                   <template #content>{{ activeWmCandidate.unmatched_tables.join('、') }}</template>
-                  <span style="color: var(--tims-tag-warning-text); cursor: help;">；缺该列 {{ activeWmCandidate.unmatched_tables.length }} 张表（悬停查看，运行期将逐表跳过）</span>
+                  <span style="color: var(--tims-tag-warning-text); cursor: help;">；缺该列 {{ activeWmCandidate.unmatched_tables.length }} 张表（悬停查看，运行期将全量比对）</span>
                 </el-tooltip>
               </div>
               <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-top: 6px;">
                 两端按同一条件过滤后比对，消除「源端持续写入+同步滞后」的永久差异假象；NULL 水位行两端一致排除。
-                运行期缺列或类型不符的表将逐表跳过（报告中标记 skip，不再计为失败）。
+                运行期缺列或类型不符的表将自动退化为全量比对（报告逐表注明）。
                 <span v-if="wmConfig.range_mode">区间为半开 [start, end)，终点行不包含。</span>
                 <span v-if="wmIsTimestamptz" style="color: var(--tims-tag-warning-text);">timestamptz 列请输入 UTC 时间。</span>
               </div>

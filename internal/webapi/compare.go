@@ -657,8 +657,9 @@ func buildCompareRunParams(task *CompareTask, reportFile string) (float64, commo
 }
 
 // compareAllTablesSkipped reports whether a finished report skipped EVERY
-// table (watermark-active run whose column was unusable everywhere): the run
-// produced no comparison evidence at all, which must not read as "completed".
+// table (watermark-active run where every table hit a residual skip path —
+// no comparable columns, or all of them excluded): the run produced no
+// comparison evidence at all, which must not read as "completed".
 func compareAllTablesSkipped(rpt *reporter.Report) bool {
 	if rpt == nil || len(rpt.Tables) == 0 {
 		return false
@@ -742,7 +743,7 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 	// Watermark active + every table skipped ⇒ no evidence at all — fail
 	// the task explicitly instead of a misleading "completed".
 	if task.Watermark != nil && compareAllTablesSkipped(report) {
-		finish(CompareStatusFailed, "水位列在所选表均不可用，已全部跳过")
+		finish(CompareStatusFailed, "所有表均被跳过（无可比列或列全被排除），未产生比对结果")
 		return
 	}
 

@@ -1,8 +1,8 @@
 // 比对页水位列改 suggest 式 Top-N 候选（任务书①②）：比对页复用 suggest
 // 打分器（按所选表子集评分）、allow-create 手输兜底、missing_tables 显式
 // 披露（部分缺失 warning / 全缺失独立 error / 无候选提示手输），运行期
-// 缺列表逐表跳过 + 报告 skip 独立灰标签。断言形=spec 精确匹配（本仓
-// vitest 惯例，禁页面盲扫）。
+// 缺列表全量比对回退（Plan A，报告逐表注明）+ 报告 skip 独立灰标签。
+// 断言形=spec 精确匹配（本仓 vitest 惯例，禁页面盲扫）。
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -41,16 +41,16 @@ describe('compare watermark Top-N candidates (任务书①②)', () => {
     expect(src).toContain(`所选表均无可比类型列，请手输列名或调整表选择`)
   })
 
-  it('candidate info panel shows coverage + unmatched tables (runtime skip note)', () => {
+  it('candidate info panel shows coverage + unmatched tables (runtime fallback note)', () => {
     const src = viewSrc()
     expect(src).toContain(`覆盖 {{ activeWmCandidate.matched_tables.length }}/{{ wmSuggestTotal || selectedTables.length }} 张表`)
     expect(src).toContain(`缺该列 {{ activeWmCandidate.unmatched_tables.length }} 张表`)
-    expect(src).toContain(`运行期将逐表跳过`)
+    expect(src).toContain(`运行期将全量比对`)
   })
 
-  it('manual (no sourceRef) mode hint says runtime per-table skip', () => {
+  it('manual (no sourceRef) mode hint says runtime full-comparison fallback', () => {
     const src = viewSrc()
-    expect(src).toContain(`运行期缺列表将逐表跳过`)
+    expect(src).toContain(`运行期缺列表将全量比对`)
   })
 
   it('report skip status renders as its own gray tag, never fail', () => {

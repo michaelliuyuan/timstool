@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"regexp"
@@ -85,6 +86,70 @@ func wmOp(wm *config.WatermarkFilter) string {
 // ordinary errors ⇒ StatusFail.
 var ErrWatermarkColumnSkip = errors.New("watermark column unavailable")
 
+// wmFallbackKey is the per-table ctx override marker: present ⇒ this table
+// degraded to full comparison (Plan A) and every query in the mode body must
+// run WITHOUT the watermark predicate, regardless of the global config. It
+// rides the existing ctx so no function signature changes and no Validator
+// field is mutated (table goroutines run concurrently).
+type wmFallbackKey struct{}
+
+// ctxWithWMFallback marks ctx as "this table fell back to full comparison".
+func ctxWithWMFallback(ctx context.Context) context.Context {
+	return context.WithValue(ctx, wmFallbackKey{}, true)
+}
+
+// wmFilterFor is the per-table-aware filter lookup for the mode bodies: a
+// fallback-marked ctx yields nil (full comparison for THIS table), otherwise
+// the global watermark filter. Entry-point gating (precheck + scope note
+// baseline) keeps using wmFilter() directly.
+func (v *Validator) wmFilterFor(ctx context.Context) *config.WatermarkFilter {
+	if _, ok := ctx.Value(wmFallbackKey{}).(bool); ok {
+		return nil
+	}
+	return v.wmFilter()
+}
+
+// wmPrecheckGate decides a table's fate after the watermark column precheck
+// (Plan A fallback semantics):
+//   - nil error       → proceed WITH the watermark filter ("" / nil)
+//   - sentinel hit    → FALL BACK to full comparison for this table; the
+//     original precheck message is returned verbatim as the fallback reason
+//   - ordinary error  → hard FAIL report (probe/DB failures stay fails)
+func wmPrecheckGate(table string, werr error) (fallback string, fail *reporter.TableReport) {
+	if werr == nil {
+		return "", nil
+	}
+	if errors.Is(werr, ErrWatermarkColumnSkip) {
+		return werr.Error(), nil
+	}
+	tr := reporter.TableReport{TableName: table, Status: reporter.StatusFail, Error: werr.Error()}
+	return "", &tr
+}
+
+// wmFallbackNote renders the per-table fallback disclosure for reports.
+func wmFallbackNote(reason string) string {
+	return fmt.Sprintf("水位列不可用（%s），该表已退化为全量比对", reason)
+}
+
+// wmTableNote picks the per-table watermark disclosure: when the table fell
+// back to full comparison the fallback note wins (a scope note would be
+// misleading — the counts are full-table), otherwise the configured scope
+// note; "" when no watermark is active and no fallback happened.
+func wmTableNote(wm *config.WatermarkFilter, fallback string, srcRows, tgtRows int64) string {
+	if fallback != "" {
+		return wmFallbackNote(fallback)
+	}
+	if wm == nil {
+		return ""
+	}
+	if wmRange(wm) {
+		return fmt.Sprintf("水位过滤 %s [%s, %s)（源 %d 行/目标 %d 行）",
+			wm.Column, wm.RangeStart, wm.RangeEnd, srcRows, tgtRows)
+	}
+	return fmt.Sprintf("水位过滤 %s %s %s（源 %d 行/目标 %d 行）",
+		wm.Column, wmOp(wm), wm.Value, srcRows, tgtRows)
+}
+
 // wmSkipError carries the ORIGINAL precheck message verbatim (the wording is
 // UI-anchored) while staying errors.Is-detectable as ErrWatermarkColumnSkip
 // via the Is hook — no text is prefixed or altered.
@@ -98,21 +163,10 @@ func wmSkipf(format string, args ...interface{}) error {
 	return wmSkipError{fmt.Sprintf(format, args...)}
 }
 
-// wmSkipReport builds the TableReport for a failed watermark column precheck:
-// a sentinel hit (column missing / type not comparable) ⇒ StatusSkip with the
-// original reason disclosed in Error and the skip explained in Suggestion;
-// any other error stays a hard StatusFail.
-func wmSkipReport(table string, werr error) reporter.TableReport {
-	if errors.Is(werr, ErrWatermarkColumnSkip) {
-		return reporter.TableReport{
-			TableName:  table,
-			Status:     reporter.StatusSkip,
-			Error:      werr.Error(),
-			Suggestion: "水位列在该表不可用，已运行期跳过（可更换水位列、手输列名或调整表选择）",
-		}
-	}
-	return reporter.TableReport{TableName: table, Status: reporter.StatusFail, Error: werr.Error()}
-}
+// wmSkipReport is REMOVED under Plan A: a sentinel hit no longer skips the
+// table — wmPrecheckGate routes it to full-comparison fallback and the
+// ordinary-error FAIL moved inline at the two call sites. See
+// wmPrecheckGate / wmFallbackNote.
 
 // MS-03: the predicate builders (wmWherePG/wmWhereMySQL), the column-check
 // probe (checkWatermarkColumn) and appendPGDSNUTC were relocated verbatim
