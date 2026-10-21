@@ -56,7 +56,8 @@ describe('MS-11i pen1: responsive tables + empty/action unification', () => {
     expect(s.split('class="tims-table-scroll"').length - 1).toBe(2)
     expect(s).toContain('prop="id" label="ID" width="90" class-name="hide-sm"')
     expect(s).toContain('label="表进度" width="120" class-name="hide-sm"')
-    expect(s).toContain('label="创建时间" width="170" class-name="hide-sm"')
+    // UX ②A: 创建时间 width→min-width（承接弹性，名称列改固定 220+省略）
+    expect(s).toContain('label="创建时间" min-width="170" class-name="hide-sm"')
     expect(s).toContain('prop="duration" label="耗时" width="90" class-name="hide-sm"')
   })
 

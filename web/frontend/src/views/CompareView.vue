@@ -809,6 +809,33 @@ onUnmounted(() => {
         <el-form-item label="任务名称">
           <el-input v-model="form.name" placeholder="可选，自动生成" style="width: 350px;" />
         </el-form-item>
+        <el-form-item label="选择表">
+          <div style="width: 100%;">
+            <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-bottom: 8px;">水位模式下请先选表，再配置候选水位列</div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <el-button size="small" @click="loadTables">加载表列表</el-button>
+              <span style="color: var(--tims-text-2); font-size: var(--tims-font-sm);">已选 {{ selectedTables.length }} / {{ availableTables.length }} 张表</span>
+            </div>
+            <el-input v-model="tableSearch" placeholder="搜索表名" style="width: 300px; margin-bottom: 8px;" clearable />
+            <el-table
+              v-if="availableTables.length > 0"
+              ref="tableRef"
+              :data="filteredTables"
+              @selection-change="handleTableSelection"
+              max-height="260"
+              :row-key="(row: any) => row.name"
+            >
+              <el-table-column type="selection" width="55" :reserve-selection="true" />
+              <el-table-column prop="name" label="表名" />
+              <el-table-column label="预估行数" width="160" align="right">
+                <template #default="{ row }">
+                  <span style="color: var(--tims-text-2);">{{ row.row_estimate >= 0 ? row.row_estimate.toLocaleString() : '-' }}</span>
+                </template>
+              </el-table-column>
+            </el-table>
+            <el-alert v-if="selectedTables.length === 0" type="info" :closable="false" title="未选择任何表，将比对全部表" style="margin-top: 8px;" />
+          </div>
+        </el-form-item>
         <el-form-item label="对比模式">
           <div style="display: flex; gap: 12px; flex-wrap: wrap;">
             <div
@@ -863,7 +890,9 @@ onUnmounted(() => {
                   <el-option v-for="c in wmCandidates" :key="c.column" :value="c.column"
                              :label="`${c.column}（覆盖 ${c.matched_tables.length}/${wmSuggestTotal || selectedTables.length} · ${c.score.toFixed(0)} 分）`" />
                 </el-select>
-                <el-button size="small" :loading="wmLoadingCols" :disabled="!sourceRef" @click="loadWmColumns">获取候选水位列</el-button>
+                <el-tooltip :disabled="sourceRef && selectedTables.length > 0" content="请先选择表" placement="top">
+                  <el-button size="small" :loading="wmLoadingCols" :disabled="!sourceRef || selectedTables.length === 0" @click="loadWmColumns">获取候选水位列</el-button>
+                </el-tooltip>
                 <el-radio-group v-if="wmRangeEligible" v-model="wmConfig.range_mode" size="small">
                   <el-radio-button :value="false">单值</el-radio-button>
                   <el-radio-button :value="true">区间</el-radio-button>
@@ -919,33 +948,6 @@ onUnmounted(() => {
         <el-form-item label="总并发数">
           <el-input-number v-model="form.concurrency" :min="1" :max="8" />
           <span style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-left: 8px;">任务同时执行的数据库查询数（所有模式共用，1–8）</span>
-        </el-form-item>
-
-        <el-form-item label="选择表">
-          <div style="width: 100%;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-              <el-button size="small" @click="loadTables">加载表列表</el-button>
-              <span style="color: var(--tims-text-2); font-size: var(--tims-font-sm);">已选 {{ selectedTables.length }} / {{ availableTables.length }} 张表</span>
-            </div>
-            <el-input v-model="tableSearch" placeholder="搜索表名" style="width: 300px; margin-bottom: 8px;" clearable />
-            <el-table
-              v-if="availableTables.length > 0"
-              ref="tableRef"
-              :data="filteredTables"
-              @selection-change="handleTableSelection"
-              max-height="260"
-              :row-key="(row: any) => row.name"
-            >
-              <el-table-column type="selection" width="55" :reserve-selection="true" />
-              <el-table-column prop="name" label="表名" />
-              <el-table-column label="预估行数" width="160" align="right">
-                <template #default="{ row }">
-                  <span style="color: var(--tims-text-2);">{{ row.row_estimate >= 0 ? row.row_estimate.toLocaleString() : '-' }}</span>
-                </template>
-              </el-table-column>
-            </el-table>
-            <el-alert v-if="selectedTables.length === 0" type="info" :closable="false" title="未选择任何表，将比对全部表" style="margin-top: 8px;" />
-          </div>
         </el-form-item>
 
         <el-form-item>
@@ -1031,10 +1033,10 @@ onUnmounted(() => {
       <div class="tims-table-scroll">
         <el-table :data="tasks" size="small">
           <el-table-column prop="id" label="ID" width="90" class-name="hide-sm" />
-          <el-table-column prop="name" label="名称" min-width="160" />
-          <el-table-column label="模式" width="90">
+          <el-table-column prop="name" label="名称" width="220" show-overflow-tooltip />
+          <el-table-column label="模式" width="130">
             <template #default="{ row }">
-            <span>{{ row.mode }}</span>
+            <span style="white-space: nowrap;">{{ row.mode }}</span>
             <el-tag v-if="row.watermark" size="small" type="warning" style="margin-left: 4px;">水位</el-tag>
           </template>
         </el-table-column>
@@ -1046,7 +1048,7 @@ onUnmounted(() => {
         <el-table-column label="表进度" width="120" class-name="hide-sm">
           <template #default="{ row }">{{ row.tables_done }} / {{ row.tables_total || '?' }}</template>
         </el-table-column>
-        <el-table-column label="创建时间" width="170" class-name="hide-sm">
+          <el-table-column label="创建时间" min-width="170" class-name="hide-sm">
           <template #default="{ row }">{{ new Date(row.created_at).toLocaleString() }}</template>
         </el-table-column>
         <el-table-column label="操作" width="140">
