@@ -1106,8 +1106,8 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
             </div>
 
             <div v-for="(t, i) in form.tables" :key="i" class="inc-table-row">
-              <el-select v-model="t.table" filterable allow-create default-first-option clearable
-                         :loading="loadingTables" placeholder="搜索或手输表名" style="width: 220px;" @change="onTableChanged(i)">
+               <el-select v-model="t.table" filterable allow-create default-first-option clearable
+                          :loading="loadingTables" placeholder="搜索或手输表名" style="width: 170px;" @change="onTableChanged(i)">
                 <el-option v-for="tb in tableList" :key="tb.name" :value="tb.name" :label="tb.row_estimate >= 0 ? `${tb.name}（约 ${tb.row_estimate.toLocaleString()} 行）` : tb.name" />
               </el-select>
               <el-tag v-if="t.missing" type="danger" size="small" style="margin-left: 4px;">不在源库表清单</el-tag>
@@ -1116,19 +1116,25 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
                 {{ t.key_info.has_pk ? '主键' : t.key_info.has_unique ? '唯一索引' : '无主键/唯一索引' }}
               </el-tag>
               <el-button size="small" style="margin: 0 4px 0 8px;" @click="loadColumns(i)">获取列</el-button>
-              <el-select v-if="t.columns.length" v-model="t.watermark_column" placeholder="水位列" style="width: 260px;" @change="onColumnPicked(i)">
+               <el-select v-if="t.columns.length" v-model="t.watermark_column" placeholder="水位列" style="width: 200px; margin-left: 4px;" @change="onColumnPicked(i)">
                 <el-option v-for="c in t.columns" :key="c.name" :value="c.name" :label="`${c.name}（${c.data_type}${c.indexed ? '' : ' · 无索引'}）`" :disabled="!c.comparable" />
               </el-select>
-              <el-input v-else v-model="t.watermark_column" placeholder="水位列（如 update_time）" style="width: 260px;" @change="touchRow(i)" />
+              <el-input v-else v-model="t.watermark_column" placeholder="水位列（如 update_time）" style="width: 200px; margin-left: 4px;" @change="touchRow(i)" />
               <el-tooltip :content="wmTooltip" placement="top">
                 <div class="wm-input-wrap">
-                  <el-date-picker v-if="rowWmKind(i) === 'datetime'" v-model="t.initial_watermark" type="datetime" value-format="YYYY-MM-DD HH:mm:ss" placeholder="留空=从最小值全量补齐" style="width: 200px;" @change="touchRow(i)" />
-                  <el-date-picker v-else-if="rowWmKind(i) === 'date'" v-model="t.initial_watermark" type="date" value-format="YYYY-MM-DD" placeholder="留空=从最小值全量补齐" style="width: 200px;" @change="touchRow(i)" />
-                  <el-input v-else v-model="t.initial_watermark" placeholder="初始水位，留空=全量补齐" style="width: 200px;" @change="touchRow(i)" />
+                  <el-date-picker v-if="rowWmKind(i) === 'datetime'" v-model="t.initial_watermark" type="datetime" value-format="YYYY-MM-DD HH:mm:ss" placeholder="留空=全量补齐" style="width: 170px;" @change="touchRow(i)" />
+                  <el-date-picker v-else-if="rowWmKind(i) === 'date'" v-model="t.initial_watermark" type="date" value-format="YYYY-MM-DD" placeholder="留空=全量补齐" style="width: 170px;" @change="touchRow(i)" />
+                  <el-input v-else v-model="t.initial_watermark" placeholder="初始水位，留空全量" style="width: 170px;" @change="touchRow(i)" />
                 </div>
               </el-tooltip>
-              <el-button type="danger" text style="margin-left: 8px;" @click="removeRow(i)">删除</el-button>
-              <div v-if="rowWmCol(i)" class="wm-hint row-hint">{{ wmHintOf(rowWmCol(i)!.data_type) }}</div>
+              <el-tooltip v-if="rowWmCol(i)" :content="wmHintOf(rowWmCol(i)!.data_type)" placement="top">
+                <span class="row-hint-ico">ⓘ</span>
+              </el-tooltip>
+              <el-tooltip content="删除" placement="top">
+                <el-button type="danger" text size="small" style="margin-left: 8px;" aria-label="删除" @click="removeRow(i)">
+                  <el-icon :size="14"><Close /></el-icon>
+                </el-button>
+              </el-tooltip>
             </div>
             <el-button size="small" style="margin-top: 8px;" @click="addRow">+ 添加表</el-button>
             <el-alert v-if="!form.source_ref" type="info" :closable="false" style="margin-top: 8px;">
@@ -1321,15 +1327,26 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
 .inc-table-row {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 4px 0;
+  flex-wrap: nowrap;
+  gap: 4px 4px;
+  min-width: 0;
   margin-bottom: 8px;
   width: 100%;
 }
 
-.row-hint {
-  width: 100%;
-  padding-left: 2px;
+.row-hint-ico {
+  margin-left: 4px;
+  color: var(--el-color-primary);
+  cursor: help;
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* 窄屏兜底：弹窗内容宽不足单行时恢复换行，避免横向溢出 */
+@media (max-width: 900px) {
+  .inc-table-row {
+    flex-wrap: wrap;
+  }
 }
 
 .row-actions {
