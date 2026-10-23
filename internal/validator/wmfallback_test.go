@@ -42,7 +42,7 @@ func TestWmFilterForZeroConfigUnchanged(t *testing.T) {
 // note, an unfiltered table gets "".
 func TestWmTableNoteMutualExclusion(t *testing.T) {
 	wm := wmTestRangeFilter()
-	note := wmTableNote(wm, "水位列 updated_at 不存在于表 orders", 10, 10)
+	note := wmTableNote(wm, "水位列 updated_at 不存在于表 orders", 10, 10, false)
 	if !strings.Contains(note, "退化为全量比对") || !strings.Contains(note, "不存在于表 orders") {
 		t.Fatalf("fallback note wrong: %q", note)
 	}
@@ -50,11 +50,11 @@ func TestWmTableNoteMutualExclusion(t *testing.T) {
 		t.Fatalf("fallback table must NOT carry the scope note: %q", note)
 	}
 
-	scope := wmTableNote(wm, "", 10, 10)
+	scope := wmTableNote(wm, "", 10, 10, false)
 	if !strings.Contains(scope, "水位过滤 updated_at [") {
 		t.Fatalf("scope note missing for non-fallback table: %q", scope)
 	}
-	if got := wmTableNote(nil, "", 0, 0); got != "" {
+	if got := wmTableNote(nil, "", 0, 0, false); got != "" {
 		t.Fatalf("no watermark and no fallback must yield empty note: %q", got)
 	}
 }

@@ -101,6 +101,16 @@ type CompareConfig struct {
 	// softened per table (kept comparable + disclosed in the report). nil =
 	// compare every column (zero regression).
 	IgnoreColumns []string `yaml:"ignore_columns,omitempty" json:"ignore_columns,omitempty"`
+
+	// TableWatermarks carries per-table watermark OVERRIDES (P1A): each
+	// entry pins ONE table's effective filter, bypassing the global group.
+	// Resolution per table: override hit → the entry's filter; else the
+	// global Watermark; else full comparison. An entry whose filter is not
+	// in an active form (see WatermarkFilter) is ignored at runtime — the
+	// table falls back to the global group. The entry's BaseMode is
+	// IGNORED (the task-level base algorithm applies to every table); it
+	// exists only because the filter group is reused verbatim.
+	TableWatermarks []TableWatermark `yaml:"table_watermarks,omitempty" json:"table_watermarks,omitempty"`
 }
 
 // WatermarkFilter is the compare-side watermark filter group. Column passes
@@ -116,6 +126,15 @@ type WatermarkFilter struct {
 	BaseMode   string `yaml:"base_mode" json:"base_mode"` // quick | sample | checksum (default checksum)
 	RangeStart string `yaml:"range_start,omitempty" json:"range_start,omitempty"`
 	RangeEnd   string `yaml:"range_end,omitempty" json:"range_end,omitempty"`
+}
+
+// TableWatermark is one per-table watermark override (P1A). The embedded
+// WatermarkFilter flattens into the JSON/YAML object ({"table": ..., column:
+// ..., value: ...}); BaseMode inside an override entry is ignored — the
+// task-level base algorithm always applies.
+type TableWatermark struct {
+	Table string `yaml:"table" json:"table"`
+	WatermarkFilter `yaml:",inline" json:",inline"`
 }
 
 type SourceConfig struct {

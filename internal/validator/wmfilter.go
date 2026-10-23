@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/common/reporter"
@@ -98,11 +99,69 @@ func ctxWithWMFallback(ctx context.Context) context.Context {
 	return context.WithValue(ctx, wmFallbackKey{}, true)
 }
 
-// wmFilterFor is the per-table-aware filter lookup for the mode bodies: a
-// fallback-marked ctx yields nil (full comparison for THIS table), otherwise
-// the global watermark filter. Entry-point gating (precheck + scope note
-// baseline) keeps using wmFilter() directly.
+// wmTableKey carries the table name through ctx so the mode bodies'
+// wmFilterFor lookups can resolve per-table overrides (P1A) without any
+// signature change. Same struct-key discipline as wmFallbackKey; the value
+// is set once per table goroutine and never mutated afterwards.
+type wmTableKey struct{ table string }
+
+// ctxWithWMTable tags ctx with the table name for override resolution.
+func ctxWithWMTable(ctx context.Context, table string) context.Context {
+	return context.WithValue(ctx, wmTableKey{}, table)
+}
+
+// wmActive mirrors wmFilter's activation rule for an arbitrary filter group
+// (used for both the global group and override entries): a group activates
+// in the single-value form or the full-interval form; anything else reads
+// as off.
+func wmActive(wm *config.WatermarkFilter) bool {
+	return wm != nil && wm.Column != "" && (wm.Value != "" || (wm.RangeStart != "" && wm.RangeEnd != ""))
+}
+
+// wmOverrideFor resolves the per-table override entry (P1A). hit ⇒ table has
+// an override entry; wm is non-nil because only ACTIVE entries resolve (an
+// inactive/half-configured entry is ignored — that table falls back to the
+// global group, mirroring the API's activation rule; disclosed in the work
+// order). The lookup reads the Validator's construction-time config every
+// call: the config is frozen after NewValidator, so this IS the task-start
+// read-only snapshot — no Validator field is mutated (concurrency red line)
+// and table goroutines only ever read it.
+func (v *Validator) wmOverrideFor(table string) (wm *config.WatermarkFilter, hit bool) {
+	for i := range v.compareCfg().TableWatermarks {
+		tw := &v.compareCfg().TableWatermarks[i]
+		if tw.Table == table && wmActive(&tw.WatermarkFilter) {
+			w := tw.WatermarkFilter // copy: callers must never see the slice element
+			return &w, true
+		}
+	}
+	return nil, false
+}
+
+// hasActiveWMOverrides reports whether ANY per-table override is active —
+// the task-level watermark-mode switch (P3A: no global group + at least one
+// override ⇒ still a watermark task for DSN/session gating).
+func (v *Validator) hasActiveWMOverrides() bool {
+	for i := range v.compareCfg().TableWatermarks {
+		if wmActive(&v.compareCfg().TableWatermarks[i].WatermarkFilter) {
+			return true
+		}
+	}
+	return false
+}
+
+// wmFilterFor is the per-table-aware filter lookup for the mode bodies.
+// Resolution order (work order D2a): per-table override entry (active form
+// only) → fallback marker (Plan A: this table runs full comparison) → the
+// global group. Override tables never carry the fallback marker (an
+// override precheck failure is a hard FAIL, P2A), so the two ctx keys never
+// conflict. Entry-point gating (precheck + scope note baseline) resolves the
+// effective filter explicitly instead.
 func (v *Validator) wmFilterFor(ctx context.Context) *config.WatermarkFilter {
+	if t, ok := ctx.Value(wmTableKey{}).(string); ok {
+		if ov, hit := v.wmOverrideFor(t); hit {
+			return ov
+		}
+	}
 	if _, ok := ctx.Value(wmFallbackKey{}).(bool); ok {
 		return nil
 	}
@@ -115,6 +174,8 @@ func (v *Validator) wmFilterFor(ctx context.Context) *config.WatermarkFilter {
 //   - sentinel hit    → FALL BACK to full comparison for this table; the
 //     original precheck message is returned verbatim as the fallback reason
 //   - ordinary error  → hard FAIL report (probe/DB failures stay fails)
+//
+// Override tables (P2A) never route through here — see wmPrecheckFailEx.
 func wmPrecheckGate(table string, werr error) (fallback string, fail *reporter.TableReport) {
 	if werr == nil {
 		return "", nil
@@ -126,6 +187,34 @@ func wmPrecheckGate(table string, werr error) (fallback string, fail *reporter.T
 	return "", &tr
 }
 
+// wmPrecheckFailEx is the override-table gate (P2A): an override is an
+// EXPLICIT per-table configuration, so a precheck failure — column absent,
+// type mismatch (sentinel) or an ordinary probe/DB error — is ALWAYS a hard
+// FAIL with the misconfiguration surfaced, never a silent full-comparison
+// fallback.
+func wmPrecheckFailEx(table string, werr error) *reporter.TableReport {
+	return &reporter.TableReport{
+		TableName: table,
+		Status:    reporter.StatusFail,
+		Error:     wmExFailPrefix + werr.Error(),
+	}
+}
+
+// wmExFailPrefix marks a wmPrecheckFailEx product — single source so the
+// isWmExFail recognizer below can never drift from the producer.
+const wmExFailPrefix = "例外水位列："
+
+// isWmExFail reports whether tr is a wmPrecheckFailEx product (an override
+// table's precheck FAIL). Such a row failed BEFORE any comparison ran, so its
+// counts are zero; the report stamp site skips the watermark scope note for
+// it (a「（源 0 行/目标 0 行）」note would read as "the filter matched
+// nothing" instead of "never ran") — the attribution already lives in the
+// Error field. Global-group FAIL rows keep their current note (out of scope
+// here).
+func isWmExFail(tr reporter.TableReport) bool {
+	return tr.Status == reporter.StatusFail && strings.HasPrefix(tr.Error, wmExFailPrefix)
+}
+
 // wmFallbackNote renders the per-table fallback disclosure for reports.
 func wmFallbackNote(reason string) string {
 	return fmt.Sprintf("水位列不可用（%s），该表已退化为全量比对", reason)
@@ -133,21 +222,27 @@ func wmFallbackNote(reason string) string {
 
 // wmTableNote picks the per-table watermark disclosure: when the table fell
 // back to full comparison the fallback note wins (a scope note would be
-// misleading — the counts are full-table), otherwise the configured scope
-// note; "" when no watermark is active and no fallback happened.
-func wmTableNote(wm *config.WatermarkFilter, fallback string, srcRows, tgtRows int64) string {
+// misleading — the counts are full-table); an override table gets the
+// override-tagged scope note (P1A/P4A: the report must show WHICH filter
+// applied); otherwise the configured scope note; "" when no watermark is
+// active and no fallback happened.
+func wmTableNote(wm *config.WatermarkFilter, fallback string, srcRows, tgtRows int64, override bool) string {
 	if fallback != "" {
 		return wmFallbackNote(fallback)
 	}
 	if wm == nil {
 		return ""
 	}
-	if wmRange(wm) {
-		return fmt.Sprintf("水位过滤 %s [%s, %s)（源 %d 行/目标 %d 行）",
-			wm.Column, wm.RangeStart, wm.RangeEnd, srcRows, tgtRows)
+	tag := ""
+	if override {
+		tag = "(例外)"
 	}
-	return fmt.Sprintf("水位过滤 %s %s %s（源 %d 行/目标 %d 行）",
-		wm.Column, wmOp(wm), wm.Value, srcRows, tgtRows)
+	if wmRange(wm) {
+		return fmt.Sprintf("水位过滤%s %s [%s, %s)（源 %d 行/目标 %d 行）",
+			tag, wm.Column, wm.RangeStart, wm.RangeEnd, srcRows, tgtRows)
+	}
+	return fmt.Sprintf("水位过滤%s %s %s %s（源 %d 行/目标 %d 行）",
+		tag, wm.Column, wmOp(wm), wm.Value, srcRows, tgtRows)
 }
 
 // wmSkipError carries the ORIGINAL precheck message verbatim (the wording is

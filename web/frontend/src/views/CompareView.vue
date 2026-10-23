@@ -239,6 +239,179 @@ const loadingTables = ref(false)
 const tableSearch = ref('')
 const selectedTables = ref<string[]>([])
 
+// ---- #wm-override: per-table watermark exceptions (P1A/P4A) ----
+// One editor entry per table; an entry ACTIVATES under the SAME rule as the
+// global group (column + value, or column + full interval) — a half-filled
+// entry is ignored on BOTH ends (the backend resolver skips inactive
+// entries; the frontend must mirror that exactly to prevent display-vs-
+// execution drift, the red-team focus of this feature).
+interface TableWmEntry {
+  column: string
+  op: string
+  value: string
+  range_mode: boolean
+  range_start: string
+  range_end: string
+}
+const tableWms = ref<Record<string, TableWmEntry>>({})
+
+// Activation mirror of the backend's wmActive: column set AND (value form or
+// full interval form). Anything else reads as off (entry ignored).
+function twmActive(e: TableWmEntry | undefined): e is TableWmEntry {
+  if (!e) return false
+  const col = e.column.trim() !== ''
+  const single = e.value.trim() !== ''
+  const fullRange = e.range_start.trim() !== '' && e.range_end.trim() !== ''
+  return col && (single || fullRange)
+}
+
+// The global group is active when the watermark card is on AND its group is
+// in an active form (startCompare validates this before sending).
+const globalWmActive = computed(() =>
+  form.mode === 'watermark'
+  && wmConfig.column.trim() !== ''
+  && (wmConfig.value.trim() !== '' || (wmConfig.range_start.trim() !== '' && wmConfig.range_end.trim() !== '')),
+)
+
+// Frontend re-computation of the engine's resolution chain (D2: override →
+// global → full). MUST stay strictly consistent with
+// internal/validator/wmfilter.go wmFilterFor.
+function wmStateFor(name: string): { kind: 'override' | 'global' | 'full'; entry?: TableWmEntry } {
+  const e = tableWms.value[name]
+  if (twmActive(e)) return { kind: 'override', entry: e }
+  if (globalWmActive.value) return { kind: 'global' }
+  return { kind: 'full' }
+}
+
+// Condition shorthand for the per-row tag/tooltips (「col ≤ v」/「col ∈ [s,e)」).
+function wmCondShort(e: { column: string; op: string; value: string; range_mode: boolean; range_start: string; range_end: string }): string {
+  if (e.range_mode && e.range_start && e.range_end) return `${e.column} ∈ [${e.range_start}, ${e.range_end})`
+  return `${e.column} ${e.op} ${e.value}`
+}
+const globalWmCondShort = computed(() => wmCondShort(wmConfig))
+
+const activeOverrideCount = computed(() =>
+  Object.values(tableWms.value).filter(e => twmActive(e)).length)
+
+// ---- #wm-override editor dialog (P4A) ----
+interface TwmColInfo { name: string; data_type: string; comparable: boolean; indexed: boolean }
+const twmDialog = ref(false)
+const twmTable = ref('')
+const twmColumns = ref<TwmColInfo[]>([])
+const twmLoadingCols = ref(false)
+const twmForm = reactive<TableWmEntry>({ column: '', op: '<=', value: '', range_mode: false, range_start: '', range_end: '' })
+const twmEditingExisting = computed(() => twmActive(tableWms.value[twmTable.value]))
+
+async function openTwmDialog(table: string) {
+  twmTable.value = table
+  const saved = tableWms.value[table]
+  Object.assign(twmForm, saved || { column: '', op: '<=', value: '', range_mode: false, range_start: '', range_end: '' })
+  // Prefill from the global group when it is active — the common path is
+  // "tune this table's condition", not "start from scratch".
+  if (!saved && globalWmActive.value) {
+    twmForm.column = wmConfig.column
+    twmForm.op = wmConfig.op
+    twmForm.value = wmConfig.value
+    twmForm.range_mode = wmConfig.range_mode
+    twmForm.range_start = wmConfig.range_start
+    twmForm.range_end = wmConfig.range_end
+  }
+  twmDialog.value = true
+  if (sourceRef.value) await loadTwmColumns()
+}
+
+async function loadTwmColumns() {
+  if (!sourceRef.value || !twmTable.value) return
+  twmLoadingCols.value = true
+  try {
+    const { data } = await apiClient.getSourceTableColumns(sourceRef.value, twmTable.value)
+    twmColumns.value = data.columns || []
+  } catch (e: any) {
+    // Column metadata is an aid, never a gate: manual entry stays available.
+    twmColumns.value = []
+    ElMessage.warning(`获取该表列信息失败（可手输列名）: ${e.response?.data?.error || e.message}`)
+  } finally {
+    twmLoadingCols.value = false
+  }
+}
+
+// Type-aware value control for the override dialog (same mapping as the
+// global block's wmKind, driven by the selected column's data_type).
+const twmSelCol = computed(() => twmColumns.value.find(c => c.name === twmForm.column))
+const twmKind = computed<'datetime' | 'date' | 'int' | 'text'>(() => {
+  const t = twmSelCol.value?.data_type || ''
+  if (t === 'timestamptz' || t === 'timestamp' || t === 'datetime') return 'datetime'
+  if (t === 'date') return 'date'
+  if (t === 'bigint' || t === 'integer') return 'int'
+  return 'text'
+})
+const twmRangeEligible = computed(() => twmKind.value === 'datetime' || twmKind.value === 'date')
+watch(twmRangeEligible, (ok) => { if (!ok) twmForm.range_mode = false })
+
+function validateTwmEntry(): string {
+  if (!twmForm.column.trim()) return '请填写例外水位列名'
+  if (twmForm.range_mode) {
+    if (!twmForm.range_start.trim() || !twmForm.range_end.trim()) return '区间起点与终点都必须填写'
+    if (twmForm.range_start >= twmForm.range_end) return '区间起点必须早于终点（半开区间）'
+  } else if (!twmForm.value.trim()) {
+    return '请填写例外水位值'
+  }
+  return ''
+}
+
+function saveTwmEntry() {
+  const verr = validateTwmEntry()
+  if (verr) { ElMessage.warning(verr); return }
+  tableWms.value = { ...tableWms.value, [twmTable.value]: { ...twmForm } }
+  twmDialog.value = false
+}
+
+function clearTwmEntry() {
+  if (tableWms.value[twmTable.value]) {
+    const next = { ...tableWms.value }
+    delete next[twmTable.value]
+    tableWms.value = next
+  }
+  twmDialog.value = false
+}
+
+// Drop override entries for tables that left the available list only when a
+// fresh table load REPLACED the list (keeps entries across search/filter).
+watch(availableTables, (nv) => {
+  if (nv.length === 0) { tableWms.value = {}; return }
+  const names = new Set(nv.map(t => t.name))
+  const next: Record<string, TableWmEntry> = {}
+  for (const [k, v] of Object.entries(tableWms.value)) if (names.has(k)) next[k] = v
+  tableWms.value = next
+})
+
+// ---- #wm-override pre-run summary dialog (P4A c) ----
+// With any active override, disclose every selected table's EFFECTIVE
+// watermark before the task starts; >10 rows collapse.
+async function confirmTableWmsBeforeRun(): Promise<boolean> {
+  const rows = selectedTables.value.length > 0
+    ? selectedTables.value
+    : availableTables.value.map(t => t.name)
+  const lines = rows.map((name) => {
+    const st = wmStateFor(name)
+    if (st.kind === 'override') return `${name}：例外 ${wmCondShort(st.entry!)}`
+    if (st.kind === 'global') return `${name}：全局 ${globalWmCondShort.value}`
+    return `${name}：全量比对`
+  })
+  const shown = lines.slice(0, 10).join('\n')
+  const collapsed = lines.length > 10 ? `\n…等共 ${lines.length} 张表` : ''
+  try {
+    await ElMessageBox.confirm(
+      `${shown}${collapsed}`,
+      '例外水位确认',
+      { type: 'info', confirmButtonText: '开始比对', cancelButtonText: '返回检查', customStyle: { whiteSpace: 'pre-line' } as any },
+    )
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function loadTables() {
   loadingTables.value = true
   availableTables.value = []
@@ -377,6 +550,24 @@ function applyCompareOptions(opts: CompareOptions) {
   if (Array.isArray(opts.ignore_columns)) {
     ignoreCols.value = [...opts.ignore_columns]
   }
+  // #wm-override: restore the saved per-table exceptions (absent/empty =
+  // none). The stored entries are already in active form (server-normalized).
+  if (Array.isArray(opts.table_watermarks)) {
+    const next: Record<string, TableWmEntry> = {}
+    for (const e of opts.table_watermarks) {
+      if (!e?.table || !e.column) continue
+      const rangeMode = !!(e.range_start && e.range_end)
+      next[e.table] = {
+        column: e.column,
+        op: e.op === '<' ? '<' : '<=',
+        value: rangeMode ? '' : (e.value || ''),
+        range_mode: rangeMode,
+        range_start: rangeMode ? e.range_start! : '',
+        range_end: rangeMode ? e.range_end! : '',
+      }
+    }
+    tableWms.value = next
+  }
   // Connection fields in the payload (legacy saves) are intentionally ignored.
   // #t3: a saved watermark group restores the "水位" card + its config.
   if (opts.watermark) {
@@ -442,6 +633,13 @@ async function saveCompareParams() {
         : null,
       // #ignore: always send the current list (empty = clear).
       ignore_columns: ignoreCols.value,
+      // #wm-override: always send the active entries (empty = clear; the
+      // mirrors-of-presence semantics of every other list option).
+      table_watermarks: Object.entries(tableWms.value)
+        .filter(([, e]) => twmActive(e))
+        .map(([table, e]) => e.range_mode
+          ? { table, column: e.column, range_start: e.range_start, range_end: e.range_end }
+          : { table, column: e.column, value: e.value, op: e.op }),
     } as any)
   } catch {
     // Silent memory: a failed save must never disturb the running compare.
@@ -523,6 +721,14 @@ async function startCompare() {
   }
   starting.value = true
   try {
+    // #wm-override (P4A c): with any active override, disclose every table's
+    // EFFECTIVE watermark first — the resolution chain is invisible in the
+    // global block alone, and a misconfigured exception fails the table at
+    // runtime (P2A); this is the last cheap checkpoint.
+    if (activeOverrideCount.value > 0) {
+      const ok = await confirmTableWmsBeforeRun()
+      if (!ok) { starting.value = false; return }
+    }
     // #t3: the "水位" card maps to mode=base_mode + watermark group.
     let watermark: CreateCompareRequest['watermark']
     let mode = form.mode
@@ -556,6 +762,13 @@ async function startCompare() {
       concurrency: form.concurrency,
       tables: selectedTables.value,
       watermark,
+      // #wm-override: active per-table exceptions (P1A); entries never carry
+      // a base_mode — the task-level mode applies to every table.
+      table_watermarks: Object.entries(tableWms.value)
+        .filter(([, e]) => twmActive(e))
+        .map(([table, e]) => e.range_mode
+          ? { table, column: e.column.trim(), range_start: e.range_start.trim(), range_end: e.range_end.trim() }
+          : { table, column: e.column.trim(), value: e.value.trim(), op: e.op }),
       // #ignore: value-comparison exclusion list (trimmed; server dedups).
       ignore_columns: ignoreCols.value.map((c) => c.trim()).filter((c) => c !== ''),
     })
@@ -811,7 +1024,7 @@ onUnmounted(() => {
         </el-form-item>
         <el-form-item label="选择表">
           <div style="width: 100%;">
-            <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-bottom: 8px;">水位模式下请先选表，再配置候选水位列</div>
+            <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-bottom: 8px;">水位模式下请先选表，再配置候选水位列；行内「设为例外」可对单表配置独立水位（优先于全局）</div>
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
               <el-button size="small" @click="loadTables">加载表列表</el-button>
               <span style="color: var(--tims-text-2); font-size: var(--tims-font-sm);">已选 {{ selectedTables.length }} / {{ availableTables.length }} 张表</span>
@@ -827,9 +1040,31 @@ onUnmounted(() => {
             >
               <el-table-column type="selection" width="55" :reserve-selection="true" />
               <el-table-column prop="name" label="表名" />
-              <el-table-column label="预估行数" width="160" align="right">
+              <el-table-column label="预估行数" width="140" align="right">
                 <template #default="{ row }">
                   <span style="color: var(--tims-text-2);">{{ row.row_estimate >= 0 ? row.row_estimate.toLocaleString() : '-' }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="水位" width="230">
+                <template #default="{ row }">
+                  <template v-if="wmStateFor(row.name).kind === 'override'">
+                    <el-tag size="small" type="primary">例外</el-tag>
+                    <el-tooltip :content="`例外 ${wmCondShort(wmStateFor(row.name).entry!)}`" placement="top">
+                      <span style="font-size: var(--tims-font-xs); margin-left: 4px; cursor: help;">{{ wmCondShort(wmStateFor(row.name).entry!).split(' ')[0] }}</span>
+                    </el-tooltip>
+                    <el-button link type="primary" size="small" style="margin-left: 4px;" @click="openTwmDialog(row.name)">编辑</el-button>
+                  </template>
+                  <template v-else-if="wmStateFor(row.name).kind === 'global'">
+                    <el-tag size="small" type="success">全局✓</el-tag>
+                    <el-tooltip :content="`全局 ${globalWmCondShort}`" placement="top">
+                      <span style="font-size: var(--tims-font-xs); margin-left: 4px; cursor: help;">{{ wmConfig.column }}</span>
+                    </el-tooltip>
+                    <el-button link type="primary" size="small" style="margin-left: 4px;" @click="openTwmDialog(row.name)">设为例外</el-button>
+                  </template>
+                  <template v-else>
+                    <el-tag size="small" type="info">全量</el-tag>
+                    <el-button link type="primary" size="small" style="margin-left: 4px;" @click="openTwmDialog(row.name)">设为例外</el-button>
+                  </template>
                 </template>
               </el-table-column>
             </el-table>
@@ -941,6 +1176,7 @@ onUnmounted(() => {
                 运行期缺列或类型不符的表将自动退化为全量比对（报告逐表注明）。
                 <span v-if="wmConfig.range_mode">区间为半开 [start, end)，终点行不包含。</span>
                 <span v-if="wmIsTimestamptz" style="color: var(--tims-tag-warning-text);">timestamptz 列请输入 UTC 时间。</span>
+                <span v-if="activeOverrideCount > 0" style="color: var(--tims-tag-warning-text);">当前 {{ activeOverrideCount }} 张表配置了例外水位（优先于全局，预检失败即该表失败）。</span>
               </div>
             </div>
           </el-form-item>
@@ -1060,6 +1296,66 @@ onUnmounted(() => {
         </el-table>
       </div>
     </el-card>
+
+    <!-- #wm-override per-table exception editor (P4A): column list is
+         metadata aid (never a gate — manual entry stays available),
+         comparable types selectable only, type-aware value control, no-index
+         warning, single-value / interval dual form. -->
+    <el-dialog v-model="twmDialog" :title="`例外水位 — ${twmTable}`" width="560px">
+      <el-form label-width="90px">
+        <el-form-item label="水位列">
+          <div style="display: flex; gap: 8px; align-items: center; width: 100%;">
+            <el-select v-model="twmForm.column" filterable allow-create default-first-option clearable
+                       :loading="twmLoadingCols" placeholder="选择列或手输列名" style="width: 260px;">
+              <el-option v-for="c in twmColumns" :key="c.name" :value="c.name" :disabled="!c.comparable"
+                         :label="c.comparable ? `${c.name}（${c.data_type}${c.indexed ? '' : '，无索引'}）` : `${c.name}（不可比类型 ${c.data_type}）`" />
+            </el-select>
+            <el-button v-if="sourceRef" size="small" :loading="twmLoadingCols" @click="loadTwmColumns">刷新列</el-button>
+          </div>
+          <div v-if="!sourceRef" style="font-size: var(--tims-font-xs); color: var(--tims-text-2); width: 100%;">
+            手填连接模式下请直接输入例外水位列名（运行期列校验仍生效）
+          </div>
+          <div v-if="twmSelCol && !twmSelCol.indexed" style="font-size: var(--tims-font-xs); color: var(--tims-tag-warning-text); width: 100%;">
+            该列无索引：例外过滤将对该表做全表扫描，大表可能较慢
+          </div>
+        </el-form-item>
+        <el-form-item label="条件">
+          <el-radio-group v-if="twmRangeEligible" v-model="twmForm.range_mode" size="small" style="margin-right: 12px;">
+            <el-radio-button :value="false">单值</el-radio-button>
+            <el-radio-button :value="true">区间</el-radio-button>
+          </el-radio-group>
+          <template v-if="twmForm.range_mode">
+            <el-date-picker v-if="twmKind === 'datetime'" v-model="twmForm.range_start" type="datetime"
+                            value-format="YYYY-MM-DD HH:mm:ss" placeholder="起点 YYYY-MM-DD HH:mm:ss" style="width: 210px;" />
+            <el-date-picker v-else-if="twmKind === 'date'" v-model="twmForm.range_start" type="date"
+                            value-format="YYYY-MM-DD" placeholder="起点 YYYY-MM-DD" style="width: 180px;" />
+            <el-input v-else v-model="twmForm.range_start" placeholder="区间起点" style="width: 180px;" />
+            <span style="color: var(--tims-text-2); margin: 0 4px;">~</span>
+            <el-date-picker v-if="twmKind === 'datetime'" v-model="twmForm.range_end" type="datetime"
+                            value-format="YYYY-MM-DD HH:mm:ss" placeholder="终点（不含）" style="width: 210px;" />
+            <el-date-picker v-else-if="twmKind === 'date'" v-model="twmForm.range_end" type="date"
+                            value-format="YYYY-MM-DD" placeholder="终点（不含）" style="width: 180px;" />
+            <el-input v-else v-model="twmForm.range_end" placeholder="区间终点（不含）" style="width: 180px;" />
+          </template>
+          <template v-else>
+            <el-select v-model="twmForm.op" style="width: 90px; margin-right: 8px;">
+              <el-option value="<=" label="≤（含边界）" />
+              <el-option value="<" label="<（严格）" />
+            </el-select>
+            <el-date-picker v-if="twmKind === 'datetime'" v-model="twmForm.value" type="datetime"
+                            value-format="YYYY-MM-DD HH:mm:ss" placeholder="水位值 YYYY-MM-DD HH:mm:ss" style="width: 210px;" />
+            <el-date-picker v-else-if="twmKind === 'date'" v-model="twmForm.value" type="date"
+                            value-format="YYYY-MM-DD" placeholder="水位值 YYYY-MM-DD" style="width: 180px;" />
+            <el-input v-else v-model="twmForm.value" placeholder="水位值" style="width: 180px;" />
+          </template>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button v-if="twmEditingExisting" type="danger" plain @click="clearTwmEntry">清除例外</el-button>
+        <el-button @click="twmDialog = false">取消</el-button>
+        <el-button type="primary" @click="saveTwmEntry">保存例外</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 

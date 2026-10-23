@@ -369,6 +369,8 @@ export interface CreateCompareRequest {
   tables: string[]
   /** #t3 optional watermark filter; when set, mode is the filter's base_mode. */
   watermark?: { column: string; value?: string; op?: string; base_mode: string; range_start?: string; range_end?: string }
+  /** #wm-override per-table watermark overrides (P1A); entries never carry a base_mode. */
+  table_watermarks?: { table: string; column: string; value?: string; op?: string; range_start?: string; range_end?: string }[]
   /** #ignore value-comparison exclusion list (columns never compared). */
   ignore_columns?: string[]
 }
@@ -385,6 +387,8 @@ export interface CompareOptions {
   concurrency?: number
   /** #t3 present-and-null clears the saved group (partial-merge by presence). */
   watermark?: { column: string; value?: string; op?: string; base_mode: string; range_start?: string; range_end?: string } | null
+  /** #wm-override present-and-empty clears the saved overrides. */
+  table_watermarks?: { table: string; column: string; value?: string; op?: string; range_start?: string; range_end?: string }[]
   /** #ignore present-and-empty clears the saved list (partial-merge by presence). */
   ignore_columns?: string[]
 }

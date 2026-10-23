@@ -49,9 +49,10 @@ type CompareTaskRequest struct {
 	ChecksumParallel  int                     `json:"checksum_parallel"`        // deprecated (#t4): kept for compat, folded into Concurrency
 	Parallel          int                     `json:"parallel"`                 // deprecated (#t4): kept for compat, folded into Concurrency
 	Concurrency       int                     `json:"concurrency"`              // #t4 unified budget 1-8 (0 = derive from legacy knobs)
-	Tables            []string                `json:"tables"`                   // empty = all tables
-	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`      // #t3 optional filter group
-	IgnoreColumns     []string                `json:"ignore_columns,omitempty"` // #ignore value-comparison exclusion list
+	Tables            []string                  `json:"tables"`                   // empty = all tables
+	Watermark         *config.WatermarkFilter   `json:"watermark,omitempty"`      // #t3 optional filter group
+	TableWatermarks   []config.TableWatermark   `json:"table_watermarks,omitempty"` // #wm-override per-table filters (P1A)
+	IgnoreColumns     []string                  `json:"ignore_columns,omitempty"` // #ignore value-comparison exclusion list
 }
 
 // CompareTask is the persisted (password-redacted) compare task state.
@@ -67,9 +68,10 @@ type CompareTask struct {
 	ChecksumParallel  int                     `json:"checksum_parallel"` // deprecated (#t4)
 	Parallel          int                     `json:"parallel"`          // deprecated (#t4)
 	Concurrency       int                     `json:"concurrency"`       // #t4 unified budget (effective value, 0 = auto)
-	Tables            []string                `json:"tables"`
-	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`
-	IgnoreColumns     []string                `json:"ignore_columns,omitempty"`
+	Tables            []string                  `json:"tables"`
+	Watermark         *config.WatermarkFilter   `json:"watermark,omitempty"`
+	TableWatermarks   []config.TableWatermark   `json:"table_watermarks,omitempty"` // #wm-override per-table filters
+	IgnoreColumns     []string                  `json:"ignore_columns,omitempty"`
 	TablesDone        int                     `json:"tables_done"`
 	TablesTotal       int                     `json:"tables_total"`
 	CurrentTable      string                  `json:"current_table,omitempty"`
@@ -183,8 +185,9 @@ type compareOptionsBody struct {
 	ChecksumParallel  int                     `json:"checksum_parallel"`        // deprecated (#t4)
 	Parallel          int                     `json:"parallel"`                 // deprecated (#t4)
 	Concurrency       int                     `json:"concurrency"`              // #t4 present-and-0 clears to auto
-	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`      // present-and-null clears
-	IgnoreColumns     []string                `json:"ignore_columns,omitempty"` // #ignore present-and-empty clears
+	Watermark         *config.WatermarkFilter   `json:"watermark,omitempty"`      // present-and-null clears
+	IgnoreColumns     []string                  `json:"ignore_columns,omitempty"` // #ignore present-and-empty clears
+	TableWatermarks   []config.TableWatermark   `json:"table_watermarks,omitempty"` // #wm-override present-and-empty clears
 }
 
 // normalizeWatermarkFilter validates and canonicalizes a watermark filter
@@ -244,6 +247,40 @@ func normalizeWatermarkFilter(wm *config.WatermarkFilter) (*config.WatermarkFilt
 		out.BaseMode = "checksum"
 	}
 	return &out, nil
+}
+
+// normalizeTableWatermarks validates and canonicalizes the per-table
+// watermark override list (#wm-override P1A): each entry's table name is
+// trimmed and must be non-empty, duplicate table names are rejected (one
+// override per table — last-write-wins would hide a config mistake), and
+// each embedded filter group passes the SAME validation as the global group
+// (identifier allow-list, single-value/interval mutual exclusion, full
+// interval, op enum). The entry's BaseMode is forced to "" — an override
+// NEVER carries a base algorithm (the task-level mode applies to every
+// table); keeping the field would invite display/execution drift.
+func normalizeTableWatermarks(tws []config.TableWatermark) ([]config.TableWatermark, error) {
+	if len(tws) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]bool, len(tws))
+	out := make([]config.TableWatermark, 0, len(tws))
+	for i := range tws {
+		table := strings.TrimSpace(tws[i].Table)
+		if table == "" {
+			return nil, fmt.Errorf("table_watermarks[%d].table: 表名必须提供", i)
+		}
+		if seen[table] {
+			return nil, fmt.Errorf("table_watermarks: 表 %q 重复配置例外水位", table)
+		}
+		seen[table] = true
+		norm, werr := normalizeWatermarkFilter(&tws[i].WatermarkFilter)
+		if werr != nil {
+			return nil, fmt.Errorf("table_watermarks[%s]: %s", table, werr.Error())
+		}
+		norm.BaseMode = "" // override entries ignore the base algorithm
+		out = append(out, config.TableWatermark{Table: table, WatermarkFilter: *norm})
+	}
+	return out, nil
 }
 
 // normalizeIgnoreColumns validates and canonicalizes the #ignore exclusion
@@ -410,6 +447,16 @@ func (s *Server) handlePutCompareOptions(w http.ResponseWriter, r *http.Request)
 		}
 		merged.IgnoreColumns = norm
 	}
+	// #wm-override: same presence-three-state merge as the exclusion list
+	// (present-and-empty clears, absent keeps the saved overrides).
+	if _, ok := presence["table_watermarks"]; ok {
+		norm, terr := normalizeTableWatermarks(req.TableWatermarks)
+		if terr != nil {
+			s.writeError(w, http.StatusBadRequest, terr.Error())
+			return
+		}
+		merged.TableWatermarks = norm
+	}
 	// Passwords never survive a save, regardless of what was sent.
 	merged.Source.Password = ""
 	merged.Target.Password = ""
@@ -525,6 +572,30 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Watermark = wm
+	twm, terr := normalizeTableWatermarks(req.TableWatermarks)
+	if terr != nil {
+		s.writeError(w, http.StatusBadRequest, terr.Error())
+		return
+	}
+	// #wm-override: with an explicit table selection an override naming a
+	// table OUTSIDE the selection is a config mistake — surface it at once
+	// (exact string match, the same identity the engine resolves by). With
+	// tables empty (= all tables) there is nothing static to check; a
+	// non-existent override table simply never matches at runtime (no-op).
+	if len(req.Tables) > 0 && len(twm) > 0 {
+		set := make(map[string]bool, len(req.Tables))
+		for _, t := range req.Tables {
+			set[t] = true
+		}
+		for _, e := range twm {
+			if !set[e.Table] {
+				s.writeError(w, http.StatusBadRequest,
+					fmt.Sprintf("table_watermarks: 例外水位表 %q 不在所选表清单中", e.Table))
+				return
+			}
+		}
+	}
+	req.TableWatermarks = twm
 	igCols, ierr := normalizeIgnoreColumns(req.IgnoreColumns)
 	if ierr != nil {
 		s.writeError(w, http.StatusBadRequest, ierr.Error())
@@ -590,6 +661,7 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 		Concurrency:       conc,
 		Tables:            req.Tables,
 		Watermark:         req.Watermark,
+		TableWatermarks:   req.TableWatermarks,
 		IgnoreColumns:     req.IgnoreColumns,
 		CreatedAt:         now,
 		StartedAt:         &now, // M2: set before the goroutine spawns (no data race on the response)
@@ -651,6 +723,7 @@ func buildCompareRunParams(task *CompareTask, reportFile string) (float64, commo
 		ChecksumParallel:  task.ChecksumParallel,
 		Concurrency:       task.Concurrency,
 		Watermark:         task.Watermark,
+		TableWatermarks:   task.TableWatermarks,
 		IgnoreColumns:     task.IgnoreColumns,
 	}
 	return sampleRatio, opts, compareCfg
@@ -740,9 +813,10 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 		return
 	}
 
-	// Watermark active + every table skipped ⇒ no evidence at all — fail
-	// the task explicitly instead of a misleading "completed".
-	if task.Watermark != nil && compareAllTablesSkipped(report) {
+	// Watermark active (global group OR per-table overrides, P3A) + every
+	// table skipped ⇒ no evidence at all — fail the task explicitly instead
+	// of a misleading "completed".
+	if (task.Watermark != nil || len(task.TableWatermarks) > 0) && compareAllTablesSkipped(report) {
 		finish(CompareStatusFailed, "所有表均被跳过（无可比列或列全被排除），未产生比对结果")
 		return
 	}

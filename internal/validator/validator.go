@@ -241,11 +241,14 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 
 	rpt := reporter.NewReport("data-validation")
 
-	// #t3: while a watermark filter is active the PG session runs in UTC so
-	// timestamptz literals compare symmetrically with the TiDB UTC session.
+	// #t3/#wm-override: while ANY watermark filter is active (global group
+	// or at least one per-table override, P3A) the PG session runs in UTC
+	// so timestamptz literals compare symmetrically with the TiDB UTC
+	// session. The DSN adjustment is task-level; tables running unfiltered
+	// are unaffected by a forced-UTC session.
 	pgDSN := v.sourceDSN()
 	wm := v.wmFilter()
-	if wm != nil {
+	if wm != nil || v.hasActiveWMOverrides() {
 		pgDSN = v.srcDialect.AdjustDSN(pgDSN)
 	}
 
@@ -290,37 +293,57 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 		go func(tableName string) {
 			defer wg.Done()
 
+			// #wm-override (P1A): resolve THIS table's effective filter —
+			// override entry → global group → none — once, before anything
+			// else; every downstream consumer (precheck, mode body via the
+			// ctx table key, scope note) uses this resolution so display and
+			// execution can never drift apart.
+			perWm, isOverride := v.wmOverrideFor(tableName)
+			if !isOverride {
+				perWm = wm
+			}
+			// The ctx table key rides every query so the mode bodies'
+			// wmFilterFor lookups resolve the SAME override (D2a: the 10
+			// call sites stay untouched; resolution order lives in one
+			// place).
+			tableCtx := ctxWithWMTable(ctx, tableName)
+
 			var tr reporter.TableReport
 			// Plan A: a sentinel precheck hit degrades THIS table to full
 			// comparison (wm=nil via ctx override); the reason is disclosed
 			// in the report. Ordinary precheck errors stay hard FAILs.
+			// Override tables NEVER fall back — any precheck failure is a
+			// hard FAIL with explicit attribution (P2A).
 			var wmFallback string
 			switch mode {
 			case "quick", "sample":
-				tr, wmFallback = v.runTableUnit(ctx, pgDB, tidbDB, sem, tableName, wm, mode, opts.SampleRatio)
+				tr, wmFallback = v.runTableUnit(tableCtx, pgDB, tidbDB, sem, tableName, perWm, mode, opts.SampleRatio)
 			case "checksum":
 				// Watermark column precheck first (1 slot, pool-backed PG
 				// query inside the slot), then the chunked comparison which
 				// manages its own per-unit slots (count = 1 unit, each
 				// chunk = 1 unit) — no slot held across waits.
-				tableCtx := ctx
-				if wm != nil {
+				if perWm != nil {
 					release, aerr := sem.acquire(ctx)
 					if aerr != nil {
 						tr = reporter.TableReport{TableName: tableName, Status: reporter.StatusFail,
 							Error: fmt.Sprintf("cancelled before start: %v", aerr)}
 						break
 					}
-					werr := v.srcDialect.ValidateWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), tableName, wm)
+					werr := v.srcDialect.ValidateWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), tableName, perWm)
 					release()
 					if werr != nil {
+						if isOverride {
+							tr = *wmPrecheckFailEx(tableName, werr)
+							break
+						}
 						fb, failRep := wmPrecheckGate(tableName, werr)
 						if failRep != nil {
 							tr = *failRep
 							break
 						}
 						wmFallback = fb
-						tableCtx = ctxWithWMFallback(ctx)
+						tableCtx = ctxWithWMFallback(tableCtx)
 					}
 				}
 				tr = v.validateChecksumChunked(tableCtx, pgDB, tidbDB, tableName, sem)
@@ -332,16 +355,25 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 				}
 			}
 
-			// #t3/#wm-fallback: stamp the per-table watermark disclosure —
-			// the fallback note when this table degraded to full comparison
-			// (a scope note would mislead: its counts are full-table), else
-			// the configured scope note (SourceRows/TargetRows are already
-			// the filtered counts — validateRowCount runs first in every mode).
-			if note := wmTableNote(wm, wmFallback, tr.SourceRows, tr.TargetRows); note != "" {
-				if tr.Suggestion == "" {
-					tr.Suggestion = note
-				} else {
-					tr.Suggestion = note + "；" + tr.Suggestion
+			// #t3/#wm-fallback/#wm-override: stamp the per-table watermark
+			// disclosure — the fallback note when this table degraded to
+			// full comparison (a scope note would mislead: its counts are
+			// full-table), else the effective scope note, override-tagged
+			// when the filter came from the per-table entry (P1A/P4a:
+			// source/TargetRows are already the filtered counts —
+			// validateRowCount runs first in every mode).
+			// #wm-override/Obs2: an override precheck FAIL row never ran, so
+			// its counts are zero — a scope note would read "the filter
+			// matched 0 rows"; its attribution already lives in the Error
+			// field, so the watermark note is skipped. Global-group FAIL rows
+			// keep their current note (ruled out of this order).
+			if !isWmExFail(tr) {
+				if note := wmTableNote(perWm, wmFallback, tr.SourceRows, tr.TargetRows, isOverride); note != "" {
+					if tr.Suggestion == "" {
+						tr.Suggestion = note
+					} else {
+						tr.Suggestion = note + "；" + tr.Suggestion
+					}
 				}
 			}
 
@@ -443,11 +475,16 @@ func (v *Validator) runTableUnit(ctx context.Context, pgDB, tidbDB *sql.DB, sem 
 // body, all while the caller holds a budget slot and the dedicated TiDB conn.
 // Plan A: a sentinel precheck hit degrades this table to full comparison
 // (the fn body then runs with a fallback-marked ctx ⇒ wm=nil everywhere);
-// ordinary probe/DB failures stay hard fails. Second return = fallback reason.
+// ordinary probe/DB failures stay hard fails. Override tables (P2A) never
+// fall back: any precheck failure is a hard FAIL with explicit attribution.
+// Second return = fallback reason.
 func (v *Validator) validateTableUnit(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string,
 	wm *config.WatermarkFilter, fn func(context.Context, *sql.Conn) reporter.TableReport) (reporter.TableReport, string) {
 	if wm != nil {
 		if werr := v.srcDialect.ValidateWatermarkColumn(ctx, pgDB, schemaOrDefault(v.sourceSchema()), table, wm); werr != nil {
+			if _, isOverride := v.wmOverrideFor(table); isOverride {
+				return *wmPrecheckFailEx(table, werr), ""
+			}
 			fb, failRep := wmPrecheckGate(table, werr)
 			if failRep != nil {
 				return *failRep, ""
