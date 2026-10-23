@@ -31,6 +31,11 @@ interface TableRow {
   columns: ColInfo[]
   key_info?: KeyInfo
   missing?: boolean // not present in the source's current table list (edit backfill)
+  // FEAT-WM-AUTO-EX: row auto-listed by applyWMCandidate because the applied
+  // candidate cannot cover the table (column missing / ident-unsafe name /
+  // over-WM_IDENT_MAX overflow). In-memory only — never submitted; any user
+  // edit clears it (promoted to a manual row the re-sync must not touch).
+  _autoExcept?: boolean
 }
 
 type WmKind = 'datetime' | 'date' | 'int' | 'text'
@@ -120,6 +125,13 @@ const form = reactive({
   tables: [] as TableRow[],
 })
 
+// ---- FEAT-WM-AUTO-EX: 例外表自动铺底 ----
+// Tables the applied candidate CANNOT cover (unmatched_tables / ident-unsafe
+// names / over-WM_IDENT_MAX overflow) are auto-listed in 例外表（单独配置）,
+// capped so a huge schema cannot render thousands of rows at once.
+const WM_AUTO_EXCEPT_MAX = 50
+const autoExceptMeta = ref<{ missing: number; badName: number; overflow: number; truncated: number } | null>(null)
+
 function resetTablePicker() {
   tableList.value = []
   tablesLoaded.value = false
@@ -127,6 +139,11 @@ function resetTablePicker() {
   batchColumn.value = ''
   batchInitialWM.value = ''
   batchPreview.value = {}
+  // Auto-listed rows belong to the previous source and its candidates; a
+  // source switch must not leak them into the new source's config (same
+  // isolation rule as the wmCandidates reset in the source_ref watch).
+  form.tables = form.tables.filter(t => !t._autoExcept)
+  autoExceptMeta.value = null
 }
 
 function openCreate() {
@@ -220,6 +237,7 @@ function removeRow(i: number) {
 }
 
 function onTableChanged(i: number) {
+  touchRow(i)
   const row = form.tables[i]
   row.columns = []
   row.watermark_column = ''
@@ -258,7 +276,16 @@ async function loadColumns(i: number, silent = false) {
   }
 }
 
+// FEAT-WM-AUTO-EX: any user edit promotes an auto-listed row to a manual
+// one — the flag drops so the next applyWMCandidate re-sync never removes
+// or rewrites it again.
+function touchRow(i: number) {
+  const row = form.tables[i]
+  if (row?._autoExcept) row._autoExcept = false
+}
+
 function onColumnPicked(i: number) {
+  touchRow(i)
   const row = form.tables[i]
   const col = row.columns.find(c => c.name === row.watermark_column)
   if (col && !col.indexed) {
@@ -414,16 +441,58 @@ function applyWMCandidate(c: WmCandidate) {
   wmAppliedColumn.value = c.column
   const badNames = c.matched_tables.filter(t => !wmIdentOK(t))
   if (badNames.length) {
-    ElMessage.warning(`${badNames.length} 张表名含特殊字符（${badNames.slice(0, 3).join('、')}${badNames.length > 3 ? '…' : ''}），未自动勾选，请在例外区走逐表配置`)
+    ElMessage.warning(`${badNames.length} 张表名含特殊字符（${badNames.slice(0, 3).join('、')}${badNames.length > 3 ? '…' : ''}），未自动勾选，已列入例外区逐表配置`)
   }
   const safe = c.matched_tables.filter(wmIdentOK)
-  if (safe.length > WM_IDENT_MAX) {
-    ElMessage.warning(`${c.matched_tables.length} 表超批量上限 ${WM_IDENT_MAX}，已填统一水位列但未自动勾表，请手选或分批`)
+  const overflowed = safe.length > WM_IDENT_MAX
+  if (overflowed) {
+    ElMessage.warning(`${c.matched_tables.length} 表超批量上限 ${WM_IDENT_MAX}，已填统一水位列但未自动勾表，超限表已列入例外区（可手选或分批）`)
   } else {
     batchTables.value = [...safe]
   }
+  syncAutoExceptRows(c, badNames, overflowed ? safe : [])
   if (c.warnings?.length) ElMessage.warning(c.warnings[0])
   if (batchTables.value.length) checkBatch()
+}
+
+// FEAT-WM-AUTO-EX: re-sync the auto-listed exception rows for THIS candidate:
+// ① drop untouched auto rows from a previous apply, ② list the tables the
+// candidate cannot put in the batch (column missing, ident-unsafe name,
+// over-cap overflow). Add-only and never clobbers user rows: the case-
+// insensitive dup-guard (mirrors the BE's strings.ToLower dedup) skips names
+// already configured as a manual row or still riding in the batch selection.
+// Capped at WM_AUTO_EXCEPT_MAX; the remainder is disclosed, never hidden.
+function syncAutoExceptRows(c: WmCandidate, badNames: string[], overflowTables: string[]) {
+  form.tables = form.tables.filter(t => !t._autoExcept)
+  const pool: { name: string; kind: 'missing' | 'badName' | 'overflow' }[] = [
+    ...(c.unmatched_tables || []).map(name => ({ name, kind: 'missing' as const })),
+    ...badNames.map(name => ({ name, kind: 'badName' as const })),
+    ...overflowTables.map(name => ({ name, kind: 'overflow' as const })),
+  ]
+  const counts = { missing: 0, badName: 0, overflow: 0 }
+  const seen = new Set<string>([
+    ...form.tables.map(t => t.table.trim().toLowerCase()),
+    ...batchTables.value.map(t => t.trim().toLowerCase()),
+  ])
+  const added: TableRow[] = []
+  let truncated = 0
+  for (const p of pool) {
+    counts[p.kind]++
+    const key = p.name.toLowerCase()
+    if (seen.has(key)) continue // already configured — not a truncation
+    if (added.length >= WM_AUTO_EXCEPT_MAX) {
+      truncated++ // cap-skipped only; never count dup-skips here
+      continue
+    }
+    seen.add(key)
+    added.push({ table: p.name, watermark_column: '', initial_watermark: '', columns: [], _autoExcept: true })
+  }
+  form.tables.push(...added)
+  const total = counts.missing + counts.badName + counts.overflow
+  autoExceptMeta.value = total > 0 ? { ...counts, truncated } : null
+  if (total > 0 && added.length > 0) {
+    ElMessage.warning(`已自动列入例外区 ${added.length} 表（缺列 ${counts.missing} · 特殊名 ${counts.badName} · 超限 ${counts.overflow}${truncated > 0 ? `，另有 ${truncated} 表超铺底上限未列入` : ''}），请为每张表选择各自水位列`)
+  }
 }
 
 async function autoSuggestWM() {
@@ -488,7 +557,15 @@ async function save() {
   const seen = new Set<string>()
   for (const t of rows) {
     if (!t.table || !t.watermark_column) {
-      ElMessage.warning('每张表都需要表名和水位列')
+      // FEAT-WM-AUTO-EX: name the offenders — auto-listed exception rows
+      // arrive with an empty watermark column by design; the BE would 400
+      // with `invalid watermark column %q` (incremental.go incIdentifierOK),
+      // the FE blocks earlier and tells the user exactly which tables still
+      // need a per-table column pick.
+      const emptyWm = rows.filter(r => r.table.trim() && !r.watermark_column.trim()).map(r => r.table.trim())
+      ElMessage.warning(emptyWm.length > 0
+        ? `表 ${emptyWm.join('、')} 未选水位列（例外区自动列入的表需逐表选择水位列后再保存）`
+        : '每张表都需要表名和水位列')
       return
     }
     const key = t.table.trim().toLowerCase()
@@ -960,7 +1037,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
                   <template v-if="activeWMCandidate.warnings?.length">（{{ activeWMCandidate.warnings.join('；') }}）</template>
                 </template>
                 <div v-if="activeWMCandidate.unmatched_tables?.length" style="font-size: var(--tims-font-sm);">
-                  {{ activeWMCandidate.unmatched_tables.length }} 张表缺该列（{{ (activeWMCandidate.unmatched_tables || []).join('、') }}），请在例外区走逐表配置
+                  {{ activeWMCandidate.unmatched_tables.length }} 张表缺该列（{{ (activeWMCandidate.unmatched_tables || []).join('、') }}），已自动列入下方例外区，请逐表选择各自水位列
                 </div>
               </el-alert>
               <el-form-item>
@@ -1018,6 +1095,14 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
                 </el-form-item>
               </template>
               <el-divider content-position="left">例外表（单独配置）</el-divider>
+              <el-alert v-if="autoExceptMeta" type="info" :closable="false" style="margin: 0 0 8px;">
+                <template #title>
+                  已自动列入例外 {{ form.tables.filter(t => t._autoExcept).length }} 表（缺列 {{ autoExceptMeta.missing }} · 特殊名 {{ autoExceptMeta.badName }} · 超限 {{ autoExceptMeta.overflow }}）——请为每张表选择各自的水位列后保存
+                </template>
+                <div v-if="autoExceptMeta.truncated > 0" style="font-size: var(--tims-font-sm);">
+                  另有 {{ autoExceptMeta.truncated }} 表超过单次铺底上限 {{ WM_AUTO_EXCEPT_MAX }} 未自动列入，请点击「+ 添加表」手动补充
+                </div>
+              </el-alert>
             </div>
 
             <div v-for="(t, i) in form.tables" :key="i" class="inc-table-row">
@@ -1026,6 +1111,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
                 <el-option v-for="tb in tableList" :key="tb.name" :value="tb.name" :label="tb.row_estimate >= 0 ? `${tb.name}（约 ${tb.row_estimate.toLocaleString()} 行）` : tb.name" />
               </el-select>
               <el-tag v-if="t.missing" type="danger" size="small" style="margin-left: 4px;">不在源库表清单</el-tag>
+              <el-tag v-if="t._autoExcept" type="info" size="small" effect="plain" style="margin-left: 4px;">自动列入</el-tag>
               <el-tag v-if="t.key_info" :type="t.key_info.has_pk || t.key_info.has_unique ? 'success' : 'danger'" size="small" style="margin-left: 4px;">
                 {{ t.key_info.has_pk ? '主键' : t.key_info.has_unique ? '唯一索引' : '无主键/唯一索引' }}
               </el-tag>
@@ -1033,12 +1119,12 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
               <el-select v-if="t.columns.length" v-model="t.watermark_column" placeholder="水位列" style="width: 260px;" @change="onColumnPicked(i)">
                 <el-option v-for="c in t.columns" :key="c.name" :value="c.name" :label="`${c.name}（${c.data_type}${c.indexed ? '' : ' · 无索引'}）`" :disabled="!c.comparable" />
               </el-select>
-              <el-input v-else v-model="t.watermark_column" placeholder="水位列（如 update_time）" style="width: 260px;" />
+              <el-input v-else v-model="t.watermark_column" placeholder="水位列（如 update_time）" style="width: 260px;" @change="touchRow(i)" />
               <el-tooltip :content="wmTooltip" placement="top">
                 <div class="wm-input-wrap">
-                  <el-date-picker v-if="rowWmKind(i) === 'datetime'" v-model="t.initial_watermark" type="datetime" value-format="YYYY-MM-DD HH:mm:ss" placeholder="留空=从最小值全量补齐" style="width: 200px;" />
-                  <el-date-picker v-else-if="rowWmKind(i) === 'date'" v-model="t.initial_watermark" type="date" value-format="YYYY-MM-DD" placeholder="留空=从最小值全量补齐" style="width: 200px;" />
-                  <el-input v-else v-model="t.initial_watermark" placeholder="初始水位，留空=全量补齐" style="width: 200px;" />
+                  <el-date-picker v-if="rowWmKind(i) === 'datetime'" v-model="t.initial_watermark" type="datetime" value-format="YYYY-MM-DD HH:mm:ss" placeholder="留空=从最小值全量补齐" style="width: 200px;" @change="touchRow(i)" />
+                  <el-date-picker v-else-if="rowWmKind(i) === 'date'" v-model="t.initial_watermark" type="date" value-format="YYYY-MM-DD" placeholder="留空=从最小值全量补齐" style="width: 200px;" @change="touchRow(i)" />
+                  <el-input v-else v-model="t.initial_watermark" placeholder="初始水位，留空=全量补齐" style="width: 200px;" @change="touchRow(i)" />
                 </div>
               </el-tooltip>
               <el-button type="danger" text style="margin-left: 8px;" @click="removeRow(i)">删除</el-button>
