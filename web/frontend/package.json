@@ -1,7 +1,7 @@
 {
   "name": "tims",
   "private": true,
-  "version": "3.19.29",
+  "version": "3.19.30",
   "type": "module",
   "scripts": {
     "dev": "vite",

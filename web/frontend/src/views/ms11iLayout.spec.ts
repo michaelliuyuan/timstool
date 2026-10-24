@@ -56,8 +56,10 @@ describe('MS-11i pen1: responsive tables + empty/action unification', () => {
     expect(s.split('class="tims-table-scroll"').length - 1).toBe(2)
     expect(s).toContain('prop="id" label="ID" width="90" class-name="hide-sm"')
     expect(s).toContain('label="表进度" width="120" class-name="hide-sm"')
-    // UX ②A: 创建时间 width→min-width（承接弹性，名称列改固定 220+省略）
-    expect(s).toContain('label="创建时间" min-width="170" class-name="hide-sm"')
+    // 第8单 2026-10-24: 创建时间回归定宽 180（族先例 TaskListView 同 toLocaleString 全时间戳格式），
+    // 名称列恢复弹性 min-width=220 承接宽屏富余宽度（UX②A 取向反转）。
+    expect(s).toContain('label="创建时间" width="180" class-name="hide-sm"')
+    expect(s).toContain('prop="name" label="名称" min-width="220" show-overflow-tooltip')
     expect(s).toContain('prop="duration" label="耗时" width="90" class-name="hide-sm"')
   })
 

@@ -1269,7 +1269,7 @@ onUnmounted(() => {
       <div class="tims-table-scroll">
         <el-table :data="tasks" size="small">
           <el-table-column prop="id" label="ID" width="90" class-name="hide-sm" />
-          <el-table-column prop="name" label="名称" width="220" show-overflow-tooltip />
+          <el-table-column prop="name" label="名称" min-width="220" show-overflow-tooltip />
           <el-table-column label="模式" width="130">
             <template #default="{ row }">
             <span style="white-space: nowrap;">{{ row.mode }}</span>
@@ -1284,7 +1284,7 @@ onUnmounted(() => {
         <el-table-column label="表进度" width="120" class-name="hide-sm">
           <template #default="{ row }">{{ row.tables_done }} / {{ row.tables_total || '?' }}</template>
         </el-table-column>
-          <el-table-column label="创建时间" min-width="170" class-name="hide-sm">
+          <el-table-column label="创建时间" width="180" class-name="hide-sm">
           <template #default="{ row }">{{ new Date(row.created_at).toLocaleString() }}</template>
         </el-table-column>
         <el-table-column label="操作" width="140">
