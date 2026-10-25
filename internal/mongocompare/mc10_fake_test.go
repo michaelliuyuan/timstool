@@ -48,10 +48,10 @@ type fakeColl struct{}
 func (fakeColl) Find(ctx context.Context, q bson.D, opts mongoconn.FindOpts) (mongoconn.DocIter, error) {
 	panic("fakeColl.Find: schema-only fixture must not stream data")
 }
-func (fakeColl) IDRange(ctx context.Context) (mongoconn.RangeStats, error) {
+func (fakeColl) IDRange(ctx context.Context, match bson.D) (mongoconn.RangeStats, error) {
 	return mongoconn.RangeStats{}, nil
 }
-func (fakeColl) CountDocuments(ctx context.Context) (int64, error) { return 0, nil }
+func (fakeColl) CountDocuments(ctx context.Context, filter bson.D) (int64, error) { return 0, nil }
 func (fakeColl) IndexSpecs(ctx context.Context) ([]source.IndexInfo, error) {
 	return nil, nil
 }

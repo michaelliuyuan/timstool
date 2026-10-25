@@ -235,9 +235,16 @@ func (c *v2Coll) Find(ctx context.Context, query bsonD, opts FindOpts) (DocIter,
 	return &v2Iter{cur: cur}, nil
 }
 
-func (c *v2Coll) IDRange(ctx context.Context) (RangeStats, error) {
+// IDRange aggregates the _id min/max/count over the documents matching
+// match (第9单 ④: the watermark predicate rides the initial $match so the
+// bucket plan is clamped inside the window; an empty match is the legacy
+// whole-collection shape, byte-identical).
+func (c *v2Coll) IDRange(ctx context.Context, match bsonD) (RangeStats, error) {
+	if match == nil {
+		match = bson.D{}
+	}
 	cur, err := c.coll.Aggregate(ctx, bson.A{
-		bson.D{{Key: "$match", Value: bson.D{}}},
+		bson.D{{Key: "$match", Value: match}},
 		bson.D{{Key: "$group", Value: bson.D{
 			{Key: "_id", Value: nil},
 			{Key: "min", Value: bson.D{{Key: "$min", Value: "$_id"}}},
@@ -263,8 +270,11 @@ func (c *v2Coll) IDRange(ctx context.Context) (RangeStats, error) {
 	return RangeStats{Min: rows[0].Min, Max: rows[0].Max, N: rows[0].N}, nil
 }
 
-func (c *v2Coll) CountDocuments(ctx context.Context) (int64, error) {
-	return c.coll.CountDocuments(ctx, bson.D{})
+func (c *v2Coll) CountDocuments(ctx context.Context, filter bsonD) (int64, error) {
+	if filter == nil {
+		filter = bson.D{}
+	}
+	return c.coll.CountDocuments(ctx, filter)
 }
 
 func (c *v2Coll) IndexSpecs(ctx context.Context) ([]source.IndexInfo, error) {

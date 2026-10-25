@@ -39,6 +39,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/mongocompare"
 	"github.com/michaelliuyuan/timstool/internal/mongoconn"
 	"github.com/michaelliuyuan/timstool/internal/source"
@@ -140,14 +141,22 @@ func (s *Server) resolveCompareRef(e *compareEndpoint) error {
 // OutDir (a retry after cancel/failure wants a clean compare); resume is an
 // explicit start-time parameter for the checkpoint-continuation case only
 // (review ruling seq=68, semantic pitfall 1).
+//
+// 第9单 ①: the optional watermark window rides the SAME filter group as the
+// pg/mysql compare side (config.WatermarkFilter / config.TableWatermark —
+// dialect-free data structures); Table = collection name within the task's
+// source database. nil/inactive = full comparison, byte-identical legacy
+// engine behavior (red line).
 type compareTaskSpec struct {
-	Source          compareEndpoint `json:"source"`
-	Target          compareEndpoint `json:"target"`
-	Buckets         int             `json:"buckets"`
-	ParallelColls   int             `json:"parallel_colls"`
-	ParallelBuckets int             `json:"parallel_buckets"`
-	BatchSize       int             `json:"batch_size"`
-	Levels          []string        `json:"levels"`
+	Source          compareEndpoint         `json:"source"`
+	Target          compareEndpoint         `json:"target"`
+	Buckets         int                     `json:"buckets"`
+	ParallelColls   int                     `json:"parallel_colls"`
+	ParallelBuckets int                     `json:"parallel_buckets"`
+	BatchSize       int                     `json:"batch_size"`
+	Levels          []string                `json:"levels"`
+	Watermark       *config.WatermarkFilter `json:"watermark,omitempty"`
+	TableWatermarks []config.TableWatermark `json:"table_watermarks,omitempty"`
 }
 
 // compareTaskEnvelope is the ConfigJSON shape for compare tasks. The kind
@@ -254,6 +263,43 @@ func (s *Server) handleCreateCompareTask(w http.ResponseWriter, r *http.Request)
 	if err := validateCompareParams(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	// 第9单 ①: watermark normalization REUSES the webapi-generic validators
+	// the pg/mysql side runs (identifier allow-list, single-value/interval
+	// mutual exclusion, op enum, duplicate-collection rejection). BaseMode is
+	// cleared afterwards — the mongo engine has no quick/sample/checksum
+	// dimension, and keeping the field would invite display drift.
+	if req.Watermark != nil {
+		norm, werr := normalizeWatermarkFilter(req.Watermark)
+		if werr != nil {
+			s.writeError(w, http.StatusBadRequest, werr.Error())
+			return
+		}
+		norm.BaseMode = ""
+		req.Watermark = norm
+		// 对抗票 P2（攻击面 d）: the shared normalizer orders range
+		// endpoints as raw STRINGS; mongo endpoints live in typed domains
+		// (ObjectId bytes / int64) where string order can differ and an
+		// inverted pair silently compares nothing — re-gate in the type
+		// domain (pg/mysql keeps the string-only contract untouched).
+		if oerr := mongocompare.WmRangeOrderErr(norm); oerr != nil {
+			s.writeError(w, http.StatusBadRequest, oerr.Error())
+			return
+		}
+	}
+	if req.TableWatermarks != nil {
+		norm, terr := normalizeTableWatermarks(req.TableWatermarks)
+		if terr != nil {
+			s.writeError(w, http.StatusBadRequest, terr.Error())
+			return
+		}
+		for i := range norm {
+			if oerr := mongocompare.WmRangeOrderErr(&norm[i].WatermarkFilter); oerr != nil {
+				s.writeError(w, http.StatusBadRequest, fmt.Sprintf("table_watermarks[%s]: %s", norm[i].Table, oerr.Error()))
+				return
+			}
+		}
+		req.TableWatermarks = norm
 	}
 
 	task := &store.Task{
@@ -402,6 +448,8 @@ func (s *Server) runMongoCompare(ctx context.Context, taskID string, spec *compa
 		BatchSize:       spec.BatchSize,
 		Resume:          resume,
 		OutDir:          outDir,
+		Watermark:       spec.Watermark,
+		TableWatermarks: spec.TableWatermarks,
 	}
 	for _, l := range spec.Levels {
 		cfg.Levels = append(cfg.Levels, mongocompare.Level(l))
@@ -424,6 +472,16 @@ func (s *Server) runMongoCompare(ctx context.Context, taskID string, spec *compa
 	}
 	if err != nil {
 		s.failCompare(taskID, "compare failed: "+err.Error())
+		return
+	}
+
+	// 第9单 ⑦ (对标 compare.go:816 的 all-skipped 门): a watermark task where
+	// NOT ONE collection ran inside its window (every applicable collection
+	// degraded / failed precheck / TTL-skipped) produced no watermark-window
+	// evidence at all — fail loudly instead of a misleading "completed".
+	if (spec.Watermark != nil || len(spec.TableWatermarks) > 0) &&
+		len(summary.Collections) > 0 && !mongocompare.WmAnyWindowed(summary.Collections) {
+		s.failCompare(taskID, "所有集合均未能应用水位过滤（水位列不可用或预检失败），未产生水位窗口比对结果")
 		return
 	}
 

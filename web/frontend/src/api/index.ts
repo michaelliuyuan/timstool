@@ -254,6 +254,13 @@ export interface CompareTaskSpec {
   parallel_buckets?: number
   batch_size?: number
   levels?: string[]
+  /** 第9单 optional watermark window (absent = full comparison). Same group
+   *  shape as the pg/mysql side; base_mode is not a mongo dimension and is
+   *  never sent (the server strips it anyway). */
+  watermark?: { column: string; value?: string; op?: string; range_start?: string; range_end?: string }
+  /** 第9单 per-collection watermark overrides; table = collection name
+   *  within the task's source database (override wins over the global group). */
+  table_watermarks?: { table: string; column: string; value?: string; op?: string; range_start?: string; range_end?: string }[]
 }
 
 // Compare result (the kind discriminator inside result_json of finished

@@ -84,10 +84,14 @@ type Coll interface {
 	// Find streams documents matching query sorted by _id ascending (the
 	// engine's only sort), batched per opts; limit 0 means unbounded.
 	Find(ctx context.Context, query bsonD, opts FindOpts) (DocIter, error)
-	// IDRange returns the collection's _id min/max/count (empty: N=0).
-	IDRange(ctx context.Context) (RangeStats, error)
-	// CountDocuments is the exact document count.
-	CountDocuments(ctx context.Context) (int64, error)
+	// IDRange returns the _id min/max/count over the documents matching
+	// match (empty match = whole collection; empty result: N=0). The
+	// watermark window rides the initial $match so bucket planning is
+	// clamped inside the window (第9单 ④).
+	IDRange(ctx context.Context, match bsonD) (RangeStats, error)
+	// CountDocuments is the exact count of documents matching filter
+	// (empty filter = whole collection — byte-identical legacy behavior).
+	CountDocuments(ctx context.Context, filter bsonD) (int64, error)
 	// IndexSpecs lists the collection's indexes (engine: TTL probe + index
 	// level; sparse/clustered ride along for the canonical index form).
 	IndexSpecs(ctx context.Context) ([]source.IndexInfo, error)

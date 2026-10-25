@@ -20,6 +20,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
+	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/mongocompare/canon"
 	"github.com/michaelliuyuan/timstool/internal/mongoconn"
 	"github.com/michaelliuyuan/timstool/internal/source"
@@ -47,6 +48,11 @@ type Config struct {
 	Opts            canon.Opts
 	Resume          bool
 	OutDir          string // report dir: summary.json, diff/*.ndjson, .checkpoints/*.json
+	// 第9单 ①: optional watermark window (the SAME filter group as the
+	// pg/mysql compare side — config.WatermarkFilter is dialect-free).
+	// nil/inactive = full comparison, byte-identical legacy behavior.
+	Watermark       *config.WatermarkFilter
+	TableWatermarks []config.TableWatermark
 }
 
 func (c Config) withDefaults() Config {
@@ -97,8 +103,14 @@ type BucketResult struct {
 
 // CollectionResult is one collection's comparison outcome.
 type CollectionResult struct {
-	DB      string `json:"db"`
-	Coll    string `json:"coll"`
+	DB   string `json:"db"`
+	Coll string `json:"coll"`
+	// 第9单 ⑦: watermark disclosure — WmState ∈ windowed/degraded/failed
+	// ("" = watermark not applicable/off) and Note carries the human
+	// wording (scope note or degradation disclosure), mirroring the
+	// pg/mysql per-table note.
+	WmState string `json:"wm_state,omitempty"`
+	Note    string `json:"note,omitempty"`
 	Overall string `json:"overall"`
 	Checks  struct {
 		Schema  map[string]any `json:"schema,omitempty"`
@@ -187,9 +199,15 @@ func recordSkippedViews(s *Summary, skipped []string) {
 }
 
 func newSummary(c Config) *Summary {
-	return &Summary{StartedAt: time.Now(), Overall: OverallEqual,
+	s := &Summary{StartedAt: time.Now(), Overall: OverallEqual,
 		Counts: map[string]int{"equal": 0, "diff": 0, "error": 0, "ttl_skip": 0},
 		Stats:  map[string]any{"buckets": c.Buckets, "parallel_colls": c.ParallelColls, "parallel_buckets": c.ParallelBuckets, "batch_size": c.BatchSize, "resume": c.Resume}}
+	// 第9单: the summary records that a watermark window was requested —
+	// the report face reads it for the 水位过滤 mode tag.
+	if c.wmRequested() {
+		s.Stats["watermark"] = true
+	}
+	return s
 }
 
 func prepOutDir(c Config) error {
@@ -358,10 +376,17 @@ const AlgoVersion = 1
 // deserialize. A stored bucket whose boundaries no longer match the
 // recomputed plan is treated as stale and recomputed — data-shift protection
 // beyond the js P1 fix).
+//
+// 第9单 ⑥: WmFP stamps the watermark predicate fingerprint the checkpoint
+// was produced under. Same bucket boundaries + different window ⇒ different
+// content, so a fingerprint mismatch discards the checkpoint wholesale (old
+// checkpoints carry "" — they stay reusable for non-watermark runs only,
+// which is exactly the backward-compatible split the plan requires).
 type checkpoint struct {
 	AlgoVersion int              `json:"algo_version"`
 	Buckets     map[int]cpBucket `json:"buckets"`
 	Done        bool             `json:"done"`
+	WmFP        string           `json:"wm_fp,omitempty"`
 }
 
 type cpBucket struct {
@@ -379,8 +404,8 @@ func cpPath(outDir, db, coll string) string {
 	return filepath.Join(outDir, ".checkpoints", strings.ReplaceAll(db+"."+coll, ".", "__")+".json")
 }
 
-func loadCheckpoint(cfg Config, db, coll string) checkpoint {
-	cp := checkpoint{AlgoVersion: AlgoVersion, Buckets: map[int]cpBucket{}}
+func loadCheckpoint(cfg Config, db, coll, wmFP string) checkpoint {
+	cp := checkpoint{AlgoVersion: AlgoVersion, Buckets: map[int]cpBucket{}, WmFP: wmFP}
 	if !cfg.Resume || cfg.OutDir == "" {
 		return cp
 	}
@@ -388,15 +413,28 @@ func loadCheckpoint(cfg Config, db, coll string) checkpoint {
 	if err != nil {
 		return cp
 	}
-	_ = json.Unmarshal(b, &cp)
-	if cp.AlgoVersion != AlgoVersion {
+	// Compare against the STORED file's own fields — unmarshaling into the
+	// pre-seeded cp would let an absent wm_fp borrow the passed-in value
+	// (a legacy checkpoint would then falsely match ANY fingerprint, the
+	// exact vacuous-defense the fingerprint exists to prevent).
+	var stored checkpoint
+	if err := json.Unmarshal(b, &stored); err != nil {
+		return cp
+	}
+	if stored.AlgoVersion != AlgoVersion {
 		// Stale semantics: discard, recompute everything (no migration).
-		return checkpoint{AlgoVersion: AlgoVersion, Buckets: map[int]cpBucket{}}
+		return cp
 	}
-	if cp.Buckets == nil {
-		cp.Buckets = map[int]cpBucket{}
+	if stored.WmFP != wmFP {
+		// Same boundaries, different watermark window ⇒ different content:
+		// discard, recompute (第9单 ⑥). "" vs "" is the legacy/no-watermark
+		// match — old checkpoints stay reusable exactly there.
+		return cp
 	}
-	return cp
+	if stored.Buckets == nil {
+		stored.Buckets = map[int]cpBucket{}
+	}
+	return stored
 }
 
 func (cp *checkpoint) save(cfg Config, db, coll string) {
@@ -477,22 +515,54 @@ func compareCollection(ctx context.Context, src, dst mongoconn.Client, srcDB, ds
 		return r
 	}
 
+	// 第9单 ②-⑤: watermark precheck + window resolution — only when a data
+	// level runs (schema/index-only configs never touch data). Plan A/P2A
+	// semantics: global group precheck failure degrades THIS collection to
+	// full comparison (disclosed); an override failure is a hard FAIL with
+	// the 例外水位列 prefix; probe/cursor errors are ordinary error rows.
+	var w *wmWindow
+	if cfg.has(LevelCount) || cfg.has(LevelHash) || cfg.has(LevelDiff) {
+		out := resolveWMWindow(ctx, sc, cfg, coll)
+		switch {
+		case out.fail != "":
+			r.Overall, r.Checks.Error = OverallError, out.fail
+			r.WmState = WmStateFailed
+			return r
+		case out.degrade != "":
+			r.WmState = WmStateDegraded
+			r.Note = wmFallbackNote(out.degrade)
+		case out.window != nil:
+			w = out.window
+			r.WmState = WmStateWindowed
+		}
+	}
+	wmFP := ""
+	var wmPred bson.D
+	if w != nil {
+		wmFP = w.fp
+		wmPred = w.pred
+	}
+
+	var srcN, dstN int64
 	if cfg.has(LevelCount) {
-		scN, err1 := sc.CountDocuments(ctx)
-		tcN, err2 := tc.CountDocuments(ctx)
+		scN, err1 := sc.CountDocuments(ctx, wmPred)
+		tcN, err2 := tc.CountDocuments(ctx, wmPred)
 		if err1 != nil || err2 != nil {
 			r.Overall, r.Checks.Error = OverallError, firstErr(err1, err2)
 			return r
 		}
+		srcN, dstN = scN, tcN
 		r.Checks.Count = map[string]any{"src": scN, "dst": tcN, "ok": scN == tcN}
 		if scN != tcN {
 			r.Overall = OverallDiff
 		}
 	}
 
-	cp := loadCheckpoint(cfg, srcDB, coll)
+	cp := loadCheckpoint(cfg, srcDB, coll, wmFP)
 	if cfg.has(LevelHash) || cfg.has(LevelDiff) {
-		rangeStats, err := sc.IDRange(ctx)
+		// 第9单 ④: IDRange's $match rides the watermark predicate — the
+		// bucket plan is clamped inside the window (no empty-bucket waste).
+		rangeStats, err := sc.IDRange(ctx, wmPred)
 		if err != nil {
 			r.Overall, r.Checks.Error = OverallError, err.Error()
 			return r
@@ -535,8 +605,11 @@ func compareCollection(ctx context.Context, src, dst mongoconn.Client, srcDB, ds
 						}
 						return
 					}
-					srcD, err1 := HashSide(ctx, sc, b.Query, cfg.Opts, cfg.BatchSize)
-					dstD, err2 := HashSide(ctx, tc, b.Query, cfg.Opts, cfg.BatchSize)
+					// 第9单 ④: every hash query $and-composes the watermark
+					// predicate — first/last open buckets intersect the
+					// window here (no loss, no duplication).
+					srcD, err1 := HashSide(ctx, sc, wmAnd(b.Query, w), cfg.Opts, cfg.BatchSize)
+					dstD, err2 := HashSide(ctx, tc, wmAnd(b.Query, w), cfg.Opts, cfg.BatchSize)
 					if err1 != nil || err2 != nil {
 						mu.Lock()
 						results[i] = BucketResult{Bucket: b.Index, Match: false}
@@ -585,7 +658,7 @@ func compareCollection(ctx context.Context, src, dst mongoconn.Client, srcDB, ds
 					byIdx[br.Bucket] = true
 				}
 			}
-			rangeStats, err := sc.IDRange(ctx)
+			rangeStats, err := sc.IDRange(ctx, wmPred)
 			if err == nil && rangeStats.N > 0 {
 				for _, b := range PlanBuckets(rangeStats.Min, rangeStats.Max, cfg.Buckets) {
 					if byIdx[b.Index] {
@@ -596,7 +669,9 @@ func compareCollection(ctx context.Context, src, dst mongoconn.Client, srcDB, ds
 		}
 		var deltas []DocDelta
 		for _, b := range diffBuckets {
-			ds, err := DiffBucket(ctx, sc, tc, b.Query, cfg.Opts, cfg.BatchSize)
+			// 第9单 ④: the drill-down runs on the same windowed universe as
+			// the hash level (identical $and composition).
+			ds, err := DiffBucket(ctx, sc, tc, wmAnd(b.Query, w), cfg.Opts, cfg.BatchSize)
 			if err != nil {
 				r.Overall, r.Checks.Error = OverallError, err.Error()
 				return r
@@ -612,6 +687,13 @@ func compareCollection(ctx context.Context, src, dst mongoconn.Client, srcDB, ds
 			r.Checks.Diff = map[string]any{"count": 0}
 		}
 		writeDeltas(cfg, srcDB, coll, deltas)
+	}
+
+	// 第9单 ⑦: windowed disclosure — the note lands only on rows that
+	// actually ran inside a window (degraded rows carry the fallback note
+	// already); row counts join when the count level ran.
+	if w != nil {
+		r.Note = wmScopeNote(w, srcN, dstN, cfg.has(LevelCount))
 	}
 
 	cp.Done = true

@@ -297,21 +297,38 @@ func (c *v1Coll) Find(ctx context.Context, query bsonD, opts FindOpts) (DocIter,
 	return &v1Iter{cur: cur}, nil
 }
 
-// v1IDRangePipeline is the outbound $match/$group min/max/count aggregate,
-// built natively on the v1 side (a fixed shape; the byte bridge handles
+// v1IDRangePipeline builds the outbound $match/$group min/max/count
+// aggregate natively on the v1 side (a fixed shape; the byte bridge handles
 // documents, and v2's Marshal does not accept a top-level array anyway).
-var v1IDRangePipeline = v1bson.A{
-	v1bson.D{{Key: "$match", Value: v1bson.D{}}},
-	v1bson.D{{Key: "$group", Value: v1bson.D{
-		{Key: "_id", Value: nil},
-		{Key: "min", Value: v1bson.D{{Key: "$min", Value: "$_id"}}},
-		{Key: "max", Value: v1bson.D{{Key: "$max", Value: "$_id"}}},
-		{Key: "n", Value: v1bson.D{{Key: "$sum", Value: 1}}},
-	}}},
+// 第9单 ④: the watermark predicate crosses the bridge via v2ToV1 and rides
+// the initial $match; an empty match keeps the legacy whole-collection
+// shape. The former package-level fixed pipeline became a builder — the
+// match is now per-call.
+func v1IDRangePipeline(match bsonD) (v1bson.A, error) {
+	if match == nil {
+		match = bson.D{}
+	}
+	var v1Match v1bson.D
+	if err := v2ToV1(&v1Match, match); err != nil {
+		return nil, err
+	}
+	return v1bson.A{
+		v1bson.D{{Key: "$match", Value: v1Match}},
+		v1bson.D{{Key: "$group", Value: v1bson.D{
+			{Key: "_id", Value: nil},
+			{Key: "min", Value: v1bson.D{{Key: "$min", Value: "$_id"}}},
+			{Key: "max", Value: v1bson.D{{Key: "$max", Value: "$_id"}}},
+			{Key: "n", Value: v1bson.D{{Key: "$sum", Value: 1}}},
+		}}},
+	}, nil
 }
 
-func (c *v1Coll) IDRange(ctx context.Context) (RangeStats, error) {
-	cur, err := c.coll.Aggregate(ctx, v1IDRangePipeline)
+func (c *v1Coll) IDRange(ctx context.Context, match bsonD) (RangeStats, error) {
+	pipeline, err := v1IDRangePipeline(match)
+	if err != nil {
+		return RangeStats{}, err
+	}
+	cur, err := c.coll.Aggregate(ctx, pipeline)
 	if err != nil {
 		return RangeStats{}, err
 	}
@@ -341,8 +358,15 @@ func (c *v1Coll) IDRange(ctx context.Context) (RangeStats, error) {
 	return RangeStats{Min: rows[0].Min, Max: rows[0].Max, N: rows[0].N}, nil
 }
 
-func (c *v1Coll) CountDocuments(ctx context.Context) (int64, error) {
-	return c.coll.CountDocuments(ctx, v1bson.D{})
+func (c *v1Coll) CountDocuments(ctx context.Context, filter bsonD) (int64, error) {
+	if filter == nil {
+		filter = bson.D{}
+	}
+	var v1Filter v1bson.D
+	if err := v2ToV1(&v1Filter, filter); err != nil {
+		return 0, err
+	}
+	return c.coll.CountDocuments(ctx, v1Filter)
 }
 
 func (c *v1Coll) IndexSpecs(ctx context.Context) ([]source.IndexInfo, error) {

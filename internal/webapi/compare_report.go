@@ -211,6 +211,19 @@ func countCheckLabel(m map[string]any) string {
 // dynamic strings pass through mcHTMLEsc; numbers are formatted server-side.
 // Mismatched-bucket drill-down lists at most 20 buckets per collection (an
 // adversarial 4096-bucket run must not produce a megabyte table row).
+// compareSpecWmOn reports whether the task's spec carries a watermark group
+// (global and/or per-collection overrides) — the HTML 水位过滤 mode tag and
+// related disclosures key off it.
+func compareSpecWmOn(spec *compareTaskSpec) bool {
+	if spec == nil {
+		return false
+	}
+	if spec.Watermark != nil && spec.Watermark.Column != "" {
+		return true
+	}
+	return len(spec.TableWatermarks) > 0
+}
+
 func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongocompare.Summary) string {
 	_, cn, overallClass := compareOverallMeta(sum.Overall)
 
@@ -254,6 +267,11 @@ func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongo
 	if spec != nil {
 		fmt.Fprintf(&sb, `<div>源端 <span>%s</span></div>`, mcHTMLEsc(compareEndpointLabel(spec.Source)))
 		fmt.Fprintf(&sb, `<div>目标端 <span>%s</span></div>`, mcHTMLEsc(compareEndpointLabel(spec.Target)))
+		// 第9单 ⑦: the 水位过滤 mode tag — shown exactly when the task ran
+		// with a watermark group (global and/or per-collection overrides).
+		if compareSpecWmOn(spec) {
+			sb.WriteString(`<div>模式 <span>水位过滤</span></div>`)
+		}
 	}
 	fmt.Fprintf(&sb, `<div>耗时 <span class="num">%.2fs</span></div>`, sum.DurationSec)
 	sb.WriteString(`</div></div>`)
@@ -292,7 +310,7 @@ func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongo
 	// Per-collection detail table.
 	if len(sum.Collections) > 0 {
 		sb.WriteString(`<div class="card"><h2>逐集合明细</h2><table><thead><tr>`)
-		sb.WriteString(`<th>#</th><th>集合</th><th>状态</th><th>存在性</th><th>索引</th><th>文档数 (源→目标)</th><th>哈希桶 (匹配/总数)</th><th>下钻差异</th><th>错误</th>`)
+		sb.WriteString(`<th>#</th><th>集合</th><th>状态</th><th>水位</th><th>存在性</th><th>索引</th><th>文档数 (源→目标)</th><th>哈希桶 (匹配/总数)</th><th>下钻差异</th><th>错误</th>`)
 		sb.WriteString(`</tr></thead><tbody>`)
 		for i, c := range sum.Collections {
 			cb, ccn, _ := compareOverallMeta(c.Overall)
@@ -311,9 +329,21 @@ func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongo
 			if c.Checks.Skipped == "ttl" {
 				ttlNote = ` <span class="badge badge-skip">TTL 数据跳过</span>`
 			}
+			// 第9单 ⑦: the watermark cell — 窗口/退化/失败 badge with the
+			// disclosure note on hover; the note itself (scope or fallback)
+			// is the engine's single source.
+			wmCell := "—"
+			switch c.WmState {
+			case mongocompare.WmStateWindowed:
+				wmCell = fmt.Sprintf(`<span class="badge badge-pass" title="%s">窗口</span>`, mcHTMLEsc(c.Note))
+			case mongocompare.WmStateDegraded:
+				wmCell = fmt.Sprintf(`<span class="badge badge-skip" title="%s">退化全量</span>`, mcHTMLEsc(c.Note))
+			case mongocompare.WmStateFailed:
+				wmCell = fmt.Sprintf(`<span class="badge badge-fail" title="%s">水位失败</span>`, mcHTMLEsc(c.Note))
+			}
 			fmt.Fprintf(&sb,
-				`<tr><td class="num">%d</td><td>%s</td><td><span class="badge %s">%s</span>%s</td><td>%s</td><td>%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td>%s</td></tr>`,
-				i+1, mcHTMLEsc(c.DB+"."+c.Coll), mcHTMLEsc(cb), mcHTMLEsc(ccn), ttlNote,
+				`<tr><td class="num">%d</td><td>%s</td><td><span class="badge %s">%s</span>%s</td><td>%s</td><td>%s</td><td>%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td>%s</td></tr>`,
+				i+1, mcHTMLEsc(c.DB+"."+c.Coll), mcHTMLEsc(cb), mcHTMLEsc(ccn), ttlNote, wmCell,
 				mcHTMLEsc(schemaCheckLabel(c.Checks.Schema)), mcHTMLEsc(indexCheckLabel(c.Checks.Index)),
 				mcHTMLEsc(countCheckLabel(c.Checks.Count)), mcHTMLEsc(hashCell), mcHTMLEsc(diffCell),
 				mcHTMLEsc(c.Checks.Error))

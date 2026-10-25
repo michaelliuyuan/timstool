@@ -19,8 +19,8 @@ describe('compare per-table watermark overrides (P1A-P4A)', () => {
   it('API types carry table_watermarks on create + options', () => {
     const src = apiSrc()
     expect(src).toContain(`table_watermarks?: { table: string; column: string; value?: string; op?: string; range_start?: string; range_end?: string }[]`)
-    // 两处（CreateCompareRequest + CompareOptions）
-    expect(src.match(/table_watermarks\?:/g)?.length).toBe(2)
+    // 三处（CreateCompareRequest + CompareOptions + 第9单 CompareTaskSpec mongo 侧）
+    expect(src.match(/table_watermarks\?:/g)?.length).toBe(3)
   })
 
   it('frontend resolution chain mirrors the engine: override → global → full', () => {
