@@ -1,25 +1,57 @@
 // 第9单锚点（Mongo 水位化对比）：CompareCreateView 水位卡片 + API 类型。
 // 卡片照搬 pg/mysql CompareView 模式（区间/单值切换、日期时间选择器、
-// 跑前确认弹窗、知情提示文案、例外/全局✓ tag），v1 列候选 = 手输 + _id
-// 默认项（suggest API 列 v1.1）；FE 激活/解析链与后端 wmfilter/watermark.go
-// 严格镜像（例外→全局→全量）。断言形态 = spec exact match（族惯例）。
+// 跑前确认弹窗、知情提示文案、例外/全局✓ tag）；FE 激活/解析链与后端
+// wmfilter/watermark.go 严格镜像（例外→全局→全量）。
+// 水位列自动发现单（seq=39 ④）: 候选流落地——_id 默认项 + suggest API
+// top-5（覆盖/分数 label、按类型直方图自动切 kind、warnings 披露）+ 手输。
+// 断言形态 = spec exact match（族惯例）。
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const src = (f: string) => readFileSync(resolve(__dirname, f), 'utf8')
 
-describe('compareMongoWatermark v3.19.31', () => {
+describe('compareMongoWatermark v3.19.32', () => {
   const s = src('CompareCreateView.vue')
   const api = src('../api/index.ts')
 
   it('watermark card: _id default candidate + kind radio + interval toggle', () => {
     expect(s).toContain('水位过滤（可选）')
-    expect(s).toContain(`const wmColumnOptions = ['_id']`)
-    expect(s).toContain(`:label="c === '_id' ? '_id（默认，ObjectId 时间戳）' : c"`)
+    expect(s).toContain(`const wmColumnOptions = computed(() => ['_id', ...wmCandidates.value.map(c => c.column).filter(c => c !== '_id')])`)
     expect(s).toContain(`const wmKind = ref<'objectid' | 'datetime' | 'int'>('objectid')`)
     expect(s).toContain('<el-radio-button value="objectid">ObjectId</el-radio-button>')
     expect(s).toContain(':value="true">区间</el-radio-button>')
+  })
+
+  it('candidates are non-exhaustive (index + first-50 sample) and invalidated on srcDb change', () => {
+    // 对抗席 c5: the disclosure must say candidates are inferred, manual
+    // entry stays open, and the run-time probe remains the authority.
+    expect(s).toContain('候选水位列基于索引与前 50 条采样文档推断、非穷尽；未列出的列可直接手输，运行期探针仍是权威')
+    // 对抗席 d5: a database switch drops stale coverage labels.
+    expect(s).toContain('watch(srcDb, () => {')
+  })
+
+  it('suggest flow: button gated on srcDb, API carries the source snapshot + database', () => {
+    expect(s).toContain('获取候选水位列')
+    expect(s).toContain(`:disabled="!srcDb"`)
+    expect(s).toContain(`await apiClient.suggestMongoWatermark({ ...endpointOf('src'), database: srcDb.value })`)
+    expect(s).toContain('未发现可比类型的候选水位列（date/int/long）；可手输列名')
+    expect(api).toContain('suggestMongoWatermark: (source: CompareEndpoint & { database: string })')
+    expect(api).toContain("'/mongocompare/suggest-watermark'")
+  })
+
+  it('candidate label carries coverage/score; kind derives from the type histogram', () => {
+    expect(s).toContain('function wmColLabel(c: string): string')
+    expect(s).toContain("'_id（默认，ObjectId 时间戳）'")
+    expect(s).toContain('覆盖 ${cand.matched_tables.length}/${wmSuggestTotal.value || \'?\'} · ${cand.score.toFixed(0)} 分')
+    expect(s).toContain(`if ((hist.datetime || 0) >= (hist.bigint || 0) + (hist.integer || 0)) return 'datetime'`)
+    expect(s).toContain(`function wmKindForColumn(col: string): 'objectid' | 'datetime' | 'int'`)
+  })
+
+  it('candidate disclosure mirrors the pg page (warnings + unmatched tooltip)', () => {
+    expect(s).toContain('v-if="activeWmCandidate"')
+    expect(s).toContain('；{{ activeWmCandidate.warnings[0] }}')
+    expect(s).toContain('缺该列 {{ activeWmCandidate.unmatched_tables.length }} 个集合（悬停查看，运行期将全量比对）')
   })
 
   it('datetime pickers ride the pg/mysql value-format convention', () => {

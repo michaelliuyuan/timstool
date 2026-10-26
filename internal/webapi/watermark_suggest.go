@@ -53,11 +53,16 @@ func wmNameNorm(s string) string {
 }
 
 // Update-series strong names: columns that actually advance on UPDATE.
+// Mongo 水位候选单（seq=39 批准③）: "utime" joins the update series and
+// "ctime" the created series — the shared dictionaries serve both dialect
+// families (wmNameNorm folds u_time/UTIME/utime into one key), so a pg/mysql
+// utime column earns its 更新系 bonus too. Advisory ranking only.
 var wmStrongNames = map[string]bool{
 	"updatedat": true, "updatetime": true, "modifiedat": true,
 	"modifytime": true, "lastmodified": true, "lastmodifiedtime": true,
 	"gmtmodified": true, "updatedate": true, "modificationtime": true,
 	"lastupdatetime": true, "lastupdate": true, "updatetimestamp": true,
+	"utime": true,
 }
 
 // Created-series: monotonic but only on INSERT — demoted with a warning.
@@ -65,6 +70,7 @@ var wmCreatedNames = map[string]bool{
 	"createdat": true, "createtime": true, "gmtcreate": true,
 	"insertedat": true, "inserttime": true, "createddate": true,
 	"creationtime": true, "created": true,
+	"ctime": true,
 }
 
 // wmNameClass returns (weight, label) for a column name. The id-family

@@ -515,6 +515,27 @@ export const apiClient = {
   createCompareTask: (req: CompareTaskSpec) =>
     api.post<Task>('/mongocompare/tasks', req),
 
+  // Mongo 水位列自动发现（seq=39 方案②）: advisory candidate catalog over the
+  // source database (index prefixes ∪ bounded doc sampling), scored by the
+  // SAME shared backend scorer as the pg/mysql suggest twin — response shape
+  // identical; default_now_ratio is structurally 0 for mongo.
+  suggestMongoWatermark: (source: CompareEndpoint & { database: string }) =>
+    api.post<{
+      total_tables: number
+      candidates: {
+        column: string
+        score: number
+        coverage: number
+        indexed_ratio: number
+        default_now_ratio: number
+        type_histogram: Record<string, number>
+        matched_tables: string[]
+        unmatched_tables: string[]
+        reasons: string[]
+        warnings: string[]
+      }[]
+    }>('/mongocompare/suggest-watermark', { source }, { timeout: LONG_TIMEOUT }),
+
   listTasks: () =>
     api.get<Task[]>('/tasks'),
 

@@ -20,8 +20,9 @@ import { useSourceSchema } from '../composables/useSourceSchema'
 // override the stored profile server-side).
 // 第9单: optional watermark window card — global group + per-collection
 // exceptions, mirroring the pg/mysql CompareView pattern (interval/single
-// toggle, datetime pickers, pre-run confirm, informed-consent text). v1
-// column candidates = manual entry + the _id default (suggest API is v1.1).
+// toggle, datetime pickers, pre-run confirm, informed-consent text).
+// 水位列自动发现单（seq=39）: column candidates = _id default + suggest
+// API top-5 (index prefixes ∪ bounded sampling, shared scorer) + manual.
 const router = useRouter()
 const { load, getSource } = useSourceSchema()
 
@@ -55,17 +56,74 @@ const testState = ref<{ src?: boolean; tgt?: boolean }>({})
 // with column + value (single, op ≤/<) or column + full interval
 // [start,end); overrides win per collection, else the global group applies,
 // else full comparison. The frontend mirrors the backend resolver exactly.
+// 水位列自动发现（seq=39 ④）: 候选 = _id 默认项 + suggest API 返回的整库
+// 评分候选（索引前缀∪采样）；候选仅辅助——运行期探针仍是权威。
 const wmEnabled = ref(false)
 const wmConfig = reactive({ column: '_id', op: '<=', value: '', range_mode: false, range_start: '', range_end: '' })
 // v1 kind is a UX aid (control + validation) auto-derived from the column
 // pick; the backend stays the authority — it probes the real BSON type and
 // converts the raw string per that type (mismatch = disclosed degrade/fail).
 const wmKind = ref<'objectid' | 'datetime' | 'int'>('objectid')
-const wmColumnOptions = ['_id'] // v1 candidates: _id default + manual entry (suggest API is v1.1)
+// suggest-flow state: ranked candidates from /mongocompare/suggest-watermark.
+interface MongoWmCandidate {
+  column: string
+  score: number
+  coverage: number
+  indexed_ratio: number
+  type_histogram: Record<string, number>
+  matched_tables: string[]
+  unmatched_tables: string[]
+  reasons: string[]
+  warnings: string[]
+}
+const wmCandidates = ref<MongoWmCandidate[]>([])
+const wmSuggestTotal = ref(0)
+const wmLoadingCandidates = ref(false)
+const wmCandByCol = computed(() => {
+  const m: Record<string, MongoWmCandidate> = {}
+  for (const c of wmCandidates.value) m[c.column] = c
+  return m
+})
+const wmColumnOptions = computed(() => ['_id', ...wmCandidates.value.map(c => c.column).filter(c => c !== '_id')])
+const activeWmCandidate = computed(() => wmCandByCol.value[wmConfig.column])
+// Candidate kind derives from its type histogram (datetime → time pickers,
+// bigint/integer → integer input); manual entries keep the datetime default.
+function wmKindForColumn(col: string): 'objectid' | 'datetime' | 'int' {
+  if (col === '_id') return 'objectid'
+  const c = wmCandByCol.value[col]
+  if (c) {
+    const hist = c.type_histogram || {}
+    if ((hist.datetime || 0) >= (hist.bigint || 0) + (hist.integer || 0)) return 'datetime'
+    return 'int'
+  }
+  return 'datetime'
+}
 watch(() => wmConfig.column, (col) => {
-  wmKind.value = col === '_id' ? 'objectid' : 'datetime'
+  wmKind.value = wmKindForColumn(col)
   wmConfig.range_mode = false
 })
+// Candidates belong to the srcDb they were fetched from — a database switch
+// invalidates coverage labels (正评席 note / 对抗席 d5).
+watch(srcDb, () => {
+  wmCandidates.value = []
+  wmSuggestTotal.value = 0
+})
+async function loadWmCandidates() {
+  if (!srcDb.value) { ElMessage.warning('请先填写源端数据库名'); return }
+  wmLoadingCandidates.value = true
+  try {
+    const { data } = await apiClient.suggestMongoWatermark({ ...endpointOf('src'), database: srcDb.value })
+    wmCandidates.value = (data.candidates || []) as MongoWmCandidate[]
+    wmSuggestTotal.value = data.total_tables || 0
+    if (wmCandidates.value.length === 0) {
+      ElMessage.warning('未发现可比类型的候选水位列（date/int/long）；可手输列名')
+    }
+  } catch (e: any) {
+    ElMessage.error(e.response?.data?.error || '获取候选水位列失败')
+  } finally {
+    wmLoadingCandidates.value = false
+  }
+}
 const wmRangeEligible = computed(() => wmKind.value === 'objectid' || wmKind.value === 'datetime')
 
 function validateWmEndpoint(raw: string, label: string): string {
@@ -122,6 +180,14 @@ const activeOverrideCount = computed(() => Object.values(collWms.value).filter(e
 function wmCondShort(e: { column: string; op: string; value: string; range_mode: boolean; range_start: string; range_end: string }): string {
   if (e.range_mode && e.range_start && e.range_end) return `${e.column} ∈ [${e.range_start}, ${e.range_end})`
   return `${e.column} ${e.op} ${e.value}`
+}
+
+// Candidate option label: the pg-page shape (coverage/score ride along).
+function wmColLabel(c: string): string {
+  if (c === '_id') return '_id（默认，ObjectId 时间戳）'
+  const cand = wmCandByCol.value[c]
+  if (!cand) return c
+  return `${c}（覆盖 ${cand.matched_tables.length}/${wmSuggestTotal.value || '?'} · ${cand.score.toFixed(0)} 分）`
 }
 
 // Override editor dialog (collection name + a full group of its own).
@@ -421,9 +487,12 @@ async function submit() {
             <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
               <el-select v-model="wmConfig.column" filterable allow-create default-first-option
                          style="width: 240px;">
-                <el-option v-for="c in wmColumnOptions" :key="c" :value="c"
-                           :label="c === '_id' ? '_id（默认，ObjectId 时间戳）' : c" />
+                <el-option v-for="c in wmColumnOptions" :key="c" :value="c" :label="wmColLabel(c)" />
               </el-select>
+              <el-tooltip :disabled="!!srcDb" content="请先填写源端数据库名" placement="top">
+                <el-button size="small" :loading="wmLoadingCandidates" :disabled="!srcDb"
+                           @click="loadWmCandidates">获取候选水位列</el-button>
+              </el-tooltip>
               <el-radio-group v-model="wmKind" size="small">
                 <el-radio-button value="objectid">ObjectId</el-radio-button>
                 <el-radio-button value="datetime">时间</el-radio-button>
@@ -458,6 +527,15 @@ async function submit() {
               两端按同一窗口过滤后比对，消除「源端持续写入+同步滞后」的永久差异假象；缺字段文档两端一致排除。
               水位前的旧文档改动、两端都已删除的文档检测不到；时间值按服务器本地时区解析；区间为半开 [start, end)，终点不含。
               运行期水位列不可用的集合将自动退化为全量比对并在报告注明（例外集合则直接失败）。
+              候选水位列基于索引与前 50 条采样文档推断、非穷尽；未列出的列可直接手输，运行期探针仍是权威。
+            </div>
+            <div v-if="activeWmCandidate" style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-top: 6px;">
+              覆盖 {{ activeWmCandidate.matched_tables.length }}/{{ wmSuggestTotal }} 个集合（{{ (activeWmCandidate.coverage * 100).toFixed(0) }}%）
+              <span v-if="activeWmCandidate.warnings?.length" style="color: var(--tims-tag-warning-text);">；{{ activeWmCandidate.warnings[0] }}</span>
+              <el-tooltip v-if="activeWmCandidate.unmatched_tables?.length" placement="top">
+                <template #content>{{ activeWmCandidate.unmatched_tables.join('、') }}</template>
+                <span style="color: var(--tims-tag-warning-text); cursor: help;">；缺该列 {{ activeWmCandidate.unmatched_tables.length }} 个集合（悬停查看，运行期将全量比对）</span>
+              </el-tooltip>
             </div>
           </div>
         </el-form-item>

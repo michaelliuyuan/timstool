@@ -309,6 +309,9 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 			// prefixed to stay clear of the /compare MySQL domain below.
 			// MC-10 C5: creation is audited (auditCompareOp); reads stay open.
 			r.Post("/mongocompare/tasks", s.auditCompareOp("mongocompare.create", s.handleCreateCompareTask))
+			// Mongo 水位列自动发现（seq=39 方案②）: advisory catalog + shared
+			// scorer, read-only — bare route like the pg/mysql suggest twin.
+			r.Post("/mongocompare/suggest-watermark", s.handleSuggestMongoWatermark)
 			r.Get("/tasks", s.handleListTasks)
 			r.Route("/tasks/{taskID}", func(r chi.Router) {
 				r.Get("/", s.handleGetTask)

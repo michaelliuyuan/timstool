@@ -106,6 +106,45 @@ func TestWMScoreIDHardWarning(t *testing.T) {
 	}
 }
 
+// TestWMScoreUtimeCtimeDictionary (mongo 水位列自动发现单 seq=39 ③): the
+// shared dictionaries gained utime (update series) and ctime (created
+// series) — wmNameNorm folds the spellings, so u_time/UTIME hit the same
+// entry. Anchored on the shared scorer: pg/mysql and mongo candidates rank
+// identically through it.
+func TestWMScoreUtimeCtimeDictionary(t *testing.T) {
+	cols := wmCols(
+		[5]string{"a", "utime", "datetime", "idx", ""},
+		[5]string{"a", "u_time", "datetime", "idx", ""},
+		[5]string{"a", "ctime", "datetime", "idx", ""},
+	)
+	_, cands := scoreWatermarkCandidates(cols)
+	ut := findCand(t, cands, "utime")
+	if len(ut.Reasons) == 0 {
+		t.Fatalf("utime reasons empty")
+	}
+	found := false
+	for _, r := range ut.Reasons {
+		if strings.HasPrefix(r, "更新系命名") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("utime reasons = %v; want 更新系命名 (dictionary hit)", ut.Reasons)
+	}
+	if ut.Score < 60 {
+		t.Errorf("indexed full-coverage utime score = %.1f; want >= 60", ut.Score)
+	}
+	ct := findCand(t, cands, "ctime")
+	if !hasWarnContaining(ct, "INSERT") {
+		t.Errorf("ctime warnings = %v; want created-series INSERT-only warning", ct.Warnings)
+	}
+	// The folded twin scores identically (same normalized dictionary key).
+	twin := findCand(t, cands, "u_time")
+	if twin.Score != ut.Score {
+		t.Errorf("u_time (%.1f) must equal utime (%.1f) after name folding", twin.Score, ut.Score)
+	}
+}
+
 func TestWMScoreCoveragePenalty(t *testing.T) {
 	// updated_at on 1/2 tables vs sync_ts on 2/2 — dictionary weight must
 	// NOT fully override a coverage hole.
