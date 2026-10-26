@@ -157,6 +157,11 @@ type compareTaskSpec struct {
 	Levels          []string                `json:"levels"`
 	Watermark       *config.WatermarkFilter `json:"watermark,omitempty"`
 	TableWatermarks []config.TableWatermark `json:"table_watermarks,omitempty"`
+	// coll-select ①: optional collection whitelist within the source
+	// database. Absent/empty = compare every collection (legacy). The FE
+	// omits the field when everything is selected so legacy payloads stay
+	// byte-identical.
+	Collections []string `json:"collections,omitempty"`
 }
 
 // compareTaskEnvelope is the ConfigJSON shape for compare tasks. The kind
@@ -263,6 +268,53 @@ func (s *Server) handleCreateCompareTask(w http.ResponseWriter, r *http.Request)
 	if err := validateCompareParams(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	// coll-select ①: normalize the optional whitelist — trim, drop empties,
+	// dedupe preserving order. A system.* selection is rejected outright:
+	// the engine excludes system namespaces by design, so a payload asking
+	// for one means a client bug or a misunderstood payload — refuse loudly
+	// instead of silently comparing less than was asked.
+	// 对抗席 F5: an EXPLICITLY provided-but-empty list (["", "  "]) must
+	// 400 — collapsing it to nil (= full database) would silently widen the
+	// scope from "compare nothing" to "compare everything". Absence of the
+	// field stays the legacy full-database contract.
+	if req.Collections != nil {
+		seen := make(map[string]bool, len(req.Collections))
+		cols := req.Collections[:0]
+		for _, c := range req.Collections {
+			c = strings.TrimSpace(c)
+			if c == "" || seen[c] {
+				continue
+			}
+			if strings.HasPrefix(c, "system.") {
+				s.writeError(w, http.StatusBadRequest, fmt.Sprintf("collections: %q is a system namespace and can never be compared", c))
+				return
+			}
+			seen[c] = true
+			cols = append(cols, c)
+		}
+		if len(cols) == 0 {
+			s.writeError(w, http.StatusBadRequest, "collections: list is empty after normalization (omit the field to compare the whole database)")
+			return
+		}
+		if len(cols) > 10000 {
+			s.writeError(w, http.StatusBadRequest, "collections: too many entries (max 10000)")
+			return
+		}
+		req.Collections = cols
+		// 对抗席 F3: a watermark override pointing outside the whitelist
+		// can never fire (wmFor is a pure name match) — refuse here so the
+		// exception is never silently lost while the confirm dialog claimed
+		// it was active.
+		for _, tw := range req.TableWatermarks {
+			// Trim before matching (对抗席 N2): normalizeTableWatermarks
+			// trims later — comparing the raw name would edge-reject a
+			// legitimately padded override.
+			if !seen[strings.TrimSpace(tw.Table)] {
+				s.writeError(w, http.StatusBadRequest, fmt.Sprintf("table_watermarks: override for %q is not in the selected collections", tw.Table))
+				return
+			}
+		}
 	}
 	// 第9单 ①: watermark normalization REUSES the webapi-generic validators
 	// the pg/mysql side runs (identifier allow-list, single-value/interval
@@ -450,6 +502,7 @@ func (s *Server) runMongoCompare(ctx context.Context, taskID string, spec *compa
 		OutDir:          outDir,
 		Watermark:       spec.Watermark,
 		TableWatermarks: spec.TableWatermarks,
+		OnlyCollections: spec.Collections,
 	}
 	for _, l := range spec.Levels {
 		cfg.Levels = append(cfg.Levels, mongocompare.Level(l))

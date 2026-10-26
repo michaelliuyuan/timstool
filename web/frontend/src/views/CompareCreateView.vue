@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, computed, watch, onMounted } from 'vue'
+import { ref, reactive, computed, watch, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowLeft } from '@element-plus/icons-vue'
@@ -107,7 +107,65 @@ watch(() => wmConfig.column, (col) => {
 watch(srcDb, () => {
   wmCandidates.value = []
   wmSuggestTotal.value = 0
+  // coll-select ①: the loaded collection list belongs to srcDb the same
+  // way — a switch must not leave a stale picker (nor a stale selection
+  // silently riding into the submitted spec).
+  collEntries.value = []
+  collSelectedNames.value = []
 })
+
+// ---- coll-select ①: per-collection picker (default all-selected) ----
+interface CollEntry { name: string; is_view: boolean }
+const collLoading = ref(false)
+const collEntries = ref<CollEntry[]>([])
+const collSelectedNames = ref<string[]>([])
+const collTable = ref<any>(null)
+const pickableColls = computed(() => collEntries.value.filter(e => !e.is_view))
+
+async function loadColls() {
+  if (!srcDb.value) { ElMessage.warning('请先填写源端数据库名'); return }
+  collLoading.value = true
+  try {
+    // 对抗席 F1: database rides inside the source snapshot (suggest twin) —
+    // endpointOf's database field is still '' at this point.
+    const { data } = await apiClient.listMongoCollections({ ...endpointOf('src'), database: srcDb.value })
+    collEntries.value = (data.collections || []) as CollEntry[]
+    collSelectedNames.value = []
+    if (collEntries.value.length === 0) {
+      // 正评席 N5: an empty listing also means a typo'd database name —
+      // mongo returns [] for a nonexistent db, say so.
+      ElMessage.warning('该数据库没有可比集合（或均为视图，或数据库名不存在）')
+      return
+    }
+    // Default = every pickable collection checked (requirement: 默认全选).
+    // Views stay unchecked AND disabled — the engine skips them by design.
+    nextTick(() => {
+      const t = collTable.value
+      if (!t) return
+      for (const row of collEntries.value) {
+        if (!row.is_view) t.toggleRowSelection(row, true)
+      }
+    })
+  } catch (e: any) {
+    ElMessage.error(e.response?.data?.error || '获取集合列表失败')
+  } finally {
+    collLoading.value = false
+  }
+}
+function onCollSelectionChange(rows: CollEntry[]) {
+  collSelectedNames.value = rows.filter(r => !r.is_view).map(r => r.name)
+}
+function selectAllColls() {
+  const t = collTable.value
+  if (!t) return
+  t.clearSelection()
+  for (const row of collEntries.value) {
+    if (!row.is_view) t.toggleRowSelection(row, true)
+  }
+}
+function clearCollSelection() {
+  collTable.value?.clearSelection()
+}
 async function loadWmCandidates() {
   if (!srcDb.value) { ElMessage.warning('请先填写源端数据库名'); return }
   wmLoadingCandidates.value = true
@@ -297,6 +355,22 @@ async function submit() {
     ElMessage.warning('请填写源端数据库名')
     return
   }
+  // 对抗席 F4: a submit while the picker is still loading would silently
+  // fall back to the whole-database task (empty entries skip the gate).
+  if (collLoading.value) {
+    ElMessage.warning('集合列表加载中，请稍候再提交')
+    return
+  }
+  // 对抗席 F3 (FE half): a watermark override pointing at a collection the
+  // whitelist excludes can never fire — refuse here instead of a silently
+  // lost exception (the backend 400s the same condition as the authority).
+  if (wmEnabled.value && collEntries.value.length > 0 && collSelectedNames.value.length > 0 && collSelectedNames.value.length !== pickableColls.value.length) {
+    const orphan = Object.keys(collWms.value).filter(t => collWmActive(collWms.value[t]) && !collSelectedNames.value.includes(t))
+    if (orphan.length > 0) {
+      ElMessage.warning(`例外水位指向未勾选的集合：${orphan.join('、')}（请勾选这些集合或移除对应例外）`)
+      return
+    }
+  }
   const targetDb = tgtSameAsSrc.value ? srcDb.value : tgtDb.value
   if (!targetDb) {
     ElMessage.warning('请填写目标端数据库名')
@@ -333,6 +407,21 @@ async function submit() {
     }))
     if (!(await confirmWmBeforeRun())) return
   }
+  // coll-select ①: assemble the whitelist ONLY for a partial pick. When
+  // every pickable collection is selected the field is omitted — payload
+  // byte-identical to the legacy full-database task; when the list was
+  // loaded but nothing survives checked, refuse (an accidental empty
+  // whitelist would fail loudly server-side anyway — better stopped here).
+  let collections: string[] | undefined
+  if (collEntries.value.length > 0 && pickableColls.value.length > 0) {
+    if (collSelectedNames.value.length === 0) {
+      ElMessage.warning('已加载集合列表但未勾选任何集合：请至少勾选一个，或点「全选」比对整库')
+      return
+    }
+    if (collSelectedNames.value.length !== pickableColls.value.length) {
+      collections = [...collSelectedNames.value]
+    }
+  }
   const spec: CompareTaskSpec = {
     source: { ...endpointOf('src'), database: srcDb.value },
     target: { ...endpointOf('tgt'), database: targetDb },
@@ -343,6 +432,7 @@ async function submit() {
     levels: [...levels.value],
     watermark,
     table_watermarks: tableWatermarks,
+    collections,
   }
   creating.value = true
   try {
@@ -403,6 +493,43 @@ async function submit() {
           </el-button>
           <el-tag v-if="testState.src === true" type="success" style="margin-left: 8px;">连接成功</el-tag>
           <el-tag v-else-if="testState.src === false" type="danger" style="margin-left: 8px;">连接失败</el-tag>
+        </el-form-item>
+        <!-- coll-select ①: per-collection picker — default all-selected,
+             views listed but disabled (engine skips them by design). -->
+        <el-form-item label="集合选择">
+          <div style="width: 100%;">
+            <el-space style="margin-bottom: 8px;">
+              <el-button size="small" :loading="collLoading" :disabled="!srcDb" @click="loadColls">
+                加载集合列表
+              </el-button>
+              <template v-if="collEntries.length > 0">
+                <el-button size="small" @click="selectAllColls">全选</el-button>
+                <el-button size="small" @click="clearCollSelection">清空</el-button>
+                <el-tag type="info" size="small">已选 {{ collSelectedNames.length }} / 可选 {{ pickableColls.length }}（视图 {{ collEntries.length - pickableColls.length }} 不可比）</el-tag>
+              </template>
+            </el-space>
+            <el-table
+              v-if="collEntries.length > 0"
+              ref="collTable"
+              :data="collEntries"
+              size="small"
+              max-height="240"
+              border
+              @selection-change="onCollSelectionChange"
+            >
+              <el-table-column type="selection" width="42" :selectable="(row: CollEntry) => !row.is_view" />
+              <el-table-column prop="name" label="集合名" min-width="220" show-overflow-tooltip />
+              <el-table-column label="类型" width="90">
+                <template #default="{ row }">
+                  <el-tag v-if="row.is_view" type="warning" size="small">视图</el-tag>
+                  <el-tag v-else type="success" size="small">集合</el-tag>
+                </template>
+              </el-table-column>
+            </el-table>
+            <div v-if="collEntries.length > 0" style="margin-top: 6px; font-size: var(--tims-font-xs, 12px); color: var(--tims-text-2, #999);">
+              默认全选 = 对比库内全部集合；部分勾选则仅比对所选集合，目标端未勾选的集合不报差异。未加载列表时等同全选整库。
+            </div>
+          </div>
         </el-form-item>
       </el-form>
     </el-card>

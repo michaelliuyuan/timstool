@@ -53,6 +53,11 @@ type Config struct {
 	// nil/inactive = full comparison, byte-identical legacy behavior.
 	Watermark       *config.WatermarkFilter
 	TableWatermarks []config.TableWatermark
+	// coll-select ①: optional collection whitelist scoped to the task's
+	// source database. nil/empty = enumerate everything (legacy semantics,
+	// byte-identical). Only the single-database task chain sets it; the
+	// all-instance CLI path (CompareClients) never does.
+	OnlyCollections []string
 }
 
 func (c Config) withDefaults() Config {
@@ -154,7 +159,7 @@ func CompareClients(ctx context.Context, src, dst mongoconn.Client, cfg Config) 
 		if d.Name == "admin" || d.Name == "config" || d.Name == "local" {
 			continue
 		}
-		rows, skipped, err := compareDB(ctx, src, dst, d.Name, d.Name, c)
+		rows, skipped, _, err := compareDB(ctx, src, dst, d.Name, d.Name, c)
 		if err != nil {
 			return nil, err
 		}
@@ -178,9 +183,23 @@ func CompareDatabases(ctx context.Context, src, dst mongoconn.Client, srcDB, dst
 	if err := prepOutDir(c); err != nil {
 		return nil, err
 	}
-	rows, skipped, err := compareDB(ctx, src, dst, srcDB, dstDB, c)
+	rows, skipped, picked, err := compareDB(ctx, src, dst, srcDB, dstDB, c)
 	if err != nil {
 		return nil, err
+	}
+	// coll-select ①: a whitelist where NOT ONE selected collection exists
+	// in the source database (typo, or the collection was dropped after
+	// task creation) must fail loudly — a silent "completed, 0 compared"
+	// would read as equality evidence.
+	if len(c.OnlyCollections) > 0 && picked == 0 {
+		return nil, fmt.Errorf("none of the %d selected collections exist in source database %q", len(c.OnlyCollections), srcDB)
+	}
+	if len(c.OnlyCollections) > 0 {
+		// Disclosure pair: selected (what the user asked for) vs matched
+		// (what the source still had). Divergence = post-creation drift,
+		// surfaced by the report face instead of failing the whole run.
+		s.Stats["selected_collections"] = len(c.OnlyCollections)
+		s.Stats["matched_collections"] = picked
 	}
 	finalize(s, rows)
 	recordSkippedViews(s, skipped)
@@ -296,14 +315,24 @@ func finalize(s *Summary, rows []CollectionResult) {
 // missing target collection); dst-only views are not reported (symmetric
 // with the source-side view filter) and system.* stays excluded on both
 // sides.
-func compareDB(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB string, c Config) ([]CollectionResult, []string, error) {
+func compareDB(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB string, c Config) ([]CollectionResult, []string, int, error) {
+	// coll-select ①: the optional whitelist gates BOTH sides symmetrically —
+	// unselected source collections are not compared and unselected target
+	// collections do not surface as missing-in-source noise.
+	only := map[string]bool{}
+	for _, n := range c.OnlyCollections {
+		only[n] = true
+	}
 	srcList, err := src.ListCollectionNameTypes(ctx, srcDB)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list collections %s: %w", srcDB, err)
+		return nil, nil, 0, fmt.Errorf("list collections %s: %w", srcDB, err)
 	}
 	srcColls := make(map[string]bool, len(srcList))
 	for _, ct := range srcList {
 		if strings.HasPrefix(ct.Name, "system.") || !ct.IsCollection() {
+			continue
+		}
+		if len(only) > 0 && !only[ct.Name] {
 			continue
 		}
 		srcColls[ct.Name] = true
@@ -313,11 +342,14 @@ func compareDB(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB stri
 	if c.has(LevelSchema) {
 		dstList, err := dst.ListCollectionNameTypes(ctx, dstDB)
 		if err != nil {
-			return nil, nil, fmt.Errorf("list collections %s: %w", dstDB, err)
+			return nil, nil, 0, fmt.Errorf("list collections %s: %w", dstDB, err)
 		}
 		dstNames = make(map[string]bool, len(dstList))
 		for _, ct := range dstList {
 			if strings.HasPrefix(ct.Name, "system.") || !ct.IsCollection() {
+				continue
+			}
+			if len(only) > 0 && !only[ct.Name] {
 				continue
 			}
 			dstNames[ct.Name] = true
@@ -339,7 +371,14 @@ func compareDB(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB stri
 		// View filter (MC-9 A2): only collections carry comparable data
 		// (empty type = collection, the M1 guard inside IsCollection).
 		if !ct.IsCollection() {
-			skippedViews = append(skippedViews, srcDB+"."+ct.Name)
+			// An UNSELECTED view is not the user's concern — only views
+			// that pass the whitelist surface in the disclosure.
+			if len(only) == 0 || only[ct.Name] {
+				skippedViews = append(skippedViews, srcDB+"."+ct.Name)
+			}
+			continue
+		}
+		if len(only) > 0 && !only[ct.Name] {
 			continue
 		}
 		tasks = append(tasks, task{srcDB, ct.Name})
@@ -361,7 +400,7 @@ func compareDB(ctx context.Context, src, dst mongoconn.Client, srcDB, dstDB stri
 	if len(dstOnly) > 0 {
 		results = append(results, dstOnly...)
 	}
-	return results, skippedViews, nil
+	return results, skippedViews, len(tasks), nil
 }
 
 // AlgoVersion stamps the canon semantics/format a checkpoint was produced

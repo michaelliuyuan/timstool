@@ -261,6 +261,10 @@ export interface CompareTaskSpec {
   /** 第9单 per-collection watermark overrides; table = collection name
    *  within the task's source database (override wins over the global group). */
   table_watermarks?: { table: string; column: string; value?: string; op?: string; range_start?: string; range_end?: string }[]
+  /** coll-select ①: partial collection selection within the source
+   *  database. OMITTED when everything is selected (= legacy full-database
+   *  semantics, byte-identical payloads); present only for a partial pick. */
+  collections?: string[]
 }
 
 // Compare result (the kind discriminator inside result_json of finished
@@ -535,6 +539,16 @@ export const apiClient = {
         warnings: string[]
       }[]
     }>('/mongocompare/suggest-watermark', { source }, { timeout: LONG_TIMEOUT }),
+
+  // coll-select ①: collection picker face — lists a database's collection
+  // names (views flagged is_view, system.* already excluded server-side) so
+  // the create form can default to all-selected with partial opt-out.
+  // Single-argument shape mirrors suggestMongoWatermark (对抗席 F1: the
+  // database rides INSIDE source — a top-level sibling is dropped by the
+  // server's decoder and the call 400s).
+  listMongoCollections: (source: CompareEndpoint & { database: string }) =>
+    api.post<{ total: number; collections: { name: string; is_view: boolean }[] }>(
+      '/mongocompare/list-collections', { source }, { timeout: LONG_TIMEOUT }),
 
   listTasks: () =>
     api.get<Task[]>('/tasks'),

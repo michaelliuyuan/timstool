@@ -8,7 +8,7 @@ MongoDB↔MongoDB 一致性对比：对源端与目标端的数据库逐集合�
 
 ## 使用（Web）
 
-导航「MongoDB 对比」→ 填写源端/目标端连接（表单字段由 `/api/v1/sources` 元数据驱动）与数据库名 → 可选高级参数 → 创建并启动。任务详情页实时显示已完成集合心跳，结束后展示总体结果（equal/diff/error/ttl_skip）、四象限计数与产物路径；终态（已完成/失败）提供「下载对比报告」（HTML 详细报告）与「下载 JSON」（summary.json 原样工件）双按钮（MC-14）。
+导航「MongoDB 对比」→ 填写源端/目标端连接（表单字段由 `/api/v1/sources` 元数据驱动）与数据库名 → 「加载集合列表」可展开源库集合并按需勾选（默认全选；视图列出但不可选；全选提交等同整库任务）→ 可选高级参数 → 创建并启动。任务详情页实时显示已完成集合心跳，结束后展示总体结果（equal/diff/error/ttl_skip）、四象限计数与产物路径，并内嵌「集合结果」表（逐集合结果/水位状态/行数/hash 不一致分桶 + 展开五级明细，支持结果筛选、集合名搜索与「导出 CSV」——带 BOM 与公式注入防御，导出所见即过滤后视图；coll-select ②）；终态（已完成/失败）另提供「下载对比报告」（HTML 详细报告）与「下载 JSON」（summary.json 原样工件）双按钮（MC-14）。
 
 ## 使用（API）
 
@@ -18,8 +18,13 @@ POST /api/v1/mongocompare/tasks
   "source": {"host": "10.0.0.1", "port": 27017, "user": "u", "password": "p", "auth_db": "admin", "database": "orders"},
   "target": {"host": "10.0.0.2", "port": 27017, "database": "orders"},
   "buckets": 64, "parallel_colls": 4, "parallel_buckets": 4, "batch_size": 1000,
-  "levels": ["schema", "index", "count", "hash", "diff"]
+  "levels": ["schema", "index", "count", "hash", "diff"],
+  "collections": ["orders_2026", "orders_2025"]
 }
+
+POST /api/v1/mongocompare/list-collections   # 集合选择列表（只读，创建页选择器数据源）
+{"source": {...同上...}, "database": "orders"}
+→ {"total": 2, "collections": [{"name": "orders_2025", "is_view": false}, ...]}   # system.* 已排除、按名排序
 
 POST /api/v1/tasks/{id}/start          # 全新对比（清空该任务的对比产物目录）
 POST /api/v1/tasks/{id}/start  {"resume": true}   # 从引擎 checkpoint 断点续跑
@@ -33,6 +38,8 @@ GET  /api/v1/tasks/{id}/report?format=json      # MC-14：summary.json 原样字
 
 - 每端可给 `uri`（完整连接串，转义由调用方负责）**或**离散字段 `host/port/user/password/auth_db`（服务端结构化构建凭证，口令含 `@ : / %` 等特殊字符安全）；两者同时给出时离散字段优先。
 - `target.database` 省略时默认与源端同名；v1 语义为**单库对单库**（两端库名可不同）。
+- **集合白名单（coll-select ①）**：可选 `collections` 数组限定源库内参与对比的集合。缺省 = 整库（legacy 语义，payload 字节级不变）；部分选择时引擎只比所选集合，**目标端未选集合不报 missing-in-source 噪音**，双向存在性检查同样受白名单约束。归一规则：逐项 trim、去空去重（上限 10000）；`system.*` 拒绝（400）；**显式提供但归一后为空 = 400**（绝不静默扩成整库）；水位例外（`table_watermarks[].table`）必须落在白名单内（400，防例外静默蒸发）。运行期披露：`summary.json` 的 `stats.selected_collections/matched_collections` 记录「已选/实际比对」（创建后集合被删不炸整跑，HTML 报告与详情页均披露）；白名单内**无一存在**于源库时任务 fail loudly（杜绝"0 compared"伪装相等证据）。
+- **集合选择列表（coll-select ①）**：`POST /mongocompare/list-collections`（body `{source, database?}` 形如 suggest-watermark——database 必填在 source 内）只读返回该库集合清单（`system.*` 排除、视图标 `is_view` 供前端禁选、按名排序）。前端创建页「加载集合列表」默认全选可部分勾选；全选提交时省略 `collections` 字段。
 - 凭证存储与迁移任务同面：ConfigJSON 落库、API 序列化 `json:"-"` 不回显。
 - **鉴权（MC-10，已移除）**：写操作端点（`POST /mongocompare/tasks` 创建与 compare 类任务的 `start/pause/resume/cancel/delete`）不再做令牌校验，直接放行。审计保留：compare 写操作逐条落 `<dataDir>/audit/mc-ops.jsonl`（action 前缀 `mongocompare.create/start/pause/resume/cancel/delete`；内存环与 CDC 共享，写失败降级语义同 CDC）；CDC 审计文件 `cdc-ops.jsonl` 不受影响。
 

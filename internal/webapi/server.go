@@ -312,6 +312,9 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 			// Mongo 水位列自动发现（seq=39 方案②）: advisory catalog + shared
 			// scorer, read-only — bare route like the pg/mysql suggest twin.
 			r.Post("/mongocompare/suggest-watermark", s.handleSuggestMongoWatermark)
+			// coll-select ①: read-only collection listing for the create
+			// form's per-collection picker (same bare-route family).
+			r.Post("/mongocompare/list-collections", s.handleListMongoCollections)
 			r.Get("/tasks", s.handleListTasks)
 			r.Route("/tasks/{taskID}", func(r chi.Router) {
 				r.Get("/", s.handleGetTask)

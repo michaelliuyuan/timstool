@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue'
+import { ref, onMounted, onUnmounted, computed, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import apiClient from '../api'
@@ -31,6 +31,117 @@ const overallMeta: Record<string, { type: string; label: string }> = {
   diff: { type: 'warning', label: '存在差异 (diff)' },
   error: { type: 'danger', label: '对比出错 (error)' },
   ttl_skip: { type: 'info', label: 'TTL 跳过 (ttl_skip)' },
+}
+
+// ---- coll-select ②: in-page per-collection result table + CSV export ----
+// Data source is the verbatim summary.json artifact (the same bytes the
+// 「下载 JSON」button saves) — no new read endpoint, one parse client-side.
+interface McBucket { bucket: number; match: boolean; src_count: number; dst_count: number; src_hash?: string; dst_hash?: string }
+interface McCollectionRow {
+  db?: string
+  coll: string
+  overall: string
+  wm_state?: string
+  note?: string
+  checks?: {
+    schema?: Record<string, any>
+    index?: Record<string, any>
+    count?: Record<string, any>
+    hash?: McBucket[]
+    diff?: Record<string, any>
+    skipped?: string
+    error?: string
+  }
+}
+interface McSummary {
+  collections?: McCollectionRow[]
+  counts?: Record<string, number>
+  stats?: Record<string, any>
+}
+const mcSummary = ref<McSummary | null>(null)
+const mcSummaryLoading = ref(false)
+const mcOverallFilter = ref('all')
+const mcCollSearch = ref('')
+
+async function loadMcSummary() {
+  if (!isCompare.value) return
+  if (task.value?.status !== 'completed' && task.value?.status !== 'failed') return
+  // In-flight guard (正评席 N2): the 5s task poll re-fires this watcher —
+  // without it a slow request would overlap itself.
+  if (mcSummary.value || mcSummaryLoading.value) return
+  mcSummaryLoading.value = true
+  try {
+    const { data } = await apiClient.getTaskReport(taskId, 'json')
+    mcSummary.value = JSON.parse(data as string) as McSummary
+  } catch {
+    // Artifact not finalized yet (race with restart) — stays null and the
+    // next poll watch retries; never surfaces a half-state to the user.
+  } finally {
+    mcSummaryLoading.value = false
+  }
+}
+watch(task, (t) => {
+  if (!t) return
+  if (isCompare.value && (t.status === 'completed' || t.status === 'failed')) {
+    loadMcSummary()
+  } else if (mcSummary.value) {
+    // A restart/resume invalidates the artifact view until the new round
+    // finalizes — showing the previous run's rows would be misleading.
+    mcSummary.value = null
+  }
+})
+
+const mcRows = computed<McCollectionRow[]>(() => mcSummary.value?.collections || [])
+const mcFilteredRows = computed(() => {
+  let rows = mcRows.value
+  if (mcOverallFilter.value !== 'all') {
+    rows = rows.filter(r => r.overall === mcOverallFilter.value)
+  }
+  const q = mcCollSearch.value.trim().toLowerCase()
+  if (q) rows = rows.filter(r => (r.coll || '').toLowerCase().includes(q))
+  return rows
+})
+function mcHashMismatch(row: McCollectionRow): number {
+  return (row.checks?.hash || []).filter(b => !b.match).length
+}
+// FE-side CSV (FEAT-0933 client-side pattern, BOM so Excel opens UTF-8
+// Chinese correctly); exports exactly the filtered view the user sees.
+// 对抗席 F2: CSV formula injection — a cell starting with = + - @ (or a
+// tab/CR) is executed as a formula by Excel/WPS; collection names and notes
+// come from database content (dst-only rows even from the FAR side), so
+// every cell is prefixed with a single quote when it matches (OWASP CSV
+// injection mitigation).
+function mcCsvCell(raw: string): string {
+  let c = raw.replace(/"/g, '""')
+  // Prefix first, THEN the quote-wrap decision (对抗席 N1: returning early
+  // here would skip the wrap and misalign columns for `=a,b`-style values).
+  if (/^[=+\-\t\r@]/.test(c)) c = `'${c}`
+  return /[",\n\r]/.test(c) ? `"${c}"` : c
+}
+function mcExportCsv() {
+  const head = ['集合名', '结果', '水位状态', '源行数', '目标行数', 'hash分桶数', 'hash不一致分桶', '差异样本数', '备注']
+  const lines = [head.join(',')]
+  for (const r of mcFilteredRows.value) {
+    const cells = [
+      r.coll || '',
+      overallMeta[r.overall]?.label || r.overall || '',
+      r.wm_state || '',
+      String(r.checks?.count?.src ?? ''),
+      String(r.checks?.count?.dst ?? ''),
+      String(r.checks?.hash?.length ?? ''),
+      String(mcHashMismatch(r)),
+      String(r.checks?.diff?.count ?? ''),
+      r.note || '',
+    ]
+    lines.push(cells.map(mcCsvCell).join(','))
+  }
+  const blob = new Blob(['\uFEFF' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `mongo-collections-${taskId}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
 }
 
 const logDrawerVisible = ref(false)
@@ -480,16 +591,111 @@ function logLevelClass(level: string): string {
           <el-col :span="6"><el-statistic title="出错集合" :value="compareResult.counts?.error ?? 0" /></el-col>
           <el-col :span="6"><el-statistic title="TTL 跳过" :value="compareResult.counts?.ttl_skip ?? 0" /></el-col>
         </el-row>
-        <el-descriptions :column="1" border size="small" style="margin-top: 12px;">
-          <el-descriptions-item label="对比耗时">{{ compareResult.duration_sec?.toFixed(2) ?? '-' }} 秒</el-descriptions-item>
-          <el-descriptions-item label="结果摘要 (summary.json)">
-            <el-text type="info" class="tims-mono">{{ compareResult.summary_path }}</el-text>
-          </el-descriptions-item>
-          <el-descriptions-item label="差异明细目录 (diff)">
-            <el-text type="info" class="tims-mono">{{ compareResult.diff_dir }}</el-text>
-          </el-descriptions-item>
-        </el-descriptions>
-      </el-card>
+          <el-descriptions :column="1" border size="small" style="margin-top: 12px;">
+            <el-descriptions-item label="对比耗时">{{ compareResult.duration_sec?.toFixed(2) ?? '-' }} 秒</el-descriptions-item>
+            <el-descriptions-item label="结果摘要 (summary.json)">
+              <el-text type="info" class="tims-mono">{{ compareResult.summary_path }}</el-text>
+            </el-descriptions-item>
+            <el-descriptions-item label="差异明细目录 (diff)">
+              <el-text type="info" class="tims-mono">{{ compareResult.diff_dir }}</el-text>
+            </el-descriptions-item>
+          </el-descriptions>
+        </el-card>
+
+        <!-- coll-select ②: per-collection result table (summary.json parsed
+             in-page; the HTML/JSON downloads below stay as the archival
+             faces). Deliberately a different gate expression than the
+             MC-14 download buttons' literal (spec anchors index by it). -->
+        <el-card
+          v-if="isCompare && ['completed', 'failed'].includes(task.status)"
+          v-loading="mcSummaryLoading"
+          style="margin-bottom: 20px;"
+        >
+          <template #header>
+            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+              <span>集合结果</span>
+              <el-tag v-if="mcSummary" type="info" size="small">{{ mcRows.length }} 个集合</el-tag>
+              <el-tag
+                v-if="mcSummary?.stats && mcSummary.stats.selected_collections !== undefined"
+                type="warning" size="small"
+              >
+                部分选择：已选 {{ mcSummary.stats.selected_collections }} · 实际比对 {{ mcSummary.stats.matched_collections ?? '-' }}
+              </el-tag>
+              <span style="flex: 1;"></span>
+              <el-select v-model="mcOverallFilter" size="small" style="width: 150px;">
+                <el-option label="全部结果" value="all" />
+                <el-option label="一致" value="equal" />
+                <el-option label="差异" value="diff" />
+                <el-option label="出错" value="error" />
+                <el-option label="TTL 跳过" value="ttl_skip" />
+              </el-select>
+              <el-input
+                v-model="mcCollSearch" size="small" placeholder="搜索集合名" clearable
+                style="width: 180px;" />
+              <el-button size="small" type="primary" plain :disabled="!mcSummary" @click="mcExportCsv">
+                <el-icon><Download /></el-icon> 导出 CSV
+              </el-button>
+            </div>
+          </template>
+          <el-table v-if="mcSummary" :data="mcFilteredRows" size="small" max-height="420" border>
+            <el-table-column type="expand">
+              <template #default="{ row }">
+                <el-descriptions :column="2" border size="small" style="padding: 8px;">
+                  <el-descriptions-item label="Schema">
+                    <span v-if="row.checks?.schema?.ok" style="color: var(--el-color-success);">一致</span>
+                    <span v-else>{{ Array.isArray(row.checks?.schema?.diff) ? row.checks.schema.diff.join('、') : (row.checks?.skipped || '-') }}</span>
+                  </el-descriptions-item>
+                  <el-descriptions-item label="索引">
+                    <span v-if="row.checks?.index?.ok" style="color: var(--el-color-success);">一致</span>
+                    <span v-else-if="Array.isArray(row.checks?.index?.diff)">{{ row.checks.index.diff.join('；') }}</span>
+                    <span v-else>-</span>
+                  </el-descriptions-item>
+                  <el-descriptions-item label="行数 (源/目标)">
+                    {{ row.checks?.count?.src ?? '-' }} / {{ row.checks?.count?.dst ?? '-' }}
+                  </el-descriptions-item>
+                  <el-descriptions-item label="hash 分桶">
+                    共 {{ row.checks?.hash?.length ?? 0 }} 桶，不一致 {{ mcHashMismatch(row) }} 桶
+                  </el-descriptions-item>
+                  <el-descriptions-item label="差异样本">
+                    {{ row.checks?.diff?.count ?? 0 }} 条（明细见 diff 目录 ndjson）
+                  </el-descriptions-item>
+                  <el-descriptions-item label="错误/跳过">
+                    {{ row.checks?.error || row.checks?.skipped || '-' }}
+                  </el-descriptions-item>
+                  <el-descriptions-item v-if="row.note" label="备注" :span="2">{{ row.note }}</el-descriptions-item>
+                </el-descriptions>
+              </template>
+            </el-table-column>
+            <el-table-column prop="coll" label="集合名" min-width="220" show-overflow-tooltip />
+            <el-table-column label="结果" width="130">
+              <template #default="{ row }">
+                <el-tag :type="(overallMeta[row.overall]?.type || 'info') as any" size="small">
+                  {{ overallMeta[row.overall]?.label || row.overall }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="水位" width="90">
+              <template #default="{ row }">
+                <el-tag v-if="row.wm_state === 'windowed'" type="success" size="small">窗口内</el-tag>
+                <el-tag v-else-if="row.wm_state === 'degraded'" type="warning" size="small">已退化</el-tag>
+                <el-tag v-else-if="row.wm_state === 'failed'" type="danger" size="small">预检失败</el-tag>
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="行数 (源/目标)" width="130">
+              <template #default="{ row }">
+                {{ row.checks?.count?.src ?? '-' }} / {{ row.checks?.count?.dst ?? '-' }}
+              </template>
+            </el-table-column>
+            <el-table-column label="hash 不一致" width="100">
+              <template #default="{ row }">
+                <span :style="mcHashMismatch(row) > 0 ? 'color: var(--el-color-warning);' : ''">{{ mcHashMismatch(row) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="note" label="备注" min-width="180" show-overflow-tooltip />
+          </el-table>
+          <el-empty v-else-if="!mcSummaryLoading" description="结果摘要不可用（任务未产生 summary.json，可刷新重试）" :image-size="60" />
+        </el-card>
 
       <!-- Actions -->
       <el-card style="margin-bottom: 20px;">

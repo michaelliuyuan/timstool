@@ -299,6 +299,12 @@ func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongo
 		if v, ok := sum.Stats["resume"].(bool); ok && v {
 			parts = append(parts, "resume=true")
 		}
+		// coll-select ① (正评席 N1): the archival face must disclose a
+		// partial-selection run — selected (asked) vs matched (the source
+		// still had) — otherwise the HTML reads like a whole-database run.
+		if v, ok := sum.Stats["selected_collections"]; ok {
+			parts = append(parts, fmt.Sprintf("selected=%v/matched=%v", v, sum.Stats["matched_collections"]))
+		}
 		if views, ok := sum.Stats["skipped_views"]; ok && fmt.Sprint(views) != "[]" {
 			parts = append(parts, fmt.Sprintf("skipped_views=%v", views))
 		}
