@@ -112,6 +112,9 @@ vi.mock('../api', () => ({
     deleteCompare: vi.fn(),
     compareRowDiffUrl: (id: string, file: string) =>
       `/api/v1/compare/tasks/${id}/rowdiff/${encodeURIComponent(file)}`,
+    // v2 行内容对照：本锚不消费（详见 compareRowDiffContent.spec.ts），提供
+    // 空数组以防展开行触发的一次性懒加载落空
+    getCompareRowDiffContent: vi.fn().mockResolvedValue({ data: [] }),
   },
 }))
 
@@ -165,8 +168,10 @@ describe('CompareView row-diff drill (行级差异)', () => {
     expect(body).toContain('仅源端 1')
     expect(body).toContain('仅目标端 1')
     expect(body).toContain('键列 id')
-    expect(body).toContain('样例键')
-    expect(body).toContain('明细截断至 100 万行')
+    // v2 统一样例键标签：差异键示例（前 10，共 N）
+    expect(body).toContain('差异键示例（前 10，共 3）')
+    // v2 裁定 2：截断 tag 泛化文案，无数字第二真相源（精确值只在后端 Suggestion）
+    expect(body).toContain('明细已截断（三项计数仍精确）')
     expect(body).toContain('orders-9f2c1b7a.csv')
     w.unmount()
   })

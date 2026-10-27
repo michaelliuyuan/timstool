@@ -346,6 +346,10 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 				// 行级差异明细（row-diff drill）: read-only artifact
 				// download, whitelist-gated filename (MC-14 read family).
 				r.Get("/rowdiff/{file}", s.handleCompareRowDiff)
+				// 行级差异内容对照（row-diff content probe）: the B-line
+				// {stem}.content.json sibling artifact, inline JSON for the
+				// FE's lazy side-by-side table (same read family/gates).
+				r.Get("/rowdiff-content/{file}", s.handleCompareRowDiffContent)
 				r.Post("/cancel", s.handleCancelCompare)
 				r.Delete("/", s.handleDeleteCompare)
 			})

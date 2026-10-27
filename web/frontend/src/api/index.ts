@@ -319,6 +319,26 @@ export interface CompareRowDiffs {
   note?: string
 }
 
+/** One side's probed row in the row-diff content artifact: column names +
+ *  display-rendered values (each value capped, cut marked with …);
+ *  truncated marks the 8KB row cap. */
+export interface CompareRowDiffContentRow {
+  columns: string[]
+  values: string[]
+  truncated?: boolean
+}
+
+/** One probed diff key of the {stem}.content.json artifact (B-line content
+ *  probe): exactly one of src_row/dst_row for *_only keys, both for
+ *  content_diff; error discloses a per-key probe failure. */
+export interface CompareRowDiffContentEntry {
+  key: string
+  category: 'content_diff' | 'src_only' | 'dst_only'
+  src_row?: CompareRowDiffContentRow
+  dst_row?: CompareRowDiffContentRow
+  error?: string
+}
+
 export interface CompareTableReport {
   table_name: string
   status: 'pass' | 'fail' | 'warn' | 'skip'
@@ -638,6 +658,12 @@ export const apiClient = {
   // report family's open-read policy; no auth header needed).
   compareRowDiffUrl: (id: string, file: string) =>
     `/api/v1/compare/tasks/${id}/rowdiff/${encodeURIComponent(file)}`,
+
+  // Row-diff content artifact (B-line content probe): the {stem}.content.json
+  // sibling of a committed CSV detail, inline application/json fetched once
+  // per expanded row (lazy, cached client-side; degrades to the CSV download).
+  getCompareRowDiffContent: (id: string, file: string) =>
+    api.get<CompareRowDiffContentEntry[]>(`/compare/tasks/${id}/rowdiff-content/${encodeURIComponent(file)}`),
 
   // Saved compare-page connection profile (passwords are never persisted
   // server-side; the fields exist so a round-trip response can be typed).

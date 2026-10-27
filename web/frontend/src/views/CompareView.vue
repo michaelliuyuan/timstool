@@ -2,7 +2,7 @@
 import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import apiClient from '../api'
-import type { CompareTask, CompareReport, CompareOptions, CreateCompareRequest } from '../api'
+import type { CompareTask, CompareReport, CompareOptions, CreateCompareRequest, CompareRowDiffs, CompareRowDiffContentEntry } from '../api'
 import ConnectionForm from '../components/ConnectionForm.vue'
 import DataSourcePicker from '../components/DataSourcePicker.vue'
 import PageHeader from '../components/PageHeader.vue'
@@ -859,6 +859,94 @@ function downloadRowDiff(file: string) {
   a.click()
 }
 
+// ---- 行级差异内容对照（B-line content probe）: expanding a drilled row
+// lazily fetches the {stem}.content.json sibling artifact ONCE (cached per
+// table+file) and renders a left/right value table — unequal cells
+// highlighted, *_only single-sided with「—」on the missing side. Failure
+// degrades to a disclosure line while the CSV download stays available. ----
+
+// Page-in-page budget: first 50 entries, 加载更多 up to the engine's 200.
+const ROWDIFF_CONTENT_PAGE = 50
+const ROWDIFF_CONTENT_MAX = 200
+
+interface RowDiffContentState {
+  status: 'loading' | 'done' | 'error'
+  entries: CompareRowDiffContentEntry[]
+  error: string
+}
+const rowDiffContentCache = ref<Record<string, RowDiffContentState>>({})
+const rowDiffContentShown = ref<Record<string, number>>({})
+
+// rowDiffContentFile derives the content artifact name from the CSV name;
+// note-only summaries (no committed file) have nothing to fetch.
+function rowDiffContentFile(rdf?: CompareRowDiffs): string | null {
+  if (!rdf?.file || rdf.note) return null
+  return rdf.file.replace(/\.csv$/, '.content.json')
+}
+function rowDiffCacheKey(table: string, rdf?: CompareRowDiffs): string {
+  return `${table}#${rdf?.file ?? ''}`
+}
+function rowDiffState(table: string, rdf?: CompareRowDiffs): RowDiffContentState | null {
+  return rowDiffContentCache.value[rowDiffCacheKey(table, rdf)] ?? null
+}
+function rowDiffShownCount(table: string, rdf: CompareRowDiffs): number {
+  return rowDiffContentShown.value[rowDiffCacheKey(table, rdf)] ?? ROWDIFF_CONTENT_PAGE
+}
+function rowDiffLoadMore(table: string, rdf: CompareRowDiffs) {
+  const key = rowDiffCacheKey(table, rdf)
+  const cur = rowDiffContentShown.value[key] ?? ROWDIFF_CONTENT_PAGE
+  rowDiffContentShown.value[key] = Math.min(cur + ROWDIFF_CONTENT_PAGE, ROWDIFF_CONTENT_MAX)
+}
+
+// el-table expand hook: fetch on first expand of a drilled row, never poll.
+function onReportRowExpand(row: any) {
+  const file = rowDiffContentFile(row.row_diffs)
+  if (!file) return
+  const key = rowDiffCacheKey(row.table_name, row.row_diffs)
+  if (rowDiffContentCache.value[key]) return // one-shot cache
+  const t = activeTask.value
+  if (!t) return
+  rowDiffContentCache.value[key] = { status: 'loading', entries: [], error: '' }
+  apiClient.getCompareRowDiffContent(t.id, file)
+    .then(res => {
+      rowDiffContentCache.value[key] = { status: 'done', entries: res.data ?? [], error: '' }
+    })
+    .catch((e: any) => {
+      rowDiffContentCache.value[key] = {
+        status: 'error', entries: [],
+        error: e?.response?.data?.error || e?.message || '请求失败',
+      }
+    })
+}
+
+// One compare row of the side-by-side table: both present + unequal →
+// highlighted; a missing side renders the「—」placeholder.
+interface RowDiffCmpCell { name: string; src: string; dst: string; diff: boolean }
+function rowDiffCmpCells(e: CompareRowDiffContentEntry): RowDiffCmpCell[] {
+  const srcCols = e.src_row?.columns ?? []
+  const dstCols = e.dst_row?.columns ?? []
+  const names = srcCols.length > 0 ? srcCols : dstCols
+  return names.map((name, i) => {
+    const hasSrc = !!e.src_row && i < e.src_row.values.length
+    const hasDst = !!e.dst_row && i < e.dst_row.values.length
+    const src = hasSrc ? e.src_row!.values[i] : '—'
+    const dst = hasDst ? e.dst_row!.values[i] : '—'
+    return { name, src, dst, diff: hasSrc && hasDst && src !== dst }
+  })
+}
+function rowDiffCategoryLabel(c: string): string {
+  if (c === 'content_diff') return '内容不一致'
+  if (c === 'src_only') return '仅源端'
+  if (c === 'dst_only') return '仅目标端'
+  return c
+}
+function rowDiffCategoryTagType(c: string): 'danger' | 'warning' | 'primary' | 'info' {
+  if (c === 'content_diff') return 'danger'
+  if (c === 'src_only') return 'warning'
+  if (c === 'dst_only') return 'primary'
+  return 'info'
+}
+
 // ---- report export (FEAT-0933, client-side CSV + HTML) ----
 
 function reportFileName(ext: string) {
@@ -1252,27 +1340,81 @@ onUnmounted(() => {
           </div>
         </div>
         <div class="tims-table-scroll">
-          <el-table :data="activeReport.tables" max-height="400" size="small" style="margin-bottom: 12px;" row-key="table_name">
+          <el-table :data="activeReport.tables" max-height="400" size="small" style="margin-bottom: 12px;" row-key="table_name"
+                    @expand-change="onReportRowExpand">
           <el-table-column type="expand">
             <template #default="{ row }">
               <template v-if="row.row_diffs">
                 <div style="padding: 4px 12px;">
                   <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 6px;">
-                    <el-tag size="small" type="info">键列 {{ row.row_diffs.key_columns?.join('、') || '—' }}</el-tag>
+                    <el-tooltip content="两端按这些列识别同一行（主键/唯一索引）" placement="top">
+                      <el-tag size="small" type="info">键列 {{ row.row_diffs.key_columns?.join('、') || '—' }}</el-tag>
+                    </el-tooltip>
                     <template v-if="!row.row_diffs.note">
-                      <el-tag size="small" type="danger">内容不一致 {{ row.row_diffs.content_diff }}</el-tag>
-                      <el-tag size="small" type="warning">仅源端 {{ row.row_diffs.src_only }}</el-tag>
-                      <el-tag size="small" type="primary">仅目标端 {{ row.row_diffs.dst_only }}</el-tag>
-                      <el-tag v-if="row.row_diffs.truncated" size="small" type="warning">明细截断至 100 万行（计数完整）</el-tag>
+                      <el-tooltip content="两端都有该行，但字段值不同" placement="top">
+                        <el-tag size="small" type="danger">内容不一致 {{ row.row_diffs.content_diff }}</el-tag>
+                      </el-tooltip>
+                      <el-tooltip content="源库有该行，目标库没有" placement="top">
+                        <el-tag size="small" type="warning">仅源端 {{ row.row_diffs.src_only }}</el-tag>
+                      </el-tooltip>
+                      <el-tooltip content="目标库有该行，源库没有" placement="top">
+                        <el-tag size="small" type="primary">仅目标端 {{ row.row_diffs.dst_only }}</el-tag>
+                      </el-tooltip>
+                      <el-tag v-if="row.row_diffs.truncated" size="small" type="warning">明细已截断（三项计数仍精确）</el-tag>
                       <el-button v-if="row.row_diffs.file" size="small" link type="primary"
                                  @click="downloadRowDiff(row.row_diffs.file)">下载差异明细（{{ row.row_diffs.file }}）</el-button>
                     </template>
                   </div>
                   <div v-if="row.row_diffs.note" style="color: var(--tims-tag-warning-text); font-size: var(--tims-font-sm);">{{ row.row_diffs.note }}</div>
                   <div v-if="row.row_diffs.sample_keys?.length" style="font-size: var(--tims-font-xs); color: var(--tims-text-2);">
-                    样例键（前 {{ row.row_diffs.sample_keys.length }} 个）：
+                    差异键示例（前 10，共 {{ row.row_diffs.sample_keys.length }}）：
                     <span v-for="k in row.row_diffs.sample_keys.slice(0, 10)" :key="k" class="rd-sample">{{ k }}</span>
                   </div>
+
+                  <!-- B: 行内容对照（content probe）— lazy side-by-side table -->
+                  <template v-if="!row.row_diffs.note && row.row_diffs.file">
+                    <div v-if="rowDiffState(row.table_name, row.row_diffs)?.status === 'loading'"
+                         style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-top: 6px;">
+                      正在加载行内容对照…
+                    </div>
+                    <div v-else-if="rowDiffState(row.table_name, row.row_diffs)?.status === 'error'"
+                         style="font-size: var(--tims-font-xs); color: var(--tims-tag-warning-text); margin-top: 6px;">
+                      行内容对照加载失败（{{ rowDiffState(row.table_name, row.row_diffs)?.error }}）——可下载差异明细 CSV 查看
+                    </div>
+                    <template v-else-if="rowDiffState(row.table_name, row.row_diffs)?.entries.length">
+                      <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-top: 8px;">
+                        行内容对照（键序，前 {{ Math.min(rowDiffShownCount(row.table_name, row.row_diffs), rowDiffState(row.table_name, row.row_diffs)!.entries.length) }} / 共 {{ rowDiffState(row.table_name, row.row_diffs)!.entries.length }} 条）
+                      </div>
+                      <div v-for="(e, ei) in rowDiffState(row.table_name, row.row_diffs)!.entries.slice(0, rowDiffShownCount(row.table_name, row.row_diffs))"
+                           :key="ei" class="rd-content-entry">
+                        <div class="rd-content-head">
+                          <span class="rd-content-key">{{ e.key }}</span>
+                          <el-tag size="small" :type="rowDiffCategoryTagType(e.category)">{{ rowDiffCategoryLabel(e.category) }}</el-tag>
+                          <span v-if="e.error" style="color: var(--tims-tag-warning-text); font-size: var(--tims-font-xs);">{{ e.error }}</span>
+                        </div>
+                        <table class="rd-cmp" v-if="rowDiffCmpCells(e).length">
+                          <thead><tr><th style="width: 22%;">列</th><th>源端值</th><th>目标端值</th></tr></thead>
+                          <tbody>
+                            <tr v-for="c in rowDiffCmpCells(e)" :key="c.name">
+                              <td>{{ c.name }}</td>
+                              <td :class="{ 'rd-val-diff': c.diff }">{{ c.src }}</td>
+                              <td :class="{ 'rd-val-diff': c.diff }">{{ c.dst }}</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                        <div v-if="e.src_row?.truncated || e.dst_row?.truncated"
+                             style="font-size: var(--tims-font-xs); color: var(--tims-text-2);">… 行超 8KB 已截断</div>
+                      </div>
+                      <el-button v-if="rowDiffShownCount(row.table_name, row.row_diffs) < rowDiffState(row.table_name, row.row_diffs)!.entries.length"
+                                 size="small" link type="primary"
+                                 @click="rowDiffLoadMore(row.table_name, row.row_diffs)">
+                        加载更多（{{ Math.min(rowDiffShownCount(row.table_name, row.row_diffs), rowDiffState(row.table_name, row.row_diffs)!.entries.length) }} / {{ rowDiffState(row.table_name, row.row_diffs)!.entries.length }}）
+                      </el-button>
+                    </template>
+                    <div v-else style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-top: 6px;">
+                      无行内容对照数据
+                    </div>
+                  </template>
                 </div>
               </template>
               <div v-else style="padding: 4px 12px; color: var(--tims-text-2); font-size: var(--tims-font-sm);">
@@ -1425,6 +1567,43 @@ onUnmounted(() => {
   border-radius: 4px;
   padding: 0 6px;
   margin: 2px 4px 2px 0;
+}
+/* 行内容对照（content probe）：键序条目 + 源/目标并排值表，不等值高亮 */
+.rd-content-entry {
+  margin-top: 8px;
+}
+.rd-content-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 4px;
+}
+.rd-content-key {
+  font-family: var(--tims-font-mono);
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 4px;
+  padding: 0 6px;
+}
+.rd-cmp {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--tims-font-xs);
+}
+.rd-cmp th,
+.rd-cmp td {
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  padding: 2px 8px;
+  text-align: left;
+  word-break: break-all;
+}
+.rd-cmp th {
+  color: var(--tims-text-2);
+  font-weight: 500;
+}
+.rd-val-diff {
+  color: var(--tims-brand);
+  background: rgba(226, 82, 66, 0.08);
+  font-family: var(--tims-font-mono);
 }
 
 @media (max-width: 900px) {

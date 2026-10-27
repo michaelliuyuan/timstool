@@ -49,28 +49,55 @@ func (r *scriptedRows) ColumnTypeDatabaseTypeName(idx int) string { return r.col
 // only) and the row dataset served for SELECT * queries (chunk windows and
 // drill windows alike — chunkOverride optionally poisons only the small
 // chunk windows to simulate data moving between the chunk phase and the
-// drill).
+// drill). Drill windows may arrive in either paging shape: the legacy
+// LIMIT/OFFSET chunk form and the v2 keyset-seek form (WHERE (k > ? …)
+// ORDER BY k LIMIT N), whose seek tuple is evaluated against the scripted
+// dataset so multi-window drills page without skip/dup. LIMIT 1 point
+// queries (content probe) serve the key-equal row.
 type sideScript struct {
 	count         int64
 	pkCols        []string
 	uniqueIdxDef  string
 	data          [][]driver.Value
 	chunkOverride [][]driver.Value
+	// probeErrKeys optionally fails content-probe point queries for the
+	// given key (rendered "v1|v2") — per-entry error anchoring.
+	probeErrKeys map[string]error
+	// probeData optionally serves point queries from a DIFFERENT dataset
+	// (simulating rows that moved between the merge and the probe).
+	probeData [][]driver.Value
 
-	mu      sync.Mutex
-	queries []string
+	mu       sync.Mutex
+	queries  []string
+	argLog   [][]driver.Value
+	probeLog []string
 }
 
 var limitOffsetRe = regexp.MustCompile(`LIMIT (\d+) OFFSET (\d+)`)
+var limitOnlyRe = regexp.MustCompile(`LIMIT (\d+)`)
+var orderByRe = regexp.MustCompile("ORDER BY ((?:\"[A-Za-z0-9_]+\"|`[A-Za-z0-9_]+`)(?:, (?:\"[A-Za-z0-9_]+\"|`[A-Za-z0-9_]+`))*)")
 
-func (s *sideScript) respond(query string) (driver.Rows, error) {
+func (s *sideScript) respond(query string, args []driver.NamedValue) (driver.Rows, error) {
 	s.mu.Lock()
 	s.queries = append(s.queries, query)
+	logged := make([]driver.Value, len(args))
+	for i, a := range args {
+		logged[i] = a.Value
+	}
+	s.argLog = append(s.argLog, logged)
 	s.mu.Unlock()
 
 	switch {
 	case strings.Contains(query, "COUNT(*)"):
 		return &scriptedRows{cols: []string{"count"}, colTypes: []string{"int8"}, rows: [][]driver.Value{{s.count}}}, nil
+	case strings.Contains(query, "information_schema.statistics"):
+		// MySQL-source key detection: PRIMARY index rows
+		// (index_name, column_name, non_unique).
+		rows := make([][]driver.Value, 0, len(s.pkCols))
+		for _, c := range s.pkCols {
+			rows = append(rows, []driver.Value{"PRIMARY", c, int64(0)})
+		}
+		return &scriptedRows{cols: []string{"index_name", "column_name", "non_unique"}, colTypes: []string{"text", "text", "int8"}, rows: rows}, nil
 	case strings.Contains(query, "table_constraints"):
 		rows := make([][]driver.Value, 0, len(s.pkCols))
 		for _, c := range s.pkCols {
@@ -83,31 +110,307 @@ func (s *sideScript) respond(query string) (driver.Rows, error) {
 			idxRows = [][]driver.Value{{s.uniqueIdxDef}}
 		}
 		return &scriptedRows{cols: []string{"indexdef"}, colTypes: []string{"text"}, rows: idxRows}, nil
+	case strings.Contains(query, "IS NULL"):
+		return s.respondNullScan(query)
 	case strings.Contains(query, "SELECT *"):
-		m := limitOffsetRe.FindStringSubmatch(query)
-		if m == nil {
-			return nil, fmt.Errorf("unexpected SELECT * without LIMIT/OFFSET: %s", query)
+		// LIMIT 1 alone = content-probe point query; a chunk window can be
+		// "LIMIT 1 OFFSET n" (last short chunk) and must take the OFFSET path.
+		if strings.Contains(query, "LIMIT 1") && !strings.Contains(query, "OFFSET") {
+			return s.respondPointQuery(query, args)
 		}
-		var limit, offset int
-		fmt.Sscanf(m[1], "%d", &limit)
-		fmt.Sscanf(m[2], "%d", &offset)
-		src := s.data
-		if limit < rowDiffWindow && s.chunkOverride != nil {
-			src = s.chunkOverride
+		if m := limitOffsetRe.FindStringSubmatch(query); m != nil {
+			return s.respondOffsetWindow(m, query)
 		}
-		// serve the windowed slice of the scripted dataset
-		all := make([][]driver.Value, len(src))
-		copy(all, src)
-		if offset > len(all) {
-			offset = len(all)
-		}
-		win := all[offset:]
-		if limit < len(win) {
-			win = win[:limit]
-		}
-		return &scriptedRows{cols: []string{"id", "name"}, colTypes: []string{"int8", "text"}, rows: win}, nil
+		return s.respondKeysetWindow(query, args)
 	}
 	return nil, fmt.Errorf("unexpected query: %s", query)
+}
+
+// respondOffsetWindow serves the legacy chunk-window shape (LIMIT n
+// OFFSET m over the scripted dataset, chunkOverride honored).
+func (s *sideScript) respondOffsetWindow(m []string, query string) (driver.Rows, error) {
+	var limit, offset int
+	fmt.Sscanf(m[1], "%d", &limit)
+	fmt.Sscanf(m[2], "%d", &offset)
+	src := s.data
+	if limit < 50000 && s.chunkOverride != nil {
+		src = s.chunkOverride
+	}
+	all := make([][]driver.Value, len(src))
+	copy(all, src)
+	if offset > len(all) {
+		offset = len(all)
+	}
+	win := all[offset:]
+	if limit < len(win) {
+		win = win[:limit]
+	}
+	return &scriptedRows{cols: []string{"id", "name"}, colTypes: []string{"int8", "text"}, rows: win}, nil
+}
+
+// isNullColRe captures the columns of a NULL pre-scan's IS NULL chain in
+// order ("name" IS NULL OR `name` IS NULL → [name]).
+var isNullColRe = regexp.MustCompile("(?:\"([A-Za-z0-9_]+)\"|`([A-Za-z0-9_]+)`) IS NULL")
+
+// respondNullScan serves the pre-paging NULL pre-scan (SELECT 1 … IS NULL
+// … LIMIT 1): a one-row result iff any scripted row holds NULL in any of
+// the scanned key columns.
+func (s *sideScript) respondNullScan(query string) (driver.Rows, error) {
+	var cols []string
+	for _, m := range isNullColRe.FindAllStringSubmatch(query, -1) {
+		if m[1] != "" {
+			cols = append(cols, m[1])
+		} else {
+			cols = append(cols, m[2])
+		}
+	}
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("null pre-scan without columns: %s", query)
+	}
+	scriptedCols := []string{"id", "name"}
+	for _, row := range s.data {
+		for _, c := range cols {
+			for ci, sc := range scriptedCols {
+				if strings.EqualFold(sc, c) && row[ci] == nil {
+					return &scriptedRows{cols: []string{"1"}, colTypes: []string{"int8"}, rows: [][]driver.Value{{int64(1)}}}, nil
+				}
+			}
+		}
+	}
+	return &scriptedRows{cols: []string{"1"}, colTypes: []string{"int8"}, rows: nil}, nil
+}
+
+// respondKeysetWindow serves the v2 drill window shape: SELECT * [… WHERE
+// (seek chain)] ORDER BY <keys> LIMIT N. The seek tuple is recovered from
+// the bound args — PG form ($N, one number per key column, watermark
+// placeholders first) or positional ? (values repeated per OR-chain
+// occurrence: v1 | v1 v2 | v1 v2 v3 …) — and rows are filtered to those
+// whose key tuple is strictly greater, preserving script order.
+func (s *sideScript) respondKeysetWindow(query string, args []driver.NamedValue) (driver.Rows, error) {
+	m := limitOnlyRe.FindStringSubmatch(query)
+	if m == nil {
+		return nil, fmt.Errorf("unexpected SELECT * without LIMIT: %s", query)
+	}
+	var limit int
+	fmt.Sscanf(m[1], "%d", &limit)
+
+	ob := orderByRe.FindStringSubmatch(query)
+	if ob == nil {
+		return nil, fmt.Errorf("drill window without ORDER BY: %s", query)
+	}
+	keyNames := parseQuotedIdentList(ob[1])
+	cols := []string{"id", "name"}
+	keyIdxs := make([]int, len(keyNames))
+	for i, k := range keyNames {
+		idx := -1
+		for ci, c := range cols {
+			if strings.EqualFold(c, k) {
+				idx = ci
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("unknown ORDER BY column %q", k)
+		}
+		keyIdxs[i] = idx
+	}
+
+	var seekTuple []driver.Value
+	if strings.Contains(query, " > ") {
+		n := len(keyIdxs)
+		pgForm := strings.Contains(query, "$")
+		chainArgs := n * (n + 1) / 2
+		if pgForm {
+			chainArgs = n
+		}
+		w := len(args) - chainArgs
+		if w < 0 {
+			return nil, fmt.Errorf("seek window with too few args: %s %v", query, args)
+		}
+		seekTuple = make([]driver.Value, n)
+		for j := 1; j <= n; j++ {
+			idx := w + j - 1 // PG form: one arg per key column, in order
+			if !pgForm {
+				// positional form: v_j first occurs at the end of group j
+				idx = w + j*(j-1)/2 + (j - 1)
+			}
+			seekTuple[j-1] = args[idx].Value
+		}
+	}
+
+	win := make([][]driver.Value, 0, limit)
+	for _, row := range s.data {
+		if seekTuple != nil && !keyTupleGreater(row, keyIdxs, seekTuple) {
+			continue
+		}
+		win = append(win, row)
+		if len(win) >= limit {
+			break
+		}
+	}
+	return &scriptedRows{cols: cols, colTypes: []string{"int8", "text"}, rows: win}, nil
+}
+
+// eqColRe captures the column names of a point query's equality chain in
+// order ("id" = $1 AND `name` = ? → [id name]).
+var eqColRe = regexp.MustCompile("(?:\"([A-Za-z0-9_]+)\"|`([A-Za-z0-9_]+)`) = ")
+
+// respondPointQuery serves a content-probe point query (LIMIT 1): the
+// first scripted row whose key equals the equality-bound values (the
+// trailing args, one per equality, in the same column order).
+func (s *sideScript) respondPointQuery(query string, args []driver.NamedValue) (driver.Rows, error) {
+	var keyNames []string
+	for _, m := range eqColRe.FindAllStringSubmatch(query, -1) {
+		if m[1] != "" {
+			keyNames = append(keyNames, m[1])
+		} else {
+			keyNames = append(keyNames, m[2])
+		}
+	}
+	nk := len(keyNames)
+	if nk == 0 || nk > len(args) {
+		return nil, fmt.Errorf("point query without key equalities: %s", query)
+	}
+	vals := make([]driver.Value, nk)
+	for i := 0; i < nk; i++ {
+		vals[i] = args[len(args)-nk+i].Value
+	}
+	key := probeKeyString(vals)
+	s.mu.Lock()
+	s.probeLog = append(s.probeLog, key)
+	s.mu.Unlock()
+	if s.probeErrKeys != nil {
+		if err, ok := s.probeErrKeys[key]; ok {
+			return nil, err
+		}
+	}
+	cols := []string{"id", "name"}
+	keyIdxs := make([]int, nk)
+	for i, k := range keyNames {
+		keyIdxs[i] = -1
+		for ci, c := range cols {
+			if strings.EqualFold(c, k) {
+				keyIdxs[i] = ci
+				break
+			}
+		}
+		if keyIdxs[i] < 0 {
+			return nil, fmt.Errorf("point query on unknown column %q", k)
+		}
+	}
+	data := s.data
+	if s.probeData != nil {
+		data = s.probeData
+	}
+	for _, row := range data {
+		match := true
+		for i := range vals {
+			if compareDriverVals(row[keyIdxs[i]], vals[i]) != 0 {
+				match = false
+				break
+			}
+		}
+		if match {
+			return &scriptedRows{cols: cols, colTypes: []string{"int8", "text"}, rows: [][]driver.Value{row}}, nil
+		}
+	}
+	return &scriptedRows{cols: cols, colTypes: []string{"int8", "text"}, rows: nil}, nil
+}
+
+// parseQuotedIdentList splits "a", "b" / `a`, `b` into bare names.
+func parseQuotedIdentList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		part = strings.Trim(part, "\"`")
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// keyTupleGreater reports row[keyIdxs] > tuple lexicographically
+// (strictly — the seek is exclusive).
+func keyTupleGreater(row []driver.Value, keyIdxs []int, tuple []driver.Value) bool {
+	for i := range keyIdxs {
+		c := compareDriverVals(row[keyIdxs[i]], tuple[i])
+		if c != 0 {
+			return c > 0
+		}
+	}
+	return false
+}
+
+// compareDriverVals orders two driver values: numbers numerically,
+// strings/[]byte bytewise, bool false<true (mixed types fall back to their
+// string render — same-side comparisons never mix).
+func compareDriverVals(a, b driver.Value) int {
+	as, aok := byteSliceString(a)
+	bs, bok := byteSliceString(b)
+	if aok && bok {
+		switch {
+		case as < bs:
+			return -1
+		case as > bs:
+			return 1
+		}
+		return 0
+	}
+	ai, aInt := a.(int64)
+	bi, bInt := b.(int64)
+	if aInt && bInt {
+		switch {
+		case ai < bi:
+			return -1
+		case ai > bi:
+			return 1
+		}
+		return 0
+	}
+	ab, aBool := a.(bool)
+	bb, bBool := b.(bool)
+	if aBool && bBool {
+		switch {
+		case !ab && bb:
+			return -1
+		case ab && !bb:
+			return 1
+		}
+		return 0
+	}
+	x, y := fmt.Sprint(a), fmt.Sprint(b)
+	switch {
+	case x < y:
+		return -1
+	case x > y:
+		return 1
+	}
+	return 0
+}
+
+// byteSliceString renders a string-ish value for bytewise comparison.
+func byteSliceString(v driver.Value) (string, bool) {
+	switch t := v.(type) {
+	case string:
+		return t, true
+	case []byte:
+		return string(t), true
+	}
+	return "", false
+}
+
+// probeKeyString renders a point-query key for logs and error maps.
+func probeKeyString(vals []driver.Value) string {
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		if b, ok := v.([]byte); ok {
+			parts[i] = string(b)
+			continue
+		}
+		parts[i] = fmt.Sprint(v)
+	}
+	return strings.Join(parts, "|")
 }
 
 type drillConn struct {
@@ -117,8 +420,8 @@ type drillConn struct {
 func (c *drillConn) Prepare(string) (driver.Stmt, error) { return nil, fmt.Errorf("unsupported") }
 func (c *drillConn) Close() error                        { return nil }
 func (c *drillConn) Begin() (driver.Tx, error)           { return nil, fmt.Errorf("unsupported") }
-func (c *drillConn) QueryContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Rows, error) {
-	return c.script.respond(q)
+func (c *drillConn) QueryContext(_ context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
+	return c.script.respond(q, args)
 }
 func (c *drillConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
 	return driver.RowsAffected(0), nil
@@ -145,6 +448,52 @@ func (s *sideScript) sawQueries(substr string) []string {
 		}
 	}
 	return out
+}
+
+// argsFor returns the bound-argument lists of every recorded query
+// containing substr (index-aligned with sawQueries).
+func (s *sideScript) argsFor(substr string) [][]driver.Value {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out [][]driver.Value
+	for i, q := range s.queries {
+		if strings.Contains(q, substr) {
+			out = append(out, s.argLog[i])
+		}
+	}
+	return out
+}
+
+// drillWindowQueries returns the side's KEYSET drill windows in order:
+// SELECT * … ORDER BY … LIMIT N — no OFFSET (chunk windows), no LIMIT 1
+// (content probes), no metadata probes.
+func (s *sideScript) drillWindowQueries() []string {
+	var out []string
+	for _, q := range s.sawQueries("SELECT *") {
+		if strings.Contains(q, "ORDER BY") && !strings.Contains(q, "OFFSET") && !strings.Contains(q, "LIMIT 1") {
+			out = append(out, q)
+		}
+	}
+	return out
+}
+
+// pointQueries returns the side's content-probe point queries in order
+// (a chunk window can legitimately be LIMIT 1 OFFSET n — excluded).
+func (s *sideScript) pointQueries() []string {
+	var out []string
+	for _, q := range s.sawQueries("SELECT *") {
+		if strings.Contains(q, "LIMIT 1") && !strings.Contains(q, "OFFSET") {
+			out = append(out, q)
+		}
+	}
+	return out
+}
+
+// probesSeen returns the rendered keys of every recorded point query.
+func (s *sideScript) probesSeen() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.probeLog...)
 }
 
 // newDrillValidator assembles a PG-dialect validator with a small chunk size

@@ -22,9 +22,13 @@
 //   - #t4 discipline: every window fetch is ONE budget unit (acquire slot →
 //     open/query/close → release); no connection is ever held while waiting
 //     for a slot.
-//   - Windows page by OFFSET on each side independently — the merge aligns
-//     by KEY, not by position, so insert/delete shifts that misalign chunk
-//     offsets cannot fabricate diffs here.
+//   - Windows page by KEYSET SEEK on each side independently: the next
+//     window re-fetches with WHERE (<key tuple> > <last row's NATIVE key
+//     values>) instead of OFFSET, so paging cost stays flat on deep tables
+//     and the native-type seek order is strictly the ORDER BY order (int 9
+//     < 10 never falls into the string-order trap). The merge aligns by
+//     KEY, not by position, so insert/delete shifts cannot fabricate diffs
+//     here.
 //   - Sortedness guard: each side's stream must arrive non-decreasing in the
 //     canonical (normalized tuple) order the merge compares by. A decrease
 //     means the two sides' ORDER BY collations (or value normalization)
@@ -52,8 +56,9 @@ import (
 
 // rowDiffWindow is the per-side fetch size (≤ 5 万行 windows, per the
 // approved plan); memory stays bounded at two windows regardless of table
-// size.
-const rowDiffWindow = 50000
+// size. A var (not const) so keyset-paging anchors can drive multi-window
+// drills cheaply; never configurable outside the package.
+var rowDiffWindow = 50000
 
 // rowDiffDetailCap is the per-table CSV detail record cap. Beyond it the
 // detail stops writing (Truncated=true) while the summary counts keep
@@ -62,6 +67,18 @@ const rowDiffWindow = 50000
 // materializing a million fake rows; never configurable outside the
 // package.
 var rowDiffDetailCap int64 = 1000000
+
+// rowDiffMegaRows is the mega-table guardrail: a FAILED table whose larger
+// side row count reaches this bound gets its drill detail capped at
+// rowDiffMegaDetailCap instead of rowDiffDetailCap — windowed keyset
+// paging keeps the SCAN bounded, the guardrail keeps the CSV bounded on
+// pathologically diverged giants. Row counts unknown (both zero) never
+// trigger. A var for anchor injection only.
+var rowDiffMegaRows int64 = 50000000
+
+// rowDiffMegaDetailCap is the effective detail cap under the mega-table
+// guardrail (rowDiffMegaRows). A var for anchor injection only.
+var rowDiffMegaDetailCap int64 = 100000
 
 // rowDiffSampleKeys is the sample-keys budget carried in the summary.
 const rowDiffSampleKeys = 20
@@ -74,10 +91,20 @@ const (
 	rowDiffCatDstOnly = "dst_only"
 )
 
+// rowDiffNullNote is the single NULL-key abort disclosure, shared by the
+// pre-paging NULL pre-scan (unique-index keys) and the in-fetch NULL
+// check (defense in depth — the two are a union, not a replacement).
+const rowDiffNullNote = "键列含 NULL（可空唯一索引下同键多行无法确定配对），无法行级对齐"
+
 // diffRow is one aligned (key, hash) observation from either side.
 type diffRow struct {
-	key  []string // normalized key tuple, one element per key column
-	hash string   // rowMD5 over the shared hash plan
+	key []string // normalized key tuple, one element per key column
+	// rawKey carries the row's NATIVE key values (driver types, []byte
+	// sanitized to string) — the keyset seek binds these so the seek's
+	// comparison order is the ORDER BY order, never the normalized-string
+	// order; the content probe re-binds them for its point queries.
+	rawKey []interface{}
+	hash   string // rowMD5 over the shared hash plan
 }
 
 // maybeDrillRowDiffs is the post-fail hook: it decides whether a FAILED
@@ -122,7 +149,35 @@ func (v *Validator) maybeDrillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB
 		igEff, _ = v.resolveIgnoreSet(keyInfo)
 	}
 
-	sum := v.drillRowDiffs(ctx, pgDB, tidbDB, sem, schema, table, orderByCols, keyCols, igEff)
+	// 1b NULL pre-scan (adversarial-review finding, leader ruling 1):
+	// keyset seek predicates are three-valued-logic UNKNOWN on NULL keys,
+	// so a NULLS-LAST side's NULL-keyed rows would silently never surface
+	// in any post-first window — the fetch-time NULL abort cannot fire.
+	// Unique-index keys are pre-scanned (one #t4 unit per side, same
+	// watermark predicate) and the drill aborts on the FIRST NULL hit;
+	// PK keys are NOT NULL by PK semantics on both engines — skipped at
+	// zero cost. The in-fetch NULL check stays as defense in depth
+	// (union, not replacement).
+	if keyInfo != nil && !keyInfo.HasPK {
+		if v.rowDiffNullKeyScan(ctx, pgDB, tidbDB, sem, schema, table, keyCols) {
+			tr.RowDiffs = &reporter.RowDiffSummary{
+				KeyColumns: append([]string(nil), keyCols...),
+				Note:       rowDiffNullNote,
+			}
+			return
+		}
+	}
+
+	// Mega-table guardrail: the larger side's row count picks the
+	// effective detail cap (unknown counts — both zero — never trigger).
+	// Counts stay exact either way; only the CSV detail is bounded tighter.
+	effCap := rowDiffDetailCap
+	mega := tr.SourceRows >= rowDiffMegaRows || tr.TargetRows >= rowDiffMegaRows
+	if mega {
+		effCap = rowDiffMegaDetailCap
+	}
+
+	sum := v.drillRowDiffs(ctx, pgDB, tidbDB, sem, schema, table, orderByCols, keyCols, igEff, effCap)
 	tr.RowDiffs = sum
 
 	// DiffRows口径修正: a completed drill replaces the coarse delta (0 for
@@ -137,16 +192,22 @@ func (v *Validator) maybeDrillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB
 		}
 		tr.Suggestion += fmt.Sprintf("行级下钻: 内容不一致 %d · 仅源端 %d · 仅目标端 %d", sum.ContentDiff, sum.SrcOnly, sum.DstOnly)
 		if sum.Truncated {
-			tr.Suggestion += fmt.Sprintf("（明细截断至 %d 万行，计数仍完整）", rowDiffDetailCap/10000)
+			if mega {
+				tr.Suggestion += fmt.Sprintf("（超大表护栏：明细截断至 %d 万行，计数仍精确）", rowDiffMegaDetailCap/10000)
+			} else {
+				tr.Suggestion += fmt.Sprintf("（明细截断至 %d 万行，计数仍完整）", effCap/10000)
+			}
 		}
 	}
 }
 
 // drillRowDiffs runs the windowed merge alignment and writes the CSV
 // detail. It never fails the table harder: every error folds into
-// RowDiffSummary.Note (the chunk/count verdict already stands).
+// RowDiffSummary.Note (the chunk/count verdict already stands). effCap is
+// the guardrail-resolved CSV detail cap (rowDiffDetailCap, or
+// rowDiffMegaDetailCap under the mega-table guardrail).
 func (v *Validator) drillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB, sem concSem,
-	schema, table, orderByCols string, keyCols []string, ig map[string]bool) *reporter.RowDiffSummary {
+	schema, table, orderByCols string, keyCols []string, ig map[string]bool, effCap int64) *reporter.RowDiffSummary {
 	sum := &reporter.RowDiffSummary{KeyColumns: append([]string(nil), keyCols...)}
 
 	// fail folds every abort reason into the note AND leaves a server-side
@@ -203,14 +264,26 @@ func (v *Validator) drillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB, sem
 		return detailW.Write([]string{"table", "key_columns", "category", "key"})
 	}
 
-	record := func(category string, key []string) error {
+	// Content probe capture: the first rowDiffContentBudget diff keys in
+	// key order (the merge discovers diffs in key order) are re-fetched as
+	// full rows AFTER the merge — rendering in-window was rejected because
+	// holding full rows for an arbitrarily diverged table is unbounded
+	// memory. Bounded at 200 × two point queries.
+	var contentProbes []rowDiffProbe
+
+	record := func(category string, key []string, srcRaw, dstRaw []interface{}) error {
+		if len(contentProbes) < rowDiffContentBudget {
+			contentProbes = append(contentProbes, rowDiffProbe{
+				key: strings.Join(key, "|"), cat: category, srcRaw: srcRaw, dstRaw: dstRaw,
+			})
+		}
 		if err := beginDetail(); err != nil {
 			return err
 		}
 		if len(sum.SampleKeys) < rowDiffSampleKeys {
 			sum.SampleKeys = append(sum.SampleKeys, strings.Join(key, "|"))
 		}
-		if detailRows >= rowDiffDetailCap {
+		if detailRows >= effCap {
 			sum.Truncated = true
 			return nil
 		}
@@ -236,7 +309,7 @@ func (v *Validator) drillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB, sem
 				if err == errDiffStreamDone {
 					src.done = true
 				} else if err == errNullKey {
-					return fail("键列含 NULL（可空唯一索引下同键多行无法确定配对），无法行级对齐")
+					return fail("%s", rowDiffNullNote)
 				} else {
 					return fail("行级下钻失败: %v", err)
 				}
@@ -247,7 +320,7 @@ func (v *Validator) drillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB, sem
 				if err == errDiffStreamDone {
 					dst.done = true
 				} else if err == errNullKey {
-					return fail("键列含 NULL（可空唯一索引下同键多行无法确定配对），无法行级对齐")
+					return fail("%s", rowDiffNullNote)
 				} else {
 					return fail("行级下钻失败: %v", err)
 				}
@@ -267,7 +340,7 @@ func (v *Validator) drillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB, sem
 			for !dst.empty() {
 				r := dst.pop()
 				sum.DstOnly++
-				if err := record(rowDiffCatDstOnly, r.key); err != nil {
+				if err := record(rowDiffCatDstOnly, r.key, nil, r.rawKey); err != nil {
 					return fail("行级下钻失败: 写差异明细: %v", err)
 				}
 			}
@@ -277,7 +350,7 @@ func (v *Validator) drillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB, sem
 			for !src.empty() {
 				r := src.pop()
 				sum.SrcOnly++
-				if err := record(rowDiffCatSrcOnly, r.key); err != nil {
+				if err := record(rowDiffCatSrcOnly, r.key, r.rawKey, nil); err != nil {
 					return fail("行级下钻失败: 写差异明细: %v", err)
 				}
 			}
@@ -289,20 +362,20 @@ func (v *Validator) drillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB, sem
 		case c < 0:
 			r := src.pop()
 			sum.SrcOnly++
-			if err := record(rowDiffCatSrcOnly, r.key); err != nil {
+			if err := record(rowDiffCatSrcOnly, r.key, r.rawKey, nil); err != nil {
 				return fail("行级下钻失败: 写差异明细: %v", err)
 			}
 		case c > 0:
 			r := dst.pop()
 			sum.DstOnly++
-			if err := record(rowDiffCatDstOnly, r.key); err != nil {
+			if err := record(rowDiffCatDstOnly, r.key, nil, r.rawKey); err != nil {
 				return fail("行级下钻失败: 写差异明细: %v", err)
 			}
 		default:
 			s, d := src.pop(), dst.pop()
 			if s.hash != d.hash {
 				sum.ContentDiff++
-				if err := record(rowDiffCatContent, s.key); err != nil {
+				if err := record(rowDiffCatContent, s.key, s.rawKey, d.rawKey); err != nil {
 					return fail("行级下钻失败: 写差异明细: %v", err)
 				}
 			}
@@ -336,6 +409,12 @@ func (v *Validator) drillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB, sem
 		}
 		detailFile = nil // committed; the deferred cleanup must not touch it
 		sum.File = final
+
+		// B-line content probe: point-query the captured diff keys and
+		// drop {stem}.content.json next to the CSV. Auxiliary artifact —
+		// a probe/write failure never demotes the drill (per-entry error
+		// fields / a logged warning instead).
+		v.writeRowDiffContent(ctx, pgDB, tidbDB, sem, schema, table, strings.TrimSuffix(final, ".csv")+".content.json", keyCols, contentProbes)
 	}
 	zap.L().Info("row diff drill complete",
 		zap.String("table", table),
@@ -347,17 +426,19 @@ func (v *Validator) drillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB, sem
 }
 
 // diffStream is the bounded per-side buffer: at most one fetched window at a
-// time, consumed by the merge loop. fetched drives the per-side OFFSET
-// paging; lastKey carries the sortedness guard across window resets.
+// time, consumed by the merge loop. lastRawKey is the previous window's last
+// yielded row's NATIVE key values — the keyset seek position (nil/empty =
+// first window, no seek predicate); like hasLast/lastKey it survives the
+// rows-reset in pop() so the guard and the seek both carry across windows.
 type diffStream struct {
-	rows    []diffRow
-	pos     int
-	fetched int64
-	done    bool // side exhausted (window fetched fewer than the window size)
+	rows []diffRow
+	pos  int
+	done bool // side exhausted (window fetched fewer than the window size)
 	// hasLast/lastKey survive the rows-reset in pop() so the guard also
 	// covers the first row of every new window (cross-window decrease).
-	hasLast bool
-	lastKey []string
+	hasLast    bool
+	lastKey    []string
+	lastRawKey []interface{}
 }
 
 func newDiffStream() *diffStream { return &diffStream{} }
@@ -378,13 +459,14 @@ func (s *diffStream) pop() diffRow {
 // push appends one scanned row and enforces the sortedness guard: the
 // canonical order the merge compares by must never see a strict decrease,
 // else the side's ORDER BY collation diverges from the canonical order and
-// the merge would fabricate only-rows.
+// the merge would fabricate only-rows. rawKey becomes the side's keyset
+// seek position (the last push wins — windows are consumed in order).
 func (s *diffStream) push(r diffRow) bool {
 	if s.hasLast && compareKeyTuples(s.lastKey, r.key) > 0 {
 		return false
 	}
 	s.rows = append(s.rows, r)
-	s.hasLast, s.lastKey = true, r.key
+	s.hasLast, s.lastKey, s.lastRawKey = true, r.key, r.rawKey
 	return true
 }
 
@@ -400,8 +482,15 @@ var errNullKey = fmt.Errorf("row-diff key column contains NULL")
 
 // fetchDiffWindow pulls the next window from one side (target=true → TiDB
 // via a dedicated UTC session conn) as ONE #t4 budget unit, appending to the
-// stream. The watermark predicate rides every query exactly like the chunk
-// hashers' (the drill compares the same filtered universe).
+// stream. Paging is KEYSET SEEK: every window after the first re-fetches
+// with WHERE (<key tuple> strictly greater than the previous window's last
+// row's native key values) ORDER BY <keys> LIMIT N — flat cost on deep
+// tables, and the seek's comparison order IS the ORDER BY order because the
+// bound values keep their native driver types (int64 10 never compares as
+// the string "10"). The watermark predicate rides every query exactly like
+// the chunk hashers' (the drill compares the same filtered universe); seek
+// placeholders number AFTER the watermark's ($1.. on PG, ? positional on
+// MySQL/TiDB).
 func (v *Validator) fetchDiffWindow(ctx context.Context, target bool, pgDB, tidbDB *sql.DB, sem concSem,
 	schema, table, orderByCols string, ig map[string]bool, stream *diffStream) error {
 	release, aerr := sem.acquire(ctx)
@@ -410,40 +499,68 @@ func (v *Validator) fetchDiffWindow(ctx context.Context, target bool, pgDB, tidb
 	}
 	defer release()
 
-	var query func(ctx context.Context, limit, offset int64) (*sql.Rows, error)
+	// Side-resolved SQL pieces: table qualification, watermark fragment,
+	// identifier quoting and the placeholder family ($N on a PG source,
+	// ? on MySQL sources and the TiDB target).
+	var query func(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	var quote func(string) string
+	var wmFrag string
+	var wmA []interface{}
+	pgPlaceholders := false
 	if target {
 		conn, err := v.getTiDBConn(ctx, tidbDB)
 		if err != nil {
 			return fmt.Errorf("get TiDB conn for row-diff window: %w", err)
 		}
 		defer conn.Close()
-		query = func(ctx context.Context, limit, offset int64) (*sql.Rows, error) {
-			if wm := v.wmFilterFor(ctx); wm != nil {
-				return conn.QueryContext(ctx, fmt.Sprintf(
-					"SELECT * FROM %s WHERE %s ORDER BY %s LIMIT %d OFFSET %d",
-					v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm),
-					quoteOrderByCols(orderByCols, v.tgtDialect.QuoteIdent), limit, offset), wmArgs(wm)...)
-			}
-			return conn.QueryContext(ctx, fmt.Sprintf(
-				"SELECT * FROM %s ORDER BY %s LIMIT %d OFFSET %d",
-				v.tgtDialect.QuoteIdent(table), quoteOrderByCols(orderByCols, v.tgtDialect.QuoteIdent), limit, offset))
+		query = func(ctx context.Context, q string, args ...interface{}) (*sql.Rows, error) {
+			return conn.QueryContext(ctx, q, args...)
+		}
+		quote = v.tgtDialect.QuoteIdent
+		if wm := v.wmFilterFor(ctx); wm != nil {
+			wmFrag = v.tgtDialect.WmPredicateFragment(wm)
+			wmA = wmArgs(wm)
 		}
 	} else {
-		query = func(ctx context.Context, limit, offset int64) (*sql.Rows, error) {
-			if wm := v.wmFilterFor(ctx); wm != nil {
-				return pgDB.QueryContext(ctx, fmt.Sprintf(
-					"SELECT * FROM %s.%s WHERE %s ORDER BY %s LIMIT %d OFFSET %d",
-					v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm),
-					quoteOrderByCols(orderByCols, v.srcDialect.QuoteIdent), limit, offset), wmArgs(wm)...)
-			}
-			return pgDB.QueryContext(ctx, fmt.Sprintf(
-				"SELECT * FROM %s.%s ORDER BY %s LIMIT %d OFFSET %d",
-				v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table),
-				quoteOrderByCols(orderByCols, v.srcDialect.QuoteIdent), limit, offset))
+		query = func(ctx context.Context, q string, args ...interface{}) (*sql.Rows, error) {
+			return pgDB.QueryContext(ctx, q, args...)
 		}
+		quote = v.srcDialect.QuoteIdent
+		if wm := v.wmFilterFor(ctx); wm != nil {
+			wmFrag = v.srcDialect.WmPredicateFragment(wm)
+			wmA = wmArgs(wm)
+		}
+		_, pgPlaceholders = v.srcDialect.(postgresDialect)
 	}
 
-	rows, err := query(ctx, rowDiffWindow, stream.offset())
+	// Keyset seek: exclusive strict-greater chain over the previous
+	// window's last native key values.
+	qualified := quote(table)
+	if !target {
+		qualified = quote(schema) + "." + quote(table)
+	}
+	keyNames := splitKeyColumns(orderByCols)
+	quotedKeys := make([]string, len(keyNames))
+	for i, k := range keyNames {
+		quotedKeys[i] = quote(k)
+	}
+	args := append([]interface{}{}, wmA...)
+	var where string
+	conds := make([]string, 0, 2)
+	if wmFrag != "" {
+		conds = append(conds, wmFrag)
+	}
+	if len(stream.lastRawKey) > 0 {
+		seek := newRowDiffSeek(pgPlaceholders, len(wmA))
+		conds = append(conds, "("+seek.chain(quotedKeys, stream.lastRawKey)+")")
+		args = append(args, seek.args...)
+	}
+	if len(conds) > 0 {
+		where = " WHERE " + strings.Join(conds, " AND ")
+	}
+	rows, err := query(ctx, fmt.Sprintf(
+		"SELECT * FROM %s%s ORDER BY %s LIMIT %d",
+		qualified, where, strings.Join(quotedKeys, ", "), rowDiffWindow), args...)
 	if err != nil {
 		return err
 	}
@@ -465,11 +582,11 @@ func (v *Validator) fetchDiffWindow(ctx context.Context, target bool, pgDB, tidb
 	for i, c := range cols {
 		lowerName[strings.ToLower(c.Name())] = i
 	}
-	keyIdxs := make([]int, 0, len(strings.Split(orderByCols, ",")))
-	for _, kc := range strings.Split(orderByCols, ",") {
-		idx, ok := lowerName[strings.ToLower(strings.TrimSpace(kc))]
+	keyIdxs := make([]int, 0, len(keyNames))
+	for _, kc := range keyNames {
+		idx, ok := lowerName[strings.ToLower(kc)]
 		if !ok {
-			return fmt.Errorf("key column %q missing on %s side", strings.TrimSpace(kc), v.sideLabel(target))
+			return fmt.Errorf("key column %q missing on %s side", kc, v.sideLabel(target))
 		}
 		keyIdxs = append(keyIdxs, idx)
 	}
@@ -486,13 +603,15 @@ func (v *Validator) fetchDiffWindow(ctx context.Context, target bool, pgDB, tidb
 			return fmt.Errorf("scan row in row-diff window: %w", err)
 		}
 		key := make([]string, len(keyIdxs))
+		rawKey := make([]interface{}, len(keyIdxs))
 		for i, idx := range keyIdxs {
 			if values[idx] == nil {
 				return errNullKey
 			}
 			key[i] = normalizeValue(values[idx])
+			rawKey[i] = sanitizeNativeValue(values[idx])
 		}
-		if !stream.push(diffRow{key: key, hash: rowMD5(values, hashIdxs)}) {
+		if !stream.push(diffRow{key: key, rawKey: rawKey, hash: rowMD5(values, hashIdxs)}) {
 			return fmt.Errorf("键序与对齐序不一致（%s 端排序规则或键值规范化差异），无法行级对齐", v.sideLabel(target))
 		}
 		fetched++
@@ -500,16 +619,176 @@ func (v *Validator) fetchDiffWindow(ctx context.Context, target bool, pgDB, tidb
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate row-diff rows: %w", err)
 	}
-	stream.fetched += int64(fetched)
 	if fetched < rowDiffWindow {
 		return errDiffStreamDone
 	}
 	return nil
 }
 
-// offset/advance track per-side OFFSET paging (each side advances by exactly
-// the rows it yielded).
-func (s *diffStream) offset() int64 { return s.fetched }
+// splitKeyColumns splits the shared orderByCols key list (comma-separated)
+// into trimmed raw column names.
+func splitKeyColumns(orderByCols string) []string {
+	parts := strings.Split(orderByCols, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// sanitizeNativeValue makes one native key value safe to hold across rows
+// and re-bind into later queries: the driver's []byte buffers are only
+// valid until the next Next call, so they are copied to string (every
+// other driver.Value — int64, float64, bool, string, time.Time — is a
+// value type already).
+func sanitizeNativeValue(v interface{}) interface{} {
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	}
+	return v
+}
+
+// rowDiffNullKeyScan pre-scans BOTH sides for NULL-keyed rows in the
+// watermark universe BEFORE any window is fetched (leader ruling 1): the
+// keyset seek is three-valued-logic UNKNOWN on NULL, so a NULLS-LAST side
+// would never surface its NULL rows in post-first windows and the
+// in-fetch NULL abort could not fire — a silent undercount. Each side's
+// probe is ONE #t4 budget unit (acquire → open/query/close → release)
+// carrying the SAME watermark predicate as the drill windows. A probe
+// ERROR does not abort the drill (the in-fetch NULL check remains as
+// defense in depth); only a NULL HIT does. Only the unique-index key
+// path calls this — PK keys are NOT NULL by PK semantics on both engines.
+func (v *Validator) rowDiffNullKeyScan(ctx context.Context, pgDB, tidbDB *sql.DB, sem concSem,
+	schema, table string, keyCols []string) bool {
+	for _, target := range []bool{false, true} {
+		if v.rowDiffNullKeyScanSide(ctx, target, pgDB, tidbDB, sem, schema, table, keyCols) {
+			return true
+		}
+	}
+	return false
+}
+
+// rowDiffNullKeyScanSide probes one side: SELECT 1 … WHERE <wm> AND
+// (k1 IS NULL OR … ) LIMIT 1 — true iff a NULL-keyed row exists in scope.
+func (v *Validator) rowDiffNullKeyScanSide(ctx context.Context, target bool, pgDB, tidbDB *sql.DB, sem concSem,
+	schema, table string, keyCols []string) bool {
+	release, aerr := sem.acquire(ctx)
+	if aerr != nil {
+		return false // cancelled: the fetch-time NULL check still stands
+	}
+	defer release()
+
+	var q dialectQueryer
+	var quote func(string) string
+	var wmFrag string
+	var wmA []interface{}
+	if target {
+		conn, err := v.getTiDBConn(ctx, tidbDB)
+		if err != nil {
+			zap.L().Warn("row diff NULL pre-scan skipped (conn)", zap.String("table", table), zap.Error(err))
+			return false
+		}
+		defer conn.Close()
+		q, quote = conn, v.tgtDialect.QuoteIdent
+		if wm := v.wmFilterFor(ctx); wm != nil {
+			wmFrag, wmA = v.tgtDialect.WmPredicateFragment(wm), wmArgs(wm)
+		}
+	} else {
+		q, quote = pgDB, v.srcDialect.QuoteIdent
+		if wm := v.wmFilterFor(ctx); wm != nil {
+			wmFrag, wmA = v.srcDialect.WmPredicateFragment(wm), wmArgs(wm)
+		}
+	}
+	qualified := quote(table)
+	if !target {
+		qualified = quote(schema) + "." + quote(table)
+	}
+	nullConds := make([]string, len(keyCols))
+	for i, kc := range keyCols {
+		nullConds[i] = quote(kc) + " IS NULL"
+	}
+	conds := make([]string, 0, 2)
+	if wmFrag != "" {
+		conds = append(conds, wmFrag)
+	}
+	conds = append(conds, "("+strings.Join(nullConds, " OR ")+")")
+	rows, err := q.QueryContext(ctx, fmt.Sprintf(
+		"SELECT 1 FROM %s WHERE %s LIMIT 1", qualified, strings.Join(conds, " AND ")), wmA...)
+	if err != nil {
+		zap.L().Warn("row diff NULL pre-scan skipped (query)", zap.String("table", table), zap.Error(err))
+		return false
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return true
+	}
+	return false
+}
+
+// rowDiffSeek renders the exclusive keyset-seek predicate chain:
+//
+//	k1 > $a OR (k1 = $a AND k2 > $b) OR (k1 = $a AND k2 = $b AND k3 > $c)
+//
+// The row-constructor form ((k1,k2) > (a,b)) is FORBIDDEN — MySQL's
+// historical evaluation of tuple comparisons is unreliable — so the OR
+// chain is spelled out. Placeholders: PG sources number $N CONTINUOUSLY
+// from the watermark's last placeholder and REUSE one number per key
+// column (every occurrence of key j binds the same value); MySQL/TiDB use
+// positional ? per occurrence with the value repeated in args. Both forms
+// bind the NATIVE driver values — never normalized strings.
+type rowDiffSeek struct {
+	pg     bool
+	next   int
+	tokens []string // per-key-column memoized $N (PG form only)
+	args   []interface{}
+}
+
+func newRowDiffSeek(pgPlaceholders bool, wmArgCount int) *rowDiffSeek {
+	return &rowDiffSeek{pg: pgPlaceholders, next: wmArgCount, tokens: make([]string, 8)}
+}
+
+// placeholder returns the bind token for key column i's value, allocating
+// (and binding) at first use.
+func (s *rowDiffSeek) placeholder(i int, val interface{}) string {
+	if !s.pg {
+		s.args = append(s.args, val)
+		return "?"
+	}
+	if i >= len(s.tokens) {
+		grow := make([]string, i+1)
+		copy(grow, s.tokens)
+		s.tokens = grow
+	}
+	if s.tokens[i] == "" {
+		s.next++
+		s.tokens[i] = fmt.Sprintf("$%d", s.next)
+		s.args = append(s.args, val)
+	}
+	return s.tokens[i]
+}
+
+// chain renders the seek predicate (without the wrapping parens the caller
+// adds) over the quoted key columns and the previous window's last native
+// key values: k1 > $a OR (k1 = $a AND k2 > $b) OR … — each multi-equality
+// group parenthesized, matching the approved OR-chain shape.
+func (s *rowDiffSeek) chain(quotedKeys []string, vals []interface{}) string {
+	groups := make([]string, 0, len(quotedKeys))
+	for last := 0; last < len(quotedKeys); last++ {
+		conds := make([]string, 0, last+1)
+		for j := 0; j < last; j++ {
+			conds = append(conds, fmt.Sprintf("%s = %s", quotedKeys[j], s.placeholder(j, vals[j])))
+		}
+		conds = append(conds, fmt.Sprintf("%s > %s", quotedKeys[last], s.placeholder(last, vals[last])))
+		group := strings.Join(conds, " AND ")
+		if last > 0 {
+			group = "(" + group + ")"
+		}
+		groups = append(groups, group)
+	}
+	return strings.Join(groups, " OR ")
+}
 
 // sideLabel renders the fetch-side label for drill error messages.
 func (v *Validator) sideLabel(target bool) string {

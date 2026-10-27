@@ -71,8 +71,9 @@ type RowDiffSummary struct {
 	// compare/{id}/diff/ (empty when no detail was written — zero diffs
 	// or drill failure, see Note).
 	File string `json:"file,omitempty"`
-	// Truncated marks that the CSV detail stopped at the 1,000,000-row
-	// record cap; the counts above remain exact.
+	// Truncated marks that the CSV detail stopped at the EFFECTIVE detail
+	// record cap (1,000,000 rows, or the 100,000 mega-table guardrail cap
+	// — see rowDiffMegaRows); the counts above remain exact.
 	Truncated bool `json:"truncated,omitempty"`
 	// Note discloses why no detail exists (no PK/unique key, chunk
 	// mismatch with zero aligned diffs, drill error, cancelled …) —
