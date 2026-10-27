@@ -40,6 +40,12 @@ type Validator struct {
 	// implementations must be safe for concurrent use.
 	onTableDone func(done, total int, tr reporter.TableReport)
 
+	// diffDetailDir enables the row-diff drill-down for FAILED checksum
+	// tables when non-empty (the standalone /compare path points it at
+	// compare/{id}/diff/). Empty — the orchestrator/CLI default — keeps the
+	// drill fully off and Run() behavior byte-identical.
+	diffDetailDir string
+
 	// MS-03 dialect injection: source-side and target-side specifics live
 	// behind CompareDialect/TargetDialect (pure relocation; see
 	// docs/MS03-DIALECT-MAP.md). Defaults preserve the pre-MS-03 behavior.
@@ -229,6 +235,11 @@ func (v *Validator) getTiDBConn(ctx context.Context, tidbDB *sql.DB) (*sql.Conn,
 func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporter.Report, error) {
 	logger := zap.L()
 	logger.Info("starting data validation", zap.String("level", opts.Level), zap.String("mode", opts.Mode))
+
+	// Row-diff drill toggle: only the standalone compare path sets a
+	// directory; empty keeps the drill (and this Run) byte-identical for
+	// orchestrator/CLI callers.
+	v.diffDetailDir = opts.DiffDetailDir
 
 	// Resolve effective mode: CLI flag > config default
 	mode := opts.Mode

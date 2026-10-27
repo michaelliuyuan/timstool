@@ -343,6 +343,9 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 				r.Use(s.requireValidCompareID)
 				r.Get("/", s.handleGetCompare)
 				r.Get("/report", s.handleCompareReport)
+				// 行级差异明细（row-diff drill）: read-only artifact
+				// download, whitelist-gated filename (MC-14 read family).
+				r.Get("/rowdiff/{file}", s.handleCompareRowDiff)
 				r.Post("/cancel", s.handleCancelCompare)
 				r.Delete("/", s.handleDeleteCompare)
 			})

@@ -847,6 +847,18 @@ function diffHeat(n: number | undefined): string {
   return 'diff-high'
 }
 
+// ---- 行级差异（row-diff drill）: failed checksum tables carry a bounded
+// summary (three-class counts + sample keys) in row_diffs; the full detail
+// downloads as CSV via the read-only rowdiff route. ----
+function downloadRowDiff(file: string) {
+  const t = activeTask.value
+  if (!t || !file) return
+  const a = document.createElement('a')
+  a.href = apiClient.compareRowDiffUrl(t.id, file)
+  a.download = file
+  a.click()
+}
+
 // ---- report export (FEAT-0933, client-side CSV + HTML) ----
 
 function reportFileName(ext: string) {
@@ -1240,7 +1252,34 @@ onUnmounted(() => {
           </div>
         </div>
         <div class="tims-table-scroll">
-          <el-table :data="activeReport.tables" max-height="400" size="small" style="margin-bottom: 12px;">
+          <el-table :data="activeReport.tables" max-height="400" size="small" style="margin-bottom: 12px;" row-key="table_name">
+          <el-table-column type="expand">
+            <template #default="{ row }">
+              <template v-if="row.row_diffs">
+                <div style="padding: 4px 12px;">
+                  <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 6px;">
+                    <el-tag size="small" type="info">键列 {{ row.row_diffs.key_columns?.join('、') || '—' }}</el-tag>
+                    <template v-if="!row.row_diffs.note">
+                      <el-tag size="small" type="danger">内容不一致 {{ row.row_diffs.content_diff }}</el-tag>
+                      <el-tag size="small" type="warning">仅源端 {{ row.row_diffs.src_only }}</el-tag>
+                      <el-tag size="small" type="primary">仅目标端 {{ row.row_diffs.dst_only }}</el-tag>
+                      <el-tag v-if="row.row_diffs.truncated" size="small" type="warning">明细截断至 100 万行（计数完整）</el-tag>
+                      <el-button v-if="row.row_diffs.file" size="small" link type="primary"
+                                 @click="downloadRowDiff(row.row_diffs.file)">下载差异明细（{{ row.row_diffs.file }}）</el-button>
+                    </template>
+                  </div>
+                  <div v-if="row.row_diffs.note" style="color: var(--tims-tag-warning-text); font-size: var(--tims-font-sm);">{{ row.row_diffs.note }}</div>
+                  <div v-if="row.row_diffs.sample_keys?.length" style="font-size: var(--tims-font-xs); color: var(--tims-text-2);">
+                    样例键（前 {{ row.row_diffs.sample_keys.length }} 个）：
+                    <span v-for="k in row.row_diffs.sample_keys.slice(0, 10)" :key="k" class="rd-sample">{{ k }}</span>
+                  </div>
+                </div>
+              </template>
+              <div v-else style="padding: 4px 12px; color: var(--tims-text-2); font-size: var(--tims-font-sm);">
+                无行级差异信息（通过/跳过的表，或未走校验和模式的表）
+              </div>
+            </template>
+          </el-table-column>
           <el-table-column prop="table_name" label="表名" min-width="140" />
           <el-table-column label="状态" width="90">
             <template #default="{ row }">
@@ -1378,6 +1417,15 @@ onUnmounted(() => {
 .diff-low { color: var(--tims-amber); }
 .diff-high { color: var(--tims-brand); font-weight: 500; }
 :deep(.tims-num-col .cell) { font-family: var(--tims-font-mono); }
+/* 行级差异样例键：等宽小块，便于逐键核对 */
+.rd-sample {
+  display: inline-block;
+  font-family: var(--tims-font-mono);
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 4px;
+  padding: 0 6px;
+  margin: 2px 4px 2px 0;
+}
 
 @media (max-width: 900px) {
   .tims-gauge-row { grid-template-columns: repeat(2, 1fr); }

@@ -303,6 +303,22 @@ export function isCompareTask(task: Task | null | undefined): boolean {
 // side by side with the mongodb compare types above — two independent faces.
 // ---------------------------------------------------------------------------
 
+/** Row-level diff summary of a FAILED checksum table (engine row-diff
+ *  drill): three-class counts + sample keys; the full detail lives in the
+ *  CSV artifact named by file (downloaded via the rowdiff route). */
+export interface CompareRowDiffs {
+  key_columns: string[]
+  content_diff: number
+  src_only: number
+  dst_only: number
+  sample_keys?: string[]
+  file?: string
+  truncated?: boolean
+  /** Disclosure when no detail exists (no PK/unique key, zero aligned
+   *  diffs, drill failure, cancelled …) — never silently empty. */
+  note?: string
+}
+
 export interface CompareTableReport {
   table_name: string
   status: 'pass' | 'fail' | 'warn' | 'skip'
@@ -312,6 +328,7 @@ export interface CompareTableReport {
   diff_rows?: number
   error?: string
   suggestion?: string
+  row_diffs?: CompareRowDiffs
 }
 
 export interface CompareReport {
@@ -615,6 +632,12 @@ export const apiClient = {
 
   deleteCompare: (id: string) =>
     api.delete(`/compare/tasks/${id}`),
+
+  // Row-diff detail artifact URL (row-diff drill): a read-only GET served as
+  // a CSV attachment — returns a same-origin URL for anchor downloads (the
+  // report family's open-read policy; no auth header needed).
+  compareRowDiffUrl: (id: string, file: string) =>
+    `/api/v1/compare/tasks/${id}/rowdiff/${encodeURIComponent(file)}`,
 
   // Saved compare-page connection profile (passwords are never persisted
   // server-side; the fields exist so a round-trip response can be typed).

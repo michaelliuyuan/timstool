@@ -797,6 +797,11 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 
 	_, validateOpts, compareCfg := buildCompareRunParams(task,
 		filepath.Join(s.compareDir(task.ID), "report.json"))
+	// Row-diff drill: standalone compare tasks get the per-task diff
+	// directory (failed checksum tables stream their row-level detail
+	// there; the summary rides report.json). Empty for every other
+	// validator caller — the feature is compare-only by design.
+	validateOpts.DiffDetailDir = filepath.Join(s.compareDir(task.ID), "diff")
 	// MS-08: DSNByType dispatches on the source type (PG keeps the legacy
 	// postgresql:// DSN byte-identically; MySQL assembles the driver DSN).
 	report, err := v.RunWithDSNs(ctx, task.Source.DSNByType(), task.Target.DSN(),

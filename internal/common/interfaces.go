@@ -54,6 +54,12 @@ type ValidateOpts struct {
 	SampleRatio float64
 	Tables      []string
 	ReportFile  string
+	// DiffDetailDir enables the row-level diff drill-down for FAILED
+	// checksum tables when non-empty: per-table CSV detail artifacts are
+	// written under this directory and summarized in report.json
+	// (TableReport.row_diffs). Empty = feature off (orchestrator/CLI
+	// default — Run behavior unchanged).
+	DiffDetailDir string
 }
 
 type PrecheckOpts struct {

@@ -49,6 +49,17 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	if tr.Status == reporter.StatusFail {
 		tidbConn.Close()
 		release()
+		// Row-diff drill (count-mismatch face): a COUNT *error* leaves both
+		// counts at zero (operational failure — nothing to align); a count
+		// *mismatch* has at least one non-zero count and is exactly the
+		// src_only/dst_only case the drill classifies.
+		if tr.SourceRows+tr.TargetRows > 0 {
+			schema := v.sourceSchema()
+			if schema == "" {
+				schema = "public"
+			}
+			v.maybeDrillRowDiffs(ctx, pgDB, tidbDB, sem, schema, table, &tr, nil, nil, "")
+		}
 		return tr
 	}
 
@@ -73,13 +84,7 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	var igProtected []string
 	igEff := map[string]bool(nil)
 	if ignoreConfigured(v.compareCfg()) {
-		var pkCols []string
-		if keyInfo != nil && keyInfo.HasPK {
-			pkCols = keyInfo.PKColumns
-		}
-		var igApplied []string
-		igApplied, igProtected = tableIgnoreColumns(v.compareCfg(), pkCols)
-		igEff = ignoreSetMap(igApplied)
+		igEff, igProtected = v.resolveIgnoreSet(keyInfo)
 		if len(igProtected) > 0 {
 			zap.L().Info("ignore columns hit primary key, kept comparable",
 				zap.String("table", table), zap.Strings("columns", igProtected))
@@ -99,6 +104,14 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 		out := v.validateSamplingWithHashGroup(ctx, pgDB, tidbConn, table, 1.0, tr, schema)
 		tidbConn.Close()
 		release()
+		// Row-diff drill scope disclosure: a FAILED no-PK table cannot be
+		// aligned row-by-row (hash_group compares multisets) — an explicit
+		// note instead of a silent summary-free failure.
+		if out.Status == reporter.StatusFail && v.diffDetailDir != "" {
+			out.RowDiffs = &reporter.RowDiffSummary{
+				Note: "该表无主键/唯一索引（hash_group 路径），无法行级定位差异",
+			}
+		}
 		return out
 	}
 	tidbConn.Close()
@@ -143,6 +156,7 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	// slot (#t4).
 	var mu sync.Mutex
 	var mismatchDetails []string
+	var hashMismatch bool
 	var noComparable bool
 	var wg sync.WaitGroup
 
@@ -190,6 +204,7 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 
 			if pgHash != tidbHash {
 				mu.Lock()
+				hashMismatch = true
 				mismatchDetails = append(mismatchDetails, fmt.Sprintf("chunk %d (rows %d-%d): hash mismatch src=%s tidb=%s",
 					idx, ch.offset, ch.offset+ch.limit, truncate(pgHash, 12), truncate(tidbHash, 12)))
 				mu.Unlock()
@@ -225,12 +240,35 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 		tr.Suggestion = "主键列不可排除: " + strings.Join(igProtected, ", ") + "；" + tr.Suggestion
 	}
 
+	// Row-diff drill (chunk-mismatch face): only a genuine hash mismatch
+	// has data divergence to locate — operational chunk errors (query
+	// failures/cancellation) carry their own triage in tr.Error and would
+	// only re-fail inside the drill. No slot is held here (all chunk units
+	// released above); the drill takes its own per-window units (#t4).
+	if tr.Status == reporter.StatusFail && hashMismatch {
+		v.maybeDrillRowDiffs(ctx, pgDB, tidbDB, sem, schema, table, &tr, keyInfo, igEff, orderByCols)
+	}
+
 	return tr
 }
 
 type chunkRange struct {
 	offset int64
 	limit  int64
+}
+
+// resolveIgnoreSet resolves the effective user-exclusion set for one table
+// (PK collisions softened away): the effective set feeds the chunk hashers
+// and the row-diff drill (same inputs, same skip channel), and the protected
+// collisions return for report disclosure. Extracted so the count-mismatch
+// drill site resolves the identical set without duplicating the logic.
+func (v *Validator) resolveIgnoreSet(keyInfo *TableKeyInfo) (map[string]bool, []string) {
+	var pkCols []string
+	if keyInfo != nil && keyInfo.HasPK {
+		pkCols = keyInfo.PKColumns
+	}
+	igApplied, igProtected := tableIgnoreColumns(v.compareCfg(), pkCols)
+	return ignoreSetMap(igApplied), igProtected
 }
 
 // quoteOrderByCols quotes a comma-separated key column list per column.
@@ -276,34 +314,11 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 		return "", fmt.Errorf("no column types")
 	}
 
-	// Build skip cols and sorted column list
-	skipCols := make(map[int]bool)
-	colNames := make([]string, len(cols))
-	colIdxMap := make(map[string]int)
-	for i, c := range cols {
-		lower := strings.ToLower(c.Name())
-		colNames[i] = c.Name()
-		colIdxMap[lower] = i
-		dt := strings.ToLower(c.DatabaseTypeName())
-		if isApproximateFloatType(dt) || strings.Contains(dt, "json") || ig[lower] {
-			skipCols[i] = true
-		}
-	}
-
-	sortedCols := make([]string, len(colNames))
-	copy(sortedCols, colNames)
-	sort.Strings(sortedCols)
-
-	// Build ordered non-skipped column indices
-	var hashIdxs []int
-	for _, name := range sortedCols {
-		idx := colIdxMap[strings.ToLower(name)]
-		if !skipCols[idx] {
-			hashIdxs = append(hashIdxs, idx)
-		}
-	}
-	if len(hashIdxs) == 0 {
-		return "", ErrNoComparableCols
+	// Shared hash plan (row-diff drill uses the SAME builder — one
+	// implementation, no drift).
+	hashIdxs, err := buildChunkHashPlan(cols, ig)
+	if err != nil {
+		return "", err
 	}
 
 	values := make([]interface{}, len(cols))
@@ -317,15 +332,7 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 		if err := rows.Scan(ptrs...); err != nil {
 			return "", fmt.Errorf("scan row in chunk: %w", err)
 		}
-		var buf strings.Builder
-		for i, idx := range hashIdxs {
-			if i > 0 {
-				buf.WriteByte('|')
-			}
-			val := normalizeValue(values[idx])
-			buf.WriteString(val)
-		}
-		rowHashes = append(rowHashes, fmt.Sprintf("%x", md5.Sum([]byte(buf.String()))))
+		rowHashes = append(rowHashes, rowMD5(values, hashIdxs))
 	}
 	if err := rows.Err(); err != nil {
 		return "", fmt.Errorf("iterate chunk rows: %w", err)
@@ -366,32 +373,10 @@ func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, ta
 		return "", fmt.Errorf("no column types")
 	}
 
-	skipCols := make(map[int]bool)
-	colNames := make([]string, len(cols))
-	colIdxMap := make(map[string]int)
-	for i, c := range cols {
-		lower := strings.ToLower(c.Name())
-		colNames[i] = c.Name()
-		colIdxMap[lower] = i
-		dt := strings.ToLower(c.DatabaseTypeName())
-		if isApproximateFloatType(dt) || strings.Contains(dt, "json") || ig[lower] {
-			skipCols[i] = true
-		}
-	}
-
-	sortedCols := make([]string, len(colNames))
-	copy(sortedCols, colNames)
-	sort.Strings(sortedCols)
-
-	var hashIdxs []int
-	for _, name := range sortedCols {
-		idx := colIdxMap[strings.ToLower(name)]
-		if !skipCols[idx] {
-			hashIdxs = append(hashIdxs, idx)
-		}
-	}
-	if len(hashIdxs) == 0 {
-		return "", ErrNoComparableCols
+	// Shared hash plan (row-diff drill uses the SAME builder).
+	hashIdxs, err := buildChunkHashPlan(cols, ig)
+	if err != nil {
+		return "", err
 	}
 
 	values := make([]interface{}, len(cols))
@@ -405,15 +390,7 @@ func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, ta
 		if err := rows.Scan(ptrs...); err != nil {
 			return "", fmt.Errorf("scan row in chunk: %w", err)
 		}
-		var buf strings.Builder
-		for i, idx := range hashIdxs {
-			if i > 0 {
-				buf.WriteByte('|')
-			}
-			val := normalizeValue(values[idx])
-			buf.WriteString(val)
-		}
-		rowHashes = append(rowHashes, fmt.Sprintf("%x", md5.Sum([]byte(buf.String()))))
+		rowHashes = append(rowHashes, rowMD5(values, hashIdxs))
 	}
 	if err := rows.Err(); err != nil {
 		return "", fmt.Errorf("iterate chunk rows: %w", err)
@@ -421,4 +398,51 @@ func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, ta
 
 	sort.Strings(rowHashes)
 	return fmt.Sprintf("%x", md5.Sum([]byte(strings.Join(rowHashes, ",")))), nil
+}
+
+// buildChunkHashPlan is the single shared hash-column plan of the checksum
+// chunk hashers AND the row-diff drill: skip approximate floats / JSON /
+// user-ignored columns, hash the remaining columns in name order. Returning
+// ErrNoComparableCols keeps the historic no-comparable-columns semantics.
+func buildChunkHashPlan(cols []*sql.ColumnType, ig map[string]bool) ([]int, error) {
+	skipCols := make(map[int]bool)
+	colNames := make([]string, len(cols))
+	colIdxMap := make(map[string]int)
+	for i, c := range cols {
+		lower := strings.ToLower(c.Name())
+		colNames[i] = c.Name()
+		colIdxMap[lower] = i
+		dt := strings.ToLower(c.DatabaseTypeName())
+		if isApproximateFloatType(dt) || strings.Contains(dt, "json") || ig[lower] {
+			skipCols[i] = true
+		}
+	}
+	sortedCols := make([]string, len(colNames))
+	copy(sortedCols, colNames)
+	sort.Strings(sortedCols)
+	var hashIdxs []int
+	for _, name := range sortedCols {
+		idx := colIdxMap[strings.ToLower(name)]
+		if !skipCols[idx] {
+			hashIdxs = append(hashIdxs, idx)
+		}
+	}
+	if len(hashIdxs) == 0 {
+		return nil, ErrNoComparableCols
+	}
+	return hashIdxs, nil
+}
+
+// rowMD5 hashes one row over the shared plan: normalized values joined with
+// '|' in the plan's (name-sorted) order — the exact per-row hash the chunk
+// aggregators fold, extracted so the row-diff drill hashes identically.
+func rowMD5(values []interface{}, hashIdxs []int) string {
+	var buf strings.Builder
+	for i, idx := range hashIdxs {
+		if i > 0 {
+			buf.WriteByte('|')
+		}
+		buf.WriteString(normalizeValue(values[idx]))
+	}
+	return fmt.Sprintf("%x", md5.Sum([]byte(buf.String())))
 }

@@ -179,10 +179,12 @@ td:not(.num) { overflow-wrap: anywhere; }
 
 	// Per-table detail: the migration-report column set plus the
 	// compare-specific 建议 column (D3 keeps it — it is the actionable
-	// signal for a data compare).
+	// signal for a data compare) and the row-diff disclosure column
+	// (row_diffs summary of the drill: three-class counts, or the honest
+	// no-drill note).
 	if len(rpt.Tables) > 0 {
 		sb.WriteString(`<div class="card"><h2>表详情</h2><table><thead><tr>`)
-		sb.WriteString(`<th>#</th><th>表名</th><th>状态</th><th>源端行数</th><th>目标行数</th><th>差异</th><th>耗时</th><th>错误</th><th>建议</th>`)
+		sb.WriteString(`<th>#</th><th>表名</th><th>状态</th><th>源端行数</th><th>目标行数</th><th>差异</th><th>耗时</th><th>错误</th><th>建议</th><th>行级差异</th>`)
 		sb.WriteString(`</tr></thead><tbody>`)
 		for i, t := range rpt.Tables {
 			badgeClass := "badge-" + string(t.Status)
@@ -196,9 +198,24 @@ td:not(.num) { overflow-wrap: anywhere; }
 			if durStr == "" {
 				durStr = "—"
 			}
+			rdStr := "—"
+			if t.RowDiffs != nil {
+				rd := t.RowDiffs
+				if rd.Note != "" {
+					rdStr = rd.Note
+				} else {
+					rdStr = fmt.Sprintf("内容不一致 %d · 仅源端 %d · 仅目标端 %d", rd.ContentDiff, rd.SrcOnly, rd.DstOnly)
+					if rd.Truncated {
+						rdStr += "（明细截断）"
+					}
+					if rd.File != "" {
+						rdStr += fmt.Sprintf("；明细文件 %s", rd.File)
+					}
+				}
+			}
 			fmt.Fprintf(&sb,
-				`<tr><td class="num">%d</td><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%d</td><td class="num">%d</td><td class="num">%s</td><td class="num">%s</td><td>%s</td><td>%s</td></tr>`,
-				i+1, mcHTMLEsc(t.TableName), mcHTMLEsc(badgeClass), mcHTMLEsc(dcStatusCN(string(t.Status))), t.SourceRows, t.TargetRows, diffStr, mcHTMLEsc(durStr), mcHTMLEsc(t.Error), mcHTMLEsc(t.Suggestion))
+				`<tr><td class="num">%d</td><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%d</td><td class="num">%d</td><td class="num">%s</td><td class="num">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
+				i+1, mcHTMLEsc(t.TableName), mcHTMLEsc(badgeClass), mcHTMLEsc(dcStatusCN(string(t.Status))), t.SourceRows, t.TargetRows, diffStr, mcHTMLEsc(durStr), mcHTMLEsc(t.Error), mcHTMLEsc(t.Suggestion), mcHTMLEsc(rdStr))
 		}
 		sb.WriteString(`</tbody></table></div>`)
 	}

@@ -41,6 +41,43 @@ type TableReport struct {
 	DiffRows   int64  `json:"diff_rows,omitempty"`
 	Error      string `json:"error,omitempty"`
 	Suggestion string `json:"suggestion,omitempty"`
+
+	// RowDiffs is the optional row-level diff disclosure for FAILED
+	// checksum tables (row-diff drill-down). nil = no drill ran (feature
+	// off, mode without drill support, or table did not fail) — old
+	// reports without the field decode with nil here untouched.
+	RowDiffs *RowDiffSummary `json:"row_diffs,omitempty"`
+}
+
+// RowDiffSummary is the per-table SUMMARY of the row-level drill-down: the
+// full detail lives in the CSV artifact named by File (downloaded via the
+// compare rowdiff route); report.json only carries counts, sample keys and
+// disclosure flags so the report stays bounded for huge tables.
+type RowDiffSummary struct {
+	// KeyColumns are the alignment key columns (PK, else unique index).
+	KeyColumns []string `json:"key_columns"`
+	// ContentDiff counts keys present on BOTH sides whose row hashes
+	// differ (same key, different content).
+	ContentDiff int64 `json:"content_diff"`
+	// SrcOnly counts keys present only in the source (within the
+	// effective watermark scope).
+	SrcOnly int64 `json:"src_only"`
+	// DstOnly counts keys present only in the target.
+	DstOnly int64 `json:"dst_only"`
+	// SampleKeys carries up to 20 sample diff keys (display form, key
+	// values joined with "|") for at-a-glance triage.
+	SampleKeys []string `json:"sample_keys,omitempty"`
+	// File is the base name of the per-table CSV detail artifact under
+	// compare/{id}/diff/ (empty when no detail was written — zero diffs
+	// or drill failure, see Note).
+	File string `json:"file,omitempty"`
+	// Truncated marks that the CSV detail stopped at the 1,000,000-row
+	// record cap; the counts above remain exact.
+	Truncated bool `json:"truncated,omitempty"`
+	// Note discloses why no detail exists (no PK/unique key, chunk
+	// mismatch with zero aligned diffs, drill error, cancelled …) —
+	// never a silent empty summary.
+	Note string `json:"note,omitempty"`
 }
 
 type Report struct {
