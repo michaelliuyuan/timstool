@@ -122,8 +122,31 @@ func (v *Validator) writeRowDiffContent(ctx context.Context, pgDB, tidbDB *sql.D
 		zap.L().Warn("row diff content dir failed", zap.String("table", table), zap.Error(err))
 		return
 	}
-	if err := os.WriteFile(filepath.Join(v.diffDetailDir, file), append(b, '\n'), 0o644); err != nil {
+	// temp+rename — the CSV twin's discipline (red team ⑥, leader final
+	// ruling): an interrupted write must never leave a half artifact under
+	// the served name; the route's whitelist does not match the tmp name,
+	// so a crashed probe is invisible to the FE, not half-readable.
+	tmp, err := os.CreateTemp(v.diffDetailDir, ".rowdiff-*.content.json.tmp")
+	if err != nil {
 		zap.L().Warn("row diff content write failed", zap.String("table", table), zap.Error(err))
+		return
+	}
+	tmpName := tmp.Name()
+	if _, werr := tmp.Write(append(b, '\n')); werr != nil {
+		tmp.Close()
+		_ = os.Remove(tmpName)
+		zap.L().Warn("row diff content write failed", zap.String("table", table), zap.Error(werr))
+		return
+	}
+	// Close BEFORE rename: Windows refuses to rename an open file.
+	if cerr := tmp.Close(); cerr != nil {
+		_ = os.Remove(tmpName)
+		zap.L().Warn("row diff content write failed", zap.String("table", table), zap.Error(cerr))
+		return
+	}
+	if rerr := os.Rename(tmpName, filepath.Join(v.diffDetailDir, file)); rerr != nil {
+		_ = os.Remove(tmpName)
+		zap.L().Warn("row diff content rename failed", zap.String("table", table), zap.Error(rerr))
 	}
 }
 

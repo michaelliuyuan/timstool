@@ -289,3 +289,56 @@ func TestRowDiffContentZeroDiffNoFile(t *testing.T) {
 		t.Fatalf("zero diffs must leave no CSV either, got %v", csvs)
 	}
 }
+
+// Test N-c (red team ④, leader final ruling): the dst side serves its id
+// column as []byte during the scan (MySQL-family drivers' binary
+// rendering) — the captured rawKey must be sanitized to string, the
+// point query re-binds the STRING (never a driver buffer), and the probe
+// still HITS. The K6 family scripts both sides as int64, so the
+// []byte→string re-bind path was never truly anchored there.
+func TestRowDiffContentByteSliceKeyPointQuery(t *testing.T) {
+	dir := t.TempDir()
+	v := newDrillValidator(dir)
+
+	src := &sideScript{count: 2, pkCols: []string{"id"},
+		data: rowsOf([2]any{int64(1), "a"}, [2]any{int64(2), "b"})}
+	dst := &sideScript{count: 2,
+		data: rowsOf([2]any{[]byte("1"), "a"}, [2]any{[]byte("2"), "c"})}
+
+	tr := v.validateChecksumChunked(context.Background(), src.open(), dst.open(), "t1", make(concSem, 4))
+	rd := tr.RowDiffs
+	if rd == nil || rd.ContentDiff != 1 || rd.SrcOnly != 0 || rd.DstOnly != 0 {
+		t.Fatalf("byte-key drill counts = %+v, want content 1 only (key 2)", rd)
+	}
+
+	entries := loadContent(t, dir, rd.File)
+	if len(entries) != 1 || entries[0].Key != "2" || entries[0].Error != "" {
+		t.Fatalf("probe entry = %+v, want key 2 without error", entries)
+	}
+	e := entries[0]
+	if e.SrcRow == nil || e.DstRow == nil {
+		t.Fatalf("content_diff must carry BOTH rows: %+v", e)
+	}
+	if e.SrcRow.Values[0] != "2" || e.SrcRow.Values[1] != "b" {
+		t.Fatalf("src row values = %v", e.SrcRow.Values)
+	}
+	if e.DstRow.Values[0] != "2" || e.DstRow.Values[1] != "c" {
+		t.Fatalf("dst row values = %v (the []byte key must render as \"2\")", e.DstRow.Values)
+	}
+
+	// the dst point query bound the SANITIZED STRING, never the []byte
+	// driver buffer; the src twin keeps its native int64 — one probe,
+	// two driver shapes, same key.
+	dstArgs := dst.argsFor("`id` = ? LIMIT 1")
+	if len(dstArgs) != 1 || len(dstArgs[0]) != 1 {
+		t.Fatalf("dst point query args = %v, want exactly one bind", dstArgs)
+	}
+	s, ok := dstArgs[0][0].(string)
+	if !ok || s != "2" {
+		t.Fatalf("dst probe must bind the sanitized string \"2\", got %T %v", dstArgs[0][0], dstArgs[0][0])
+	}
+	srcArgs := src.argsFor(`"id" = $1 LIMIT 1`)
+	if len(srcArgs) != 1 || srcArgs[0][0] != int64(2) {
+		t.Fatalf("src probe must keep the native int64, got %v", srcArgs)
+	}
+}

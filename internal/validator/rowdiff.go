@@ -29,11 +29,22 @@
 //     < 10 never falls into the string-order trap). The merge aligns by
 //     KEY, not by position, so insert/delete shifts cannot fabricate diffs
 //     here.
-//   - Sortedness guard: each side's stream must arrive non-decreasing in the
-//     canonical (normalized tuple) order the merge compares by. A decrease
-//     means the two sides' ORDER BY collations (or value normalization)
-//     disagree with the canonical order — the drill aborts with an explicit
-//     note instead of emitting fabricated only-rows.
+//   - Numeric-aware canonical order (leader ruling 3): key columns whose
+//     DRIVER-reported database type sits in the integer family (int/int2/
+//     int4/int8/bigint/smallint/tinyint/mediumint — deliberately NOT
+//     numeric/decimal/float) compare NUMERICALLY in the canonical order,
+//     negotiated per column across both sides (both must agree the column
+//     is integer); integer PK tables page 9→10→11 where the bytewise
+//     order would abort on "10" < "9". One int side + one non-int side is
+//     a schema drift whose pairing would be luck — the drill aborts with
+//     rowDiffKeyKindNote. String/decimal keys keep the V1 bytewise order;
+//     timestamps render fixed-length strings that sort chronologically.
+//   - Sortedness guard: each side's stream must arrive non-decreasing in
+//     the canonical (numeric-aware normalized tuple) order the merge
+//     compares by. A decrease means the side's ORDER BY collation (or
+//     value normalization) disagrees with the canonical order — the drill
+//     aborts with an explicit note instead of emitting fabricated
+//     only-rows.
 //   - NULL keys abort: a nullable unique index may hold many NULL-keyed
 //     rows that all normalize to the same key tuple; pairing them by
 //     stream order would be luck, not alignment — the drill discloses
@@ -48,6 +59,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/michaelliuyuan/timstool/internal/common/reporter"
@@ -95,6 +107,25 @@ const (
 // pre-paging NULL pre-scan (unique-index keys) and the in-fetch NULL
 // check (defense in depth — the two are a union, not a replacement).
 const rowDiffNullNote = "键列含 NULL（可空唯一索引下同键多行无法确定配对），无法行级对齐"
+
+// rowDiffKeyKindNote is the cross-end integer-ness mismatch abort (leader
+// ruling 3): when one side's key column is integer-typed and the other's is
+// not, the numeric-aware canonical order cannot be negotiated — pairing
+// under a half-numeric order would fabricate diffs, so the drill discloses.
+const rowDiffKeyKindNote = "两端键列整数性不一致（一端 int 键、另一端非 int，数值序对齐不可协商），无法行级对齐"
+
+// rowDiffIntTypeNames is the integer column-type family backing the
+// numeric-aware canonical order (leader ruling 3): a key column whose
+// database type name (driver-reported, upper-cased) sits in this set is
+// compared numerically once BOTH sides agree — int keys page 9→10→11 where
+// the bytewise order would see "10" < "9". numeric/decimal/float stay OUT
+// (variable renderings keep the V1 bytewise behavior); timestamp/date
+// render fixed-length strings that already sort chronologically.
+var rowDiffIntTypeNames = map[string]bool{
+	"INT": true, "INT2": true, "INT4": true, "INT8": true,
+	"BIGINT": true, "SMALLINT": true, "INTEGER": true,
+	"TINYINT": true, "MEDIUMINT": true,
+}
 
 // diffRow is one aligned (key, hash) observation from either side.
 type diffRow struct {
@@ -271,6 +302,11 @@ func (v *Validator) drillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB, sem
 	// memory. Bounded at 200 × two point queries.
 	var contentProbes []rowDiffProbe
 
+	// intMask is the negotiated numeric-aware key column mask (leader
+	// ruling 3) — nil until both sides' first windows have reported their
+	// key column types (compareKeyTuples treats out-of-range as bytewise).
+	var intMask []bool
+
 	record := func(category string, key []string, srcRaw, dstRaw []interface{}) error {
 		if len(contentProbes) < rowDiffContentBudget {
 			contentProbes = append(contentProbes, rowDiffProbe{
@@ -327,6 +363,26 @@ func (v *Validator) drillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB, sem
 			}
 		}
 
+		// Negotiated numeric mask (leader ruling 3): both sides' first
+		// windows have reported their key column types by now — the
+		// canonical order goes numeric per column iff BOTH sides agree
+		// the column is integer family. One int side + one non-int side
+		// is a schema drift whose pairing would be luck: honest abort
+		// before ANY classification.
+		if intMask == nil && src.keyIntCols != nil && dst.keyIntCols != nil {
+			intMask = make([]bool, len(src.keyIntCols))
+			drift := false
+			for i := range intMask {
+				intMask[i] = src.keyIntCols[i] && dst.keyIntCols[i]
+				if src.keyIntCols[i] != dst.keyIntCols[i] {
+					drift = true
+				}
+			}
+			if drift {
+				return fail("%s", rowDiffKeyKindNote)
+			}
+		}
+
 		// Both sides exhausted AND both buffers fully consumed — done.
 		// (done alone is NOT enough: the final short window's rows are
 		// still in the buffer waiting to be classified.)
@@ -357,7 +413,7 @@ func (v *Validator) drillRowDiffs(ctx context.Context, pgDB, tidbDB *sql.DB, sem
 			continue
 		}
 
-		c := compareKeyTuples(src.head().key, dst.head().key)
+		c := compareKeyTuples(src.head().key, dst.head().key, intMask)
 		switch {
 		case c < 0:
 			r := src.pop()
@@ -439,6 +495,12 @@ type diffStream struct {
 	hasLast    bool
 	lastKey    []string
 	lastRawKey []interface{}
+	// keyIntCols marks which key columns this side's driver reports as
+	// INTEGER family (the per-side input to the negotiated numeric-aware
+	// canonical order, leader ruling 3) — the side's OWN mask drives its
+	// sortedness guard; whenever the merge proceeds, both sides' masks
+	// agree column-for-column (a drift aborts first).
+	keyIntCols []bool
 }
 
 func newDiffStream() *diffStream { return &diffStream{} }
@@ -462,7 +524,7 @@ func (s *diffStream) pop() diffRow {
 // the merge would fabricate only-rows. rawKey becomes the side's keyset
 // seek position (the last push wins — windows are consumed in order).
 func (s *diffStream) push(r diffRow) bool {
-	if s.hasLast && compareKeyTuples(s.lastKey, r.key) > 0 {
+	if s.hasLast && compareKeyTuples(s.lastKey, r.key, s.keyIntCols) > 0 {
 		return false
 	}
 	s.rows = append(s.rows, r)
@@ -590,6 +652,18 @@ func (v *Validator) fetchDiffWindow(ctx context.Context, target bool, pgDB, tidb
 		}
 		keyIdxs = append(keyIdxs, idx)
 	}
+
+	// Integer-family detection (leader ruling 3): key columns whose
+	// database type sits in the integer family switch this side's
+	// canonical order to NUMERIC — int keys page 9→10→11 where the
+	// bytewise order would abort on "10" < "9". The merge negotiates the
+	// mask across both sides (drillRowDiffs); a driver reporting no type
+	// names yields all-false — the V1 bytewise defensive default.
+	keyIntCols := make([]bool, len(keyIdxs))
+	for i, idx := range keyIdxs {
+		keyIntCols[i] = rowDiffIntTypeNames[strings.ToUpper(cols[idx].DatabaseTypeName())]
+	}
+	stream.keyIntCols = keyIntCols
 
 	values := make([]interface{}, len(cols))
 	ptrs := make([]interface{}, len(cols))
@@ -724,6 +798,11 @@ func (v *Validator) rowDiffNullKeyScanSide(ctx context.Context, target bool, pgD
 	if rows.Next() {
 		return true
 	}
+	if err := rows.Err(); err != nil {
+		// Iteration error degrades exactly like a query error: warn and
+		// fall through to the fetch-time NULL check (defense in depth).
+		zap.L().Warn("row diff NULL pre-scan skipped (iterate)", zap.String("table", table), zap.Error(err))
+	}
 	return false
 }
 
@@ -798,11 +877,30 @@ func (v *Validator) sideLabel(target bool) string {
 	return v.srcLabel()
 }
 
-// compareKeyTuples compares two normalized key tuples element-wise bytewise
-// (shorter tuple sorts first on full-prefix equality — cannot happen for a
-// fixed key column list, kept for total order).
-func compareKeyTuples(a, b []string) int {
+// compareKeyTuples compares two normalized key tuples element-wise:
+// columns flagged in intMask (the NEGOTIATED integer family — both sides
+// agreed the column is int-typed) compare NUMERICALLY (both renderings
+// parse as int64; native integer columns always render canonical
+// decimals), any parse failure falls back to bytewise (defensive:
+// unsigned-overflow renderings and stray string keys keep a total order);
+// unflagged columns compare bytewise. Shorter tuple sorts first on
+// full-prefix equality — cannot happen for a fixed key column list, kept
+// for total order.
+func compareKeyTuples(a, b []string, intMask []bool) int {
 	for i := 0; i < len(a) && i < len(b); i++ {
+		if i < len(intMask) && intMask[i] {
+			if ai, err := strconv.ParseInt(a[i], 10, 64); err == nil {
+				if bi, err := strconv.ParseInt(b[i], 10, 64); err == nil {
+					switch {
+					case ai < bi:
+						return -1
+					case ai > bi:
+						return 1
+					}
+					continue
+				}
+			}
+		}
 		if a[i] != b[i] {
 			if a[i] < b[i] {
 				return -1

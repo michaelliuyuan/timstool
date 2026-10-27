@@ -38,7 +38,7 @@ const contentEntries = [
   },
 ]
 
-const { mockGetCompareReport, mockGetContent, completedTask, jsonReport } = vi.hoisted(() => {
+const { mockGetCompareReport, mockGetContent, completedTask, taskTwin, jsonReport } = vi.hoisted(() => {
   const completedTask = {
     id: 'rd0diff',
     name: '内容对照锚',
@@ -56,6 +56,9 @@ const { mockGetCompareReport, mockGetContent, completedTask, jsonReport } = vi.h
     tables_total: 3,
     created_at: '2026-01-01T00:00:00Z',
   }
+  // taskTwin: 第二个任务比同一张表（content 文件名由表名派生、跨任务
+  // 确定）——N-a 跨任务缓存隔离锚的对手方。
+  const taskTwin = { ...completedTask, id: 'rd1diff', name: '跨任务缓存锚' }
   const jsonReport = {
     overall_status: 'fail',
     start_time: '2026-01-01T00:00:00Z',
@@ -117,7 +120,7 @@ const { mockGetCompareReport, mockGetContent, completedTask, jsonReport } = vi.h
       : Promise.resolve({ data: jsonReport }),
   )
   const mockGetContent = vi.fn(() => Promise.resolve({ data: contentEntries }))
-  return { mockGetCompareReport, mockGetContent, completedTask, jsonReport }
+  return { mockGetCompareReport, mockGetContent, completedTask, taskTwin, jsonReport }
 })
 
 vi.mock('../api', () => ({
@@ -126,7 +129,7 @@ vi.mock('../api', () => ({
     listDataSources: vi.fn().mockResolvedValue({ data: { datasources: [] } }),
     getCompareOptions: vi.fn().mockResolvedValue({ data: {} }),
     saveCompareOptions: vi.fn().mockResolvedValue({ data: { success: true } }),
-    listCompares: vi.fn().mockResolvedValue({ data: [completedTask] }),
+    listCompares: vi.fn().mockResolvedValue({ data: [completedTask, taskTwin] }),
     getCompareReport: mockGetCompareReport,
     cancelCompare: vi.fn(),
     deleteCompare: vi.fn(),
@@ -255,6 +258,74 @@ describe('CompareView row-diff content probe (行内容对照)', () => {
     const w = await openReportPanel()
     await expandRow(w, 1) // logs row: note-only, no file
     expect(mockGetContent).not.toHaveBeenCalled()
+    w.unmount()
+  })
+
+  it('aligns columns by NAME (union) — interleaved order + single-side columns (红队⑤)', async () => {
+    const entry = {
+      key: '9',
+      category: 'content_diff' as const,
+      // 列序交错夹具：dst 列序完全不同、缺 amount、多 remark——按列序
+      // index 配对会逐位错位（id↔status 等），按名对齐才能照见真差异。
+      src_row: { columns: ['id', 'amount', 'status'], values: ['9', '100', 'A'] },
+      dst_row: { columns: ['status', 'id', 'remark'], values: ['B', '9', 'hi'] },
+    }
+    mockGetContent.mockImplementation(() => Promise.resolve({ data: [entry] }))
+    const w = await openReportPanel()
+    await expandRow(w, 0)
+
+    const rows = Array.from(document.querySelectorAll('.rd-cmp tbody tr'))
+    expect(rows.length).toBe(4) // union: id, amount, status, remark（源端序在前）
+    const cells = (name: string) => {
+      const tr = rows.find(r => (r as HTMLElement).querySelectorAll('td')[0]?.textContent === name)
+      if (!tr) throw new Error(`column ${name} not rendered`)
+      const tds = (tr as HTMLElement).querySelectorAll('td')
+      return {
+        src: tds[1]?.textContent ?? '',
+        dst: tds[2]?.textContent ?? '',
+        diff: tr.querySelectorAll('.rd-val-diff').length,
+      }
+    }
+    expect(cells('id')).toEqual({ src: '9', dst: '9', diff: 0 })
+    expect(cells('amount')).toEqual({ src: '100', dst: '—', diff: 0 }) // dst 缺列
+    expect(cells('status')).toEqual({ src: 'A', dst: 'B', diff: 2 })   // 真差异（列序漂移下仍按名对齐）
+    expect(cells('remark')).toEqual({ src: '—', dst: 'hi', diff: 0 })  // src 缺列
+    w.unmount()
+  })
+
+  it('isolates the content cache across tasks on the SAME table (红队①)', async () => {
+    const entriesB = [
+      {
+        key: '3',
+        category: 'content_diff' as const,
+        src_row: { columns: ['id', 'name'], values: ['3', 'zzz-B'] },
+        dst_row: { columns: ['id', 'name'], values: ['3', 'w-B'] },
+      },
+    ]
+    mockGetContent.mockImplementation((id: string) =>
+      Promise.resolve({ data: id === 'rd1diff' ? entriesB : contentEntries }))
+
+    const w = await openReportPanel()
+    await expandRow(w, 0) // 任务 A（rd0diff）展开 orders
+    expect(mockGetContent).toHaveBeenCalledTimes(1)
+    expect(mockGetContent).toHaveBeenCalledWith('rd0diff', 'orders-9f2c1b7a.content.json')
+
+    // 切到任务 B（rd1diff）——同一张表、同一个派生 content 文件名
+    const viewBtns = w.findAll('button').filter(b => b.text().includes('查看'))
+    expect(viewBtns.length).toBeGreaterThanOrEqual(2)
+    await viewBtns[1].trigger('click')
+    await flushPromises()
+    await expandRow(w, 0)
+    // 缓存键含任务维度 → 必须发第二次请求（带 B 的 id），绝不串 A 的旧行
+    expect(mockGetContent).toHaveBeenCalledTimes(2)
+    expect(mockGetContent).toHaveBeenLastCalledWith('rd1diff', 'orders-9f2c1b7a.content.json')
+    expect(document.body.innerHTML).toContain('zzz-B') // 渲染的是 B 的数据
+    expect(document.body.innerHTML).not.toContain('>c<') // A 的旧值不得串显
+
+    // B 内部收起再展开 → 一次性缓存照常（不因任务维度而失效）
+    await expandRow(w, 0)
+    await expandRow(w, 0)
+    expect(mockGetContent).toHaveBeenCalledTimes(2)
     w.unmount()
   })
 

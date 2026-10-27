@@ -55,10 +55,16 @@ func (r *scriptedRows) ColumnTypeDatabaseTypeName(idx int) string { return r.col
 // dataset so multi-window drills page without skip/dup. LIMIT 1 point
 // queries (content probe) serve the key-equal row.
 type sideScript struct {
-	count         int64
-	pkCols        []string
-	uniqueIdxDef  string
-	data          [][]driver.Value
+	count        int64
+	pkCols       []string
+	uniqueIdxDef string
+	data         [][]driver.Value
+	// dataCols/dataColTypes optionally override the dataset's column
+	// names and DATABASE type names for SELECT * serving (default
+	// id/name = int8/text) — the N-anchors script varchar/numeric key
+	// columns to drive the negotiated numeric-aware mask.
+	dataCols      []string
+	dataColTypes  []string
 	chunkOverride [][]driver.Value
 	// probeErrKeys optionally fails content-probe point queries for the
 	// given key (rendered "v1|v2") — per-entry error anchoring.
@@ -75,6 +81,24 @@ type sideScript struct {
 
 var limitOffsetRe = regexp.MustCompile(`LIMIT (\d+) OFFSET (\d+)`)
 var limitOnlyRe = regexp.MustCompile(`LIMIT (\d+)`)
+
+// datasetCols returns the dataset's column names and database type names
+// (defaults preserve the historical id/name = int8/text shape). Either
+// override may be set alone.
+func (s *sideScript) datasetCols() ([]string, []string) {
+	cols, types := s.dataCols, s.dataColTypes
+	if cols == nil && types == nil {
+		return []string{"id", "name"}, []string{"int8", "text"}
+	}
+	if cols == nil {
+		cols = []string{"id", "name"}
+	}
+	if types == nil {
+		types = []string{"int8", "text"}
+	}
+	return cols, types
+}
+
 var orderByRe = regexp.MustCompile("ORDER BY ((?:\"[A-Za-z0-9_]+\"|`[A-Za-z0-9_]+`)(?:, (?:\"[A-Za-z0-9_]+\"|`[A-Za-z0-9_]+`))*)")
 
 func (s *sideScript) respond(query string, args []driver.NamedValue) (driver.Rows, error) {
@@ -145,7 +169,8 @@ func (s *sideScript) respondOffsetWindow(m []string, query string) (driver.Rows,
 	if limit < len(win) {
 		win = win[:limit]
 	}
-	return &scriptedRows{cols: []string{"id", "name"}, colTypes: []string{"int8", "text"}, rows: win}, nil
+	cols, colTypes := s.datasetCols()
+	return &scriptedRows{cols: cols, colTypes: colTypes, rows: win}, nil
 }
 
 // isNullColRe captures the columns of a NULL pre-scan's IS NULL chain in
@@ -167,7 +192,7 @@ func (s *sideScript) respondNullScan(query string) (driver.Rows, error) {
 	if len(cols) == 0 {
 		return nil, fmt.Errorf("null pre-scan without columns: %s", query)
 	}
-	scriptedCols := []string{"id", "name"}
+	scriptedCols, _ := s.datasetCols()
 	for _, row := range s.data {
 		for _, c := range cols {
 			for ci, sc := range scriptedCols {
@@ -199,7 +224,7 @@ func (s *sideScript) respondKeysetWindow(query string, args []driver.NamedValue)
 		return nil, fmt.Errorf("drill window without ORDER BY: %s", query)
 	}
 	keyNames := parseQuotedIdentList(ob[1])
-	cols := []string{"id", "name"}
+	cols, colTypes := s.datasetCols()
 	keyIdxs := make([]int, len(keyNames))
 	for i, k := range keyNames {
 		idx := -1
@@ -248,7 +273,7 @@ func (s *sideScript) respondKeysetWindow(query string, args []driver.NamedValue)
 			break
 		}
 	}
-	return &scriptedRows{cols: cols, colTypes: []string{"int8", "text"}, rows: win}, nil
+	return &scriptedRows{cols: cols, colTypes: colTypes, rows: win}, nil
 }
 
 // eqColRe captures the column names of a point query's equality chain in
@@ -284,7 +309,7 @@ func (s *sideScript) respondPointQuery(query string, args []driver.NamedValue) (
 			return nil, err
 		}
 	}
-	cols := []string{"id", "name"}
+	cols, colTypes := s.datasetCols()
 	keyIdxs := make([]int, nk)
 	for i, k := range keyNames {
 		keyIdxs[i] = -1
@@ -311,10 +336,10 @@ func (s *sideScript) respondPointQuery(query string, args []driver.NamedValue) (
 			}
 		}
 		if match {
-			return &scriptedRows{cols: cols, colTypes: []string{"int8", "text"}, rows: [][]driver.Value{row}}, nil
+			return &scriptedRows{cols: cols, colTypes: colTypes, rows: [][]driver.Value{row}}, nil
 		}
 	}
-	return &scriptedRows{cols: cols, colTypes: []string{"int8", "text"}, rows: nil}, nil
+	return &scriptedRows{cols: cols, colTypes: colTypes, rows: nil}, nil
 }
 
 // parseQuotedIdentList splits "a", "b" / `a`, `b` into bare names.

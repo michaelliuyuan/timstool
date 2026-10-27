@@ -861,9 +861,10 @@ function downloadRowDiff(file: string) {
 
 // ---- 行级差异内容对照（B-line content probe）: expanding a drilled row
 // lazily fetches the {stem}.content.json sibling artifact ONCE (cached per
-// table+file) and renders a left/right value table — unequal cells
-// highlighted, *_only single-sided with「—」on the missing side. Failure
-// degrades to a disclosure line while the CSV download stays available. ----
+// task+table+file) and renders a left/right value table — columns aligned
+// by NAME across the two sides' union (single-side columns「—」), unequal
+// cells highlighted, *_only single-sided. Failure degrades to a disclosure
+// line while the CSV download stays available. ----
 
 // Page-in-page budget: first 50 entries, 加载更多 up to the engine's 200.
 const ROWDIFF_CONTENT_PAGE = 50
@@ -883,8 +884,11 @@ function rowDiffContentFile(rdf?: CompareRowDiffs): string | null {
   if (!rdf?.file || rdf.note) return null
   return rdf.file.replace(/\.csv$/, '.content.json')
 }
+// 缓存键含任务维度（红队①，leader 终裁）：content 文件名由表名派生、
+// 跨任务确定——两任务比同一表时，不带 t.id 的键会让后展开的任务看到
+// 先展开任务的陈旧行（校验工具展示错行=最劣级缺陷）。
 function rowDiffCacheKey(table: string, rdf?: CompareRowDiffs): string {
-  return `${table}#${rdf?.file ?? ''}`
+  return `${activeTask.value?.id ?? ''}#${table}#${rdf?.file ?? ''}`
 }
 function rowDiffState(table: string, rdf?: CompareRowDiffs): RowDiffContentState | null {
   return rowDiffContentCache.value[rowDiffCacheKey(table, rdf)] ?? null
@@ -922,16 +926,24 @@ function onReportRowExpand(row: any) {
 // One compare row of the side-by-side table: both present + unequal →
 // highlighted; a missing side renders the「—」placeholder.
 interface RowDiffCmpCell { name: string; src: string; dst: string; diff: boolean }
+
+// 列名对齐（红队⑤，leader 终裁）：取两侧列名并集（源端原序在前、
+// 目标端独有列随后），逐列按名取值——列序漂移正是本工具要照见的场景，
+// 按列序 index 配对会逐位错位（展示层信息错误）；缺侧列渲染「—」，
+// 不等高亮口径不变（两侧都在且值不等才高亮）。
 function rowDiffCmpCells(e: CompareRowDiffContentEntry): RowDiffCmpCell[] {
-  const srcCols = e.src_row?.columns ?? []
-  const dstCols = e.dst_row?.columns ?? []
-  const names = srcCols.length > 0 ? srcCols : dstCols
-  return names.map((name, i) => {
-    const hasSrc = !!e.src_row && i < e.src_row.values.length
-    const hasDst = !!e.dst_row && i < e.dst_row.values.length
-    const src = hasSrc ? e.src_row!.values[i] : '—'
-    const dst = hasDst ? e.dst_row!.values[i] : '—'
-    return { name, src, dst, diff: hasSrc && hasDst && src !== dst }
+  const names: string[] = []
+  for (const n of [...(e.src_row?.columns ?? []), ...(e.dst_row?.columns ?? [])]) {
+    if (!names.includes(n)) names.push(n)
+  }
+  const cellOf = (row: NonNullable<CompareRowDiffContentEntry['src_row']>, name: string): string | null => {
+    const i = row.columns.indexOf(name)
+    return i >= 0 && i < row.values.length ? row.values[i] : null
+  }
+  return names.map(name => {
+    const s = e.src_row ? cellOf(e.src_row, name) : null
+    const d = e.dst_row ? cellOf(e.dst_row, name) : null
+    return { name, src: s ?? '—', dst: d ?? '—', diff: s !== null && d !== null && s !== d }
   })
 }
 function rowDiffCategoryLabel(c: string): string {

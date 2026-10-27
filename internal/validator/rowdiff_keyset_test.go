@@ -305,8 +305,14 @@ func TestRowDiffKeysetPagingEquivalence(t *testing.T) {
 		dstData[keyIdx("k050")][1] = "y"                     // content_diff exactly ON the boundary
 		dstData = append(dstData, []driver.Value{"z9", "a"}) // dst_only, sorts last
 
-		src := &sideScript{count: int64(len(srcData)), pkCols: []string{"id"}, data: srcData}
-		dst := &sideScript{count: int64(len(dstData)), data: dstData}
+		src := &sideScript{count: int64(len(srcData)), pkCols: []string{"id"}, data: srcData,
+			// varchar keys (ruling 3 isolation): the id column carries
+			// STRINGS here, so its reported type must be varchar — the
+			// bytewise canonical order keeps this anchor's "10"<"11"<"2"
+			// string-order universe intact.
+			dataColTypes: []string{"varchar", "text"}}
+		dst := &sideScript{count: int64(len(dstData)), data: dstData,
+			dataColTypes: []string{"varchar", "text"}}
 
 		tr := drillQueries(t, dir, src, dst)
 
