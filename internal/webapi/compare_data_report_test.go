@@ -385,10 +385,13 @@ func TestDataCompareReport_StatusClassEscaped(t *testing.T) {
 	}
 }
 
-// TestDataCompareReport_TableLayoutCSSAnchor (MC-18): the four layout rules
-// that keep the 表详情 table readable — headers/number cells/badges never
-// wrap, long text cells break inside tokens — must stay in the rendered
-// style block (compare_data_report.go local style, ReportCSS untouched).
+// TestDataCompareReport_TableLayoutCSSAnchor (MC-18 + unit-11 P2): the
+// layout rules that keep the 表详情 table readable — headers/number
+// cells/badges never wrap, long text cells break inside tokens, and the
+// non-zero-diff cell actually renders red (rule presence, not just the
+// class in HTML — review-P2 blind-spot closure) — must stay in the
+// rendered style block (compare_data_report.go local style, ReportCSS
+// untouched).
 func TestDataCompareReport_TableLayoutCSSAnchor(t *testing.T) {
 	s, _ := newTestServer(t)
 	id := dcTaskFixture(t, s, dcReport(), nil)
@@ -403,6 +406,7 @@ func TestDataCompareReport_TableLayoutCSSAnchor(t *testing.T) {
 		"td.num { white-space: nowrap; }",
 		".badge { white-space: nowrap; }",
 		"td:not(.num) { overflow-wrap: anywhere; }",
+		"td.diff-pos { color: #E13C3C; font-weight: 600; }", // unit-11 E: diff-red rule must exist (review P2)
 	} {
 		if !strings.Contains(body, rule) {
 			t.Errorf("layout rule missing from style block: %q", rule)

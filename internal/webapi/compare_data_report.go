@@ -213,6 +213,7 @@ td.num { white-space: nowrap; }
 td:not(.num) { overflow-wrap: anywhere; }
 th, td { padding: 8px 10px; }
 td.num, th.colnum { text-align: right; }
+td.diff-pos { color: #E13C3C; font-weight: 600; }
 thead th { position: sticky; top: 0; z-index: 5; }
 tr.row-fail td { background: #FDF1F1; }
 tr.row-fail td:first-child { box-shadow: inset 3px 0 0 #E13C3C; }
