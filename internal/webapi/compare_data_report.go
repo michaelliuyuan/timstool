@@ -3,7 +3,8 @@
 // /api/v1/compare/tasks/{taskID}/report branches on format — html (the
 // default) serves a family report built from task.json plus the
 // engine-written report.json (TiMS banner + meta grid + overview/stats
-// cards + per-table detail keeping the compare-specific 建议 column), or
+// cards + the unit-11 表详情 face: 8 columns, failure-first sort, count
+// pills, native <details> expand rows, thousand-separated numbers), or
 // the verbatim report.json bytes (format=json). reporter.ToHTML is
 // physically untouched — zero drift on the migration path (MC-16 leader
 // design ruling): this file follows the MC-14 local-twin pattern instead.
@@ -17,12 +18,19 @@ package webapi
 import (
 	"fmt"
 	"math"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/common/reporter"
 )
+
+// dcReportVersion is the data-compare report renderer's own version stamp
+// (rendered once in the footer badge). It versions the REPORT face — the
+// FE app version (web/frontend) is an independent line.
+const dcReportVersion = "3.19.36"
 
 // dcStatusCN is the data-compare report's status translator (reporter.statusCN
 // twin — kept local because the reporter one is unexported; the compare engine
@@ -100,6 +108,84 @@ func dcModeLabel(task *CompareTask) string {
 	return label
 }
 
+// dcComma renders n with thousand separators (99,997) — server-side number
+// formatting for the 表详情 columns (unit-11 E: scan-friendly digits).
+func dcComma(n int64) string {
+	s := strconv.FormatInt(n, 10)
+	neg := strings.HasPrefix(s, "-")
+	if neg {
+		s = s[1:]
+	}
+	first := len(s) % 3
+	if first == 0 {
+		first = 3
+	}
+	var b strings.Builder
+	b.WriteString(s[:first])
+	for i := first; i < len(s); i += 3 {
+		b.WriteByte(',')
+		b.WriteString(s[i : i+3])
+	}
+	if neg {
+		return "-" + b.String()
+	}
+	return b.String()
+}
+
+// dcBrief renders the 备注 cell (unit-11): the suggestion's first segment —
+// the Chinese conclusion before the engine's '；' joiner or a newline — cut
+// at 40 runes with an honest '…' whenever anything was cut. Display-side
+// only: the engine original stays byte-identical in the expand area (C).
+func dcBrief(s string) string {
+	if s == "" {
+		return "—"
+	}
+	seg := s
+	if i := strings.IndexAny(seg, "；\n"); i >= 0 {
+		seg = seg[:i]
+	}
+	r := []rune(seg)
+	switch {
+	case seg == s && len(r) <= 40:
+		return s
+	case len(r) > 40:
+		return string(r[:40]) + "…"
+	default:
+		return seg + "…"
+	}
+}
+
+// dcStatusRank orders 表详情 rows failure-first (unit-11 D): 失败 → 警告 →
+// 通过/跳过. The rendered # keeps the engine's original order for
+// traceability — sort is stable within a severity class.
+func dcStatusRank(s reporter.Status) int {
+	switch s {
+	case reporter.StatusFail:
+		return 0
+	case reporter.StatusWarn:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// dcValidatedSummaryRE matches the validator engine's canonical English
+// summary ("validated N tables at level X") for the render-side Chinese
+// mapping (unit-11 G).
+var dcValidatedSummaryRE = regexp.MustCompile(`^validated ([0-9]+) tables at level (.+)$`)
+
+// dcSummaryCN maps the engine's canonical English summary onto the report's
+// Chinese vocabulary at the RENDER layer only — the persisted report.json
+// and the format=json face stay verbatim. Anything the map cannot match
+// (or matches with a blank level) passes through unchanged: the honest
+// face never swallows an unknown summary.
+func dcSummaryCN(s string) string {
+	if m := dcValidatedSummaryRE.FindStringSubmatch(s); m != nil && strings.TrimSpace(m[2]) != "" {
+		return "已校验 " + m[1] + " 张表 · 级别：" + m[2]
+	}
+	return s
+}
+
 // renderDataCompareReportHTML builds the standalone offline HTML report in
 // the family format (reporter.ToHTML structure + the MC-14 .header block).
 // All dynamic strings pass through mcHTMLEsc (the report family's escaper —
@@ -125,6 +211,26 @@ th { white-space: nowrap; }
 td.num { white-space: nowrap; }
 .badge { white-space: nowrap; }
 td:not(.num) { overflow-wrap: anywhere; }
+th, td { padding: 8px 10px; }
+td.num, th.colnum { text-align: right; }
+thead th { position: sticky; top: 0; z-index: 5; }
+tr.row-fail td { background: #FDF1F1; }
+tr.row-fail td:first-child { box-shadow: inset 3px 0 0 #E13C3C; }
+.rd-pill { display: inline-block; margin: 1px 3px 1px 0; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.rd-content { background: rgba(225,60,60,0.09); color: #E13C3C; }
+.rd-srconly { background: rgba(217,126,0,0.10); color: #D97E00; }
+.rd-dstonly { background: #EEF0F5; color: #6B7280; }
+tr.row-detail td { padding: 0 10px 8px 13px; }
+tr.row-detail details { background: #F6F7FB; border: 1px solid #E6E8F0; border-radius: 8px; padding: 8px 12px; font-size: 13px; line-height: 1.7; }
+tr.row-detail summary { cursor: pointer; color: #6B7280; font-size: 12px; user-select: none; }
+.det-label { color: #6B7280; margin-right: 8px; }
+.det-file { font-family: 'JetBrains Mono', 'Cascadia Mono', Consolas, ui-monospace, monospace; font-size: 12px; overflow-wrap: anywhere; }
+.tims-version { font-size: 11px; opacity: 0.85; }
+@media print {
+thead th { position: static; }
+tr.row-detail details > *:not(summary) { display: block !important; }
+tr.row-detail details::details-content { display: block !important; content-visibility: visible !important; }
+}
 </style>
 </head>
 <body>
@@ -160,7 +266,7 @@ td:not(.num) { overflow-wrap: anywhere; }
 	fmt.Fprintf(&sb, `<div class="stat"><div class="value">%d</div><div class="label">目标行数</div></div>`, rpt.Stats.TotalTargetRows)
 	sb.WriteString(`</div>`)
 	if rpt.Summary != "" {
-		fmt.Fprintf(&sb, `<div class="summary">%s</div>`, mcHTMLEsc(rpt.Summary))
+		fmt.Fprintf(&sb, `<div class="summary">%s</div>`, mcHTMLEsc(dcSummaryCN(rpt.Summary)))
 	}
 	sb.WriteString(`</div>`)
 
@@ -177,50 +283,80 @@ td:not(.num) { overflow-wrap: anywhere; }
 	}
 	sb.WriteString(`</div></div>`)
 
-	// Per-table detail: the migration-report column set plus the
-	// compare-specific 建议 column (D3 keeps it — it is the actionable
-	// signal for a data compare) and the row-diff disclosure column
-	// (row_diffs summary of the drill: three-class counts, or the honest
-	// no-drill note).
+	// Per-table detail (unit-11 A–F): 8 columns — # | 表名 | 状态 | 源端行数
+	// | 目标行数 | 差异 | 行级差异 | 备注. 耗时 is gone (task-level duration
+	// lives in the overview card), 错误/建议全文/明细文件名 moved into the
+	// per-row native <details> expand area (zero JS). Rows sort
+	// failure-first (失败 → 警告 → 通过/跳过) with the engine's original #
+	// kept for traceability; failed rows get the light-red tint + 3px left
+	// bar. Numbers render thousand-separated, right-aligned, diff>0 red.
+	// The 行级差异 cell carries the three count pills (内容 n red / 仅源 n
+	// orange / 仅目标 n grey) or the honest-abort note in brief; the full
+	// engine sentences stay byte-identical in the expand area.
 	if len(rpt.Tables) > 0 {
 		sb.WriteString(`<div class="card"><h2>表详情</h2><table><thead><tr>`)
-		sb.WriteString(`<th>#</th><th>表名</th><th>状态</th><th>源端行数</th><th>目标行数</th><th>差异</th><th>耗时</th><th>错误</th><th>建议</th><th>行级差异</th>`)
+		sb.WriteString(`<th>#</th><th>表名</th><th>状态</th><th class="colnum">源端行数</th><th class="colnum">目标行数</th><th class="colnum">差异</th><th>行级差异</th><th>备注</th>`)
 		sb.WriteString(`</tr></thead><tbody>`)
-		for i, t := range rpt.Tables {
+		order := make([]int, len(rpt.Tables))
+		for i := range order {
+			order[i] = i
+		}
+		sort.SliceStable(order, func(a, b int) bool {
+			return dcStatusRank(rpt.Tables[order[a]].Status) < dcStatusRank(rpt.Tables[order[b]].Status)
+		})
+		for _, idx := range order {
+			t := rpt.Tables[idx]
+			rowClass := ""
+			if t.Status == reporter.StatusFail {
+				rowClass = ` class="row-fail"`
+			}
 			badgeClass := "badge-" + string(t.Status)
-			diffStr := ""
+			diffHTML := `<td class="num">—</td>`
 			if t.DiffRows != 0 {
-				diffStr = fmt.Sprintf("%d", t.DiffRows)
+				diffHTML = fmt.Sprintf(`<td class="num diff-pos">%s</td>`, mcHTMLEsc(dcComma(t.DiffRows)))
 			}
-			// Honest "—" for a table with no measurable duration instead of
-			// a silently blank cell (reporter.ToHTML precedent).
-			durStr := t.Duration
-			if durStr == "" {
-				durStr = "—"
-			}
-			rdStr := "—"
+			rdCell := "—"
+			var det []string
 			if t.RowDiffs != nil {
 				rd := t.RowDiffs
 				if rd.Note != "" {
-					rdStr = rd.Note
+					// Honest no-drill note: brief in the cell, full text in
+					// the expand area.
+					rdCell = mcHTMLEsc(dcBrief(rd.Note))
+					det = append(det, fmt.Sprintf(`<div><span class="det-label">行级差异说明</span>%s</div>`, mcHTMLEsc(rd.Note)))
 				} else {
-					rdStr = fmt.Sprintf("内容不一致 %d · 仅源端 %d · 仅目标端 %d", rd.ContentDiff, rd.SrcOnly, rd.DstOnly)
+					rdCell = fmt.Sprintf(`<span class="rd-pill rd-content">内容 %s</span><span class="rd-pill rd-srconly">仅源 %s</span><span class="rd-pill rd-dstonly">仅目标 %s</span>`,
+						mcHTMLEsc(dcComma(rd.ContentDiff)), mcHTMLEsc(dcComma(rd.SrcOnly)), mcHTMLEsc(dcComma(rd.DstOnly)))
+					trunc := ""
 					if rd.Truncated {
-						rdStr += "（明细截断）"
+						trunc = "（明细截断）"
 					}
-					if rd.File != "" {
-						rdStr += fmt.Sprintf("；明细文件 %s", rd.File)
-					}
+					det = append(det, fmt.Sprintf(`<div><span class="det-label">行级差异</span>内容不一致 %s · 仅源端 %s · 仅目标端 %s%s</div>`,
+						mcHTMLEsc(dcComma(rd.ContentDiff)), mcHTMLEsc(dcComma(rd.SrcOnly)), mcHTMLEsc(dcComma(rd.DstOnly)), trunc))
+				}
+				if rd.File != "" {
+					det = append(det, fmt.Sprintf(`<div><span class="det-label">明细文件</span><span class="det-file">%s</span></div>`, mcHTMLEsc(rd.File)))
 				}
 			}
+			if t.Suggestion != "" {
+				det = append(det, fmt.Sprintf(`<div><span class="det-label">建议原文</span>%s</div>`, mcHTMLEsc(t.Suggestion)))
+			}
+			if t.Error != "" {
+				det = append(det, fmt.Sprintf(`<div><span class="det-label">错误全文</span>%s</div>`, mcHTMLEsc(t.Error)))
+			}
 			fmt.Fprintf(&sb,
-				`<tr><td class="num">%d</td><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%d</td><td class="num">%d</td><td class="num">%s</td><td class="num">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
-				i+1, mcHTMLEsc(t.TableName), mcHTMLEsc(badgeClass), mcHTMLEsc(dcStatusCN(string(t.Status))), t.SourceRows, t.TargetRows, diffStr, mcHTMLEsc(durStr), mcHTMLEsc(t.Error), mcHTMLEsc(t.Suggestion), mcHTMLEsc(rdStr))
+				`<tr%s><td class="num">%d</td><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%s</td><td class="num">%s</td>%s<td>%s</td><td>%s</td></tr>`,
+				rowClass, idx+1, mcHTMLEsc(t.TableName), mcHTMLEsc(badgeClass), mcHTMLEsc(dcStatusCN(string(t.Status))), mcHTMLEsc(dcComma(t.SourceRows)), mcHTMLEsc(dcComma(t.TargetRows)), diffHTML, rdCell, mcHTMLEsc(dcBrief(t.Suggestion)))
+			if len(det) > 0 {
+				fmt.Fprintf(&sb, `<tr class="row-detail"><td colspan="8"><details><summary>诊断详情</summary>%s</details></td></tr>`, strings.Join(det, ""))
+			}
 		}
 		sb.WriteString(`</tbody></table></div>`)
 	}
 
-	sb.WriteString(`<div class="footer">由 TiMS (TiDB Migration Suite) 生成 &middot; 数据比对 &middot; `)
+	sb.WriteString(`<div class="footer">由 TiMS (TiDB Migration Suite) 生成 &middot; 数据比对 &middot; <span class="tims-version">V`)
+	sb.WriteString(mcHTMLEsc(dcReportVersion))
+	sb.WriteString(`</span> &middot; `)
 	sb.WriteString(mcHTMLEsc(time.Now().Format("2006-01-02 15:04:05")))
 	sb.WriteString(`</div></div></body></html>`)
 	return sb.String()

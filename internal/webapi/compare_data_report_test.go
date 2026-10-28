@@ -1,12 +1,16 @@
 package webapi
 
 // MC-16 data-compare report tests: the /compare/tasks/{id}/report family
-// faces — HTML rendering anchors (banner/meta grid/两卡/# 列/中文徽章/建议列/
-// 页脚), verbatim JSON serving, default-format html, the 404 dual cause set,
-// the corrupt-artifact 500 (generic body, no path leak), the four mode-label
-// mappings, XSS escaping of every attacker-controllable string, and the
-// credential negative anchor. The migration and mongo report test sets are
-// untouched and must stay green (family regression anchors).
+// faces — HTML rendering anchors (banner/meta grid/两卡/# 列/中文徽章/页脚),
+// the unit-11 表详情 face (8-column header, failure-first sort with
+// original #, thousand separators, count pills, details/summary expand
+// rows + print force-open, suggestion brief cut, G summary mapping with
+// verbatim passthrough, V3.19.36 badge), verbatim JSON serving,
+// default-format html, the 404 dual cause set, the corrupt-artifact 500
+// (generic body, no path leak), the four mode-label mappings, XSS escaping
+// of every attacker-controllable string, and the credential negative
+// anchor. The migration and mongo report test sets are untouched and must
+// stay green (family regression anchors).
 
 import (
 	"net/http"
@@ -61,10 +65,12 @@ func dcTaskFixture(t *testing.T, s *Server, rpt *reporter.Report, mutate func(*C
 // dcReport builds a representative engine report: three of the four table
 // states, a diff row, an error, and a suggestion (the compare-specific
 // column). Finish() computes Stats; stable times/duration are set after.
+// The orders row counts (99,997/181,117) pin the unit-11 thousand-separator
+// face end-to-end.
 func dcReport() *reporter.Report {
 	rpt := reporter.NewReport("validate")
 	rpt.Tables = []reporter.TableReport{
-		{TableName: "public.orders", Status: reporter.StatusPass, Duration: "10.200s", SourceRows: 1000, TargetRows: 1000},
+		{TableName: "public.orders", Status: reporter.StatusPass, Duration: "10.200s", SourceRows: 99997, TargetRows: 181117},
 		{TableName: "public.users", Status: reporter.StatusWarn, Duration: "5.000s", SourceRows: 50, TargetRows: 49, DiffRows: 1, Suggestion: "run a checksum compare on public.users"},
 		{TableName: "public.logs", Status: reporter.StatusSkip},
 		{TableName: "public.bad", Status: reporter.StatusFail, Error: "connect refused"},
@@ -122,17 +128,50 @@ func TestDataCompareReport_HTML(t *testing.T) {
 		"采样比对完成：3/4 表通过", // summary line
 		"<h2>统计</h2>", "通过", "失败", "警告", "跳过", "差异行数",
 		"<h2>表详情</h2>",
-		`<th>#</th><th>表名</th><th>状态</th><th>源端行数</th><th>目标行数</th><th>差异</th><th>耗时</th><th>错误</th><th>建议</th>`,
-		`<td class="num">1</td><td>public.orders</td>`, // # column
+		`<th>#</th><th>表名</th><th>状态</th><th class="colnum">源端行数</th><th class="colnum">目标行数</th><th class="colnum">差异</th><th>行级差异</th><th>备注</th>`, // unit-11 A: 8 columns
+		`<td class="num">1</td><td>public.orders</td>`, // original # survives the failure-first sort
+		`<td class="num">4</td><td>public.bad</td>`,    // fail row keeps engine # 4
+		`<tr class="row-fail">`,                        // unit-11 D: fail tint
 		`<span class="badge badge-warn">警告</span>`,     // Chinese badge
 		`<span class="badge badge-skip">跳过</span>`,
-		"run a checksum compare on public.users", // 建议 column (D3)
-		"connect refused",                        // error column
+		`<td class="num">99,997</td>`, // unit-11 E: thousand separator
+		`<td class="num">181,117</td>`,
+		`<td class="num diff-pos">1</td>`,                                         // diff>0 red class
+		"run a checksum compare on public.users",                                  // 备注 cell (≤40 runes → whole)
+		"connect refused",                                                         // 错误全文 in the expand area (C)
+		`<tr class="row-detail"><td colspan="8"><details><summary>诊断详情</summary>`, // C expand row structure
+		"tr.row-detail details > *:not(summary) { display: block !important; }",   // C print force-open
+		"tr.row-detail details::details-content { display: block !important; content-visibility: visible !important; }",
+		`<span class="tims-version">V3.19.36</span>`, // version badge
 		"由 TiMS (TiDB Migration Suite) 生成 &middot; 数据比对 &middot; ",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("html missing %q", want)
 		}
+	}
+	// Failure-first order (unit-11 D): 失败(#4) → 警告(#2) → 通过(#1) → 跳过(#3)
+	// in body order, original #s preserved for traceability.
+	pos := func(sub string) int { return strings.Index(body, sub) }
+	if !(pos(`<td class="num">4</td><td>public.bad</td>`) < pos(`<td class="num">2</td><td>public.users</td>`) &&
+		pos(`<td class="num">2</td><td>public.users</td>`) < pos(`<td class="num">1</td><td>public.orders</td>`) &&
+		pos(`<td class="num">1</td><td>public.orders</td>`) < pos(`<td class="num">3</td><td>public.logs</td>`)) {
+		t.Error("表详情 must render failure-first (失败→警告→通过/跳过) with original # order")
+	}
+	// The dropped columns must be gone (unit-11 A).
+	for _, gone := range []string{"<th>耗时</th>", "<th>错误</th>", "<th>建议</th>"} {
+		if strings.Contains(body, gone) {
+			t.Errorf("dropped column header still rendered: %q", gone)
+		}
+	}
+	// Version badge: exactly one V3.19.36 stamp, no stale version.
+	if n := strings.Count(body, "V3.19.36"); n != 1 {
+		t.Errorf("V3.19.36 badge count=%d want 1", n)
+	}
+	if n := strings.Count(body, `class="tims-version"`); n != 1 {
+		t.Errorf("tims-version badge count=%d want 1", n)
+	}
+	if strings.Contains(body, "V3.19.35") {
+		t.Error("stale version V3.19.35 rendered")
 	}
 	// The pre-MC-16 browser-side title/footer vocabulary must be gone.
 	if strings.Contains(body, "TimsTool") {
@@ -387,5 +426,142 @@ func TestDataCompareReport_CredentialsNeverRender(t *testing.T) {
 		if strings.Contains(body, secret) {
 			t.Errorf("credential %q rendered into report", secret)
 		}
+	}
+}
+
+// TestDataCompareReport_NumberAndBriefFormat (unit-11 E + 备注): dcComma
+// thousand-separator edges and dcBrief's first-segment / 40-rune cut.
+func TestDataCompareReport_NumberAndBriefFormat(t *testing.T) {
+	nums := []struct {
+		in   int64
+		want string
+	}{
+		{0, "0"}, {999, "999"}, {1000, "1,000"}, {99997, "99,997"},
+		{181117, "181,117"}, {1234567, "1,234,567"}, {-1234, "-1,234"},
+	}
+	for _, c := range nums {
+		if got := dcComma(c.in); got != c.want {
+			t.Errorf("dcComma(%d)=%q want %q", c.in, got, c.want)
+		}
+	}
+	briefs := []struct {
+		in   string
+		want string
+	}{
+		{"", "—"},
+		{"短建议", "短建议"},
+		{"run a checksum compare on public.users", "run a checksum compare on public.users"}, // ≤40, whole
+		{"首段结论；checksum mode: 1 chunks × 1000 rows, 0 mismatches", "首段结论…"},                  // 首段 cut at the engine joiner
+		{strings.Repeat("查", 41), strings.Repeat("查", 40) + "…"},                             // rune cut, multibyte safe
+		{strings.Repeat("查", 40), strings.Repeat("查", 40)},                                   // exactly 40: no ellipsis
+		{"第一段\n第二段", "第一段…"},
+	}
+	for _, c := range briefs {
+		if got := dcBrief(c.in); got != c.want {
+			t.Errorf("dcBrief(%q)=%q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestDataCompareReport_SummaryCN (unit-11 G): the canonical English
+// validator summary maps to Chinese at the RENDER layer; everything
+// unmatchable (or with a blank level) passes through verbatim — the honest
+// face never swallows an unknown summary.
+func TestDataCompareReport_SummaryCN(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"validated 13 tables at level data", "已校验 13 张表 · 级别：data"},
+		{"validated 1 tables at level schema", "已校验 1 张表 · 级别：schema"},
+		{"采样比对完成：3/4 表通过", "采样比对完成：3/4 表通过"},                               // 透传锚
+		{"validated 13 tables", "validated 13 tables"},                     // malformed → passthrough
+		{"validated 13 tables at level ", "validated 13 tables at level "}, // blank level → passthrough
+	}
+	for _, c := range cases {
+		if got := dcSummaryCN(c.in); got != c.want {
+			t.Errorf("dcSummaryCN(%q)=%q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestDataCompareReport_TableDetailPills (unit-11 B/C/D/E/G end-to-end):
+// a failed checksum table with a drilled row-diff summary renders the three
+// count pills, the fail tint, comma numbers, the truncated suggestion
+// (brief in the cell, engine original byte-identical in the expand area),
+// the CSV detail file ONLY in the expand area, the honest-abort note
+// (brief in the cell, full text in the expand area, no pills), and the G
+// summary mapping through the handler.
+func TestDataCompareReport_TableDetailPills(t *testing.T) {
+	s, _ := newTestServer(t)
+	rpt := reporter.NewReport("validate")
+	rpt.Tables = []reporter.TableReport{
+		{TableName: "public.big", Status: reporter.StatusFail, SourceRows: 99997, TargetRows: 181117, DiffRows: 12,
+			Error:      "checksum mismatch in 1/1 chunks",
+			Suggestion: "首段结论；checksum mode: 1 chunks × 1000 rows, 0 mismatches",
+			RowDiffs: &reporter.RowDiffSummary{KeyColumns: []string{"id"}, ContentDiff: 6, SrcOnly: 9, DstOnly: 0,
+				File: "big-12345678.csv", Truncated: true}},
+		{TableName: "public.nn", Status: reporter.StatusFail,
+			RowDiffs: &reporter.RowDiffSummary{Note: "键列含 NULL，无法行级对齐"}},
+		{TableName: "public.ok", Status: reporter.StatusPass, Suggestion: strings.Repeat("查", 80)},
+	}
+	rpt.Finish(reporter.StatusFail, "validated 13 tables at level data")
+	id := dcTaskFixture(t, s, rpt, nil)
+
+	rec := dcReportGet(t, s, id, "html")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		`<span class="rd-pill rd-content">内容 6</span>`, // B: three count pills
+		`<span class="rd-pill rd-srconly">仅源 9</span>`,
+		`<span class="rd-pill rd-dstonly">仅目标 0</span>`,
+		`内容不一致 6 · 仅源端 9 · 仅目标端 0（明细截断）`,                 // readable sentence + truncation marker in the expand area
+		`<span class="det-file">big-12345678.csv</span>`, // CSV file name, monospace, expand area only
+		"checksum mismatch in 1/1 chunks",                // 错误全文 in the expand area
+		"首段结论…",                                          // 备注 cell: first segment, ellipsized
+		strings.Repeat("查", 40) + "…",                    // rune-cut brief cell for the 80-rune suggestion
+		strings.Repeat("查", 80),                          // engine original byte-identical in the expand area
+		"键列含 NULL，无法行级对齐",                                // honest-abort note
+		`<span class="det-label">行级差异说明</span>`,
+		`已校验 13 张表 · 级别：data`, // G mapping through the handler
+		`<tr class="row-fail">`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("html missing %q", want)
+		}
+	}
+	// Exactly three pills — the note-aborted table renders no pills (the
+	// count keys on the span class literal so the .rd-pill CSS rule text
+	// does not skew it).
+	if n := strings.Count(body, `class="rd-pill `); n != 3 {
+		t.Errorf("pill span count=%d want 3 (counts table only, note table pill-free)", n)
+	}
+	// Exactly two fail tints (big + nn), pass table untinted.
+	if n := strings.Count(body, `<tr class="row-fail">`); n != 2 {
+		t.Errorf("row-fail count=%d want 2", n)
+	}
+	// The suggestion tail and the CSV file name live ONLY in the expand
+	// area, never in the main row cells.
+	if n := strings.Count(body, "checksum mode: 1 chunks × 1000 rows, 0 mismatches"); n != 1 {
+		t.Errorf("suggestion tail count=%d want 1 (expand area only)", n)
+	}
+	if n := strings.Count(body, "big-12345678.csv"); n != 1 {
+		t.Errorf("csv file count=%d want 1 (expand area only)", n)
+	}
+	if strings.Index(body, "big-12345678.csv") < strings.Index(body, "<details") {
+		t.Error("csv file name must render inside the details expand area")
+	}
+	// The mapped summary replaces the English original on the html face.
+	if strings.Contains(body, "validated 13 tables") {
+		t.Error("unmapped English summary leaked past the G mapping")
+	}
+	// Brief cells stay whole-token-safe: 40查… appears once (cell), 80查 once (expand).
+	if n := strings.Count(body, strings.Repeat("查", 40)+"…"); n != 1 {
+		t.Errorf("brief ellipsis cell count=%d want 1", n)
+	}
+	if n := strings.Count(body, strings.Repeat("查", 80)); n != 1 {
+		t.Errorf("full suggestion count=%d want 1 (expand area only)", n)
 	}
 }
