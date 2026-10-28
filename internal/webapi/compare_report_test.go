@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -449,5 +450,189 @@ func TestCompareReport_SchemaMissingLabels(t *testing.T) {
 	}
 	if got := indexCheckLabel(map[string]any{"diff": []any{"a", "b"}}); got != fmt.Sprintf("差异 %d 项", 2) {
 		t.Errorf("[]any index label = %q", got)
+	}
+}
+
+// ---- unit-12: mongodiff export (read route + report link/preview/badge) ----
+
+// mcMongoDiffFixture persists a mongocompare task (store) via the report
+// fixture and optionally writes one diff ndjson artifact under
+// <dataDir>/compare/<id>/diff/.
+func mcMongoDiffFixture(t *testing.T, s *Server, sum *mongocompare.Summary, file, content string) string {
+	t.Helper()
+	id := mcReportFixture(t, s, sum)
+	if file != "" {
+		dir := filepath.Join(s.dataDir, "compare", id, "diff")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, file), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return id
+}
+
+func mcMongoDiffGet(t *testing.T, s *Server, id, file string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := withChiParams(httptest.NewRequest(http.MethodGet, "/api/v1/tasks/"+id+"/mongodiff/"+url.PathEscape(file), nil), "taskID", id, "file", file)
+	rec := httptest.NewRecorder()
+	s.handleMongoDiff(rec, req)
+	return rec
+}
+
+// TestMongoDiffRoute404Family: the gate order — unknown task, non-mongo
+// task, whitelist violations (traversal/extension/inner dot/space), and
+// the whitelisted-but-missing artifact — every face 404s with its own
+// cause vocabulary.
+func TestMongoDiffRoute404Family(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	// unknown task → 404 task-not-found (before any fs touch)
+	rec := mcMongoDiffGet(t, s, "nosuch", "shop__orders.ndjson")
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "task not found") {
+		t.Fatalf("unknown task: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// non-mongocompare task → 404 (parseCompareTask gate)
+	mig := &store.Task{ID: "migt1", ConfigJSON: `{"kind":"migration"}`}
+	if err := s.store.CreateTask(mig); err != nil {
+		t.Fatal(err)
+	}
+	rec = mcMongoDiffGet(t, s, "migt1", "shop__orders.ndjson")
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "not a mongocompare task") {
+		t.Fatalf("non-mongo task: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// mongo task, whitelist violations — all 404 naming the whitelist
+	mcMongoDiffFixture(t, s, nil, "", "")
+	for _, bad := range []string{
+		"../../task.json",    // traversal (decoded ..%2f form)
+		"shop.orders.ndjson", // inner dot outside the alphabet
+		"secrets.txt",        // wrong extension
+		"a b.ndjson",         // space outside the alphabet
+	} {
+		rec = mcMongoDiffGet(t, s, "mc14rep", bad)
+		if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "whitelist") {
+			t.Fatalf("whitelist violation %q: code=%d body=%s", bad, rec.Code, rec.Body.String())
+		}
+	}
+
+	// whitelisted name, artifact missing → 404 with the cause set
+	rec = mcMongoDiffGet(t, s, "mc14rep", "shop__orders.ndjson")
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "produced no such artifact") {
+		t.Fatalf("missing artifact: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestMongoDiffRouteServesArtifact: the happy path serves the ndjson bytes
+// verbatim with the ndjson attachment headers.
+func TestMongoDiffRouteServesArtifact(t *testing.T) {
+	s, _ := newTestServer(t)
+	const artifact = `{"_id":1,"type":"modified","fields":[{"key":"qty","type":"number"}]}` + "\n" +
+		`{"_id":2,"type":"missing-in-target"}` + "\n"
+	id := mcMongoDiffFixture(t, s, nil, "shop__orders.ndjson", artifact)
+
+	rec := mcMongoDiffGet(t, s, id, "shop__orders.ndjson")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/x-ndjson" {
+		t.Errorf("content-type=%q want application/x-ndjson", ct)
+	}
+	if cd := rec.Header().Get("Content-Disposition"); cd != "attachment; filename=shop__orders.ndjson" {
+		t.Errorf("content-disposition=%q", cd)
+	}
+	if rec.Body.String() != artifact {
+		t.Errorf("body must be byte-identical to the artifact: %q", rec.Body.String())
+	}
+}
+
+// TestMongoDiffReportLinkBadgeAndDegrade: the diff>0 collection carries
+// exactly one download link (engine naming contract), zero/error rows stay
+// link-free, the version badge renders exactly once, an unreadable
+// artifact degrades to no preview without breaking the page, and every
+// new class carries a CSS rule (unit-11 P2 lesson).
+func TestMongoDiffReportLinkBadgeAndDegrade(t *testing.T) {
+	s, _ := newTestServer(t)
+	id := mcReportFixture(t, s, mcReportSummary()) // no ndjson on disk
+	rec := mcReportGet(t, s, id, "html")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	body := rec.Body.String()
+	if n := strings.Count(body, `href="/api/v1/tasks/mc14rep/mongodiff/shop__orders.ndjson"`); n != 1 {
+		t.Errorf("download link count=%d want 1 (exactly the diff>0 collection)", n)
+	}
+	if !strings.Contains(body, `>下载差异明细 (ndjson)</a>`) {
+		t.Error("download link anchor text missing")
+	}
+	if n := strings.Count(body, "/mongodiff/"); n != 1 {
+		t.Errorf("/mongodiff/ href count=%d want 1 (diff=0 and error rows stay link-free)", n)
+	}
+	if n := strings.Count(body, `class="mc-diff-preview"`); n != 0 {
+		t.Errorf("unreadable artifact must degrade to no preview block, got %d", n)
+	}
+	if n := strings.Count(body, "V3.19.37"); n != 1 {
+		t.Errorf("V3.19.37 badge count=%d want 1", n)
+	}
+	if strings.Contains(body, "V3.19.36") {
+		t.Error("stale version rendered")
+	}
+	for _, rule := range []string{
+		".mc-diff-dl {",
+		".mc-diff-preview {",
+		".mc-diff-preview summary {",
+		".mc-diff-table {",
+		".mc-diff-more {",
+	} {
+		if !strings.Contains(body, rule) {
+			t.Errorf("preview CSS rule missing from style block: %q", rule)
+		}
+	}
+}
+
+// TestMongoDiffReportPreviewCap: the inline preview caps at 50 records —
+// the first record renders with the CN type vocabulary and field keys, a
+// malformed line is skipped without breaking the page, and the beyond-cap
+// tail is replaced by the download note.
+func TestMongoDiffReportPreviewCap(t *testing.T) {
+	s, _ := newTestServer(t)
+	lines := []string{
+		`{"_id":1,"type":"modified","fields":[{"key":"qty","type":"number"}]}`,
+		`{"_id":"a2","type":"missing-in-target"}`,
+		`{"_id":3,"type":"missing-in-source","fields":[{"key":"f3","type":"string"}]}`,
+		`not-json-at-all`, // malformed line: skipped, never breaks the page
+	}
+	for i := 4; i <= 60; i++ {
+		lines = append(lines, fmt.Sprintf(`{"_id":%d,"type":"modified","fields":[{"key":"f%d","type":"string"}]}`, i, i))
+	}
+	id := mcMongoDiffFixture(t, s, mcReportSummary(), "shop__orders.ndjson", strings.Join(lines, "\n")+"\n")
+
+	rec := mcReportGet(t, s, id, "html")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `<details class="mc-diff-preview"><summary>差异明细预览</summary>`) {
+		t.Error("preview details/summary structure missing")
+	}
+	if n := strings.Count(body, "仅预览前 50 条，全文请下载"); n != 1 {
+		t.Errorf("preview cap note count=%d want 1", n)
+	}
+	if !strings.Contains(body, `<td class="num">1</td><td><span class="badge badge-warn">内容有差异</span>`) {
+		t.Error("first record (_id 1) with CN type badge missing")
+	}
+	if !strings.Contains(body, `<td class="num">a2</td><td><span class="badge badge-fail">目标端缺失</span>`) {
+		t.Error("string _id (any type) with target-missing badge missing")
+	}
+	if !strings.Contains(body, `<span class="badge badge-skip">源端缺失</span>`) {
+		t.Error("source-missing badge missing")
+	}
+	if !strings.Contains(body, `<td>qty</td>`) || !strings.Contains(body, `<td>f3</td>`) {
+		t.Error("field keys (canon.Delta.Key) missing from the preview cells")
+	}
+	if strings.Contains(body, `<td class="num">60</td>`) || strings.Contains(body, `<td class="num">61</td>`) {
+		t.Error("records beyond the 50-record cap must not render")
 	}
 }

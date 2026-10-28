@@ -327,6 +327,11 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 				r.Get("/report", s.handleTaskReport)
 				r.Get("/logs", s.handleTaskLogs)
 				r.Get("/phases", s.handleTaskPhases)
+				// MongoDB 比对差异明细（mongodiff）: read-only ndjson
+				// artifact download, whitelist-gated filename (unit-12 A —
+				// the rowdiff twin on the shared tasks namespace; the
+				// handler gates non-mongocompare tasks out first).
+				r.Get("/mongodiff/{file}", s.handleMongoDiff)
 			})
 			r.Get("/ws", s.handleWebSocket)
 			// Source DDL export (F-01): schema listing + zip download

@@ -119,7 +119,7 @@ func TestCompareReportWatermarkFace(t *testing.T) {
 	deg.Note = "水位列不可用（字段 absent 不存在（集合内没有文档包含该字段）），该集合已退化为全量比对"
 	sum.Collections = []mongocompare.CollectionResult{win, deg}
 
-	html := renderCompareReportHTML(task, spec, sum)
+	html := renderCompareReportHTML(task, spec, sum, "")
 	for _, want := range []string{
 		`<div>模式 <span>水位过滤</span></div>`,
 		"<th>水位</th>",
@@ -134,7 +134,7 @@ func TestCompareReportWatermarkFace(t *testing.T) {
 
 	// No watermark in the spec: no mode tag (the per-row notes above may
 	// legitimately repeat the phrase — the TAG is the precise anchor).
-	plain := renderCompareReportHTML(task, &compareTaskSpec{}, sum)
+	plain := renderCompareReportHTML(task, &compareTaskSpec{}, sum, "")
 	if strings.Contains(plain, `<div>模式 <span>水位过滤</span></div>`) {
 		t.Errorf("non-watermark spec must not carry the mode tag")
 	}

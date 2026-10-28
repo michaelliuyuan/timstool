@@ -13,6 +13,8 @@
 package webapi
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -26,6 +28,18 @@ import (
 	"github.com/michaelliuyuan/timstool/internal/store"
 	"go.uber.org/zap"
 )
+
+// mcReportVersion is the mongocompare report renderer's own version stamp
+// (rendered once in the header meta grid, unit-12 D — the dcReportVersion
+// twin; the FE app version is an independent line).
+const mcReportVersion = "3.19.37"
+
+// mongoDiffFileName builds the engine-side diff artifact name for one
+// collection (writeDeltas twin: {db}__{coll}.ndjson, inner dots replaced)
+// — the report download link and the route whitelist share this contract.
+func mongoDiffFileName(db, coll string) string {
+	return strings.ReplaceAll(db+"."+coll, ".", "__") + ".ndjson"
+}
 
 // loadCompareSummary reads and decodes the engine-written summary.json.
 func loadCompareSummary(path string) (*mongocompare.Summary, error) {
@@ -68,7 +82,7 @@ func (s *Server) handleCompareTaskReport(w http.ResponseWriter, r *http.Request,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-report-%s.html", task.ID))
-	w.Write([]byte(renderCompareReportHTML(task, spec, sum)))
+	w.Write([]byte(renderCompareReportHTML(task, spec, sum, filepath.Join(s.dataDir, "compare", task.ID, "diff"))))
 }
 
 // writeCompareSummaryError maps missing → 404 (cause named — MC-15: the
@@ -224,7 +238,7 @@ func compareSpecWmOn(spec *compareTaskSpec) bool {
 	return len(spec.TableWatermarks) > 0
 }
 
-func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongocompare.Summary) string {
+func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongocompare.Summary, diffDir string) string {
 	_, cn, overallClass := compareOverallMeta(sum.Overall)
 
 	var sb strings.Builder
@@ -248,6 +262,11 @@ func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongo
 .coll-sub { padding: 14px 12px; border-bottom: 1px solid #E6E8F0; background: #FAFBFD; }
 .coll-sub:last-child { border-bottom: none; }
 .coll-sub h3 { font-size: 14px; margin-bottom: 6px; color: #0C1222; }
+.mc-diff-dl { margin-left: 8px; color: #0C1222; font-weight: 600; }
+.mc-diff-preview { margin-top: 8px; border: 1px solid #E6E8F0; border-radius: 8px; background: #F6F7FB; padding: 6px 12px; }
+.mc-diff-preview summary { cursor: pointer; color: #6B7280; font-size: 12px; user-select: none; }
+.mc-diff-table { margin-top: 6px; font-size: 13px; }
+.mc-diff-more { color: #6B7280; font-size: 12px; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -274,6 +293,7 @@ func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongo
 		}
 	}
 	fmt.Fprintf(&sb, `<div>耗时 <span class="num">%.2fs</span></div>`, sum.DurationSec)
+	fmt.Fprintf(&sb, `<div>版本 <span class="num">V%s</span></div>`, mcHTMLEsc(mcReportVersion))
 	sb.WriteString(`</div></div>`)
 
 	// Overview stats: four-state counts (the engine's own vocabulary).
@@ -389,7 +409,13 @@ func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongo
 			fmt.Fprintf(&sb, `<div class="c-brand">错误：%s</div>`, mcHTMLEsc(c.Checks.Error))
 		}
 		if diffN > 0 {
-			fmt.Fprintf(&sb, `<div>字段级差异文档 <span class="num c-brand">%d</span> 条（明细见任务 diff 目录 ndjson）</div>`, diffN)
+			// unit-12 B: the diff-count row now carries the download link
+			// (engine writeDeltas naming contract) plus the zero-JS inline
+			// preview; zero/error rows stay link-free.
+			name := mongoDiffFileName(c.DB, c.Coll)
+			href := "/api/v1/tasks/" + task.ID + "/mongodiff/" + name
+			fmt.Fprintf(&sb, `<div>字段级差异文档 <span class="num c-brand">%d</span> 条<a class="mc-diff-dl" href="%s">下载差异明细 (ndjson)</a></div>`, diffN, mcHTMLEsc(href))
+			sb.WriteString(mcDiffPreviewHTML(diffDir, name))
 		} else if diffN == 0 {
 			sb.WriteString(`<div>字段级差异文档 <span class="num c-teal">0</span> 条</div>`)
 		}
@@ -416,5 +442,91 @@ func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongo
 	sb.WriteString(`<div class="footer">由 TiMS (TiDB Migration Suite) 生成 · MongoDB 一致性对比 · `)
 	sb.WriteString(mcHTMLEsc(time.Now().Format("2006-01-02 15:04:05")))
 	sb.WriteString(`</div></div></body></html>`)
+	return sb.String()
+}
+
+// mcDiffPreviewMax caps the inline diff preview (unit-12 C): the ndjson
+// artifact can be huge; the preview shows the first 50 records and defers
+// the rest to the download.
+const mcDiffPreviewMax = 50
+
+// mcDiffTypeCN maps the engine's DocDelta type onto the report's Chinese
+// vocabulary (schemaCheckLabel twin words) and its badge class (diff
+// borrows warn, target-missing is the data-loss red, source-missing the
+// muted grey — compareOverallMeta color logic).
+func mcDiffTypeCN(t string) string {
+	switch t {
+	case "modified":
+		return "内容有差异"
+	case "missing-in-target":
+		return "目标端缺失"
+	case "missing-in-source":
+		return "源端缺失"
+	default:
+		return t
+	}
+}
+
+func mcDiffTypeBadge(t string) string {
+	switch t {
+	case "modified":
+		return "badge-warn"
+	case "missing-in-target":
+		return "badge-fail"
+	default:
+		return "badge-skip"
+	}
+}
+
+// mcDiffPreviewHTML renders the zero-JS inline preview of one collection's
+// diff ndjson: the first mcDiffPreviewMax records inside a native
+// <details>/<summary> block (_id / type / diff-field keys). Any open or
+// read failure degrades to no preview — the download link stays and a
+// preview failure must never break the page (unit-12 C).
+func mcDiffPreviewHTML(diffDir, name string) string {
+	if diffDir == "" {
+		return ""
+	}
+	f, err := os.Open(filepath.Join(diffDir, name))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	var rows []mongocompare.DocDelta
+	truncated := false
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		if len(rows) >= mcDiffPreviewMax {
+			truncated = true
+			break
+		}
+		var d mongocompare.DocDelta
+		if err := json.Unmarshal(line, &d); err != nil {
+			continue // malformed line: skipped, never breaks the page
+		}
+		rows = append(rows, d)
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString(`<details class="mc-diff-preview"><summary>差异明细预览</summary><table class="mc-diff-table"><thead><tr><th>_id</th><th>类型</th><th>差异字段</th></tr></thead><tbody>`)
+	for _, d := range rows {
+		keys := make([]string, 0, len(d.Fields))
+		for _, fl := range d.Fields {
+			keys = append(keys, fl.Key)
+		}
+		fmt.Fprintf(&sb, `<tr><td class="num">%s</td><td><span class="badge %s">%s</span></td><td>%s</td></tr>`,
+			mcHTMLEsc(fmt.Sprint(d.ID)), mcHTMLEsc(mcDiffTypeBadge(d.Type)), mcHTMLEsc(mcDiffTypeCN(d.Type)), mcHTMLEsc(strings.Join(keys, ", ")))
+	}
+	sb.WriteString(`</tbody></table>`)
+	if truncated {
+		sb.WriteString(`<div class="mc-diff-more">仅预览前 50 条，全文请下载</div>`)
+	}
+	sb.WriteString(`</details>`)
 	return sb.String()
 }
