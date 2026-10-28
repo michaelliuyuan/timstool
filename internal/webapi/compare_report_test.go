@@ -106,11 +106,21 @@ func mcReportSummary() *mongocompare.Summary {
 
 func mcReportGet(t *testing.T, s *Server, id, format string) *httptest.ResponseRecorder {
 	t.Helper()
+	return mcReportGetAt(t, s, id, format, "")
+}
+
+// mcReportGetAt is mcReportGet with an explicit request Host (unit-13: the
+// html report absolutizes the mongodiff download link against r.Host).
+func mcReportGetAt(t *testing.T, s *Server, id, format, host string) *httptest.ResponseRecorder {
+	t.Helper()
 	path := "/api/v1/tasks/" + id + "/report"
 	if format != "" {
 		path += "?format=" + format
 	}
 	req := withChiParam(httptest.NewRequest(http.MethodGet, path, nil), "taskID", id)
+	if host != "" {
+		req.Host = host
+	}
 	rec := httptest.NewRecorder()
 	s.handleTaskReport(rec, req)
 	return rec
@@ -549,20 +559,24 @@ func TestMongoDiffRouteServesArtifact(t *testing.T) {
 }
 
 // TestMongoDiffReportLinkBadgeAndDegrade: the diff>0 collection carries
-// exactly one download link (engine naming contract), zero/error rows stay
-// link-free, the version badge renders exactly once, an unreadable
-// artifact degrades to no preview without breaking the page, and every
-// new class carries a CSS rule (unit-11 P2 lesson).
+// exactly one download link absolutized against the request Host (unit-13),
+// with zero root-relative href residue; zero/error rows stay link-free, the
+// version badge renders exactly once, an unreadable artifact degrades to no
+// preview without breaking the page, and every new class carries a CSS rule
+// (unit-11 P2 lesson).
 func TestMongoDiffReportLinkBadgeAndDegrade(t *testing.T) {
 	s, _ := newTestServer(t)
 	id := mcReportFixture(t, s, mcReportSummary()) // no ndjson on disk
-	rec := mcReportGet(t, s, id, "html")
+	rec := mcReportGetAt(t, s, id, "html", "tims.example:8080")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d", rec.Code)
 	}
 	body := rec.Body.String()
-	if n := strings.Count(body, `href="/api/v1/tasks/mc14rep/mongodiff/shop__orders.ndjson"`); n != 1 {
-		t.Errorf("download link count=%d want 1 (exactly the diff>0 collection)", n)
+	if n := strings.Count(body, `href="http://tims.example:8080/api/v1/tasks/mc14rep/mongodiff/shop__orders.ndjson"`); n != 1 {
+		t.Errorf("absolute download link count=%d want 1 (exactly the diff>0 collection)", n)
+	}
+	if n := strings.Count(body, `href="/api/v1`); n != 0 {
+		t.Errorf("root-relative href residue count=%d want 0 (link must be absolute)", n)
 	}
 	if !strings.Contains(body, `>下载差异明细 (ndjson)</a>`) {
 		t.Error("download link anchor text missing")
@@ -573,10 +587,10 @@ func TestMongoDiffReportLinkBadgeAndDegrade(t *testing.T) {
 	if n := strings.Count(body, `class="mc-diff-preview"`); n != 0 {
 		t.Errorf("unreadable artifact must degrade to no preview block, got %d", n)
 	}
-	if n := strings.Count(body, "V3.19.37"); n != 1 {
-		t.Errorf("V3.19.37 badge count=%d want 1", n)
+	if n := strings.Count(body, "V3.19.38"); n != 1 {
+		t.Errorf("V3.19.38 badge count=%d want 1", n)
 	}
-	if strings.Contains(body, "V3.19.36") {
+	if strings.Contains(body, "V3.19.37") {
 		t.Error("stale version rendered")
 	}
 	for _, rule := range []string{
@@ -589,6 +603,25 @@ func TestMongoDiffReportLinkBadgeAndDegrade(t *testing.T) {
 		if !strings.Contains(body, rule) {
 			t.Errorf("preview CSS rule missing from style block: %q", rule)
 		}
+	}
+}
+
+// TestMongoDiffReportLinkRelativeFallback: the unit-13 base="" face (local
+// render/tests with no Host) degrades the download link honestly to the
+// root-relative form.
+func TestMongoDiffReportLinkRelativeFallback(t *testing.T) {
+	task := &store.Task{ID: "mc14rep", Name: "MC-14 fixture"}
+	spec := &compareTaskSpec{
+		Source:  compareEndpoint{Host: "src.example", Port: 27017, Database: "shop"},
+		Target:  compareEndpoint{Host: "dst.example", Port: 27018, Database: "shop2"},
+		Buckets: 64,
+	}
+	html := renderCompareReportHTML(task, spec, mcReportSummary(), "", "")
+	if n := strings.Count(html, `href="/api/v1/tasks/mc14rep/mongodiff/shop__orders.ndjson"`); n != 1 {
+		t.Errorf("relative fallback link count=%d want 1", n)
+	}
+	if n := strings.Count(html, `href="http://`); n != 0 {
+		t.Errorf("absolute href count=%d want 0 on the base=\"\" face", n)
 	}
 }
 

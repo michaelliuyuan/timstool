@@ -32,7 +32,7 @@ import (
 // mcReportVersion is the mongocompare report renderer's own version stamp
 // (rendered once in the header meta grid, unit-12 D — the dcReportVersion
 // twin; the FE app version is an independent line).
-const mcReportVersion = "3.19.37"
+const mcReportVersion = "3.19.38"
 
 // mongoDiffFileName builds the engine-side diff artifact name for one
 // collection (writeDeltas twin: {db}__{coll}.ndjson, inner dots replaced)
@@ -82,7 +82,14 @@ func (s *Server) handleCompareTaskReport(w http.ResponseWriter, r *http.Request,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-report-%s.html", task.ID))
-	w.Write([]byte(renderCompareReportHTML(task, spec, sum, filepath.Join(s.dataDir, "compare", task.ID, "diff"))))
+	// unit-13: the download link is absolutized against the request Host so
+	// the saved offline report still points back at this server; an empty
+	// Host (local render/tests) degrades honestly to a relative href.
+	base := ""
+	if r.Host != "" {
+		base = "http://" + r.Host
+	}
+	w.Write([]byte(renderCompareReportHTML(task, spec, sum, base, filepath.Join(s.dataDir, "compare", task.ID, "diff"))))
 }
 
 // writeCompareSummaryError maps missing → 404 (cause named — MC-15: the
@@ -223,6 +230,7 @@ func countCheckLabel(m map[string]any) string {
 
 // renderCompareReportHTML builds the standalone offline HTML report. All
 // dynamic strings pass through mcHTMLEsc; numbers are formatted server-side.
+// base absolutizes the mongodiff download link ("" = relative degrade).
 // Mismatched-bucket drill-down lists at most 20 buckets per collection (an
 // adversarial 4096-bucket run must not produce a megabyte table row).
 // compareSpecWmOn reports whether the task's spec carries a watermark group
@@ -238,7 +246,7 @@ func compareSpecWmOn(spec *compareTaskSpec) bool {
 	return len(spec.TableWatermarks) > 0
 }
 
-func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongocompare.Summary, diffDir string) string {
+func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongocompare.Summary, base, diffDir string) string {
 	_, cn, overallClass := compareOverallMeta(sum.Overall)
 
 	var sb strings.Builder
@@ -411,9 +419,12 @@ func renderCompareReportHTML(task *store.Task, spec *compareTaskSpec, sum *mongo
 		if diffN > 0 {
 			// unit-12 B: the diff-count row now carries the download link
 			// (engine writeDeltas naming contract) plus the zero-JS inline
-			// preview; zero/error rows stay link-free.
+			// preview; zero/error rows stay link-free. unit-13: the href is
+			// absolutized against the request Host (base="" degrades to the
+			// root-relative form) so the saved offline report still points
+			// back at the server.
 			name := mongoDiffFileName(c.DB, c.Coll)
-			href := "/api/v1/tasks/" + task.ID + "/mongodiff/" + name
+			href := base + "/api/v1/tasks/" + task.ID + "/mongodiff/" + name
 			fmt.Fprintf(&sb, `<div>字段级差异文档 <span class="num c-brand">%d</span> 条<a class="mc-diff-dl" href="%s">下载差异明细 (ndjson)</a></div>`, diffN, mcHTMLEsc(href))
 			sb.WriteString(mcDiffPreviewHTML(diffDir, name))
 		} else if diffN == 0 {
