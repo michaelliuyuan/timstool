@@ -821,6 +821,21 @@ export const apiClient = {
   ddlExport: (body: Record<string, any>) =>
     api.post<Blob>('/ddl-export', body, { timeout: LONG_TIMEOUT, responseType: 'blob' }),
 
+  // DDL 对比 (ddlcompare): per-side schema probing + the synchronous run
+  // (both-side structure walk — long timeout) + history listing. Report
+  // downloads are plain GETs (no token — read routes), so they get URL
+  // helpers instead of axios calls.
+  ddlCompareSchemas: (side: 'source' | 'target', ref: string) =>
+    api.post<{ schemas: string[] }>('/ddl-compare/schemas', { side, ref }, { timeout: LONG_TIMEOUT }),
+
+  ddlCompareRun: (body: Record<string, any>) =>
+    api.post<{ task_id: string; result: any }>('/ddl-compare', body, { timeout: LONG_TIMEOUT }),
+
+  ddlCompareTasks: () => api.get<{ tasks: any[] }>('/ddl-compare/tasks'),
+
+  ddlCompareReportURL: (id: string, format: 'html' | 'json') =>
+    `/api/v1/ddl-compare/tasks/${id}/report?format=${format}`,
+
   // CDC monitoring/control (S1-UI-08: migrated off raw fetch). precheck
   // probes PG slot/publication server-side — extended timeout.
   cdcStatus: () => api.get('/cdc/status'),

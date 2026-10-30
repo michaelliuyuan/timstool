@@ -1,4 +1,4 @@
-﻿// watermark_suggest_mongo_test.go anchors the mongo watermark candidate
+// watermark_suggest_mongo_test.go anchors the mongo watermark candidate
 // catalog (mongo 水位列自动发现单) offline: type mapping, index-prefix
 // detection, sample histogram, the $exists probe-back, view/system
 // exclusion, and the shared-scorer integration (utime 更新系 after the
@@ -37,8 +37,8 @@ func (it *wmFakeIter) Next(ctx context.Context) bool {
 	it.i++
 	return true
 }
-func (it *wmFakeIter) Doc() bson.D            { return it.docs[it.i-1] }
-func (it *wmFakeIter) Err() error             { return it.err }
+func (it *wmFakeIter) Doc() bson.D                     { return it.docs[it.i-1] }
+func (it *wmFakeIter) Err() error                      { return it.err }
 func (it *wmFakeIter) Close(ctx context.Context) error { return nil }
 
 type wmFakeColl struct {
@@ -123,8 +123,8 @@ func (f *wmFakeClient) ListCollectionNameTypes(ctx context.Context, database str
 	return out, nil
 }
 func (f *wmFakeClient) Collection(database, coll string) mongoconn.Coll { return f.colls[coll] }
-func (f *wmFakeClient) Driver() string                                 { return "fake" }
-func (f *wmFakeClient) Disconnect(ctx context.Context) error           { return nil }
+func (f *wmFakeClient) Driver() string                                  { return "fake" }
+func (f *wmFakeClient) Disconnect(ctx context.Context) error            { return nil }
 
 // doc builds one bson.D from field/value pairs (keeps nested literals sane).
 func doc(kv ...any) bson.D {
@@ -171,11 +171,11 @@ func TestWmMongoRepTypeMajorityAndTimeTiebreak(t *testing.T) {
 
 func TestWmMongoIndexedFieldsPrefixNumericOnly(t *testing.T) {
 	specs := []source.IndexInfo{
-		{Name: "ut", Keys: []source.IndexKey{{Field: "utime", Order: int32(1)}}},                                                                // single
-		{Name: "cmp", Keys: []source.IndexKey{{Field: "utime", Order: int32(-1)}, {Field: "user", Order: int32(1)}}},                            // compound prefix
-		{Name: "txt", Keys: []source.IndexKey{{Field: "body", Order: "text"}}},                                                                  // text never ranges
-		{Name: "hsh", Keys: []source.IndexKey{{Field: "uid", Order: "hashed"}}},                                                                 // hashed never ranges
-		{Name: "sec", Keys: []source.IndexKey{{Field: "x", Order: int32(1)}, {Field: "user", Order: int32(1)}}},                                 // user only SECOND key: not a prefix
+		{Name: "ut", Keys: []source.IndexKey{{Field: "utime", Order: int32(1)}}},                                     // single
+		{Name: "cmp", Keys: []source.IndexKey{{Field: "utime", Order: int32(-1)}, {Field: "user", Order: int32(1)}}}, // compound prefix
+		{Name: "txt", Keys: []source.IndexKey{{Field: "body", Order: "text"}}},                                       // text never ranges
+		{Name: "hsh", Keys: []source.IndexKey{{Field: "uid", Order: "hashed"}}},                                      // hashed never ranges
+		{Name: "sec", Keys: []source.IndexKey{{Field: "x", Order: int32(1)}, {Field: "user", Order: int32(1)}}},      // user only SECOND key: not a prefix
 	}
 	got := wmMongoIndexedFields(specs)
 	want := map[string]bool{"utime": true, "x": true} // x = sec's FIRST key; user (second key only) stays out
@@ -263,7 +263,7 @@ func TestWmMongoCollCatalogHistogramAndProbes(t *testing.T) {
 		c := &wmFakeColl{
 			docs: []bson.D{doc("更新时间", dt, "a.b", dt, "$x", int64(1), "utime", dt)},
 			specs: []source.IndexInfo{
-				{Keys: []source.IndexKey{{Field: "$**", Order: int32(1)}}},   // wildcard: must be skipped, never probed
+				{Keys: []source.IndexKey{{Field: "$**", Order: int32(1)}}},  // wildcard: must be skipped, never probed
 				{Keys: []source.IndexKey{{Field: "更新时间", Order: int32(1)}}}, // non-ASCII key: outside the identifier gate
 			},
 		}

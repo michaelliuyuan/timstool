@@ -337,6 +337,16 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 			// Source DDL export (F-01): schema listing + zip download
 			// Standalone comparison (独立数据比对): run the validator against
 			// explicit connections without migrating; own task namespace.
+			// DDL 对比校验: synchronous structural compare with its own
+			// task namespace (history reads here; runs live in the 120s
+			// group below).
+			r.Get("/ddl-compare/tasks", s.handleListDDLCompares)
+			r.Route("/ddl-compare/tasks/{dcID}", func(r chi.Router) {
+				// {dcID} allow-list gate (compareIDRe twin): a non-
+				// conforming id 404s before any filesystem touch.
+				r.Use(s.requireValidDDLCompareID)
+				r.Get("/report", s.handleDDLCompareReport)
+			})
 			r.Post("/compare/tasks", s.handleCreateCompare)
 			r.Get("/compare/options", s.handleGetCompareOptions)
 			r.Put("/compare/options", s.handlePutCompareOptions)
@@ -399,6 +409,10 @@ func NewServer(store *store.Store, host string, port int, dataDir string, static
 			r.Post("/assess", s.handleAssess)
 			r.Post("/ddl-export/schemas", s.handleDDLSchemas)
 			r.Post("/ddl-export", s.handleDDLExport)
+			// DDL 对比: schema probing + the synchronous run (structure
+			// queries are light; the 120s deadline governs — F-10 ruling).
+			r.Post("/ddl-compare/schemas", s.handleDDLCompareSchemas)
+			r.Post("/ddl-compare", s.handleDDLCompareRun)
 			r.Get("/cdc/precheck", s.handleCDCPrecheck)
 			r.Post("/cdc/replica-identity", s.auditCDCOp("cdc.replica_identity", s.handleCDCReplicaIdentity))
 		})

@@ -48,7 +48,7 @@ func rowsByColl(s *Summary) map[string]CollectionResult {
 func TestCollSelectWhitelistGatesBothSides(t *testing.T) {
 	src, dst := collSelectFixture()
 	s, err := CompareDatabases(context.Background(), src, dst, "sdb", "ddb", Config{
-		Levels:         []Level{LevelSchema},
+		Levels:          []Level{LevelSchema},
 		OnlyCollections: []string{"c1"},
 	})
 	if err != nil {
@@ -79,7 +79,7 @@ func TestCollSelectWhitelistGatesBothSides(t *testing.T) {
 func TestCollSelectDriftDisclosure(t *testing.T) {
 	src, dst := collSelectFixture()
 	s, err := CompareDatabases(context.Background(), src, dst, "sdb", "ddb", Config{
-		Levels:         []Level{LevelSchema},
+		Levels:          []Level{LevelSchema},
 		OnlyCollections: []string{"c1", "ghost"},
 	})
 	if err != nil {
@@ -103,7 +103,7 @@ func TestCollSelectNoneMatchedFailsLoudly(t *testing.T) {
 	for _, cols := range [][]string{{"ghost"}, {"sv"}, {"ghost", "sv2"}} {
 		src, dst := collSelectFixture()
 		_, err := CompareDatabases(context.Background(), src, dst, "sdb", "ddb", Config{
-			Levels:         []Level{LevelSchema},
+			Levels:          []Level{LevelSchema},
 			OnlyCollections: cols,
 		})
 		if err == nil {
@@ -121,7 +121,7 @@ func TestCollSelectNoneMatchedFailsLoudly(t *testing.T) {
 func TestCollSelectSelectedViewDisclosed(t *testing.T) {
 	src, dst := collSelectFixture()
 	s, err := CompareDatabases(context.Background(), src, dst, "sdb", "ddb", Config{
-		Levels:         []Level{LevelSchema},
+		Levels:          []Level{LevelSchema},
 		OnlyCollections: []string{"c1", "sv"},
 	})
 	if err != nil {

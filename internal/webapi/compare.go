@@ -46,13 +46,13 @@ type CompareTaskRequest struct {
 	Mode              string                  `json:"mode"`       // quick | sample | checksum (= watermark.base_mode when watermark active)
 	SampleRatio       float64                 `json:"sample_ratio"`
 	ChecksumChunkSize int64                   `json:"checksum_chunk_size"`
-	ChecksumParallel  int                     `json:"checksum_parallel"`        // deprecated (#t4): kept for compat, folded into Concurrency
-	Parallel          int                     `json:"parallel"`                 // deprecated (#t4): kept for compat, folded into Concurrency
-	Concurrency       int                     `json:"concurrency"`              // #t4 unified budget 1-8 (0 = derive from legacy knobs)
-	Tables            []string                  `json:"tables"`                   // empty = all tables
-	Watermark         *config.WatermarkFilter   `json:"watermark,omitempty"`      // #t3 optional filter group
-	TableWatermarks   []config.TableWatermark   `json:"table_watermarks,omitempty"` // #wm-override per-table filters (P1A)
-	IgnoreColumns     []string                  `json:"ignore_columns,omitempty"` // #ignore value-comparison exclusion list
+	ChecksumParallel  int                     `json:"checksum_parallel"`          // deprecated (#t4): kept for compat, folded into Concurrency
+	Parallel          int                     `json:"parallel"`                   // deprecated (#t4): kept for compat, folded into Concurrency
+	Concurrency       int                     `json:"concurrency"`                // #t4 unified budget 1-8 (0 = derive from legacy knobs)
+	Tables            []string                `json:"tables"`                     // empty = all tables
+	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`        // #t3 optional filter group
+	TableWatermarks   []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override per-table filters (P1A)
+	IgnoreColumns     []string                `json:"ignore_columns,omitempty"`   // #ignore value-comparison exclusion list
 }
 
 // CompareTask is the persisted (password-redacted) compare task state.
@@ -68,10 +68,10 @@ type CompareTask struct {
 	ChecksumParallel  int                     `json:"checksum_parallel"` // deprecated (#t4)
 	Parallel          int                     `json:"parallel"`          // deprecated (#t4)
 	Concurrency       int                     `json:"concurrency"`       // #t4 unified budget (effective value, 0 = auto)
-	Tables            []string                  `json:"tables"`
-	Watermark         *config.WatermarkFilter   `json:"watermark,omitempty"`
-	TableWatermarks   []config.TableWatermark   `json:"table_watermarks,omitempty"` // #wm-override per-table filters
-	IgnoreColumns     []string                  `json:"ignore_columns,omitempty"`
+	Tables            []string                `json:"tables"`
+	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`
+	TableWatermarks   []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override per-table filters
+	IgnoreColumns     []string                `json:"ignore_columns,omitempty"`
 	TablesDone        int                     `json:"tables_done"`
 	TablesTotal       int                     `json:"tables_total"`
 	CurrentTable      string                  `json:"current_table,omitempty"`
@@ -182,12 +182,12 @@ type compareOptionsBody struct {
 	Mode              string                  `json:"mode"`
 	SampleRatio       float64                 `json:"sample_ratio"`
 	ChecksumChunkSize int64                   `json:"checksum_chunk_size"`
-	ChecksumParallel  int                     `json:"checksum_parallel"`        // deprecated (#t4)
-	Parallel          int                     `json:"parallel"`                 // deprecated (#t4)
-	Concurrency       int                     `json:"concurrency"`              // #t4 present-and-0 clears to auto
-	Watermark         *config.WatermarkFilter   `json:"watermark,omitempty"`      // present-and-null clears
-	IgnoreColumns     []string                  `json:"ignore_columns,omitempty"` // #ignore present-and-empty clears
-	TableWatermarks   []config.TableWatermark   `json:"table_watermarks,omitempty"` // #wm-override present-and-empty clears
+	ChecksumParallel  int                     `json:"checksum_parallel"`          // deprecated (#t4)
+	Parallel          int                     `json:"parallel"`                   // deprecated (#t4)
+	Concurrency       int                     `json:"concurrency"`                // #t4 present-and-0 clears to auto
+	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`        // present-and-null clears
+	IgnoreColumns     []string                `json:"ignore_columns,omitempty"`   // #ignore present-and-empty clears
+	TableWatermarks   []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override present-and-empty clears
 }
 
 // normalizeWatermarkFilter validates and canonicalizes a watermark filter

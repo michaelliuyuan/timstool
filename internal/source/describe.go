@@ -86,6 +86,25 @@ func IsMongoDB(kind string) bool {
 	return err == nil && k == "mongodb"
 }
 
+// IsMySQLWire reports whether the (normalized) kind speaks the MySQL
+// client protocol (mysql, tidb) — the registry home for that truth, same
+// five-pin #3 discipline. Consumers so far: the DDL-compare target-side
+// eligibility gate and the collector dialect dispatch (mysql-family walk
+// vs the pg_catalog walk); callers must not re-branch on the raw string.
+func IsMySQLWire(kind string) bool {
+	k, err := NormalizeKind(kind)
+	return err == nil && (k == "mysql" || k == "tidb")
+}
+
+// IsTiDB reports whether the (normalized) kind is tidb (IsMongoDB twin;
+// registry home for the kind truth). Consumer: the DDL-compare
+// tidb_enable_procedure operational hint, which only applies to a TiDB
+// target.
+func IsTiDB(kind string) bool {
+	k, err := NormalizeKind(kind)
+	return err == nil && k == "tidb"
+}
+
 // Capable reports whether the (normalized) source kind has the capability bit
 // set. It is the single truth for UI greying and backend 400 double-guarding;
 // callers must not branch on the raw type string themselves.

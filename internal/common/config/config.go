@@ -133,7 +133,7 @@ type WatermarkFilter struct {
 // ..., value: ...}); BaseMode inside an override entry is ignored — the
 // task-level base algorithm always applies.
 type TableWatermark struct {
-	Table string `yaml:"table" json:"table"`
+	Table           string `yaml:"table" json:"table"`
 	WatermarkFilter `yaml:",inline" json:",inline"`
 }
 

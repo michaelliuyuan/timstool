@@ -214,6 +214,35 @@ func isExcluded(line string) bool {
 	return false
 }
 
+func TestIsMySQLWireAndIsTiDB(t *testing.T) {
+	// IsMySQLWire (DDL-compare target gate + collector dispatch): mysql
+	// and tidb speak the wire; postgres/mongodb don't; the legacy empty
+	// kind normalizes to postgres.
+	for _, k := range []string{"mysql", "tidb"} {
+		if !source.IsMySQLWire(k) {
+			t.Errorf("IsMySQLWire(%q) = false; want true", k)
+		}
+	}
+	for _, k := range []string{"postgres", "mongodb", ""} {
+		if source.IsMySQLWire(k) {
+			t.Errorf("IsMySQLWire(%q) = true; want false", k)
+		}
+	}
+	// IsTiDB (tidb_enable_procedure hint gate).
+	if !source.IsTiDB("tidb") {
+		t.Error(`IsTiDB("tidb") = false; want true`)
+	}
+	for _, k := range []string{"mysql", "postgres", "mongodb", ""} {
+		if source.IsTiDB(k) {
+			t.Errorf("IsTiDB(%q) = true; want false", k)
+		}
+	}
+	// Unknown kinds resolve false on both, never error out.
+	if source.IsMySQLWire("oracle") || source.IsTiDB("oracle") {
+		t.Error("unknown kind must resolve false on both predicates")
+	}
+}
+
 func TestTypeBranchFrozenBaseline(t *testing.T) {
 	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {

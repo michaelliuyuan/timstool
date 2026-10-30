@@ -65,6 +65,7 @@ const navSections = computed(() => {
         { path: '/mongocompare/new', label: 'MongoDB 对比', icon: 'Switch' },
         { path: '/assess', label: '兼容评估', icon: 'DataAnalysis' },
         { path: '/ddl-export', label: 'DDL 导出', icon: 'Download' },
+        { path: '/ddl-compare', label: 'DDL 对比', icon: 'Document' },
       ],
     },
     { label: '数据同步', items: syncItems },

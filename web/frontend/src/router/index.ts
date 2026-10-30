@@ -62,6 +62,12 @@ const router = createRouter({
       meta: { title: 'DDL 导出' },
     },
     {
+      path: '/ddl-compare',
+      name: 'DDLCompare',
+      component: () => import('../views/DdlCompareView.vue'),
+      meta: { title: 'DDL 对比' },
+    },
+    {
       path: '/incremental',
       name: 'Incremental',
       component: () => import('../views/IncrementalView.vue'),
