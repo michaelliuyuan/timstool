@@ -184,3 +184,42 @@ describe('B 二期: 只读红线与护栏', () => {
     expect(s).toContain('.pl-svg { min-width: 720px; }')
   })
 })
+
+// B 三期拓扑微调（刘源 21:08 点单 ④⑤⑥）：浮层披露归并名 / 焦点闭环 /
+// 失败 chip 悬浮拆分（DDL 结论失败仅 tooltip，不进计数）。
+describe('B 三期: 浮层披露④ + 焦点闭环⑤ + 失败 chip 悬浮拆分⑥', () => {
+  it('④ 同主机归并披露：merged 名单入 PlNode，浮层加行「同主机数据源」（空则不渲染）', () => {
+    const s = src('PipelineView.vue')
+    expect(s).toContain(`merged: string[]`)
+    expect(s).toContain(`n.merged.push(name)`)
+    expect(s).toContain(`v-if="openNode.merged.length"`)
+    expect(s).toContain(`<span>同主机数据源</span>`)
+    expect(s).toContain(`{{ openNode.merged.join('，') }}`)
+  })
+
+  it('⑤ 焦点闭环：开浮层焦点入层（tabindex=-1 + focus），关闭归位来源节点 g', () => {
+    const s = src('PipelineView.vue')
+    expect(s).toContain(`ref="popEl"`)
+    expect(s).toContain(`tabindex="-1"`)
+    expect(s).toContain(`const popTrigger = ref<SVGGElement | null>(null)`)
+    expect(s).toContain(`popTrigger.value = e.currentTarget as SVGGElement`)
+    expect(s).toContain(`if (n) nextTick(() => popEl.value?.focus())`)
+    expect(s).toContain(`popTrigger.value.focus()`)
+    // 关闭通道原样：Esc 闸 + 点外 overlay（watch 统一归位焦点）。
+    expect(s).toContain(`if (e.key === 'Escape') openNode.value = null`)
+    expect(s).toContain(`class="pl-overlay" @click="openNode = null"`)
+  })
+
+  it('⑥ 失败 chip 悬浮拆分：值维持任务态 13 口径，DDL 结论失败仅 tooltip 披露', () => {
+    const s = src('PipelineView.vue')
+    expect(s).toContain(`:disabled="c.key !== 'failed'"`)
+    expect(s).toContain(`:content="failedChipTip"`)
+    expect(s).toContain(`const ddlFailCount = computed(() => ddlTasks.value.filter(isDdlFailed).length)`)
+    expect(s).toContain(`任务执行失败 · `)
+    expect(s).toContain(`DDL 对比结论失败`)
+    // 负锚（裁决①不回归）：chip 计数仍单行任务态，DDL 合算形态全源退场。
+    expect(s).toContain(`const failCount = computed(() => tasks.value.filter((t) => t.status === 'failed').length)`)
+    expect(s).not.toContain(`tasks.value.filter((t) => t.status === 'failed').length +`)
+    expect(s).not.toContain(`ddlTasks.value.filter((t) => t.overall === 'fail' || t.status === 'failed').length`)
+  })
+})

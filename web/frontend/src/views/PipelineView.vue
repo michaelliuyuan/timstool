@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import apiClient from '../api'
 import type { DataSource, Task } from '../api'
@@ -91,6 +91,7 @@ interface PlNode {
   tgtCount: number
   inEdges: number
   failed: number
+  merged: string[]
   schemas: Set<string>
   latest: any | null
   lastTestOk?: boolean
@@ -136,9 +137,13 @@ const graph = computed<{ nodeList: PlNode[]; edges: PlEdge[]; canvasH: number }>
         column: 'source', asSource: false, asTarget: false,
         x: 0, y: 0, w: 220, h: 80,
         srcCount: 0, tgtCount: 0, inEdges: 0, failed: 0,
-        schemas: new Set<string>(), latest: null,
+        merged: [], schemas: new Set<string>(), latest: null,
       }
       nodes.set(host, n)
+    } else if (!virtual) {
+      // B 三期④：同 host 后续登记的数据源并入首节点——名字留在 merged，
+      // 由浮层「同主机数据源」行披露，host 归并不丢信息。
+      n.merged.push(name)
     }
     return n
   }
@@ -298,6 +303,11 @@ const chips = computed(() => [
   { key: 'failed', label: '失败任务', value: failCount.value, to: '/tasks', tone: 'red' },
 ])
 
+// B 三期⑥ 失败 chip 悬浮拆分：chip 值维持任务态口径（裁决① 13），DDL 结论
+// 失败数仅经 tooltip 披露（复用 isDdlFailed 谓词，不进任何 chip 计数）。
+const ddlFailCount = computed(() => ddlTasks.value.filter(isDdlFailed).length)
+const failedChipTip = computed(() => `${failCount.value} 任务执行失败 · ${ddlFailCount.value} DDL 对比结论失败`)
+
 // ---- 浮层 ----
 const ddlVerdictText = (v?: string) =>
   v === 'pass' ? '通过' : v === 'hint' ? '提示' : v === 'warn' ? '警告' : v === 'fail' ? '失败' : '—'
@@ -312,6 +322,19 @@ const latestClass = (n: PlNode) =>
         : 'is-pass'
     : ''
 const connText = (n: PlNode) => (n.lastTestOk ? '正常' : n.lastTested ? '异常' : '—')
+
+// B 三期⑤ 焦点闭环：开浮层 → 焦点移入浮层；关闭（Esc/点外/切换节点）→
+// 焦点归位来源节点 g（tabindex=0 在位），键盘链路完整。
+const popEl = ref<HTMLElement | null>(null)
+const popTrigger = ref<SVGGElement | null>(null)
+const openPop = (n: PlNode, e: Event) => {
+  popTrigger.value = e.currentTarget as SVGGElement
+  openNode.value = n
+}
+watch(openNode, (n) => {
+  if (n) nextTick(() => popEl.value?.focus())
+  else if (popTrigger.value) popTrigger.value.focus()
+})
 
 function fmtTime(s?: string): string {
   if (!s) return '-'
@@ -341,17 +364,23 @@ const popStyle = computed(() => {
       </template>
     </PageHeader>
 
-    <!-- ① 顶部汇总条：6 chips，点击跳对应页 -->
+    <!-- ① 顶部汇总条：6 chips，点击跳对应页（失败 chip 悬浮拆分披露 B 三期⑥） -->
     <div class="pl-chips" data-testid="pl-chips">
-      <button
+      <el-tooltip
         v-for="c in chips"
         :key="c.key"
-        class="pl-chip"
-        :data-testid="`pl-chip-${c.key}`"
-        @click="router.push(c.to)"
+        :disabled="c.key !== 'failed'"
+        :content="failedChipTip"
+        placement="top"
       >
-        {{ c.label }}<b class="tims-num" :class="c.tone">{{ c.value }}</b>
-      </button>
+        <button
+          class="pl-chip"
+          :data-testid="`pl-chip-${c.key}`"
+          @click="router.push(c.to)"
+        >
+          {{ c.label }}<b class="tims-num" :class="c.tone">{{ c.value }}</b>
+        </button>
+      </el-tooltip>
     </div>
 
     <!-- ② 拓扑画布：SVG 左源右目 + 贝塞尔连线 + 节点浮层 -->
@@ -410,9 +439,9 @@ const popStyle = computed(() => {
               role="button"
               :data-testid="`pl-node-${n.key}`"
               :aria-label="`${n.name}（${typeLabel(n.type)}），查看节点详情`"
-              @click="openNode = n"
-              @keydown.enter.prevent="openNode = n"
-              @keydown.space.prevent="openNode = n"
+              @click="openPop(n, $event)"
+              @keydown.enter.prevent="openPop(n, $event)"
+              @keydown.space.prevent="openPop(n, $event)"
             >
               <rect class="pl-node-card" :x="n.x" :y="n.y" :width="n.w" :height="n.h" rx="10" />
               <rect
@@ -439,9 +468,17 @@ const popStyle = computed(() => {
             </g>
           </svg>
 
-          <!-- 点外关闭（透明覆盖层）+ 节点详情浮层 -->
+          <!-- 点外关闭（透明覆盖层）+ 节点详情浮层（焦点闭环 B 三期⑤：入层/归位） -->
           <div v-if="openNode" class="pl-overlay" @click="openNode = null"></div>
-          <div v-if="openNode" class="pl-pop" :class="{ 'pl-pop--flip': openNode.column === 'target' }" data-testid="pl-pop" :style="popStyle">
+          <div
+            v-if="openNode"
+            ref="popEl"
+            tabindex="-1"
+            class="pl-pop"
+            :class="{ 'pl-pop--flip': openNode.column === 'target' }"
+            data-testid="pl-pop"
+            :style="popStyle"
+          >
             <h4>{{ openNode.name }} · {{ typeLabel(openNode.type) }}</h4>
             <div class="pl-pop-row">
               <span>DDL 对比（源端）</span>
@@ -450,6 +487,10 @@ const popStyle = computed(() => {
             <div class="pl-pop-row">
               <span>最近 DDL 对比</span>
               <b :class="latestClass(openNode)">{{ latestText(openNode) }}</b>
+            </div>
+            <div v-if="openNode.merged.length" class="pl-pop-row">
+              <span>同主机数据源</span>
+              <b>{{ openNode.merged.join('，') }}</b>
             </div>
             <div v-if="!openNode.virtual" class="pl-pop-row">
               <span>连接测试</span>

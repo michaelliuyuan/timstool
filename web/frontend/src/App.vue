@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 
 const router = useRouter()
@@ -87,6 +87,40 @@ const navSections = computed(() => {
 const isActive = (path: string) =>
   path === '/' ? route.path === '/' : route.path === path || route.path.startsWith(path + '/')
 
+// B3 可折叠分组（刘源 21:08 点单）：组头可点折叠（button 语义，原生 Enter/Space
+// 触发 click）+ 计数徽章 + 箭头旋转过渡；默认全展开=原行为；折叠态 localStorage
+// 持久化；路由进入已折叠组自动展开——活动项必须可见。
+const NAV_COLLAPSE_KEY = 'tims-nav-collapse'
+const collapsed = ref<Record<string, boolean>>({})
+try {
+  const saved = JSON.parse(localStorage.getItem(NAV_COLLAPSE_KEY) || '{}')
+  if (saved && typeof saved === 'object') collapsed.value = saved
+} catch {
+  // 存储损坏回落全展开（默认态）
+}
+function persistCollapse() {
+  try {
+    localStorage.setItem(NAV_COLLAPSE_KEY, JSON.stringify(collapsed.value))
+  } catch {
+    // 隐私模式等写失败：仅本会话内生效
+  }
+}
+const toggleGroup = (label: string) => {
+  collapsed.value = { ...collapsed.value, [label]: !collapsed.value[label] }
+  persistCollapse()
+}
+watch(
+  () => route.path,
+  () => {
+    const sec = navSections.value.find((s) => s.items.some((i) => isActive(i.path)))
+    if (sec && collapsed.value[sec.label]) {
+      collapsed.value = { ...collapsed.value, [sec.label]: false }
+      persistCollapse()
+    }
+  },
+  { immediate: true },
+)
+
 // v3.20 方案A：浅色顶栏面包屑「工作台 / 当前页」，当前页取路由 meta.title；
 // 工作台自身（/）只有一级，不重复渲染第二级。
 const crumbTitle = computed(() => {
@@ -103,18 +137,30 @@ const crumbTitle = computed(() => {
         <span class="tims-logo-sub">迁移工作台</span>
       </div>
       <nav class="tims-nav">
-        <template v-for="section in navSections" :key="section.label || 'main'">
-          <div class="tims-nav-group">{{ section.label }}</div>
+        <template v-for="(section, si) in navSections" :key="section.label || 'main'">
           <button
-            v-for="item in section.items"
-            :key="item.path"
-            class="tims-nav-item"
-            :class="{ 'is-active': isActive(item.path) }"
-            @click="router.push(item.path)"
+            type="button"
+            class="tims-nav-group"
+            :aria-expanded="!collapsed[section.label]"
+            :aria-controls="`tims-nav-gp-${si}`"
+            @click="toggleGroup(section.label)"
           >
-            <el-icon :size="18"><component :is="item.icon" /></el-icon>
-            <span class="tims-nav-label">{{ item.label }}</span>
+            <span class="tims-nav-group-label">{{ section.label }}</span>
+            <span class="tims-nav-count" aria-hidden="true">{{ section.items.length }}</span>
+            <span class="tims-nav-arrow" :class="{ 'is-collapsed': collapsed[section.label] }" aria-hidden="true">▾</span>
           </button>
+          <div class="tims-nav-items" :id="`tims-nav-gp-${si}`" v-show="!collapsed[section.label]">
+            <button
+              v-for="item in section.items"
+              :key="item.path"
+              class="tims-nav-item"
+              :class="{ 'is-active': isActive(item.path) }"
+              @click="router.push(item.path)"
+            >
+              <el-icon :size="18"><component :is="item.icon" /></el-icon>
+              <span class="tims-nav-label">{{ item.label }}</span>
+            </button>
+          </div>
         </template>
       </nav>
     </aside>
@@ -198,19 +244,60 @@ const crumbTitle = computed(() => {
 }
 .tims-nav::-webkit-scrollbar { width: 4px; }
 .tims-nav::-webkit-scrollbar-thumb { background: var(--tims-border-ink); border-radius: 2px; }
+/* B3：组头升级为可点折叠按钮（原静态分组标题；布局=圆点+标签+计数徽章+箭头）。 */
 .tims-nav-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
   margin: 22px 8px 10px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font: inherit;
   font-size: 11px;
   letter-spacing: 1.5px;
   color: var(--tims-text-inv-2);
   opacity: 0.65;
   white-space: nowrap;
+  text-align: left;
+  cursor: pointer;
+}
+.tims-nav-group:hover { opacity: 0.9; }
+.tims-nav-group-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+/* 计数徽章：弱化样式（组内项数，仅宽屏折叠形态披露）。 */
+.tims-nav-count {
+  flex: none;
+  min-width: 16px;
+  height: 16px;
+  line-height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--tims-ink-3);
+  font-size: 10px;
+  letter-spacing: 0;
+  text-align: center;
+}
+/* 折叠箭头：展开 ▾ 朝下，折叠态旋转 -90° 朝右（过渡 0.15s）。 */
+.tims-nav-arrow {
+  flex: none;
+  font-size: 10px;
+  line-height: 1;
+  transition: transform 0.15s ease;
+}
+.tims-nav-arrow.is-collapsed { transform: rotate(-90deg); }
+/* B3：组内项容器（折叠 v-show 整组收纳；间距承接 nav gap 8px）。 */
+.tims-nav-items {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 /* B1.1 加档：组头分隔线退役，teal 4px 圆点替代（容器 opacity 下实收≈.59，
    样张 .75×.9≈.68 同档观感）。 */
 .tims-nav-group::before {
   content: '';
   display: inline-block;
+  flex: none;
   width: 4px;
   height: 4px;
   border-radius: 50%;
@@ -333,12 +420,18 @@ const crumbTitle = computed(() => {
   .tims-logo-sub { display: none; }
   .tims-nav-item { flex-direction: column; gap: 4px; padding: 10px 0; }
   .tims-nav-label { display: none; }
-  /* B1：窄轨组头居中，teal 圆点隐藏（标签隐藏逻辑不变）。 */
+  /* B1：窄轨组头居中，teal 圆点隐藏（标签隐藏逻辑不变）。B3：折叠不适用
+     图标轨——徽章/箭头隐藏，折叠残留的 v-show 内联 display 被 !important
+     压制，项目强制直显。 */
   .tims-nav-group {
+    justify-content: center;
     text-align: center;
     letter-spacing: 0.5px;
   }
   .tims-nav-group::before { display: none; }
+  .tims-nav-count { display: none; }
+  .tims-nav-arrow { display: none; }
+  .tims-nav-items { display: flex !important; }
   .tims-crumb-home { display: none; }
   .tims-crumb-sep { display: none; }
   .tims-workspace { padding: 14px; }
@@ -350,6 +443,7 @@ const crumbTitle = computed(() => {
   .tims-logo { padding: 10px 6px 10px; }
   .tims-nav { gap: 4px; }
   .tims-nav-group { margin: 14px 6px 6px; }
+  .tims-nav-items { gap: 4px; }
   .tims-nav-item { padding: 8px 12px; }
 }
 @media (max-height: 680px) and (min-width: 901px) {

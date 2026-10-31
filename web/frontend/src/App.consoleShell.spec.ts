@@ -189,3 +189,37 @@ describe('裁定②: hint 蓝收敛（info 回归灰档；hint=跨方言提示�
     expect(s).not.toContain('tims-tag-hint')
   })
 })
+
+// B3 可折叠分组（刘源 21:08 点单「B3+4/5/6」，leader 21:08 派单）：组头
+// button 化 + 计数徽章 + 箭头旋转；折叠态 localStorage 持久化；路由进入
+// 已折叠组自动展开；≤900 图标轨折叠不适用（徽章/箭头隐藏、项目强制直显）。
+describe('B3 侧栏可折叠分组', () => {
+  it('组头 button 化：aria-expanded + 计数徽章 + 折叠箭头旋转 + 整组 v-show 收纳', () => {
+    const s = src('App.vue')
+    expect(s).toContain(`type="button"`)
+    expect(s).toContain(`class="tims-nav-group"`)
+    expect(s).toContain(`:aria-expanded="!collapsed[section.label]"`)
+    expect(s).toContain(`:aria-controls="\`tims-nav-gp-\${si}\`"`)
+    expect(s).toContain(`@click="toggleGroup(section.label)"`)
+    expect(s).toContain(`{{ section.items.length }}`)
+    expect(s).toContain(`:class="{ 'is-collapsed': collapsed[section.label] }"`)
+    expect(s).toContain(`v-show="!collapsed[section.label]"`)
+    expect(s).toContain(`transform: rotate(-90deg);`)
+  })
+
+  it('折叠态 localStorage 持久化（tims-nav-collapse 单键 JSON，损坏回落全展开）', () => {
+    const s = src('App.vue')
+    expect(s).toContain(`const NAV_COLLAPSE_KEY = 'tims-nav-collapse'`)
+    expect(s).toContain(`localStorage.getItem(NAV_COLLAPSE_KEY)`)
+    expect(s).toContain(`localStorage.setItem(NAV_COLLAPSE_KEY, JSON.stringify(collapsed.value))`)
+  })
+
+  it('路由进入已折叠组自动展开（活动项必须可见）；rail 模式折叠不适用强制直显', () => {
+    const s = src('App.vue')
+    expect(s).toContain(`s.items.some((i) => isActive(i.path))`)
+    expect(s).toContain(`{ immediate: true },`)
+    expect(s).toContain(`.tims-nav-count { display: none; }`)
+    expect(s).toContain(`.tims-nav-arrow { display: none; }`)
+    expect(s).toContain(`.tims-nav-items { display: flex !important; }`)
+  })
+})
