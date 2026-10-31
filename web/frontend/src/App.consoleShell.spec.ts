@@ -217,9 +217,20 @@ describe('B3 侧栏可折叠分组', () => {
   it('路由进入已折叠组自动展开（活动项必须可见）；rail 模式折叠不适用强制直显', () => {
     const s = src('App.vue')
     expect(s).toContain(`s.items.some((i) => isActive(i.path))`)
-    expect(s).toContain(`{ immediate: true },`)
     expect(s).toContain(`.tims-nav-count { display: none; }`)
     expect(s).toContain(`.tims-nav-arrow { display: none; }`)
     expect(s).toContain(`.tims-nav-items { display: flex !important; }`)
+  })
+
+  // 差异①回归守卫（te 实证 / leader 21:27 裁决，FE 3.22.1）：整页刷新时
+  // useRoute() 初值是 START_LOCATION（path='/'）——自动展开首跑判定必须挂
+  // router.isReady() 就绪后；无 immediate 的 watch 管后续导航。旧形态
+  // `{ immediate: true }` 会在非概览路由 reload 时误展概览组并覆写持久化。
+  it('差异①守卫：初始路由判定挂 router.isReady()，无 immediate 瞬态误展', () => {
+    const s = src('App.vue')
+    expect(s).toContain(`const expandActiveGroup = () => {`)
+    expect(s).toContain(`router.isReady().then(expandActiveGroup)`)
+    expect(s).toContain(`watch(() => route.path, expandActiveGroup)`)
+    expect(s).not.toContain(`{ immediate: true }`)
   })
 })

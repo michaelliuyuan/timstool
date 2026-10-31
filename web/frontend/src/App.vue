@@ -109,17 +109,21 @@ const toggleGroup = (label: string) => {
   collapsed.value = { ...collapsed.value, [label]: !collapsed.value[label] }
   persistCollapse()
 }
-watch(
-  () => route.path,
-  () => {
-    const sec = navSections.value.find((s) => s.items.some((i) => isActive(i.path)))
-    if (sec && collapsed.value[sec.label]) {
-      collapsed.value = { ...collapsed.value, [sec.label]: false }
-      persistCollapse()
-    }
-  },
-  { immediate: true },
-)
+// 差异①修正（te 实证 / leader 21:27 裁决）：vue-router 4 初始导航完成前
+// useRoute() 处于 START_LOCATION（path='/'）瞬态，immediate 首跑会把概览组
+// 误判为活动组而展开并覆写持久化——自动展开的首跑判定改挂 router.isReady()
+// 就绪后执行；watch 只管后续 path 变化（无 immediate）。行为规格不变：
+// 刷新直落活动组仍自动展开该组（仅活动组）、SPA 导航进入折叠组自动展开、
+// 非活动组折叠态 reload 不丢不被覆写。
+const expandActiveGroup = () => {
+  const sec = navSections.value.find((s) => s.items.some((i) => isActive(i.path)))
+  if (sec && collapsed.value[sec.label]) {
+    collapsed.value = { ...collapsed.value, [sec.label]: false }
+    persistCollapse()
+  }
+}
+router.isReady().then(expandActiveGroup)
+watch(() => route.path, expandActiveGroup)
 
 // v3.20 方案A：浅色顶栏面包屑「工作台 / 当前页」，当前页取路由 meta.title；
 // 工作台自身（/）只有一级，不重复渲染第二级。
