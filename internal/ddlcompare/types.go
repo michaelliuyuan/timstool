@@ -26,13 +26,23 @@ type Verdict string
 
 const (
 	VerdictPass Verdict = "pass"
+	// VerdictHint is the v1.4 提示级: a dialect-inherent, low-importance
+	// difference disclosed for information (cross-dialect charset values,
+	// collation vocabularies, privilege vocabularies). It never drives a
+	// category or the overall conclusion toward failure — the overall
+	// aggregation skips hint categories entirely (user ruling 11:13:
+	// 「不应该设置为对比错误，可以加一个小的提示」).
+	VerdictHint Verdict = "hint"
 	VerdictWarn Verdict = "warn"
 	VerdictFail Verdict = "fail"
 )
 
-// Worst returns the harsher of two verdicts (fail > warn > pass).
+// Worst returns the harsher of two verdicts (fail > warn > hint > pass).
+// hint sits between pass and warn so a hinted table lifts its category to
+// hint (visible) without ever reaching warn/fail; an already-failed table
+// keeps the failure (Worst is monotone, never a downgrade).
 func Worst(a, b Verdict) Verdict {
-	rank := map[Verdict]int{VerdictPass: 0, VerdictWarn: 1, VerdictFail: 2}
+	rank := map[Verdict]int{VerdictPass: 0, VerdictHint: 1, VerdictWarn: 2, VerdictFail: 3}
 	if rank[a] >= rank[b] {
 		return a
 	}

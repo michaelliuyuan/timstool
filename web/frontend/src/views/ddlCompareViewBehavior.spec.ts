@@ -130,4 +130,55 @@ describe('ddlCompareView behavior (D3 empty-vs-empty)', () => {
     expect(w.text()).toContain('总体结论：失败')
     w.unmount()
   })
+
+  it('renders v1.4 hint (提示级) rows without failing the run (cross-dialect downgrade)', async () => {
+    // 跨方言固有差异（排序规则词汇表/权限词汇表）→ verdict=hint：提示级
+    // 徽标、结构不一致计数排除 hint、总体结论仍为通过。
+    const hinted = {
+      data: {
+        task_id: 'dchint1',
+        result: {
+          ...emptyRunResponse.data.result,
+          overall: 'pass',
+          categories: [
+            {
+              key: 'tables', label: '表', source_count: 2, target_count: 2, matched: 2, verdict: 'hint',
+              tables: [
+                { table: 'users', verdict: 'hint',
+                  pk_diff: { source: ['id'], target: ['id'], equal: true },
+                  collation_diff: { source: 'en_US.UTF-8', target: 'utf8mb4_bin', equal: false,
+                    note: '跨方言排序规则词汇表不相交，仅提示（不判错）' } },
+                { table: 'orders', verdict: 'pass' },
+              ],
+            },
+            { key: 'views', label: '视图', source_count: 0, target_count: 0, matched: 0, verdict: 'pass', names: {} },
+            { key: 'procedures', label: '存储过程', source_count: 0, target_count: 0, matched: 0, verdict: 'pass', names: {} },
+            { key: 'functions', label: '自定义函数', source_count: 0, target_count: 0, matched: 0, verdict: 'pass', names: {} },
+            { key: 'triggers', label: '触发器', source_count: 0, target_count: 0, matched: 0, verdict: 'pass', names: {} },
+            { key: 'sequences', label: '序列', source_count: 1, target_count: 1, matched: 1, verdict: 'pass',
+              names: { common: ['s1'] } },
+            { key: 'users', label: '用户', source_count: 1, target_count: 1, matched: 1, verdict: 'pass',
+              names: { common: ['app'] } },
+            { key: 'privileges', label: '权限', source_count: 1, target_count: 1, matched: 0, verdict: 'hint',
+              note: '跨方言权限词汇表不相交，不做结论',
+              privileges: { comparable: false, cross_dialect: true, users: [
+                { user: 'app', source: ['SUPER'], target: ['Select_priv'], equal: false },
+              ] } },
+          ],
+        },
+      },
+    }
+    mockRun.mockReset().mockResolvedValue(hinted)
+    const w = await mountAndRun()
+    const body = document.body.innerHTML
+    // 提示级计入「提示」而排除出「结构不一致」。
+    expect(body).toContain('结构不一致 0')
+    expect(body).toContain('提示 1')
+    // hint 徽标文案渲染（表行 + 类汇总行共用 verdictText）。
+    expect(w.text()).toContain('提示')
+    expect(w.text()).toContain('总体结论：通过')
+    // 跨方言权限行渲染「提示（不判）」而非 warn 文案。
+    expect(w.text()).toContain('提示（不判）')
+    w.unmount()
+  })
 })

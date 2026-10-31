@@ -146,17 +146,21 @@ func catByKey(t *testing.T, res *Result, key string) *Category {
 }
 
 func TestDiffEqual(t *testing.T) {
-	// PG→TiDB: charset folds (UTF8 → utf8mb4, target superset) but
-	// collation vocabularies differ → tables warn; sequences (PG has
-	// them, target carries none) → fail; privileges cross-dialect →
-	// warn. Overall fail.
+	// PG→TiDB (cross-dialect, v1.4): charset folds (UTF8 → utf8mb4, target
+	// superset); collation vocabularies differ → hint (提示级), and the
+	// twins still count as matched (practical equality); sequences (PG has
+	// them, target carries none) → fail (single-side existence); privileges
+	// cross-dialect → hint. Overall fail (sequences).
 	res := Diff(snapA(), snapBEqual(), optLoose())
 	if res.Overall != VerdictFail {
 		t.Fatalf("overall = %q, want fail; categories: %+v", res.Overall, res.Categories)
 	}
 	tb := catByKey(t, res, "tables")
-	if tb.SourceCount != 2 || tb.TargetCount != 2 || tb.Matched != 0 {
-		t.Errorf("tables counts = %d/%d/%d, want 2/2/0", tb.SourceCount, tb.TargetCount, tb.Matched)
+	if tb.SourceCount != 2 || tb.TargetCount != 2 || tb.Matched != 2 {
+		t.Errorf("tables counts = %d/%d/%d, want 2/2/2 (cross-dialect collation vocab does not break matched, v1.4)", tb.SourceCount, tb.TargetCount, tb.Matched)
+	}
+	if tb.Verdict != VerdictHint {
+		t.Errorf("tables category verdict = %q, want hint (提示级)", tb.Verdict)
 	}
 	// users existence: both sides have appuser + reporter → pass.
 	uc := catByKey(t, res, "users")
@@ -171,10 +175,10 @@ func TestDiffEqual(t *testing.T) {
 	if !strings.Contains(sc.Note, "目标端无序列对象") {
 		t.Errorf("sequences note must carry the target-no-sequence annotation: %q", sc.Note)
 	}
-	// privileges cross-dialect: warn, not comparable.
+	// privileges cross-dialect: hint (提示级, v1.4), not comparable.
 	pc := catByKey(t, res, "privileges")
-	if pc.Verdict != VerdictWarn || pc.Privileges == nil || pc.Privileges.Comparable {
-		t.Fatalf("privileges cross-dialect: verdict=%q comparable=%v, want warn/false", pc.Verdict, pc.Privileges != nil && pc.Privileges.Comparable)
+	if pc.Verdict != VerdictHint || pc.Privileges == nil || pc.Privileges.Comparable {
+		t.Fatalf("privileges cross-dialect: verdict=%q comparable=%v, want hint/false", pc.Verdict, pc.Privileges != nil && pc.Privileges.Comparable)
 	}
 	if !strings.Contains(pc.Note, "跨方言权限词汇表不相交") {
 		t.Errorf("privileges cross-dialect note must be carried on the category (E2/P3): %q", pc.Note)
@@ -182,16 +186,16 @@ func TestDiffEqual(t *testing.T) {
 	if len(pc.Privileges.Users) != 2 {
 		t.Errorf("privileges users = %d, want 2 (full disclosure)", len(pc.Privileges.Users))
 	}
-	// tables: charset folded equal, collation warn (vocab mismatch).
+	// tables: charset folded equal, collation hint (vocab mismatch).
 	for _, td := range tb.Tables {
 		if td.CharsetDiff != nil && !td.CharsetDiff.Equal {
 			t.Errorf("charset %s must fold equal (UTF8 → utf8mb4): %+v", td.Table, td.CharsetDiff)
 		}
 		if td.CollationDiff == nil || td.CollationDiff.Equal {
-			t.Errorf("collation %s must warn on PG-locale vs MySQL vocab: %+v", td.Table, td.CollationDiff)
+			t.Errorf("collation %s must disclose the PG-locale vs MySQL vocab delta: %+v", td.Table, td.CollationDiff)
 		}
-		if td.Verdict != VerdictWarn {
-			t.Errorf("table %s verdict = %q, want warn (collation vocab)", td.Table, td.Verdict)
+		if td.Verdict != VerdictHint {
+			t.Errorf("table %s verdict = %q, want hint (collation vocab, v1.4)", td.Table, td.Verdict)
 		}
 	}
 }
@@ -545,12 +549,95 @@ func TestPrivilegesBothEmptyPass(t *testing.T) {
 		t.Errorf("cross-dialect both-empty privileges: verdict=%q, want pass", pc.Verdict)
 	}
 
-	// One-sided (PG users but mysql side degraded/empty) → warn disclosure.
+	// One-sided (PG users but mysql side degraded/empty) → hint disclosure
+	// (提示级, v1.4; was warn).
 	src.Users = []UserMeta{{Name: "app", Privileges: []string{"SUPER"}}}
 	res = Diff(src, tgt, optLoose())
 	pc = catByKey(t, res, "privileges")
-	if pc.Verdict != VerdictWarn {
-		t.Errorf("cross-dialect one-sided privileges: verdict=%q, want warn", pc.Verdict)
+	if pc.Verdict != VerdictHint {
+		t.Errorf("cross-dialect one-sided privileges: verdict=%q, want hint", pc.Verdict)
+	}
+}
+
+// TestCrossDialectHintDowngrade pins the v1.4 提示级 policy (user ruling
+// 11:13「跨方言固有差异不设为对比错误，加小提示」): in cross-dialect runs
+// charset/collation value differences and the privileges vocabulary gap
+// downgrade to hint and never drive the overall conclusion; PK differences
+// and single-side existence stay fail; same-dialect runs keep the strict
+// v1.3 verdicts.
+func TestCrossDialectHintDowngrade(t *testing.T) {
+	pgSide := func() *Snapshot {
+		return &Snapshot{
+			Dialect: "postgres", Schema: "public",
+			Tables: []TableMeta{
+				{Name: "t_twin", Charset: "UTF8", Collation: "en_US.UTF-8", PK: []string{"id"}},
+				{Name: "t_cs", Charset: "UTF8", Collation: "en_US.UTF-8", PK: []string{"id"}},
+				{Name: "t_pk", Charset: "UTF8", Collation: "en_US.UTF-8", PK: []string{"id"}},
+			},
+			Sequences: []string{"s1"},
+			Users:     []UserMeta{{Name: "u1", Privileges: []string{"CREATEDB"}}},
+		}
+	}
+	tidbSide := func() *Snapshot {
+		return &Snapshot{
+			Dialect: "mysql", Schema: "migration_test",
+			Tables: []TableMeta{
+				{Name: "t_twin", Charset: "utf8mb4", Collation: "utf8mb4_bin", PK: []string{"id"}},
+				{Name: "t_cs", Charset: "latin1", Collation: "latin1_bin", PK: []string{"id"}},
+				{Name: "t_pk", Charset: "utf8mb4", Collation: "utf8mb4_bin", PK: []string{"id", "ext"}},
+			},
+			Sequences: []string{"s1"},
+			Users:     []UserMeta{{Name: "u1", Privileges: []string{"Select_priv"}}},
+		}
+	}
+
+	res := Diff(pgSide(), tidbSide(), optLoose())
+	tb := catByKey(t, res, "tables")
+	byName := map[string]TableDiff{}
+	for _, td := range tb.Tables {
+		byName[td.Table] = td
+	}
+	// twins: collation vocab disjoint → hint, still matched (practical
+	// equality, the noise the ruling targets).
+	if td := byName["t_twin"]; td.Verdict != VerdictHint {
+		t.Errorf("t_twin verdict = %q, want hint (cross-dialect collation vocab)", td.Verdict)
+	}
+	if tb.Matched != 1 {
+		t.Errorf("tables matched = %d, want 1 (t_twin; hint twins count as 一致)", tb.Matched)
+	}
+	// charset value diff (UTF8 vs latin1) → hint, disclosed, NOT matched.
+	if td := byName["t_cs"]; td.Verdict != VerdictHint || td.CharsetDiff == nil || td.CharsetDiff.Equal {
+		t.Errorf("t_cs verdict = %q charset=%+v, want hint + disclosed unequal charset", td.Verdict, td.CharsetDiff)
+	}
+	if td := byName["t_cs"]; td.CharsetDiff != nil && !strings.Contains(td.CharsetDiff.Note, "仅提示") {
+		t.Errorf("t_cs charset note must say 仅提示: %q", td.CharsetDiff.Note)
+	}
+	// PK diff → fail regardless of dialect.
+	if td := byName["t_pk"]; td.Verdict != VerdictFail {
+		t.Errorf("t_pk verdict = %q, want fail (PK diff stays structural)", td.Verdict)
+	}
+	// privileges cross-dialect with accounts → hint.
+	if pc := catByKey(t, res, "privileges"); pc.Verdict != VerdictHint {
+		t.Errorf("privileges verdict = %q, want hint", pc.Verdict)
+	}
+	// overall: sequences match, users match, tables fail only via t_pk →
+	// fail; and WITHOUT the PK diff the run must be overall pass despite
+	// the hints.
+	pgClean, tidbClean := pgSide(), tidbSide()
+	pgClean.Tables = pgClean.Tables[:1]
+	tidbClean.Tables = tidbClean.Tables[:1]
+	if res2 := Diff(pgClean, tidbClean, optLoose()); res2.Overall != VerdictPass {
+		t.Errorf("overall = %q, want pass (hints must not fail the run)", res2.Overall)
+	}
+
+	// Same-dialect guard: mysql→mysql latin1 diff stays fail (the
+	// downgrade is exclusively cross-dialect).
+	srcM := &Snapshot{Dialect: "mysql", Schema: "a", Tables: []TableMeta{
+		{Name: "t", Charset: "utf8mb4", Collation: "utf8mb4_bin", PK: []string{"id"}}}}
+	tgtM := &Snapshot{Dialect: "mysql", Schema: "b", Tables: []TableMeta{
+		{Name: "t", Charset: "latin1", Collation: "latin1_bin", PK: []string{"id"}}}}
+	if res3 := Diff(srcM, tgtM, optLoose()); res3.Overall != VerdictFail {
+		t.Errorf("same-dialect charset diff overall = %q, want fail (no downgrade)", res3.Overall)
 	}
 }
 

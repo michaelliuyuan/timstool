@@ -19,7 +19,7 @@ interface CategoryResult {
   source_count: number
   target_count: number
   matched: number
-  verdict: 'pass' | 'warn' | 'fail'
+  verdict: 'pass' | 'hint' | 'warn' | 'fail'
   tables?: any[]
   names?: { source_only?: string[]; target_only?: string[]; common?: string[] } | null
   privileges?: {
@@ -34,7 +34,7 @@ interface CompareResult {
   generated_at: string
   duration: string
   categories: CategoryResult[]
-  overall: 'pass' | 'warn' | 'fail'
+  overall: 'pass' | 'hint' | 'warn' | 'fail'
   warnings?: string[]
 }
 
@@ -107,7 +107,11 @@ async function runCompare() {
     })
     resultTaskID.value = data.task_id
     result.value = data.result
-    if (data.result.overall === 'pass') ElMessage.success('DDL 对比完成：全部一致')
+    // v1.4 提示级: hint categories (cross-dialect charset/collation/privilege
+    // vocab deltas) never fail the run — surface them as an informational
+    // suffix on the success toast instead.
+    const hintCats = (data.result.categories || []).filter((c: any) => c.verdict === 'hint').length
+    if (data.result.overall === 'pass') ElMessage.success(hintCats ? `DDL 对比完成：结构一致（${hintCats} 类跨方言提示）` : 'DDL 对比完成：全部一致')
     else if (data.result.overall === 'warn') ElMessage.warning('DDL 对比完成：存在警告')
     else ElMessage.error('DDL 对比完成：存在差异')
     loadHistory()
@@ -119,8 +123,8 @@ async function runCompare() {
 }
 
 // ---- result rendering helpers ----
-const verdictTag = (v: string) => (v === 'pass' ? 'success' : v === 'warn' ? 'warning' : 'danger')
-const verdictText = (v: string) => (v === 'pass' ? '通过' : v === 'warn' ? '警告' : '失败')
+const verdictTag = (v: string) => (v === 'pass' ? 'success' : v === 'hint' ? 'info' : v === 'warn' ? 'warning' : 'danger')
+const verdictText = (v: string) => (v === 'pass' ? '通过' : v === 'hint' ? '提示' : v === 'warn' ? '警告' : '失败')
 const joinNames = (list?: string[]) => (list && list.length ? list.join('、') : '—')
 const pkText = (cols?: string[]) => (cols && cols.length ? cols.join(', ') : '无主键')
 const attrText = (d?: any) => {
@@ -285,7 +289,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
         <el-table-column label="差异摘要">
           <template #default="{ row }">
             <span v-if="row.key === 'tables'" class="dc-diff">
-              仅源 {{ (row.tables || []).filter((t: any) => t.source_only).length }} · 仅目标 {{ (row.tables || []).filter((t: any) => t.target_only).length }} · 结构不一致 {{ (row.tables || []).filter((t: any) => !t.source_only && !t.target_only && t.verdict !== 'pass').length }}
+              仅源 {{ (row.tables || []).filter((t: any) => t.source_only).length }} · 仅目标 {{ (row.tables || []).filter((t: any) => t.target_only).length }} · 结构不一致 {{ (row.tables || []).filter((t: any) => !t.source_only && !t.target_only && t.verdict !== 'pass' && t.verdict !== 'hint').length }} · 提示 {{ (row.tables || []).filter((t: any) => t.verdict === 'hint').length }}
             </span>
             <span v-else-if="row.names" class="dc-diff">
               仅源 {{ (row.names.source_only || []).length }} · 仅目标 {{ (row.names.target_only || []).length }} · 一致 {{ (row.names.common || []).length }}
@@ -376,10 +380,10 @@ function historyReportURL(id: string, format: 'html' | 'json') {
           <el-table-column label="结论" width="90">
             <template #default="{ row }">
               <el-tag
-                :type="!privilegeCategory.privileges?.comparable ? 'warning' : row.equal ? 'success' : 'danger'"
+                :type="!privilegeCategory.privileges?.comparable ? 'info' : row.equal ? 'success' : 'danger'"
                 size="small"
               >
-                {{ !privilegeCategory.privileges?.comparable ? '不判' : row.verdict }}
+                {{ !privilegeCategory.privileges?.comparable ? '提示（不判）' : row.verdict }}
               </el-tag>
             </template>
           </el-table-column>

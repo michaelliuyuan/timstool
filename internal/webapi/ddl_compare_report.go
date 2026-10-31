@@ -22,13 +22,15 @@ import (
 // dcmpReportVersion is the DDL-compare report renderer's own version
 // stamp (dcReportVersion/mcReportVersion twin — rendered once in the
 // footer badge).
-const dcmpReportVersion = "3.19.40"
+const dcmpReportVersion = "3.20.0"
 
 // dcmpVerdictCN translates a verdict for the report vocabulary.
 func dcmpVerdictCN(v ddlcompare.Verdict) string {
 	switch v {
 	case ddlcompare.VerdictPass:
 		return "通过"
+	case ddlcompare.VerdictHint:
+		return "提示"
 	case ddlcompare.VerdictWarn:
 		return "警告"
 	case ddlcompare.VerdictFail:
@@ -101,6 +103,10 @@ tr.row-fail td { background: #FDF1F1; }
 tr.row-fail td:first-child { box-shadow: inset 3px 0 0 #E13C3C; }
 tr.row-warn td { background: #FDF7EE; }
 tr.row-warn td:first-child { box-shadow: inset 3px 0 0 #D97E00; }
+tr.row-hint td { background: #F2F5FA; }
+tr.row-hint td:first-child { box-shadow: inset 3px 0 0 #5873B0; }
+.badge-hint { background: rgba(88,115,176,0.10); color: #5873B0; }
+.overall-hint { color: #5873B0; }
 .wn { background: #FDF7EE; border: 1px solid #F0DFC2; border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; font-size: 13px; line-height: 1.8; color: #8A5A00; }
 .names-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
 .names-3 > div { background: #F6F7FB; border: 1px solid #E6E8F0; border-radius: 8px; padding: 10px 12px; font-size: 13px; line-height: 1.9; overflow-wrap: anywhere; }
@@ -140,6 +146,9 @@ tr.row-detail summary { cursor: pointer; color: #6B7280; font-size: 12px; user-s
 	for _, c := range res.Categories {
 		fmt.Fprintf(&sb, `<div class="stat"><div class="value">%d / %d</div><div class="label">%s（源/目标）</div></div>`,
 			c.SourceCount, c.TargetCount, mcHTMLEsc(c.Label))
+	}
+	if hintCats := dcmpHintCategories(res); hintCats > 0 {
+		fmt.Fprintf(&sb, `<div class="stat"><div class="value" style="color:#5873B0;">%d</div><div class="label">跨方言提示类（不判错）</div></div>`, hintCats)
 	}
 	sb.WriteString(`</div></div>`)
 
@@ -284,7 +293,7 @@ func dcmpPrivilegesCard(c ddlcompare.Category) string {
 	}
 	sb.WriteString(`<table><thead><tr><th>#</th><th>用户</th><th>源端权限</th><th>目标端权限</th><th>结论</th></tr></thead><tbody>`)
 	for i, u := range c.Privileges.Users {
-		badge := "badge-warn"
+		badge := "badge-hint"
 		text := "—"
 		if c.Privileges.Comparable {
 			if u.Equal {
@@ -321,10 +330,22 @@ func dcmpPrivilegesCard(c ddlcompare.Category) string {
 	return sb.String()
 }
 
+// dcmpHintCategories counts hint (提示级) categories — the v1.4 cross-
+// dialect downgrade surface, summarized on the 结论 card.
+func dcmpHintCategories(res *ddlcompare.Result) int {
+	n := 0
+	for _, c := range res.Categories {
+		if c.Verdict == ddlcompare.VerdictHint {
+			n++
+		}
+	}
+	return n
+}
+
 // dcmpPrivRowClass maps a privilege row to its stripe class.
 func dcmpPrivRowClass(u ddlcompare.PrivUserDiff, comparable bool) string {
 	if !comparable {
-		return "row-warn"
+		return "row-hint"
 	}
 	if u.Equal {
 		return "row-pass"

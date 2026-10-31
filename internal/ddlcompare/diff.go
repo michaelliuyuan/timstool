@@ -1,19 +1,25 @@
 // diff.go — the pure comparison engine. Inputs are two Snapshots + one
 // Options; the output names every object on both sides. Verdict policy
-// (v1.3):
-//   - tables: one-sided table, PK difference, charset difference (unfolded
-//     direction) → fail; charset reverse-superset / collation semantic
-//     differences → warn (V4 direction-limited fold);
+// (v1.4, user ruling 11:13「跨方言固有差异不设为对比错误，加小提示」):
+//   - tables: one-sided table, PK difference → fail (structural, dialect
+//     independent); charset/collation differences → fail/warn in
+//     SAME-dialect runs, but in CROSS-dialect runs (PG source vs MySQL-wire
+//     target) they downgrade to hint (提示级) — charset values and collation
+//     vocabularies are dialect-inherent and carry no migration-correctness
+//     signal. A both-sided table whose only cross-dialect deltas are hints
+//     still counts as matched (一致) for the category count;
 //   - views / procedures / functions / triggers / sequences: count + name
-//     sets — any difference → fail; a PG source's sequences against a
-//     MySQL-wire target (which has no SEQUENCE type) carry the「目标端无此
-//     对象类型」annotation (V2/A3);
-//   - users: count + name sets — any difference → fail (V1: user
-//     existence compares across dialects, both sides are name lists);
-//   - privileges: SAME-dialect (both mysql-wire) → per-user global
-//     privilege set difference, can fail, full lists; CROSS-dialect (any
-//     PG side) → vocabulary disjoint, no pass/fail conclusion: warn +
-//     both sides' raw token lists disclosed (V1).
+//     sets — any difference → fail (single-side existence is a real diff);
+//     a PG source's sequences against a MySQL-wire target without any carry
+//     the「目标端无序列对象」annotation (V2/A3);
+//   - users: count + name sets — any difference → fail (V1: user existence
+//     compares across dialects, both sides are name lists);
+//   - privileges: SAME-dialect (both mysql-wire) → per-user global privilege
+//     set difference, can fail, full lists; CROSS-dialect (any PG side) →
+//     vocabulary disjoint, hint (提示级) + both sides' raw token lists
+//     disclosed (V1; warn → hint per v1.4);
+//   - overall: Worst over categories EXCLUDING hint — hint never turns the
+//     overall conclusion away from pass.
 package ddlcompare
 
 import (
@@ -25,8 +31,9 @@ import (
 // the collection error; the engine itself expects both present.
 func Diff(src, tgt *Snapshot, opts Options) *Result {
 	res := &Result{Options: opts}
+	crossDialect := src.Dialect != tgt.Dialect
 	res.Categories = []Category{
-		diffTables(src, tgt, opts),
+		diffTables(src, tgt, opts, crossDialect),
 		nameCategory("views", "视图", src.Views, tgt.Views, opts),
 		nameCategory("procedures", "存储过程", src.Procedures, tgt.Procedures, opts),
 		nameCategory("functions", "自定义函数", src.Functions, tgt.Functions, opts),
@@ -37,6 +44,10 @@ func Diff(src, tgt *Snapshot, opts Options) *Result {
 	}
 	res.Overall = VerdictPass
 	for _, c := range res.Categories {
+		if c.Verdict == VerdictHint {
+			// v1.4: 提示级 never drives the overall conclusion.
+			continue
+		}
 		res.Overall = Worst(res.Overall, c.Verdict)
 	}
 	return res
@@ -61,7 +72,7 @@ func tableIndex(tables []TableMeta, opts Options) map[string]*TableMeta {
 	return m
 }
 
-func diffTables(src, tgt *Snapshot, opts Options) Category {
+func diffTables(src, tgt *Snapshot, opts Options, crossDialect bool) Category {
 	cat := Category{Key: "tables", Label: "表"}
 	si, ti := tableIndex(src.Tables, opts), tableIndex(tgt.Tables, opts)
 	cat.SourceCount, cat.TargetCount = len(src.Tables), len(tgt.Tables)
@@ -92,7 +103,7 @@ func diffTables(src, tgt *Snapshot, opts Options) Category {
 				Table: t.Name, TargetOnly: true, Verdict: VerdictFail,
 			})
 		default:
-			td, matched := compareTable(s, t, opts)
+			td, matched := compareTable(s, t, opts, crossDialect)
 			cat.Tables = append(cat.Tables, td)
 			if matched {
 				cat.Matched++
@@ -107,22 +118,35 @@ func diffTables(src, tgt *Snapshot, opts Options) Category {
 }
 
 // compareTable diffs two present tables under the v1.3 口径 (主键 +
-// 字符集 + 排序规则; 字段级与索引级已取消). matched = fully equal (verdict
-// pass).
-func compareTable(s, t *TableMeta, opts Options) (TableDiff, bool) {
+// 字符集 + 排序规则; 字段级与索引级已取消). matched = practically equal:
+// PK equal + charset equal + collation equal — EXCEPT that in cross-dialect
+// runs (v1.4) a collation inequality that only reflects the disjoint
+// dialect vocabularies does not break matched (the twins ARE consistent;
+// the difference renders as a hint, never as 不一致).
+func compareTable(s, t *TableMeta, opts Options, crossDialect bool) (TableDiff, bool) {
 	td := TableDiff{Table: s.Name, Verdict: VerdictPass}
 
-	// primary key (exact, key-ordered).
+	// primary key (exact, key-ordered) — structural, dialect independent:
+	// a PK difference is always a fail, cross-dialect or not.
 	pkEqual := normJoin(s.PK, opts) == normJoin(t.PK, opts)
 	td.PKDiff = &PKDiff{Source: s.PK, Target: t.PK, Equal: pkEqual}
 	if !pkEqual {
 		td.Verdict = VerdictFail
 	}
 
-	// charset (V4 direction-limited fold).
+	// charset (V4 direction-limited fold; v1.4: cross-dialect value diffs
+	// downgrade to hint — charset values are dialect-inherent, not a
+	// migration-correctness signal).
+	charsetEqual := true
 	if cv, ceq, cnote := CharsetVerdict(s.Charset, t.Charset); !ceq {
+		charsetEqual = false
+		if crossDialect {
+			cnote = "跨方言字符集差异仅提示（不判错）：" + cnote
+			td.Verdict = Worst(td.Verdict, VerdictHint)
+		} else {
+			td.Verdict = Worst(td.Verdict, cv)
+		}
 		td.CharsetDiff = &AttrDiff{Source: s.Charset, Target: t.Charset, Equal: false, Note: cnote}
-		td.Verdict = Worst(td.Verdict, cv)
 	} else if s.Charset != t.Charset {
 		// folded-equal (utf8 → utf8mb4): record the pair as equal so the
 		// report shows the fold, not a difference.
@@ -130,15 +154,24 @@ func compareTable(s, t *TableMeta, opts Options) (TableDiff, bool) {
 	}
 
 	// collation (V4: same-strength different-impl and vocabulary-mismatch
-	// both warn; never a silent fold).
+	// both warn in same-dialect runs, never a silent fold; v1.4:
+	// cross-dialect vocabulary mismatches downgrade to hint).
+	collationEqual := true
 	if ov, oeq, onote := CollationVerdict(s.Charset, s.Collation, t.Charset, t.Collation); !oeq {
+		collationEqual = false
+		if crossDialect {
+			onote = "跨方言排序规则词汇表不相交，仅提示（不判错）"
+			td.Verdict = Worst(td.Verdict, VerdictHint)
+		} else {
+			td.Verdict = Worst(td.Verdict, ov)
+		}
 		td.CollationDiff = &AttrDiff{Source: s.Collation, Target: t.Collation, Equal: false, Note: onote}
-		td.Verdict = Worst(td.Verdict, ov)
 	} else if s.Collation != t.Collation {
 		td.CollationDiff = &AttrDiff{Source: s.Collation, Target: t.Collation, Equal: true}
 	}
 
-	return td, td.Verdict == VerdictPass
+	matched := pkEqual && charsetEqual && (collationEqual || crossDialect)
+	return td, matched
 }
 
 // normJoin renders the PK sequence as a comparable "a,b" string.
@@ -209,8 +242,9 @@ func nameCategory(key, label string, src, tgt []string, opts Options) Category {
 // vocabularies are the same mysql.user _priv columns, so the set
 // difference is a real verdict (can fail; full lists). Cross-dialect (the
 // source is PG): the vocabulary is disjoint (mysql _priv columns vs PG
-// booleans + memberships), so no pass/fail conclusion is drawn — warn +
-// both sides' raw token lists disclosed. Either side's users degraded to
+// booleans + memberships), so no pass/fail conclusion is drawn — hint
+// (提示级, v1.4; was warn) + both sides' raw token lists disclosed. Either
+// side's users degraded to
 // empty (no privilege to read mysql.user / pg_roles) is handled honestly:
 // the lists simply show what each side could collect, and the collector
 // warning explains the cause.
@@ -286,8 +320,8 @@ func diffPrivileges(src, tgt *Snapshot, opts Options) Category {
 		cat.Verdict = VerdictPass
 	} else {
 		// cross-dialect with at least one account: vocabulary disjoint,
-		// no conclusion — warn, never pass/fail.
-		cat.Verdict = VerdictWarn
+		// no conclusion — hint (提示级, v1.4; was warn), never pass/fail.
+		cat.Verdict = VerdictHint
 	}
 	return cat
 }

@@ -48,8 +48,8 @@ describe('ddlCompareView v3.19.40 structure anchors', () => {
     // (row.tables || [])；运行期行为见 ddlCompareViewBehavior.spec.ts。
     expect(src).toContain('(row.tables || []).filter((t: any) => t.source_only)')
     expect(src).toContain('(row.tables || []).filter((t: any) => t.target_only)')
-    expect(src).toContain("(row.tables || []).filter((t: any) => !t.source_only && !t.target_only && t.verdict !== 'pass')")
-    expect(src).toContain(':data="cat.tables || []"')
+    expect(src).toContain("(row.tables || []).filter((t: any) => !t.source_only && !t.target_only && t.verdict !== 'pass' && t.verdict !== 'hint')")
+    expect(src).toContain(":data=\"cat.tables || []\"")
   })
 
   it('name categories render the three-pane layout (source-only / target-only / common)', () => {

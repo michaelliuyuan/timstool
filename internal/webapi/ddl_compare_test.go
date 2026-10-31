@@ -174,12 +174,12 @@ func dcSeedResult(t *testing.T) *ddlcompare.Result {
 		Target:      ddlcompare.Endpoint{Kind: "target", Type: "tidb", Schema: "db"},
 		Categories: []ddlcompare.Category{
 			{
-				Key: "tables", Label: "表", SourceCount: 2, TargetCount: 1, Matched: 0, Verdict: ddlcompare.VerdictFail,
+				Key: "tables", Label: "表", SourceCount: 2, TargetCount: 1, Matched: 1, Verdict: ddlcompare.VerdictHint,
 				Tables: []ddlcompare.TableDiff{
-					{Table: "users", Verdict: ddlcompare.VerdictWarn,
+					{Table: "users", Verdict: ddlcompare.VerdictHint,
 						PKDiff:        &ddlcompare.PKDiff{Source: []string{"id"}, Target: []string{"id"}, Equal: true},
 						CharsetDiff:   &ddlcompare.AttrDiff{Source: "UTF8", Target: "utf8mb4", Equal: true},
-						CollationDiff: &ddlcompare.AttrDiff{Source: "en_US.UTF-8", Target: "utf8mb4_bin", Equal: false, Note: "排序规则词汇表跨方言不相交（PG locale 与 MySQL 命名不互认），不做结论"}},
+						CollationDiff: &ddlcompare.AttrDiff{Source: "en_US.UTF-8", Target: "utf8mb4_bin", Equal: false, Note: "跨方言排序规则词汇表不相交，仅提示（不判错）"}},
 					{Table: "orders<script>", SourceOnly: true, Verdict: ddlcompare.VerdictFail},
 				},
 			},
@@ -196,7 +196,7 @@ func dcSeedResult(t *testing.T) *ddlcompare.Result {
 				Note:  "目标端无此对象类型（TiDB/MySQL 无 SEQUENCE 对象）：PG 源含序列时总体结论预期为 FAIL"},
 			{Key: "users", Label: "用户", SourceCount: 2, TargetCount: 2, Matched: 2, Verdict: ddlcompare.VerdictPass,
 				Names: &ddlcompare.NameSetDiff{Common: []string{"appuser", "reporter"}}},
-			{Key: "privileges", Label: "权限", SourceCount: 2, TargetCount: 2, Matched: 0, Verdict: ddlcompare.VerdictWarn,
+			{Key: "privileges", Label: "权限", SourceCount: 2, TargetCount: 2, Matched: 0, Verdict: ddlcompare.VerdictHint,
 				Note: "跨方言权限词汇表不相交，不做结论",
 				Privileges: &ddlcompare.PrivSetDiff{Comparable: false, CrossDialect: true, Users: []ddlcompare.PrivUserDiff{
 					{User: "appuser", Source: []string{"SUPER", "CREATEDB"}, Target: []string{"Select_priv", "Insert_priv"}, Equal: false},
@@ -258,8 +258,9 @@ func TestDDLCompareReportFaces(t *testing.T) {
 		"seq_users", "seq_orders",
 		"目标端无此对象类型",
 		"跨方言权限词汇表不相交，不做结论",
+		"badge-hint", "提示", "跨方言提示类（不判错）",
 		"SUPER", "CREATEDB", "Select_priv",
-		"V3.19.40",
+		"V3.20.0",
 		"tidb_enable_procedure",
 		"orders&lt;script&gt;",
 	} {
