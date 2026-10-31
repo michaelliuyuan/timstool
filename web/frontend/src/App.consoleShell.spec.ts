@@ -37,25 +37,36 @@ describe('v3.20 方案A: 宽侧栏分组导航（console shell）', () => {
     expect(s).not.toContain('-webkit-line-clamp')
   })
 
-  // bf 返修（刘源 17:18 批复方案一「呼吸感」，B1 样张，FE 3.20.1）：
-  // 行距 6px / 行高 37px 档（padding 10px 12px）/ 图标 18 / 组头 teal 圆点替代分隔线。
-  it('B1 呼吸感：nav gap 6px / item 10px 12px / 图标 18 / 组头 teal 圆点+间距 18/8/8', () => {
+  // bf 返修（刘源 18:55 批复 B1.1 加档，样张 B11 pane，FE 3.20.2）：
+  // 基础档 行距 8px / 行高 42px 档（padding 12px 12px）/ 图标 18 / 组头 teal 圆点；
+  // ≤880 笔记本档同步放宽（gap 4 / 8px 12px / 14-6-6），≤680 最小回退档不动。
+  it('B1.1 加档：nav gap 8px / item 12px 12px / 组头 22-8-10 + teal 圆点 / first-child 4px', () => {
     const s = src('App.vue')
-    // 正锚：新密度与圆点（B1 样张口径）。
+    // 正锚：基础档新密度与圆点（B11 样张口径）。
     expect(s).toContain('<el-icon :size="18">')
-    expect(s).toMatch(/\.tims-nav \{[^}]*gap: 6px;/)
-    expect(s).toContain('gap: 12px;')
-    expect(s).toContain('padding: 10px 12px;')
-    expect(s).toContain('margin: 18px 8px 8px;')
-    expect(s).toContain('.tims-nav-group:first-child { margin-top: 2px; }')
+    expect(s).toMatch(/\.tims-nav \{[^}]*gap: 8px;/)
+    expect(s).toContain('gap: 14px;')
+    expect(s).toContain('padding: 12px 12px;')
+    expect(s).toContain('margin: 22px 8px 10px;')
+    expect(s).toContain('.tims-nav-group:first-child { margin-top: 4px; }')
     expect(s).toContain('.tims-nav-group::before {')
     expect(s).toContain('border-radius: 50%;')
     expect(s).toContain('margin-right: 7px;')
-    // 负锚：组头 border-top 分隔线不回归；旧密度值退场。
+    // 正锚：≤880 笔记本档放宽（MC-19 旧压缩档退役，1366×768 观感受益）。
+    expect(s).toContain('.tims-nav { gap: 4px; }')
+    expect(s).toContain('.tims-nav-item { padding: 8px 12px; }')
+    expect(s).toContain('.tims-nav-group { margin: 14px 6px 6px; }')
+    // 负锚：组头 border-top 分隔线不回归；B1/B1.1 旧密度值退场（nav gap 6px 用
+    // 块作用域负锚——顶栏 .tims-heartbeat 的 gap:6px 与 nav 无关，勿用全局）。
     expect(s).not.toMatch(/\.tims-nav-group[^{]*\{[^}]*border-top/)
     expect(s).not.toContain(':size="17">')
-    expect(s).not.toContain('padding: 8px 10px;')
-    expect(s).not.toContain('margin: 12px 6px 4px;')
+    expect(s).not.toMatch(/\.tims-nav \{[^}]*gap: 6px;/)
+    expect(s).not.toContain('padding: 10px 12px;')
+    expect(s).not.toContain('margin: 18px 8px 8px;')
+    expect(s).not.toContain('margin-top: 2px;')
+    expect(s).not.toContain('.tims-nav { gap: 1px; }')
+    expect(s).not.toContain('.tims-nav-item { padding: 6px 10px; }')
+    expect(s).not.toContain('.tims-nav-group { margin: 8px 6px 3px; }')
     // 窄轨（≤900px）圆点隐藏，标签隐藏逻辑不变。
     expect(s).toContain('.tims-nav-group::before { display: none; }')
     expect(s).toContain('.tims-nav-label { display: none; }')

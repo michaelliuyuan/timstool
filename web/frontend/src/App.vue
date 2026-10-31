@@ -150,7 +150,7 @@ const crumbTitle = computed(() => {
 }
 
 /* --- v3.20 方案A：224px 宽侧栏（深色墨蓝保留；图标+单行文字+分组标题；
-    B1 呼吸感 3.20.1：行距 6px / 行高 37px 档 / 图标 18 / 组头 teal 圆点） --- */
+    B1.1 加档 3.20.2：行距 8px / 行高 42px 档 / 图标 18 / 组头 teal 圆点） --- */
 .tims-sidenav {
   width: 224px;
   flex: none;
@@ -185,7 +185,7 @@ const crumbTitle = computed(() => {
 .tims-nav {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   /* MC-19 A：侧栏内滚动兜底——高度不足时 nav 自身内滚（shell 100vh+overflow:hidden
       锁页滚，被裁项原本完全不可达）；内容不溢出时零视觉差。 */
   flex: 1;
@@ -198,14 +198,14 @@ const crumbTitle = computed(() => {
 .tims-nav::-webkit-scrollbar { width: 4px; }
 .tims-nav::-webkit-scrollbar-thumb { background: var(--tims-border-ink); border-radius: 2px; }
 .tims-nav-group {
-  margin: 18px 8px 8px;
+  margin: 22px 8px 10px;
   font-size: 11px;
   letter-spacing: 1.5px;
   color: var(--tims-text-inv-2);
   opacity: 0.65;
   white-space: nowrap;
 }
-/* B1 呼吸感：组头分隔线退役，teal 4px 圆点替代（容器 opacity 下实收≈.59，
+/* B1.1 加档：组头分隔线退役，teal 4px 圆点替代（容器 opacity 下实收≈.59，
    样张 .75×.9≈.68 同档观感）。 */
 .tims-nav-group::before {
   content: '';
@@ -218,15 +218,15 @@ const crumbTitle = computed(() => {
   margin-right: 7px;
   vertical-align: 2px;
 }
-/* 概览组贴顶：首组微距 2px（B1 样张）。 */
-.tims-nav-group:first-child { margin-top: 2px; }
+/* 概览组贴顶：首组微距 4px（B1.1 样张）。 */
+.tims-nav-group:first-child { margin-top: 4px; }
 .tims-nav-item {
   position: relative;
   display: flex;
   align-items: center;
   justify-content: flex-start;
-  gap: 12px;
-  padding: 10px 12px;
+  gap: 14px;
+  padding: 12px 12px;
   border: none;
   border-radius: var(--tims-radius-s);
   background: transparent;
@@ -347,9 +347,9 @@ const crumbTitle = computed(() => {
      既有响应式只看宽度，恰落盲区。压缩优先全量直显，极限档收紧内距）--- */
 @media (max-height: 880px) and (min-width: 901px) {
   .tims-logo { padding: 10px 6px 10px; }
-  .tims-nav { gap: 1px; }
-  .tims-nav-group { margin: 8px 6px 3px; }
-  .tims-nav-item { padding: 6px 10px; }
+  .tims-nav { gap: 4px; }
+  .tims-nav-group { margin: 14px 6px 6px; }
+  .tims-nav-item { padding: 8px 12px; }
 }
 @media (max-height: 680px) and (min-width: 901px) {
   .tims-logo { font-size: 20px; padding: 6px 6px 6px; }
