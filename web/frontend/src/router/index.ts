@@ -10,6 +10,12 @@ const router = createRouter({
       meta: { title: '工作台' },
     },
     {
+      path: '/pipeline',
+      name: 'Pipeline',
+      component: () => import('../views/PipelineView.vue'),
+      meta: { title: '管线拓扑' },
+    },
+    {
       path: '/wizard',
       name: 'Wizard',
       component: () => import('../views/WizardView.vue'),

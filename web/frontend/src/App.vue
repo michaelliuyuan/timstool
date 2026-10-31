@@ -58,6 +58,7 @@ const navSections = computed(() => {
       label: '概览',
       items: [
         { path: '/', label: '工作台', icon: 'Odometer' },
+        { path: '/pipeline', label: '管线拓扑', icon: 'Share' },
       ],
     },
     {
