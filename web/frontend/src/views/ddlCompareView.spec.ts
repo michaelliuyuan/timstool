@@ -84,3 +84,34 @@ describe('ddlCompareView v3.19.40 structure anchors', () => {
     expect(routerSrc).toContain("title: 'DDL 对比'")
   })
 })
+
+// bf 返修（刘源 19:19 指示，leader 实测定界，FE 3.20.3）：DC 页两处样式修正——
+// ① 跨方言说明框删 max-width:760px，与权限 alert/汇总表卡片内容满宽对齐；
+// ② verdict/注解定宽列 90→118×5（「提示（不判）」5 字 tag 实需 114px、
+//    「无此对象类型」6 字注解同裁；118 留余量）。
+describe('DC 页样式修正（3.20.3）：dc-global 满宽 + verdict/注解列宽 118', () => {
+  it('修① dc-global 无 max-width 钳宽（其余属性原样）', () => {
+    expect(src).not.toContain('max-width: 760px')
+    // 正锚：说明框样式三件套原样保留（仅宽度钳制退场）。
+    const block = src.match(/\.dc-global \{[^}]*\}/)?.[0] || ''
+    expect(block).toContain('background: #f2f5fa;')
+    expect(block).toContain('border: 1px solid #dce4f2;')
+    expect(block).toContain('padding: 8px 12px;')
+  })
+
+  it('修② verdict/注解定宽列 90→118×5；合法 90 列（源端数/一侧/历史状态）保留', () => {
+    // 正锚：五处目标列新宽（结论×3 = 汇总/权限/历史，注解、表对比状态）。
+    expect((src.match(/label="结论" width="118"/g) || []).length).toBe(3)
+    expect(src).toContain('label="注解" width="118"')
+    expect(src).toContain('label="状态" width="118"')
+    // 负锚：目标列不得回 90（label+width 精确串限定，不误伤其他合法 90 列）。
+    expect(src).not.toContain('label="结论" width="90"')
+    expect(src).toContain('label="注解" width="118" v-if=')
+    // 合法 90 列保留锚（数值/短文案列，非 verdict 面）。
+    expect(src).toContain('label="源端数" width="90"')
+    expect(src).toContain('label="一侧" width="90"')
+    expect(src).toContain('prop="status" label="状态" width="90"')
+    // 裁字根因在案：「提示（不判）」5 字渲染于权限表结论列。
+    expect(src).toContain(`? '提示（不判）' : row.verdict`)
+  })
+})

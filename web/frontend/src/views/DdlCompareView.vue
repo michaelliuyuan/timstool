@@ -295,7 +295,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
         <el-table-column prop="source_count" label="源端数" width="90" align="right" />
         <el-table-column prop="target_count" label="目标端数" width="100" align="right" />
         <el-table-column prop="matched" label="一致" width="80" align="right" />
-        <el-table-column label="结论" width="90">
+        <el-table-column label="结论" width="118">
           <template #default="{ row }">
             <el-tag :type="verdictTag(row.verdict)" :class="verdictClass(row.verdict)" size="small">{{ verdictText(row.verdict) }}</el-tag>
           </template>
@@ -314,7 +314,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
             <span v-else class="dc-diff">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="注解" width="90" v-if="result.categories.some((c) => c.note)">
+        <el-table-column label="注解" width="118" v-if="result.categories.some((c) => c.note)">
           <template #default="{ row }">
             <el-tooltip v-if="row.note" :content="row.note" placement="top">
               <el-tag type="warning" size="small" effect="plain">无此对象类型</el-tag>
@@ -328,7 +328,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
         <h3 class="dc-section">表（主键 / 字符集 / 排序规则）</h3>
         <el-table stripe :data="cat.tables || []" size="small" style="margin-bottom: 20px;">
           <el-table-column prop="table" label="表名" min-width="140" />
-          <el-table-column label="状态" width="90">
+          <el-table-column label="状态" width="118">
             <template #default="{ row }">
               <el-tag :type="row.source_only ? 'danger' : row.target_only ? 'warning' : verdictTag(row.verdict)" :class="!row.source_only && !row.target_only ? verdictClass(row.verdict) : ''" size="small">
                 {{ row.source_only ? '仅源端' : row.target_only ? '仅目标端' : verdictText(row.verdict) }}
@@ -378,7 +378,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
           <el-table-column prop="target" label="目标端权限" min-width="220">
             <template #default="{ row }"><code class="dc-priv">{{ row.target }}</code></template>
           </el-table-column>
-          <el-table-column label="结论" width="90">
+          <el-table-column label="结论" width="118">
             <template #default="{ row }">
               <el-tag
                 :type="!privilegeCategory.privileges?.comparable ? 'info' : row.equal ? 'success' : 'danger'"
@@ -439,7 +439,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="结论" width="90">
+        <el-table-column label="结论" width="118">
           <template #default="{ row }">
             <el-tag v-if="row.overall" :type="verdictTag(row.overall)" :class="verdictClass(row.overall)" size="small">{{ verdictText(row.overall) }}</el-tag>
             <span v-else>—</span>
@@ -493,7 +493,6 @@ function historyReportURL(id: string, format: 'html' | 'json') {
   border: 1px solid #dce4f2;
   border-radius: 6px;
   padding: 8px 12px;
-  max-width: 760px;
 }
 .dc-names {
   border: 1px solid var(--el-border-color-light, #ebeef5);
