@@ -427,9 +427,9 @@ const popStyle = computed(() => {
               />
               <circle class="pl-dot" :class="`pl-dot--${n.type}`" :cx="n.x + 28" :cy="n.y + n.h / 2" r="7" />
               <template v-if="n.column === 'target'">
-                <text class="pl-t-name" :x="n.x + 18" :y="n.y + 30">{{ n.name }}</text>
-                <text class="pl-t-type" :x="n.x + 18" :y="n.y + 47">{{ typeLabel(n.type) }}</text>
-                <text class="pl-t-sub" :x="n.x + 18" :y="n.y + 65">{{ subText(n) }}</text>
+                <text class="pl-t-name" :x="n.x + 46" :y="n.y + 30">{{ n.name }}</text>
+                <text class="pl-t-type" :x="n.x + 46" :y="n.y + 47">{{ typeLabel(n.type) }}</text>
+                <text class="pl-t-sub" :x="n.x + 46" :y="n.y + 65">{{ subText(n) }}</text>
               </template>
               <template v-else>
                 <text class="pl-t-name" :x="n.x + 46" :y="n.y + (n.virtual ? 27 : 35)">{{ n.name }}</text>

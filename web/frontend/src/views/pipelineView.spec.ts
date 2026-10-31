@@ -101,6 +101,15 @@ describe('B 二期: SVG 拓扑画布与连线色档', () => {
     expect(s).toContain(`if (ts.includes('warn')) return 'warn'`)
     expect(s).toContain(`.pl-node-topbar--fail { fill: var(--tims-brand); }`)
   })
+
+  it('目标卡文案让位类型点：三行 x+46 与源卡同构（B2.1 压字回归锚）', () => {
+    const s = src('PipelineView.vue')
+    expect(s).toContain(`:x="n.x + 46" :y="n.y + 30">{{ n.name }}`)
+    expect(s).toContain(`:x="n.x + 46" :y="n.y + 47">{{ typeLabel(n.type) }}`)
+    expect(s).toContain(`:x="n.x + 46" :y="n.y + 65">{{ subText(n) }}`)
+    // B2.1 负锚：目标卡文案起点不再落进类型圆点占位（dot cx=x+28 r=7 → x+21..35）。
+    expect(s).not.toContain(`n.x + 18`)
+  })
 })
 
 describe('B 二期: 节点浮层（必做交互）', () => {
