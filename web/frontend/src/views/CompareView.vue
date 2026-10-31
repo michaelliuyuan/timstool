@@ -1352,7 +1352,7 @@ onUnmounted(() => {
           </div>
         </div>
         <div class="tims-table-scroll">
-          <el-table :data="activeReport.tables" max-height="400" size="small" style="margin-bottom: 12px;" row-key="table_name"
+          <el-table stripe :data="activeReport.tables" max-height="400" size="small" style="margin-bottom: 12px;" row-key="table_name"
                     @expand-change="onReportRowExpand">
           <el-table-column type="expand">
             <template #default="{ row }">
@@ -1460,7 +1460,7 @@ onUnmounted(() => {
     <el-card shadow="never">
       <template #header><span style="font-weight: bold;">比对历史</span></template>
       <div class="tims-table-scroll">
-        <el-table :data="tasks" size="small">
+        <el-table stripe :data="tasks" size="small">
           <el-table-column prop="id" label="ID" width="90" class-name="hide-sm" />
           <el-table-column prop="name" label="名称" min-width="220" show-overflow-tooltip />
           <el-table-column label="模式" width="130">

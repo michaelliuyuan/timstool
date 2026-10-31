@@ -84,7 +84,7 @@ onUnmounted(() => {
            the single empty face (previously the built-in "暂无数据" row and the
            el-empty + CTA stacked as two empty messages). -->
       <div v-if="tasks.length > 0" class="tims-table-scroll">
-        <el-table :data="pagedTasks" style="width: 100%;" @row-click="(row: Task) => goToTask(row.id)">
+        <el-table stripe :data="pagedTasks" style="width: 100%;" @row-click="(row: Task) => goToTask(row.id)">
           <el-table-column prop="name" label="任务名称" min-width="180">
             <template #default="{ row }">
               <span>{{ row.name }}</span>

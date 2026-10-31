@@ -287,7 +287,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
         </div>
       </div>
 
-      <el-table :data="result.categories" size="small" style="margin-bottom: 20px;" data-testid="dc-summary">
+      <el-table stripe :data="result.categories" size="small" style="margin-bottom: 20px;" data-testid="dc-summary">
         <el-table-column prop="label" label="类别" width="120" />
         <el-table-column prop="source_count" label="源端数" width="90" align="right" />
         <el-table-column prop="target_count" label="目标端数" width="100" align="right" />
@@ -323,7 +323,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
 
       <template v-for="cat in tableCategories" :key="cat.key">
         <h3 class="dc-section">表（主键 / 字符集 / 排序规则）</h3>
-        <el-table :data="cat.tables || []" size="small" style="margin-bottom: 20px;">
+        <el-table stripe :data="cat.tables || []" size="small" style="margin-bottom: 20px;">
           <el-table-column prop="table" label="表名" min-width="140" />
           <el-table-column label="状态" width="90">
             <template #default="{ row }">
@@ -361,7 +361,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
           :closable="false"
           style="margin-bottom: 10px;"
         />
-        <el-table :data="privilegeRows(privilegeCategory)" size="small" style="margin-bottom: 20px;">
+        <el-table stripe :data="privilegeRows(privilegeCategory)" size="small" style="margin-bottom: 20px;">
           <el-table-column prop="user" label="用户" min-width="140" />
           <el-table-column label="一侧" width="90">
             <template #default="{ row }">
@@ -419,7 +419,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
 
     <el-card shadow="never">
       <template #header><span style="font-weight: 600;">历史记录</span></template>
-      <el-table :data="history" size="small" v-loading="historyLoading">
+      <el-table stripe :data="history" size="small" v-loading="historyLoading">
         <el-table-column prop="created_at" label="时间" width="180">
           <template #default="{ row }">{{ (row.created_at || '').replace('T', ' ').slice(0, 19) }}</template>
         </el-table-column>

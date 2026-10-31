@@ -1,8 +1,10 @@
 ﻿/* ============================================================
-   TiMS Design Tokens — V2.2 UI revamp
+   TiMS Design Tokens — V2.3 UI revamp（v3.20 方案A 云控制台风）
    墨蓝 #0C1222 · 工作区 #F6F7FB · 品牌红 #CC3030（识别+危险） · 数据青 #0D8484（主操作）
    色彩语义：主操作/进行中/强调 = 数据青；删除/失败/错误 = 品牌红；
    品牌红仅保留 logo 识别与危险语义，不再作为主操作色。
+   V2.3（v3.20）：hint 提示蓝档 + 连接器类型色（PG/MySQL/TiDB/Mongo）
+   + 状态胶囊四档系统化 + 卡片标题色条 + 表格斑马纹/悬浮 + 空状态通用样式。
    ============================================================ */
 
 /* --- Self-hosted fonts (offline-safe, ~91KB) --- */
@@ -48,12 +50,20 @@
   --tims-teal-soft: rgba(13, 132, 132, 0.10); /* #t2 色相跟随 */
   --tims-amber: #d97e00;      /* 琥珀：warn */
   --tims-amber-soft: rgba(217, 126, 0, 0.10);
+  --tims-hint: #5873b0;       /* 提示蓝：跨方言/提示级信息（v3.20 方案A 四档胶囊 hint 档） */
+  --tims-hint-soft: rgba(88, 115, 176, 0.12);
+  --tims-hint-text: #4a619a;  /* on hint-soft ≈ 5.1 / on #fff = 5.7，AA */
+  --tims-pg: #336791;         /* 连接器类型色：PostgreSQL（白字 5.55） */
+  --tims-mysql: #e97f0f;      /* 连接器类型色：MySQL（徽章底，名称以相邻文字披露） */
+  --tims-mongo: #12805c;      /* 连接器类型色：MongoDB（白字 4.91） */
   --tims-text: #2a3040;       /* 主文字 */
   --tims-text-2: #6b7280;     /* 次文字 */
   --tims-text-inv: #eef1f8;   /* 深底文字 */
   --tims-text-inv-2: #97a0b5; /* 深底次文字 */
   --tims-border: #e6e8f0;
   --tims-border-ink: #263154;
+  --tims-table-zebra: #fafbfd; /* 表格斑马纹偶数行底 */
+  --tims-table-hover: #f2f6f6; /* 表格悬浮行底（teal 一档淡底） */
 
   /* Shape & depth */
   --tims-radius: 12px;   /* 大容器档（卡片级） */
@@ -234,6 +244,128 @@ button, input, optgroup, select, textarea {
   box-shadow: var(--tims-shadow);
 }
 .el-card__header { font-weight: 600; }
+
+/* --- v3.20 方案A：卡片标题色条（全站 el-card 头部统一 3.5px teal 短条）---
+   全局一条规则覆盖 12 个页面视图的卡片头；is-red 变体按需在视图侧
+   class="tims-card-title--red" 声明（危险语义卡，如 DDL 对比结论）。 */
+.el-card__header {
+  position: relative;
+  padding-left: 20px;
+}
+.el-card__header::before {
+  content: '';
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3.5px;
+  height: 15px;
+  border-radius: 2px;
+  background: var(--tims-teal);
+}
+.el-card__header.tims-card-title--red::before { background: var(--tims-brand); }
+
+/* --- v3.20 方案A：状态胶囊四档（pass / hint / warn / fail）---
+   底色按样张四档 soft 系、文字用既有 AA 深色令牌；原生 span 用法，
+   DashboardView 等自定义标记处使用；EP el-tag 全站胶囊化见下。 */
+.tims-pill {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: var(--tims-font-xs);
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.tims-pill--pass { background: var(--tims-teal-soft); color: var(--tims-tag-success-text); }
+.tims-pill--fail { background: var(--tims-brand-soft); color: var(--tims-tag-danger-text); }
+.tims-pill--warn { background: var(--tims-amber-soft); color: var(--tims-tag-warning-text); }
+.tims-pill--hint { background: var(--tims-hint-soft); color: var(--tims-hint-text); }
+
+/* --- v3.20 方案A：el-tag 全站胶囊化（状态胶囊系统化）---
+   圆角收敛 999px、去描边、四档底色走 soft 系 + AA 深字；info 档由灰改
+   hint 蓝（样张口径：跨方言提示）。dark（反白）形态不动。 */
+.el-tag { border-radius: 999px; font-weight: 600; }
+.el-tag.el-tag--success:not(.el-tag--dark),
+.el-tag.el-tag--primary:not(.el-tag--dark) {
+  --el-tag-bg-color: var(--tims-teal-soft);
+  --el-tag-border-color: transparent;
+}
+.el-tag.el-tag--warning:not(.el-tag--dark) {
+  --el-tag-bg-color: var(--tims-amber-soft);
+  --el-tag-border-color: transparent;
+}
+.el-tag.el-tag--danger:not(.el-tag--dark) {
+  --el-tag-bg-color: var(--tims-brand-soft);
+  --el-tag-border-color: transparent;
+}
+.el-tag.el-tag--error:not(.el-tag--dark) {
+  --el-tag-bg-color: var(--tims-brand-soft);
+  --el-tag-border-color: transparent;
+}
+.el-tag.el-tag--info:not(.el-tag--dark) {
+  --el-tag-text-color: var(--tims-hint-text);
+  --el-tag-bg-color: var(--tims-hint-soft);
+  --el-tag-border-color: transparent;
+}
+
+/* --- v3.20 方案A：表格斑马纹 + 悬浮态（el-table 全站统一）---
+   斑马纹走 EP 的 $index 档（el-table 加 stripe 属性，行类 --striped 按
+   数据行序计算）——expand 展开（CompareView/TaskDetail 插入额外 tr）与
+   fixed 列镜像表均不错位；悬浮 teal 一档淡底。 */
+.el-table { --el-table-row-hover-bg-color: var(--tims-table-hover); }
+.el-table .el-table__row--striped td.el-table__cell {
+  background-color: var(--tims-table-zebra);
+}
+.el-table--enable-row-hover .el-table__body tr.el-table__row:hover > td.el-table__cell {
+  background-color: var(--tims-table-hover);
+}
+
+/* --- v3.20 方案A：连接器类型色徽章（PG / MySQL / TiDB / MongoDB）---
+   34px 圆角方块 + 白色图标/字母；类型名称由相邻文字披露（徽章为装饰性
+   色块，不承载唯一信息，AA 以相邻文本满足）。 */
+.tims-conn-dot {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+.tims-conn-dot.is-pg { background: var(--tims-pg); }
+.tims-conn-dot.is-mysql { background: var(--tims-mysql); }
+.tims-conn-dot.is-tidb { background: var(--tims-brand); }
+.tims-conn-dot.is-mongodb { background: var(--tims-mongo); }
+
+/* --- v3.20 方案A：空状态通用样式（插画 + 引导按钮容器档）--- */
+.el-empty { padding: 30px 20px; }
+.el-empty .el-empty__description p {
+  color: var(--tims-text-2);
+  font-size: var(--tims-font-sm);
+}
+.tims-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 30px 20px;
+  text-align: center;
+}
+.tims-empty .tims-empty-icon { color: #c9cedb; }
+.tims-empty .tims-empty-title {
+  font-size: var(--tims-font-sm);
+  font-weight: 600;
+  color: var(--tims-text);
+}
+.tims-empty .tims-empty-sub {
+  font-size: var(--tims-font-xs);
+  color: var(--tims-text-2);
+}
 
 /* Focus visibility (a11y) — 焦点环随主操作色（数据青），与危险红区分 */
 :focus-visible {

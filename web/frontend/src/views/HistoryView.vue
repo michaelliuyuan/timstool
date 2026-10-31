@@ -85,7 +85,7 @@ onMounted(fetchHistory)
     <PageHeader title="迁移历史" />
     <el-card v-loading="loading">
       <div v-if="tasks.length > 0" class="tims-table-scroll">
-        <el-table :data="pagedTasks" style="width: 100%;">
+        <el-table stripe :data="pagedTasks" style="width: 100%;">
           <el-table-column prop="name" label="任务名称" min-width="200" />
           <el-table-column label="状态" width="120">
             <template #default="{ row }">

@@ -637,7 +637,7 @@ function logLevelClass(level: string): string {
               </el-button>
             </div>
           </template>
-          <el-table v-if="mcSummary" :data="mcFilteredRows" size="small" max-height="420" border>
+          <el-table stripe v-if="mcSummary" :data="mcFilteredRows" size="small" max-height="420" border>
             <el-table-column type="expand">
               <template #default="{ row }">
                 <el-descriptions :column="2" border size="small" style="padding: 8px;">
@@ -796,7 +796,7 @@ function logLevelClass(level: string): string {
                   <el-descriptions-item label="已完成">{{ phase.tables_done }}</el-descriptions-item>
                   <el-descriptions-item label="行进度">{{ phase.rows_done.toLocaleString() }} / {{ phase.rows_total.toLocaleString() }}</el-descriptions-item>
                 </el-descriptions>
-                <el-table v-if="phase.tables?.length" :data="phase.tables" size="small" style="margin-top: 12px;" max-height="200">
+                <el-table stripe v-if="phase.tables?.length" :data="phase.tables" size="small" style="margin-top: 12px;" max-height="200">
                   <el-table-column prop="name" label="表名" />
                   <el-table-column prop="state" label="状态" width="100">
                     <template #default="{ row }">
@@ -817,7 +817,7 @@ function logLevelClass(level: string): string {
                   <el-descriptions-item label="表总数">{{ phase.table_count }}</el-descriptions-item>
                   <el-descriptions-item label="已完成">{{ phase.tables_done }}</el-descriptions-item>
                 </el-descriptions>
-                <el-table v-if="phase.tables?.length" :data="phase.tables" size="small" style="margin-top: 12px;" max-height="200">
+                <el-table stripe v-if="phase.tables?.length" :data="phase.tables" size="small" style="margin-top: 12px;" max-height="200">
                   <el-table-column prop="name" label="表名" />
                   <el-table-column prop="state" label="状态" width="100">
                     <template #default="{ row }">

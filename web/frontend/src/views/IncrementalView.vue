@@ -874,7 +874,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
           <el-button type="primary" @click="openCreate">新建任务</el-button>
         </div>
       </template>
-      <el-table :data="jobs" v-loading="loading">
+      <el-table stripe :data="jobs" v-loading="loading">
         <template #empty>
           <div class="inc-empty">
             <el-icon :size="42" class="inc-empty-icon"><Calendar /></el-icon>
@@ -1162,7 +1162,7 @@ const wmTooltip = '首次同步的起点：只同步水位列晚于（大于）�
           <div style="margin-bottom: 8px;">
             <el-button size="small" @click="openRunLogs(historyJob!.id, h.run_id)">日志</el-button>
           </div>
-          <el-table :data="h.tables" size="small">
+          <el-table stripe :data="h.tables" size="small">
             <el-table-column prop="table" label="表" width="140" />
             <el-table-column prop="from_watermark" label="起始水位" min-width="160" />
             <el-table-column prop="to_watermark" label="推进至" min-width="160" />
