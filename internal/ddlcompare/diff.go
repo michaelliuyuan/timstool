@@ -147,9 +147,12 @@ func compareTable(s, t *TableMeta, opts Options, crossDialect bool) (TableDiff, 
 			td.Verdict = Worst(td.Verdict, cv)
 		}
 		td.CharsetDiff = &AttrDiff{Source: s.Charset, Target: t.Charset, Equal: false, Note: cnote}
-	} else if s.Charset != t.Charset {
-		// folded-equal (utf8 → utf8mb4): record the pair as equal so the
-		// report shows the fold, not a difference.
+	} else if s.Charset != "" {
+		// B 口径 (2026-10-31 刘源拍板): verdict-equal pairs (identical
+		// non-empty, or folded utf8→utf8mb4) are always emitted so the report
+		// shows 取到且相等 rather than an ambiguous absence; double-empty
+		// (equal-by-absence, MySQL-family rows without TABLE_COLLATION)
+		// stays nil and renders '—'.
 		td.CharsetDiff = &AttrDiff{Source: s.Charset, Target: t.Charset, Equal: true}
 	}
 
@@ -166,7 +169,9 @@ func compareTable(s, t *TableMeta, opts Options, crossDialect bool) (TableDiff, 
 			td.Verdict = Worst(td.Verdict, ov)
 		}
 		td.CollationDiff = &AttrDiff{Source: s.Collation, Target: t.Collation, Equal: false, Note: onote}
-	} else if s.Collation != t.Collation {
+	} else if s.Collation != "" {
+		// B 口径同守: identical non-empty collations are emitted as
+		// Equal:true; double-empty stays nil → '—'.
 		td.CollationDiff = &AttrDiff{Source: s.Collation, Target: t.Collation, Equal: true}
 	}
 
@@ -191,7 +196,7 @@ func normJoin(cols []string, opts Options) string {
 // TABLE_TYPE='SEQUENCE', so a TiDB target compares for real; a target
 // that carries none (vanilla MySQL instance, or a TiDB database without
 // sequences) makes a PG source with sequences fail honestly with the
-//「目标端无序列对象」annotation carried on the category (rendered
+// 「目标端无序列对象」annotation carried on the category (rendered
 // distinctly, not as a regular set-difference FAIL).
 func diffSequences(src, tgt *Snapshot, opts Options) Category {
 	cat := nameCategory("sequences", "序列", src.Sequences, tgt.Sequences, opts)

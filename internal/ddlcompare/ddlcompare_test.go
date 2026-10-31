@@ -265,6 +265,32 @@ func TestDiffSameDialectTablesFold(t *testing.T) {
 	}
 }
 
+func TestDiffTableAttrsEmitEqualNonEmpty(t *testing.T) {
+	// B 口径 (2026-10-31 刘源拍板): 字符集/排序规则「非空且 verdict-equal」也
+	// 下发 AttrDiff{Equal:true}（FE 渲染 utf8mb4 → utf8mb4，区分「取到且相等」
+	// 与「未获取」）；双空（MySQL 族无 TABLE_COLLATION，equal-by-absence）
+	// 保持 nil → FE 渲染 '—'。
+	src := &Snapshot{Dialect: "mysql", Schema: "a", Tables: []TableMeta{
+		{Name: "t_eq", Charset: "utf8mb4", Collation: "utf8mb4_bin", PK: []string{"id"}},
+		{Name: "t_absent", Charset: "", Collation: "", PK: []string{"id"}},
+	}}
+	tgt := &Snapshot{Dialect: "mysql", Schema: "b", Tables: []TableMeta{
+		{Name: "t_eq", Charset: "utf8mb4", Collation: "utf8mb4_bin", PK: []string{"id"}},
+		{Name: "t_absent", Charset: "", Collation: "", PK: []string{"id"}},
+	}}
+	res := Diff(src, tgt, optLoose())
+	byName := map[string]TableDiff{}
+	for _, td := range catByKey(t, res, "tables").Tables {
+		byName[td.Table] = td
+	}
+	if d := byName["t_eq"]; d.Verdict != VerdictPass || d.CharsetDiff == nil || !d.CharsetDiff.Equal || d.CollationDiff == nil || !d.CollationDiff.Equal {
+		t.Errorf("identical non-empty attrs must emit Equal:true diffs: %+v", d)
+	}
+	if d := byName["t_absent"]; d.Verdict != VerdictPass || d.CharsetDiff != nil || d.CollationDiff != nil {
+		t.Errorf("double-empty attrs must stay nil (equal-by-absence → '—'): %+v", d)
+	}
+}
+
 func TestDiffMissingAndExtraTable(t *testing.T) {
 	tgt := snapBEqual()
 	tgt.Tables = tgt.Tables[:1] // drop orders
