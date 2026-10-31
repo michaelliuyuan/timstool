@@ -146,6 +146,14 @@ const nameCategories = computed(() =>
     : [],
 )
 
+// v3.19.41（用户 13:45 裁定）：跨方言固有差异不再逐格注记，整份结果
+// 只渲染一条统一「跨方言说明」。
+const hasHints = computed(() =>
+  result.value
+    ? result.value.categories.some((c) => c.verdict === 'hint' || (c.tables || []).some((t: any) => t.verdict === 'hint'))
+    : false,
+)
+
 function privilegeRows(cat?: CategoryResult) {
   const rows: { user: string; side: string; source: string; target: string; verdict: string; equal: boolean }[] = []
   for (const u of cat?.privileges?.users || []) {
@@ -274,6 +282,9 @@ function historyReportURL(id: string, format: 'html' | 'json') {
         <el-tag :type="verdictTag(result.overall)" size="large" data-testid="dc-overall">
           总体结论：{{ verdictText(result.overall) }}
         </el-tag>
+        <div v-if="hasHints" class="dc-global" data-testid="dc-global-hint">
+          跨方言说明：「提示」为两端固有差异（字符集取值、排序规则 / 权限词汇），仅披露、不判错；「失败」为真实结构差异（主键不同、对象仅一端存在）。
+        </div>
       </div>
 
       <el-table :data="result.categories" size="small" style="margin-bottom: 20px;" data-testid="dc-summary">
@@ -330,13 +341,11 @@ function historyReportURL(id: string, format: 'html' | 'json') {
           <el-table-column label="字符集（源 → 目标）" min-width="150">
             <template #default="{ row }">
               <span :class="row.charset_diff && !row.charset_diff.equal ? 'dc-amber' : ''">{{ attrText(row.charset_diff) }}</span>
-              <div v-if="row.charset_diff && !row.charset_diff.equal && row.charset_diff.note" class="dc-note">{{ row.charset_diff.note }}</div>
             </template>
           </el-table-column>
           <el-table-column label="排序规则（源 → 目标）" min-width="180">
             <template #default="{ row }">
               <span :class="row.collation_diff && !row.collation_diff.equal ? 'dc-amber' : ''">{{ attrText(row.collation_diff) }}</span>
-              <div v-if="row.collation_diff && !row.collation_diff.equal && row.collation_diff.note" class="dc-note">{{ row.collation_diff.note }}</div>
             </template>
           </el-table-column>
         </el-table>
@@ -472,12 +481,16 @@ function historyReportURL(id: string, format: 'html' | 'json') {
   line-height: 1.8;
   padding: 0 12px;
 }
-.dc-note {
+.dc-global {
+  margin-top: 8px;
   font-size: 12px;
-  line-height: 1.5;
-  color: var(--tims-text-2, #97a0b5);
-  margin-top: 2px;
-  overflow-wrap: anywhere;
+  line-height: 1.7;
+  color: #5873b0;
+  background: #f2f5fa;
+  border: 1px solid #dce4f2;
+  border-radius: 6px;
+  padding: 8px 12px;
+  max-width: 760px;
 }
 .dc-names {
   border: 1px solid var(--el-border-color-light, #ebeef5);

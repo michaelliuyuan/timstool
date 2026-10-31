@@ -260,9 +260,9 @@ func TestDDLCompareReportFaces(t *testing.T) {
 		"目标端无此对象类型",
 		"跨方言权限词汇表不相交，不做结论",
 		"badge-hint", "提示", "跨方言提示类（不判错）",
-		"cell-note", "跨方言排序规则词汇表不相交，仅提示（不判错）",
+		"hintnote", "跨方言说明", "「提示」为两端固有差异（字符集取值、排序规则 / 权限词汇），仅披露、不判错",
 		"SUPER", "CREATEDB", "Select_priv",
-		"V3.20.1",
+		"V3.20.2",
 		`<td class="status">`, `<th class="keep">用户</th>`, `<td class="keep">`,
 		`th.colnum { text-align: right; }`, `<span class="c-muted">—</span>`,
 		"tidb_enable_procedure",
@@ -272,11 +272,11 @@ func TestDDLCompareReportFaces(t *testing.T) {
 			t.Errorf("html report missing %q", want)
 		}
 	}
-	// v1.4 报告体验（用户 11:16 裁定）：差异原因内联属性单元格，展开行
-	// 与「V4 说明」术语绝迹。
-	for _, banned := range []string{"V4 说明", "row-detail", "<details>"} {
+	// v3.20.2 报告体验（用户 13:45 裁定）：差异原因不再逐格内联，改全
+	// 报告一条统一「跨方言说明」；展开行与「V4 说明」术语绝迹。
+	for _, banned := range []string{"V4 说明", "row-detail", "<details>", "cell-note", "仅提示（不判错）"} {
 		if strings.Contains(html, banned) {
-			t.Errorf("html report must not contain %q (inlined notes only)", banned)
+			t.Errorf("html report must not contain %q (global hintnote only)", banned)
 		}
 	}
 	if strings.Contains(html, "<script>alert") {

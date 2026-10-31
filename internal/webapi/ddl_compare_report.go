@@ -22,7 +22,7 @@ import (
 // dcmpReportVersion is the DDL-compare report renderer's own version
 // stamp (dcReportVersion/mcReportVersion twin — rendered once in the
 // footer badge).
-const dcmpReportVersion = "3.20.1"
+const dcmpReportVersion = "3.20.2"
 
 // dcmpVerdictCN translates a verdict for the report vocabulary.
 func dcmpVerdictCN(v ddlcompare.Verdict) string {
@@ -108,7 +108,7 @@ tr.row-warn td { background: #FDF7EE; }
 tr.row-warn td:first-child { box-shadow: inset 3px 0 0 #D97E00; }
 tr.row-hint td { background: #F2F5FA; }
 tr.row-hint td:first-child { box-shadow: inset 3px 0 0 #5873B0; }
-.cell-note { color: #6B7280; font-size: 12px; line-height: 1.5; margin-top: 2px; overflow-wrap: anywhere; }
+.hintnote { background: #F2F5FA; border: 1px solid #DCE4F2; border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; font-size: 13px; line-height: 1.8; color: #4A5B8C; }
 .badge-hint { background: rgba(88,115,176,0.10); color: #5873B0; }
 .overall-hint { color: #5873B0; }
 .wn { background: #FDF7EE; border: 1px solid #F0DFC2; border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; font-size: 13px; line-height: 1.8; color: #8A5A00; }
@@ -153,6 +153,12 @@ tr.row-hint td:first-child { box-shadow: inset 3px 0 0 #5873B0; }
 	}
 	sb.WriteString(`</div></div>`)
 
+	// 跨方言全局说明（v3.20.2 口径，用户 13:45 裁定）：不再在每个属
+	// 性单元格下重复注记，改为整份报告一条统一说明。
+	if dcmpHasAnyHint(res) {
+		sb.WriteString(`<div class="hintnote"><strong>跨方言说明</strong>：「提示」为两端固有差异（字符集取值、排序规则 / 权限词汇），仅披露、不判错；「失败」为真实结构差异（主键不同、对象仅一端存在）。</div>`)
+	}
+
 	if len(res.Warnings) > 0 {
 		sb.WriteString(`<div class="wn"><strong>提示</strong><br>`)
 		for i, wn := range res.Warnings {
@@ -189,9 +195,6 @@ tr.row-hint td:first-child { box-shadow: inset 3px 0 0 #5873B0; }
 					pk = fmt.Sprintf("%s → %s", dcmpPK(td.PKDiff.Source), dcmpPK(td.PKDiff.Target))
 				}
 				status := dcmpTableStatus(td)
-				// 差异原因内联在属性单元格内（v1.4 报告体验口径，用户
-				// 11:16 裁定：不再用展开行分隔表格，也不再用「V4 说明」
-				// 这类术语）——一行一表，原因以弱化小字随值呈现。
 				fmt.Fprintf(&sb, `<tr class="%s"><td class="num">%d</td><td>%s</td><td class="status"><span class="badge badge-%s">%s</span></td><td>%s</td><td>%s</td><td>%s</td></tr>`,
 					mcHTMLEsc(row), i+1, mcHTMLEsc(td.Table), mcHTMLEsc(string(td.Verdict)), mcHTMLEsc(status),
 					mcHTMLEsc(pk), dcmpAttrCell(td.CharsetDiff), dcmpAttrCell(td.CollationDiff))
@@ -234,10 +237,9 @@ func dcmpTableStatus(td ddlcompare.TableDiff) string {
 	}
 }
 
-// dcmpAttrCell renders one attribute cell as escaped "source → target"
-// plus, for an unequal attribute carrying a reason, the note inlined as a
-// muted second line (v1.4: one row per table, no expand rows, no version
-// jargon — the reason travels with the value it explains).
+// dcmpAttrCell renders one attribute cell as escaped "source → target".
+// v3.20.2（用户 13:45 裁定）：差异原因不再逐格内联，全报告统一一条
+// 「跨方言说明」（见 renderDDLCompareReportHTML 顶部 hintnote 块）。
 func dcmpAttrCell(d *ddlcompare.AttrDiff) string {
 	if d == nil {
 		return "—"
@@ -249,11 +251,7 @@ func dcmpAttrCell(d *ddlcompare.AttrDiff) string {
 	if tgt == "" {
 		tgt = "(无)"
 	}
-	cell := mcHTMLEsc(src) + " → " + mcHTMLEsc(tgt)
-	if !d.Equal && d.Note != "" {
-		cell += `<div class="cell-note">` + mcHTMLEsc(d.Note) + `</div>`
-	}
-	return cell
+	return mcHTMLEsc(src) + " → " + mcHTMLEsc(tgt)
 }
 
 // dcmpPrivilegesCard renders the privileges category (V1 分轨). Same-dialect
@@ -325,6 +323,22 @@ func dcmpHintCategories(res *ddlcompare.Result) int {
 		}
 	}
 	return n
+}
+
+// dcmpHasAnyHint reports whether any category or table row carries the
+// hint verdict — the gate for the single global 跨方言说明 block.
+func dcmpHasAnyHint(res *ddlcompare.Result) bool {
+	for _, c := range res.Categories {
+		if c.Verdict == ddlcompare.VerdictHint {
+			return true
+		}
+		for _, t := range c.Tables {
+			if t.Verdict == ddlcompare.VerdictHint {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // dcmpPrivRowClass maps a privilege row to its stripe class.
