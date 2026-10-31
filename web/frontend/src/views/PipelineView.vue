@@ -283,11 +283,9 @@ const runningCount = computed(
     tasks.value.filter((t) => t.status === 'running').length +
     ddlTasks.value.filter((t) => t.status === 'running').length,
 )
-const failCount = computed(
-  () =>
-    tasks.value.filter((t) => t.status === 'failed').length +
-    ddlTasks.value.filter((t) => t.overall === 'fail' || t.status === 'failed').length,
-)
+// leader 终门裁决①（20:25）：失败 chip 回归任务态口径（mockup 批准口径 13，
+// 与点击落 /tasks 实显一致）；DDL 结论失败由连线红档/目标顶条/浮层「最近失败」三处披露。
+const failCount = computed(() => tasks.value.filter((t) => t.status === 'failed').length)
 // 推不出流向的任务（迁移 + Mongo 对比）→ 底部注记 chip，不画线。
 const unlabeledCount = computed(() => migCount.value + mongoCount.value)
 

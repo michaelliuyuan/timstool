@@ -50,14 +50,16 @@ describe('B 二期: 顶部汇总条 6 chips', () => {
     expect(s).toContain(`@click="router.push(c.to)"`)
   })
 
-  it('计数推导：kind 判别迁移/Mongo；运行中/失败双列表（tasks + ddl）合算', () => {
+  it('计数推导：kind 判别迁移/Mongo；运行中双表合算；失败 chip 回归任务态口径（裁决①）', () => {
     const s = src('PipelineView.vue')
     expect(s).toContain(`import { isCompareTask } from '../api'`)
     expect(s).toContain(`tasks.value.filter((t) => !isCompareTask(t)).length`)
     expect(s).toContain(`tasks.value.filter((t) => isCompareTask(t)).length`)
     expect(s).toContain(`tasks.value.filter((t) => t.status === 'running').length`)
-    expect(s).toContain(`tasks.value.filter((t) => t.status === 'failed').length`)
-    expect(s).toContain(`ddlTasks.value.filter((t) => t.overall === 'fail' || t.status === 'failed').length`)
+    expect(s).toContain(`const failCount = computed(() => tasks.value.filter((t) => t.status === 'failed').length)`)
+    // 裁决①负锚：失败 chip 不再双表合算 DDL 结论失败（回归 mockup 批准口径 13）。
+    expect(s).not.toContain(`tasks.value.filter((t) => t.status === 'failed').length +`)
+    expect(s).not.toContain(`ddlTasks.value.filter((t) => t.overall === 'fail' || t.status === 'failed').length`)
   })
 })
 
