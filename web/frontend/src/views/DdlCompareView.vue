@@ -327,7 +327,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
       <template v-for="cat in tableCategories" :key="cat.key">
         <h3 class="dc-section">表（主键 / 字符集 / 排序规则）</h3>
         <el-table stripe :data="cat.tables || []" size="small" style="margin-bottom: 20px;">
-          <el-table-column prop="table" label="表名" min-width="140" />
+          <el-table-column prop="table" label="表名" min-width="140" show-overflow-tooltip />
           <el-table-column label="状态" width="118">
             <template #default="{ row }">
               <el-tag :type="row.source_only ? 'danger' : row.target_only ? 'warning' : verdictTag(row.verdict)" :class="!row.source_only && !row.target_only ? verdictClass(row.verdict) : ''" size="small">
@@ -335,18 +335,18 @@ function historyReportURL(id: string, format: 'html' | 'json') {
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="主键（源 → 目标）" min-width="160">
+          <el-table-column label="主键（源 → 目标）" min-width="160" show-overflow-tooltip>
             <template #default="{ row }">
               <span v-if="row.pk_diff">{{ pkText(row.pk_diff.source) }} → {{ pkText(row.pk_diff.target) }}</span>
               <span v-else>—</span>
             </template>
           </el-table-column>
-          <el-table-column label="字符集（源 → 目标）" min-width="150">
+          <el-table-column label="字符集（源 → 目标）" min-width="170" show-overflow-tooltip>
             <template #default="{ row }">
               <span :class="row.charset_diff && !row.charset_diff.equal ? 'dc-amber' : ''">{{ attrText(row.charset_diff) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="排序规则（源 → 目标）" min-width="180">
+          <el-table-column label="排序规则（源 → 目标）" min-width="210" show-overflow-tooltip>
             <template #default="{ row }">
               <span :class="row.collation_diff && !row.collation_diff.equal ? 'dc-amber' : ''">{{ attrText(row.collation_diff) }}</span>
             </template>

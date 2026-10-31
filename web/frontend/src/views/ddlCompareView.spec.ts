@@ -115,3 +115,22 @@ describe('DC 页样式修正（3.20.3）：dc-global 满宽 + verdict/注解列�
     expect(src).toContain(`? '提示（不判）' : row.verdict`)
   })
 })
+
+// bf B 案 FE 加单（刘源 22:38 换行/列宽令，leader seq=133 口径，FE 3.23.0）：
+// 表类表格 4 列（表名/主键/字符集/排序规则）加 show-overflow-tooltip 不换行
+// （house 惯例，7 视图同款），字符集 150→170 / 排序规则 180→210（保 te 实测
+// utf8mb4_unicode_ci → utf8mb4_bin 整行直显，超长省略悬停）；状态列 118 与
+// 权限表本轮不动（台账候后续）。
+describe('DC 表类表格列不换行（3.23.0）：4 列 tooltip + 列宽 170/210', () => {
+  it('表名/主键列：tooltip 上身，宽维持 140/160', () => {
+    expect(src).toContain('prop="table" label="表名" min-width="140" show-overflow-tooltip')
+    expect(src).toContain('label="主键（源 → 目标）" min-width="160" show-overflow-tooltip')
+  })
+
+  it('字符集/排序规则列：150→170 / 180→210 + tooltip（live 值整行直显）', () => {
+    expect(src).toContain('label="字符集（源 → 目标）" min-width="170" show-overflow-tooltip')
+    expect(src).toContain('label="排序规则（源 → 目标）" min-width="210" show-overflow-tooltip')
+    expect(src).not.toContain('label="字符集（源 → 目标）" min-width="150"')
+    expect(src).not.toContain('label="排序规则（源 → 目标）" min-width="180"')
+  })
+})
