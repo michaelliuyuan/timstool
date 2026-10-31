@@ -111,7 +111,7 @@ const crumbTitle = computed(() => {
             :class="{ 'is-active': isActive(item.path) }"
             @click="router.push(item.path)"
           >
-            <el-icon :size="17"><component :is="item.icon" /></el-icon>
+            <el-icon :size="18"><component :is="item.icon" /></el-icon>
             <span class="tims-nav-label">{{ item.label }}</span>
           </button>
         </template>
@@ -149,7 +149,8 @@ const crumbTitle = computed(() => {
   overflow: hidden;
 }
 
-/* --- v3.20 方案A：224px 宽侧栏（深色墨蓝保留；图标+单行文字+分组标题） --- */
+/* --- v3.20 方案A：224px 宽侧栏（深色墨蓝保留；图标+单行文字+分组标题；
+    B1 呼吸感 3.20.1：行距 6px / 行高 37px 档 / 图标 18 / 组头 teal 圆点） --- */
 .tims-sidenav {
   width: 224px;
   flex: none;
@@ -184,7 +185,7 @@ const crumbTitle = computed(() => {
 .tims-nav {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 6px;
   /* MC-19 A：侧栏内滚动兜底——高度不足时 nav 自身内滚（shell 100vh+overflow:hidden
       锁页滚，被裁项原本完全不可达）；内容不溢出时零视觉差。 */
   flex: 1;
@@ -197,28 +198,35 @@ const crumbTitle = computed(() => {
 .tims-nav::-webkit-scrollbar { width: 4px; }
 .tims-nav::-webkit-scrollbar-thumb { background: var(--tims-border-ink); border-radius: 2px; }
 .tims-nav-group {
-  margin: 12px 6px 4px;
+  margin: 18px 8px 8px;
   font-size: 11px;
   letter-spacing: 1.5px;
   color: var(--tims-text-inv-2);
   opacity: 0.65;
-  border-top: 1px solid var(--tims-border-ink);
-  padding-top: 10px;
   white-space: nowrap;
 }
-/* 概览组贴顶：首组不画分隔线（其余组以细线分节）。 */
-.tims-nav-group:first-child {
-  border-top: none;
-  margin-top: 0;
-  padding-top: 0;
+/* B1 呼吸感：组头分隔线退役，teal 4px 圆点替代（容器 opacity 下实收≈.59，
+   样张 .75×.9≈.68 同档观感）。 */
+.tims-nav-group::before {
+  content: '';
+  display: inline-block;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--tims-teal);
+  opacity: 0.9;
+  margin-right: 7px;
+  vertical-align: 2px;
 }
+/* 概览组贴顶：首组微距 2px（B1 样张）。 */
+.tims-nav-group:first-child { margin-top: 2px; }
 .tims-nav-item {
   position: relative;
   display: flex;
   align-items: center;
   justify-content: flex-start;
-  gap: 10px;
-  padding: 8px 10px;
+  gap: 12px;
+  padding: 10px 12px;
   border: none;
   border-radius: var(--tims-radius-s);
   background: transparent;
@@ -324,12 +332,12 @@ const crumbTitle = computed(() => {
   .tims-logo-sub { display: none; }
   .tims-nav-item { flex-direction: column; gap: 4px; padding: 10px 0; }
   .tims-nav-label { display: none; }
+  /* B1：窄轨组头居中，teal 圆点隐藏（标签隐藏逻辑不变）。 */
   .tims-nav-group {
     text-align: center;
     letter-spacing: 0.5px;
-    border-top: none;
-    padding-top: 4px;
   }
+  .tims-nav-group::before { display: none; }
   .tims-crumb-home { display: none; }
   .tims-crumb-sep { display: none; }
   .tims-workspace { padding: 14px; }
@@ -340,12 +348,12 @@ const crumbTitle = computed(() => {
 @media (max-height: 880px) and (min-width: 901px) {
   .tims-logo { padding: 10px 6px 10px; }
   .tims-nav { gap: 1px; }
-  .tims-nav-group { margin: 8px 6px 3px; padding-top: 8px; }
+  .tims-nav-group { margin: 8px 6px 3px; }
   .tims-nav-item { padding: 6px 10px; }
 }
 @media (max-height: 680px) and (min-width: 901px) {
   .tims-logo { font-size: 20px; padding: 6px 6px 6px; }
-  .tims-nav-group { margin: 6px 6px 2px; padding-top: 6px; }
+  .tims-nav-group { margin: 6px 6px 2px; }
   .tims-nav-item { padding: 4px 10px; }
 }
 </style>

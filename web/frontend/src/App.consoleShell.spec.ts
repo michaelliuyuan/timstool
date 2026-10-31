@@ -37,6 +37,30 @@ describe('v3.20 方案A: 宽侧栏分组导航（console shell）', () => {
     expect(s).not.toContain('-webkit-line-clamp')
   })
 
+  // bf 返修（刘源 17:18 批复方案一「呼吸感」，B1 样张，FE 3.20.1）：
+  // 行距 6px / 行高 37px 档（padding 10px 12px）/ 图标 18 / 组头 teal 圆点替代分隔线。
+  it('B1 呼吸感：nav gap 6px / item 10px 12px / 图标 18 / 组头 teal 圆点+间距 18/8/8', () => {
+    const s = src('App.vue')
+    // 正锚：新密度与圆点（B1 样张口径）。
+    expect(s).toContain('<el-icon :size="18">')
+    expect(s).toMatch(/\.tims-nav \{[^}]*gap: 6px;/)
+    expect(s).toContain('gap: 12px;')
+    expect(s).toContain('padding: 10px 12px;')
+    expect(s).toContain('margin: 18px 8px 8px;')
+    expect(s).toContain('.tims-nav-group:first-child { margin-top: 2px; }')
+    expect(s).toContain('.tims-nav-group::before {')
+    expect(s).toContain('border-radius: 50%;')
+    expect(s).toContain('margin-right: 7px;')
+    // 负锚：组头 border-top 分隔线不回归；旧密度值退场。
+    expect(s).not.toMatch(/\.tims-nav-group[^{]*\{[^}]*border-top/)
+    expect(s).not.toContain(':size="17">')
+    expect(s).not.toContain('padding: 8px 10px;')
+    expect(s).not.toContain('margin: 12px 6px 4px;')
+    // 窄轨（≤900px）圆点隐藏，标签隐藏逻辑不变。
+    expect(s).toContain('.tims-nav-group::before { display: none; }')
+    expect(s).toContain('.tims-nav-label { display: none; }')
+  })
+
   it('顶栏浅色面包屑（工作台 / 当前页）；心跳与版本徽章保留', () => {
     const s = src('App.vue')
     expect(s).toContain('class="tims-crumb"')
