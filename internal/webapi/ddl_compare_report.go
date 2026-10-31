@@ -22,7 +22,7 @@ import (
 // dcmpReportVersion is the DDL-compare report renderer's own version
 // stamp (dcReportVersion/mcReportVersion twin — rendered once in the
 // footer badge).
-const dcmpReportVersion = "3.20.0"
+const dcmpReportVersion = "3.20.1"
 
 // dcmpVerdictCN translates a verdict for the report vocabulary.
 func dcmpVerdictCN(v ddlcompare.Verdict) string {
@@ -95,8 +95,11 @@ func renderDDLCompareReportHTML(task *ddlCompareTask, res *ddlcompare.Result) st
 .header .meta div { color: #97A0B5; }
 .header .meta span { color: #EEF1F8; font-weight: 500; }
 th { white-space: nowrap; }
+th.colnum { text-align: right; }
 td.num { white-space: nowrap; text-align: right; }
 td:not(.num) { overflow-wrap: anywhere; }
+td.status { white-space: nowrap; }
+th.keep, td.keep { white-space: nowrap; }
 th, td { padding: 8px 10px; }
 td.diff-pos { color: #E13C3C; font-weight: 600; }
 tr.row-fail td { background: #FDF1F1; }
@@ -189,7 +192,7 @@ tr.row-hint td:first-child { box-shadow: inset 3px 0 0 #5873B0; }
 				// 差异原因内联在属性单元格内（v1.4 报告体验口径，用户
 				// 11:16 裁定：不再用展开行分隔表格，也不再用「V4 说明」
 				// 这类术语）——一行一表，原因以弱化小字随值呈现。
-				fmt.Fprintf(&sb, `<tr class="%s"><td class="num">%d</td><td>%s</td><td><span class="badge badge-%s">%s</span></td><td>%s</td><td>%s</td><td>%s</td></tr>`,
+				fmt.Fprintf(&sb, `<tr class="%s"><td class="num">%d</td><td>%s</td><td class="status"><span class="badge badge-%s">%s</span></td><td>%s</td><td>%s</td><td>%s</td></tr>`,
 					mcHTMLEsc(row), i+1, mcHTMLEsc(td.Table), mcHTMLEsc(string(td.Verdict)), mcHTMLEsc(status),
 					mcHTMLEsc(pk), dcmpAttrCell(td.CharsetDiff), dcmpAttrCell(td.CollationDiff))
 			}
@@ -273,7 +276,7 @@ func dcmpPrivilegesCard(c ddlcompare.Category) string {
 		}
 		sb.WriteString(`<div class="wn"><strong>` + mcHTMLEsc(note) + `</strong> — MySQL 全局权限（mysql.user ` + strconv.Itoa(len(c.Privileges.Users)) + ` 类列）与 PG 布尔/角色成员词汇表无交集，以下仅按用户全量披露两侧原始权限清单。</div>`)
 	}
-	sb.WriteString(`<table><thead><tr><th>#</th><th>用户</th><th>源端权限</th><th>目标端权限</th><th>结论</th></tr></thead><tbody>`)
+	sb.WriteString(`<table><thead><tr><th>#</th><th class="keep">用户</th><th>源端权限</th><th>目标端权限</th><th class="keep">结论</th></tr></thead><tbody>`)
 	for i, u := range c.Privileges.Users {
 		badge := "badge-hint"
 		text := "—"
@@ -304,9 +307,9 @@ func dcmpPrivilegesCard(c ddlcompare.Category) string {
 		} else {
 			side = ""
 		}
-		fmt.Fprintf(&sb, `<tr class="%s"><td class="num">%d</td><td>%s%s</td><td><code>%s</code></td><td><code>%s</code></td><td><span class="badge %s">%s</span></td></tr>`,
+		fmt.Fprintf(&sb, `<tr class="%s"><td class="num">%d</td><td class="keep">%s%s</td><td>%s</td><td>%s</td><td class="keep"><span class="badge %s">%s</span></td></tr>`,
 			dcmpPrivRowClass(u, c.Privileges.Comparable), i+1, mcHTMLEsc(u.User), dcmpSideTag(side),
-			mcHTMLEsc(strings.Join(u.Source, ", ")), mcHTMLEsc(strings.Join(u.Target, ", ")), mcHTMLEsc(badge), mcHTMLEsc(text))
+			dcmpPrivCell(u.Source), dcmpPrivCell(u.Target), mcHTMLEsc(badge), mcHTMLEsc(text))
 	}
 	sb.WriteString(`</tbody></table></div>`)
 	return sb.String()
@@ -341,4 +344,14 @@ func dcmpSideTag(side string) string {
 		return ""
 	}
 	return ` <span class="badge badge-warn">` + side + `</span>`
+}
+
+// dcmpPrivCell renders one side of a per-user privilege list; an empty
+// list renders as a muted dash instead of an empty code block (v3.20.1
+// 报告体验口径：空白侧不渲染空标签，与全报告「空 = —」约定一致).
+func dcmpPrivCell(list []string) string {
+	if len(list) == 0 {
+		return `<span class="c-muted">—</span>`
+	}
+	return `<code>` + mcHTMLEsc(strings.Join(list, ", ")) + `</code>`
 }

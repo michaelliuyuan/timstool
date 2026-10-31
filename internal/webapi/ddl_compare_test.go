@@ -201,6 +201,7 @@ func dcSeedResult(t *testing.T) *ddlcompare.Result {
 				Privileges: &ddlcompare.PrivSetDiff{Comparable: false, CrossDialect: true, Users: []ddlcompare.PrivUserDiff{
 					{User: "appuser", Source: []string{"SUPER", "CREATEDB"}, Target: []string{"Select_priv", "Insert_priv"}, Equal: false},
 					{User: "reporter", Source: []string{"MEMBER:reader"}, Target: []string{"Select_priv"}, Equal: false},
+					{User: "ghost_left", Source: nil, Target: nil, SourceOnly: true, Equal: false},
 				}}},
 		},
 		Overall:  ddlcompare.VerdictFail,
@@ -261,7 +262,9 @@ func TestDDLCompareReportFaces(t *testing.T) {
 		"badge-hint", "提示", "跨方言提示类（不判错）",
 		"cell-note", "跨方言排序规则词汇表不相交，仅提示（不判错）",
 		"SUPER", "CREATEDB", "Select_priv",
-		"V3.20.0",
+		"V3.20.1",
+		`<td class="status">`, `<th class="keep">用户</th>`, `<td class="keep">`,
+		`th.colnum { text-align: right; }`, `<span class="c-muted">—</span>`,
 		"tidb_enable_procedure",
 		"orders&lt;script&gt;",
 	} {
