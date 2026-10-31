@@ -76,12 +76,17 @@ web/frontend/src/api/index.ts               # 四个 API + 报告 URL 助手
 
 用户存在性对比不受 V1 影响（两边都是用户名清单，可比，照 v1.3 口径 FAIL-able）。
 
-### 4.2 序列（V2/A3 裁定）
+### 4.2 序列（V2/A3 裁定 → v1.3.1 采集升级，用户 10-31 裁定）
 
-TiDB/MySQL 无 SEQUENCE 对象类型；PG 源几乎必然带序列（serial/identity 即
-隐式序列）。**PG→TiDB 只要有任意序列，序列类如实 FAIL、总体结论预期为
-FAIL**（用户已批"如实 FAIL"）。报告/FE 将「目标端无此对象类型（TiDB/MySQL
-无 SEQUENCE）」作为**独立注解/徽章**呈现，与真实差异 FAIL 视觉可区分。
+TiDB v7.1.9 实际支持 CREATE SEQUENCE（元数据：`information_schema.SEQUENCES`
+含 SEQUENCE_SCHEMA/START/INCREMENT/MAX_VALUE/CYCLE 等属性，
+`information_schema.TABLES` 以 `TABLE_TYPE='SEQUENCE'` 列出对象）；原版
+MySQL 无此对象类型。采集器经 `TABLE_TYPE='SEQUENCE'` 清点 MySQL 协议端
+序列：**TiDB 目标端与 PG 源做真实的存在性比对**（共有/单侧如实呈现，
+集合相等即 PASS）；仅当目标端确无序列（MySQL 实例，或 TiDB 目标库未建
+序列）时，落「目标端无序列对象…」**独立注解/徽章**，与真实差异 FAIL
+视觉可区分。PG 源几乎必然带序列（serial/identity 即隐式序列），故
+PG→MySQL 的序列类与总体结论预期仍为 FAIL（如实）。
 
 ## 5. 采集边界（已知降级，报告 Warnings 呈现）
 

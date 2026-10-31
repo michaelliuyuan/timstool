@@ -147,8 +147,9 @@ func catByKey(t *testing.T, res *Result, key string) *Category {
 
 func TestDiffEqual(t *testing.T) {
 	// PG→TiDB: charset folds (UTF8 → utf8mb4, target superset) but
-	// collation vocabularies differ → tables warn; sequences (PG has them,
-	// TiDB does not) → fail; privileges cross-dialect → warn. Overall fail.
+	// collation vocabularies differ → tables warn; sequences (PG has
+	// them, target carries none) → fail; privileges cross-dialect →
+	// warn. Overall fail.
 	res := Diff(snapA(), snapBEqual(), optLoose())
 	if res.Overall != VerdictFail {
 		t.Fatalf("overall = %q, want fail; categories: %+v", res.Overall, res.Categories)
@@ -162,13 +163,13 @@ func TestDiffEqual(t *testing.T) {
 	if uc.Verdict != VerdictPass || uc.Matched != 2 {
 		t.Errorf("users: verdict=%q matched=%d, want pass/2", uc.Verdict, uc.Matched)
 	}
-	// sequences: PG 源含序列 → 目标端无此对象类型注解 + fail.
+	// sequences: PG 源含序列 → 目标端无序列对象注解 + fail.
 	sc := catByKey(t, res, "sequences")
 	if sc.Verdict != VerdictFail || sc.Note == "" {
 		t.Errorf("sequences: verdict=%q note=%q, want fail + annotation", sc.Verdict, sc.Note)
 	}
-	if !strings.Contains(sc.Note, "目标端无此对象类型") {
-		t.Errorf("sequences note must carry the target-no-type annotation: %q", sc.Note)
+	if !strings.Contains(sc.Note, "目标端无序列对象") {
+		t.Errorf("sequences note must carry the target-no-sequence annotation: %q", sc.Note)
 	}
 	// privileges cross-dialect: warn, not comparable.
 	pc := catByKey(t, res, "privileges")
@@ -476,6 +477,59 @@ func TestSequencesMySQLToTiDB(t *testing.T) {
 	sc := catByKey(t, res, "sequences")
 	if sc.Verdict != VerdictPass || sc.Note != "" {
 		t.Errorf("mysql→mysql sequences: verdict=%q note=%q, want pass/empty", sc.Verdict, sc.Note)
+	}
+}
+
+func TestSequencesPGToTiDBRealDiff(t *testing.T) {
+	// v1.3.1: the MySQL-wire collector inventories TiDB SEQUENCE objects,
+	// so a TiDB target compares for real — common sequences pass, real
+	// set differences fail, and the「目标端无序列对象」annotation must
+	// NOT appear while the target carries sequences.
+	src := &Snapshot{Dialect: "postgres", Schema: "public",
+		Sequences: []string{"seq_users", "seq_orders", "seq_extra"}}
+	tgt := &Snapshot{Dialect: "mysql", Schema: "migration_test",
+		Sequences: []string{"seq_users", "seq_orders"}}
+	res := Diff(src, tgt, optLoose())
+	sc := catByKey(t, res, "sequences")
+	if sc.Verdict != VerdictFail {
+		t.Errorf("verdict = %q, want fail (seq_extra missing on target)", sc.Verdict)
+	}
+	if sc.Note != "" {
+		t.Errorf("note = %q, want empty while target carries sequences", sc.Note)
+	}
+	if !reflect.DeepEqual(sc.Names.Common, []string{"seq_orders", "seq_users"}) {
+		t.Errorf("common = %v, want [seq_orders seq_users]", sc.Names.Common)
+	}
+	if !reflect.DeepEqual(sc.Names.SourceOnly, []string{"seq_extra"}) || len(sc.Names.TargetOnly) != 0 {
+		t.Errorf("source_only = %v target_only = %v, want [seq_extra]/[]", sc.Names.SourceOnly, sc.Names.TargetOnly)
+	}
+	// Equal sequence sets across dialects → pass, no annotation.
+	tgt2 := &Snapshot{Dialect: "mysql", Schema: "migration_test",
+		Sequences: []string{"seq_users", "seq_orders", "seq_extra"}}
+	sc2 := catByKey(t, Diff(src, tgt2, optLoose()), "sequences")
+	if sc2.Verdict != VerdictPass || sc2.Note != "" {
+		t.Errorf("equal sequences: verdict=%q note=%q, want pass/empty", sc2.Verdict, sc2.Note)
+	}
+}
+
+func TestCollectMySQLSequencesFromTableType(t *testing.T) {
+	// v1.3.1 contract: sequences on the MySQL-wire side are read from
+	// information_schema.TABLES TABLE_TYPE='SEQUENCE' (present on TiDB,
+	// empty on vanilla MySQL — one portable query for both).
+	s := &capScript{rules: []capRule{
+		{contains: "TABLE_TYPE = 'SEQUENCE'", cols: []string{"TABLE_NAME"},
+			rows: [][]driver.Value{{"mock_seq_diff"}, {"mock_seq_shared"}}},
+	}}
+	db := newCapDB(t, s)
+	snap, _, err := CollectMySQL(context.Background(), db, "db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(snap.Sequences, []string{"mock_seq_diff", "mock_seq_shared"}) {
+		t.Errorf("sequences = %v, want [mock_seq_diff mock_seq_shared]", snap.Sequences)
+	}
+	if q := s.hits["TABLE_TYPE = 'SEQUENCE'"]; !strings.Contains(q, "information_schema.TABLES") {
+		t.Errorf("sequence query must read information_schema.TABLES: %s", q)
 	}
 }
 

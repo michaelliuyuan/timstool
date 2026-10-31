@@ -81,8 +81,8 @@ func CountMySQLTopLevel(ctx context.Context, db *sql.DB, database string) (int, 
 
 // CollectMySQL inventories one database over the MySQL protocol (MySQL
 // source or TiDB target). Structural classes (tables) are load-bearing and
-// fail the run on error; list classes (views, routines, triggers, users,
-// privileges) degrade to a warning + empty set.
+// fail the run on error; list classes (views, routines, triggers,
+// sequences, users, privileges) degrade to a warning + empty set.
 func CollectMySQL(ctx context.Context, db *sql.DB, database string) (*Snapshot, []string, error) {
 	snap := &Snapshot{Dialect: "mysql", Schema: database}
 	var warns []string
@@ -104,11 +104,14 @@ func CollectMySQL(ctx context.Context, db *sql.DB, database string) (*Snapshot, 
 		SELECT CONCAT(EVENT_OBJECT_TABLE, '.', TRIGGER_NAME)
 		FROM information_schema.TRIGGERS
 		WHERE TRIGGER_SCHEMA = ? ORDER BY EVENT_OBJECT_TABLE, TRIGGER_NAME`, database, "触发器", &warns)
-	// The MySQL-wire collector does not inventory SEQUENCE objects (V2/A3:
-	// TiDB v7.1.9 does support CREATE SEQUENCE, collection is simply not
-	// implemented on this side): the class compares as absent here; a PG
-	// source's sequences then fail honestly with the「目标端无此对象类型」
-	// annotation.
+	// TiDB (v7.1.9) implements CREATE SEQUENCE and lists sequence objects
+	// in information_schema.TABLES as TABLE_TYPE='SEQUENCE' (attributes
+	// live in information_schema.SEQUENCES); vanilla MySQL has none, the
+	// query yields an empty set there and the class compares as absent.
+	snap.Sequences = mysqlNames(ctx, db, `
+		SELECT TABLE_NAME FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'SEQUENCE'
+		ORDER BY TABLE_NAME`, database, "序列", &warns)
 	snap.Users = mysqlUsers(ctx, db, &warns)
 	return snap, warns, nil
 }
