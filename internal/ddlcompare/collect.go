@@ -104,9 +104,11 @@ func CollectMySQL(ctx context.Context, db *sql.DB, database string) (*Snapshot, 
 		SELECT CONCAT(EVENT_OBJECT_TABLE, '.', TRIGGER_NAME)
 		FROM information_schema.TRIGGERS
 		WHERE TRIGGER_SCHEMA = ? ORDER BY EVENT_OBJECT_TABLE, TRIGGER_NAME`, database, "触发器", &warns)
-	// MySQL/TiDB have no SEQUENCE object type (V2/A3): the class compares
-	// as absent on this side; a PG source's sequences then fail honestly
-	// with the「目标端无此对象类型」annotation.
+	// The MySQL-wire collector does not inventory SEQUENCE objects (V2/A3:
+	// TiDB v7.1.9 does support CREATE SEQUENCE, collection is simply not
+	// implemented on this side): the class compares as absent here; a PG
+	// source's sequences then fail honestly with the「目标端无此对象类型」
+	// annotation.
 	snap.Users = mysqlUsers(ctx, db, &warns)
 	return snap, warns, nil
 }
@@ -126,23 +128,27 @@ func mysqlTableMeta(ctx context.Context, db *sql.DB, database string) ([]TableMe
 		return nil, err
 	}
 	defer rows.Close()
+	// F1: index-based addressing only — appending past the initial cap
+	// reallocates the backing array, so element pointers captured earlier
+	// would dangle and their PK writes land in the abandoned array
+	// (>16 tables silently lost their PKs and false-failed).
 	tables := make([]TableMeta, 0, 16)
-	byName := map[string]*TableMeta{}
+	idx := map[string]int{}
 	for rows.Next() {
 		var name string
 		var collation sql.NullString
 		if err := rows.Scan(&name, &collation); err != nil {
 			return nil, err
 		}
-		t := &TableMeta{Name: name}
+		t := TableMeta{Name: name}
 		if collation.Valid && collation.String != "" {
 			t.Collation = collation.String
 			if i := strings.IndexByte(collation.String, '_'); i > 0 {
 				t.Charset = collation.String[:i]
 			}
 		}
-		tables = append(tables, *t)
-		byName[name] = &tables[len(tables)-1]
+		tables = append(tables, t)
+		idx[name] = len(tables) - 1
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -162,8 +168,8 @@ func mysqlTableMeta(ctx context.Context, db *sql.DB, database string) ([]TableMe
 		if err := pkRows.Scan(&table, &column); err != nil {
 			return nil, err
 		}
-		if t, ok := byName[table]; ok {
-			t.PK = append(t.PK, column)
+		if i, ok := idx[table]; ok {
+			tables[i].PK = append(tables[i].PK, column)
 		}
 	}
 	return tables, pkRows.Err()

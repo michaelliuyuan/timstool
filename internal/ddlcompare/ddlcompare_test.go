@@ -662,6 +662,48 @@ func TestCollectMySQLCharsetFromCollation(t *testing.T) {
 	}
 }
 
+func TestCollectMySQLTableMetaPKBeyondInitialCap(t *testing.T) {
+	// F1: mysqlTableMeta used to address rows through *TableMeta pointers
+	// captured before append reallocations — past the initial cap of 16
+	// the backing array moves and the stale pointers' PK writes landed in
+	// the abandoned array, so tables 1..N-before-last-growth silently
+	// compared with an empty target PK (false FAIL on >16-table schemas).
+	// Index-based addressing must keep every PK regardless of table count.
+	const n = 20 // 16 initial cap + 4 more → at least one realloc
+	tabRows := make([][]driver.Value, 0, n)
+	pkRows := make([][]driver.Value, 0, 2*n)
+	want := map[string][]string{}
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("t%02d", i)
+		tabRows = append(tabRows, []driver.Value{name, "utf8mb4_bin"})
+		pk := []string{"id"}
+		if i%3 == 0 {
+			pk = []string{"id", "ext"} // composite PKs mix in
+		}
+		for _, c := range pk {
+			pkRows = append(pkRows, []driver.Value{name, c})
+		}
+		want[name] = pk
+	}
+	s := &capScript{rules: []capRule{
+		{contains: "TABLE_COLLATION", cols: []string{"TABLE_NAME", "TABLE_COLLATION"}, rows: tabRows},
+		{contains: "COLUMN_KEY = 'PRI'", cols: []string{"TABLE_NAME", "COLUMN_NAME"}, rows: pkRows},
+	}}
+	db := newCapDB(t, s)
+	snap, _, err := CollectMySQL(context.Background(), db, "db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Tables) != n {
+		t.Fatalf("tables = %d, want %d", len(snap.Tables), n)
+	}
+	for _, tm := range snap.Tables {
+		if !reflect.DeepEqual(tm.PK, want[tm.Name]) {
+			t.Errorf("table %s PK = %v, want %v (F1 pointer-aliasing regression)", tm.Name, tm.PK, want[tm.Name])
+		}
+	}
+}
+
 // --- V3 mysql.user read-only red lines ---
 
 func TestCollectMySQLUsersWhitelistNoHash(t *testing.T) {

@@ -194,7 +194,8 @@ type Category struct {
 	// Privileges carries the per-user privilege diff (privileges category).
 	Privileges *PrivSetDiff `json:"privileges,omitempty"`
 	// Note is a category-level annotation rendered distinctly (V2):
-	// e.g. sequences「目标端无此对象类型（TiDB/MySQL 无 SEQUENCE）」.
+	// e.g. sequences「目标端无此对象类型（采集器未实现 MySQL 侧
+	// SEQUENCE 采集）」.
 	Note string `json:"note,omitempty"`
 }
 

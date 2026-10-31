@@ -154,14 +154,15 @@ func normJoin(cols []string, opts Options) string {
 }
 
 // diffSequences compares the sequences class by existence (count + name
-// set). Per V2/A3, a MySQL-wire target has no SEQUENCE object type, so a
-// PG source with sequences fails honestly with the「目标端无此对象类型」
-// annotation carried on the category (rendered distinctly, not as a
-// regular set-difference FAIL).
+// set). Per V2/A3, the MySQL-wire collector does not inventory SEQUENCE
+// objects (TiDB v7.1.9 itself supports them), so a PG source with
+// sequences fails honestly with the「目标端无此对象类型」annotation
+// carried on the category (rendered distinctly, not as a regular
+// set-difference FAIL).
 func diffSequences(src, tgt *Snapshot, opts Options) Category {
 	cat := nameCategory("sequences", "序列", src.Sequences, tgt.Sequences, opts)
 	if len(src.Sequences) > 0 && tgt.Dialect == "mysql" {
-		cat.Note = "目标端无此对象类型（TiDB/MySQL 无 SEQUENCE 对象）：PG 源含序列时总体结论预期为 FAIL"
+		cat.Note = "目标端无此对象类型（采集器未实现 MySQL 侧 SEQUENCE 采集；TiDB v7.1.9 实际支持 SEQUENCE）：PG 源含序列时总体结论预期为 FAIL"
 	}
 	return cat
 }
