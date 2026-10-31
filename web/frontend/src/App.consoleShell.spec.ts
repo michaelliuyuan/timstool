@@ -68,12 +68,14 @@ describe('v3.20 方案A: 宽侧栏分组导航（console shell）', () => {
 describe('v3.20 方案A: 全站主题系统（design-tokens.css）', () => {
   const css = () => src('styles/design-tokens.css')
 
-  it('状态胶囊四档：pass / hint / warn / fail（底色按样张四档）', () => {
+  it('状态胶囊四档：pass / hint / warn / fail（底色按样张四档）+ 中性 muted 档', () => {
     const c = css()
     for (const cls of ['.tims-pill--pass', '.tims-pill--hint', '.tims-pill--warn', '.tims-pill--fail']) {
       expect(c).toContain(cls)
     }
     expect(c).toContain('border-radius: 999px;')
+    // bf 返修 裁定①：中性运行态/未决档 muted（灰底 AA 字，不参与四档结论语义）。
+    expect(c).toContain('.tims-pill--muted { background: #f4f4f5; color: var(--tims-tag-info-text); }')
   })
 
   it('hint 提示蓝档令牌 + 连接器类型色（PG/MySQL/TiDB/Mongo）', () => {
@@ -90,11 +92,9 @@ describe('v3.20 方案A: 全站主题系统（design-tokens.css）', () => {
     expect(c).toContain('.tims-conn-dot.is-tidb { background: var(--tims-brand); }')
   })
 
-  it('el-tag 全站胶囊化（状态胶囊系统化落点；info 档转 hint 蓝）', () => {
+  it('el-tag 全站胶囊化（状态胶囊系统化落点）', () => {
     const c = css()
     expect(c).toContain('.el-tag { border-radius: 999px; font-weight: 600; }')
-    expect(c).toContain('.el-tag.el-tag--info:not(.el-tag--dark) {')
-    expect(c).toContain('--el-tag-text-color: var(--tims-hint-text);')
   })
 
   it('卡片标题色条：el-card 头部全局 teal 短条 + is-red 变体', () => {
@@ -117,5 +117,40 @@ describe('v3.20 方案A: 全站主题系统（design-tokens.css）', () => {
     expect(c).toContain('.tims-empty {')
     expect(c).toContain('.tims-empty .tims-empty-title {')
     expect(c).toContain('.el-empty { padding: 30px 20px; }')
+  })
+})
+
+// bf 返修（leader 15:06 裁定②）：hint 蓝收敛——info 档回归灰档中性，
+// hint 蓝 = 跨方言提示语义专属（v3.20.x 四档口径），仅经专用类落位。
+describe('裁定②: hint 蓝收敛（info 回归灰档；hint=跨方言提示专属）', () => {
+  it('tokens: 全局 el-tag--info→hint 蓝映射已删（负锚）；专用类 .tims-tag-hint 落 hint 蓝', () => {
+    const c = src('styles/design-tokens.css')
+    // 负锚：info 档规则不得再耦合任何 hint 令牌（全局蓝映射退场）。
+    expect(c).not.toMatch(/el-tag--info[^{}]*--tims-hint/)
+    // 正锚：专用类是全站唯一染 hint 蓝的 el-tag 通道。
+    expect(c).toContain('.el-tag.tims-tag-hint:not(.el-tag--dark) {')
+    expect(c).toContain('--el-tag-bg-color: var(--tims-hint-soft);')
+    expect(c).toContain('--el-tag-text-color: var(--tims-hint-text);')
+    // info 档灰锚：既有 AA 灰字规则保留，中性标签（已创建/已取消等 20+ 处）回归灰。
+    expect(c).toContain('.el-tag.el-tag--info:not(.el-tag--dark) { --el-tag-text-color: var(--tims-tag-info-text); }')
+  })
+
+  it('DdlCompareView: hint verdict 落专用类 tims-tag-hint（总体结论/类别/表行/历史四处）', () => {
+    const s = src('views/DdlCompareView.vue')
+    expect(s).toContain(`const verdictClass = (v: string) => (v === 'hint' ? 'tims-tag-hint' : '')`)
+    expect(s).toContain(':class="verdictClass(result.overall)"')
+    expect(s).toContain(':class="verdictClass(row.verdict)"')
+    expect(s).toContain(`:class="!row.source_only && !row.target_only ? verdictClass(row.verdict) : ''"`)
+    expect(s).toContain(':class="verdictClass(row.overall)"')
+    // hint 档 EP 基型仍为 info（中性基型 + 专用类染蓝，两档解耦）。
+    expect(s).toContain(`v === 'hint' ? 'info'`)
+  })
+
+  it('TaskList 等中性状态标签保持灰档 info（不染 hint 蓝）', () => {
+    const s = src('views/TaskListView.vue')
+    expect(s).toContain(`created: { type: 'info', label: '已创建' },`)
+    expect(s).toContain(`cancelled: { type: 'info', label: '已取消' },`)
+    // 中性标签不声明 hint 专用类（非蓝锚）。
+    expect(s).not.toContain('tims-tag-hint')
   })
 })

@@ -281,10 +281,16 @@ button, input, optgroup, select, textarea {
 .tims-pill--fail { background: var(--tims-brand-soft); color: var(--tims-tag-danger-text); }
 .tims-pill--warn { background: var(--tims-amber-soft); color: var(--tims-tag-warning-text); }
 .tims-pill--hint { background: var(--tims-hint-soft); color: var(--tims-hint-text); }
+/* 中性运行态/未决档（运行中/已创建等非结论状态）：灰底胶囊，不参与四档结论
+   语义（leader 裁定①：Dashboard 运行态不得误落 fail 红档）。 */
+.tims-pill--muted { background: #f4f4f5; color: var(--tims-tag-info-text); }
 
 /* --- v3.20 方案A：el-tag 全站胶囊化（状态胶囊系统化）---
-   圆角收敛 999px、去描边、四档底色走 soft 系 + AA 深字；info 档由灰改
-   hint 蓝（样张口径：跨方言提示）。dark（反白）形态不动。 */
+   圆角收敛 999px、去描边、四档底色走 soft 系 + AA 深字。info 档回归灰档
+   中性（已创建/已取消/等待中/已跳过等中性状态标签，leader 裁定②），不再
+   全局映射 hint 蓝——hint 蓝 = 跨方言提示语义专属（v3.20.x 报表+FE 四档
+   口径：pass/hint/warn/fail，hint=跨方言仅提示），仅经下方专用类
+   .tims-tag-hint 显式落位。dark（反白）形态不动。 */
 .el-tag { border-radius: 999px; font-weight: 600; }
 .el-tag.el-tag--success:not(.el-tag--dark),
 .el-tag.el-tag--primary:not(.el-tag--dark) {
@@ -303,7 +309,11 @@ button, input, optgroup, select, textarea {
   --el-tag-bg-color: var(--tims-brand-soft);
   --el-tag-border-color: transparent;
 }
-.el-tag.el-tag--info:not(.el-tag--dark) {
+/* 裁定②：跨方言提示语义专用 hint 蓝胶囊——全站唯一把 el-tag 染 hint 蓝的
+   通道（DdlCompareView 四档 verdict 的 hint 档显式声明此类）；中性 info
+   灰档标签不声明即不受影响。(0,3,0) 压 EP .el-tag--info(0,1,0) 与上方
+   146 行灰字 AA 规则（同特异性、后置胜）。 */
+.el-tag.tims-tag-hint:not(.el-tag--dark) {
   --el-tag-text-color: var(--tims-hint-text);
   --el-tag-bg-color: var(--tims-hint-soft);
   --el-tag-border-color: transparent;

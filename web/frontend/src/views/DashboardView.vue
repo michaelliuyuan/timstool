@@ -86,12 +86,30 @@ const latestMongo = computed(() => {
     .sort((a, b) => (b.finished_at || b.created_at || '').localeCompare(a.finished_at || a.created_at || ''))
   return sorted[0] || null
 })
-// mongocompare 的结论在 result_json 里（CompareResult.overall），运行中/失败任务无结论。
-const latestMongoOverall = computed(() => (latestMongo.value ? parseCompareResult(latestMongo.value)?.overall : undefined))
+// mongocompare 的结论在 result_json 里（CompareResult.overall），仅 completed
+// 且有 result 才有结论；其余按任务 status 分流（leader 裁定①：运行态/未决态
+// 不得误落 fail 红档，失败任务标「失败」而非「运行中」）。
 const mongoOverallPill = (o?: string): string =>
   o === 'equal' ? 'tims-pill--pass' : o === 'ttl_skip' ? 'tims-pill--hint' : 'tims-pill--fail'
 const mongoOverallText = (o?: string): string =>
-  o === 'equal' ? '一致' : o === 'ttl_skip' ? 'TTL 跳过' : o === 'diff' ? '存在差异' : o === 'error' ? '错误' : (o || '运行中')
+  o === 'equal' ? '一致' : o === 'ttl_skip' ? 'TTL 跳过' : o === 'diff' ? '存在差异' : o === 'error' ? '错误' : '—'
+const MONGO_STATUS_PILL: Record<string, { cls: string; text: string }> = {
+  running: { cls: 'tims-pill--muted', text: '运行中' },
+  failed: { cls: 'tims-pill--fail', text: '失败' },
+  created: { cls: 'tims-pill--muted', text: '已创建' },
+  paused: { cls: 'tims-pill--muted', text: '已暂停' },
+  cancelled: { cls: 'tims-pill--muted', text: '已取消' },
+}
+const mongoLatestPill = computed<{ cls: string; text: string }>(() => {
+  const t = latestMongo.value
+  if (!t) return { cls: '', text: '' }
+  if (t.status === 'completed') {
+    const o = parseCompareResult(t)?.overall
+    // 仅完成且有结果才给四档结论胶囊；完成但无 result 走中性兜底。
+    return o ? { cls: mongoOverallPill(o), text: mongoOverallText(o) } : { cls: 'tims-pill--muted', text: '已完成' }
+  }
+  return MONGO_STATUS_PILL[t.status] || { cls: 'tims-pill--muted', text: t.status }
+})
 </script>
 
 <template>
@@ -187,9 +205,12 @@ const mongoOverallText = (o?: string): string =>
           <el-table-column label="结论" width="90">
             <template #default="{ row }">
               <span v-if="row.overall" class="tims-pill" :class="verdictPill(row.overall)">{{ verdictText(row.overall) }}</span>
-              <el-tooltip v-else :content="row.error || '失败'" placement="top">
+              <!-- 裁定③：仅 error/failed 落红「失败」；运行中/未决走中性胶囊，不再误红兜底。 -->
+              <el-tooltip v-else-if="row.error || row.status === 'failed'" :content="row.error || '失败'" placement="top">
                 <span class="tims-pill tims-pill--fail">失败</span>
               </el-tooltip>
+              <span v-else-if="row.status === 'running'" class="tims-pill tims-pill--muted">运行中</span>
+              <span v-else class="tims-pill tims-pill--muted">—</span>
             </template>
           </el-table-column>
           <el-table-column label="耗时" width="90" class-name="hide-sm">
@@ -218,7 +239,7 @@ const mongoOverallText = (o?: string): string =>
         <span style="font-weight: 600;">MongoDB 对比<span class="dash-card-sub">集合级数据一致性比对</span></span>
       </template>
       <div v-if="latestMongo" class="dash-mongo-latest">
-        <span class="tims-pill" :class="mongoOverallPill(latestMongoOverall)">{{ mongoOverallText(latestMongoOverall) }}</span>
+        <span class="tims-pill" :class="mongoLatestPill.cls">{{ mongoLatestPill.text }}</span>
         <span class="dash-mongo-name">{{ latestMongo.name || latestMongo.id }}</span>
         <span class="dash-muted tims-mono">{{ fmtTime(latestMongo.finished_at || latestMongo.created_at) }}</span>
         <el-button link type="primary" @click="router.push(`/tasks/${latestMongo.id}`)">详情 →</el-button>

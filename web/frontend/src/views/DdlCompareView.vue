@@ -124,6 +124,9 @@ async function runCompare() {
 
 // ---- result rendering helpers ----
 const verdictTag = (v: string) => (v === 'pass' ? 'success' : v === 'hint' ? 'info' : v === 'warn' ? 'warning' : 'danger')
+// 裁定②：info 档回归灰档中性后，跨方言 hint 语义经专用类 tims-tag-hint 落
+// hint 蓝（design-tokens.css 全局规则）；其余 verdict 档走 EP 原生类型色。
+const verdictClass = (v: string) => (v === 'hint' ? 'tims-tag-hint' : '')
 const verdictText = (v: string) => (v === 'pass' ? '通过' : v === 'hint' ? '提示' : v === 'warn' ? '警告' : '失败')
 const joinNames = (list?: string[]) => (list && list.length ? list.join('、') : '—')
 const pkText = (cols?: string[]) => (cols && cols.length ? cols.join(', ') : '无主键')
@@ -279,7 +282,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
       />
 
       <div style="margin-bottom: 16px;">
-        <el-tag :type="verdictTag(result.overall)" size="large" data-testid="dc-overall">
+        <el-tag :type="verdictTag(result.overall)" :class="verdictClass(result.overall)" size="large" data-testid="dc-overall">
           总体结论：{{ verdictText(result.overall) }}
         </el-tag>
         <div v-if="hasHints" class="dc-global" data-testid="dc-global-hint">
@@ -294,7 +297,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
         <el-table-column prop="matched" label="一致" width="80" align="right" />
         <el-table-column label="结论" width="90">
           <template #default="{ row }">
-            <el-tag :type="verdictTag(row.verdict)" size="small">{{ verdictText(row.verdict) }}</el-tag>
+            <el-tag :type="verdictTag(row.verdict)" :class="verdictClass(row.verdict)" size="small">{{ verdictText(row.verdict) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="差异摘要">
@@ -327,7 +330,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
           <el-table-column prop="table" label="表名" min-width="140" />
           <el-table-column label="状态" width="90">
             <template #default="{ row }">
-              <el-tag :type="row.source_only ? 'danger' : row.target_only ? 'warning' : verdictTag(row.verdict)" size="small">
+              <el-tag :type="row.source_only ? 'danger' : row.target_only ? 'warning' : verdictTag(row.verdict)" :class="!row.source_only && !row.target_only ? verdictClass(row.verdict) : ''" size="small">
                 {{ row.source_only ? '仅源端' : row.target_only ? '仅目标端' : verdictText(row.verdict) }}
               </el-tag>
             </template>
@@ -438,7 +441,7 @@ function historyReportURL(id: string, format: 'html' | 'json') {
         </el-table-column>
         <el-table-column label="结论" width="90">
           <template #default="{ row }">
-            <el-tag v-if="row.overall" :type="verdictTag(row.overall)" size="small">{{ verdictText(row.overall) }}</el-tag>
+            <el-tag v-if="row.overall" :type="verdictTag(row.overall)" :class="verdictClass(row.overall)" size="small">{{ verdictText(row.overall) }}</el-tag>
             <span v-else>—</span>
           </template>
         </el-table-column>
