@@ -259,6 +259,7 @@ func TestDDLCompareReportFaces(t *testing.T) {
 		"目标端无此对象类型",
 		"跨方言权限词汇表不相交，不做结论",
 		"badge-hint", "提示", "跨方言提示类（不判错）",
+		"cell-note", "跨方言排序规则词汇表不相交，仅提示（不判错）",
 		"SUPER", "CREATEDB", "Select_priv",
 		"V3.20.0",
 		"tidb_enable_procedure",
@@ -266,6 +267,13 @@ func TestDDLCompareReportFaces(t *testing.T) {
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("html report missing %q", want)
+		}
+	}
+	// v1.4 报告体验（用户 11:16 裁定）：差异原因内联属性单元格，展开行
+	// 与「V4 说明」术语绝迹。
+	for _, banned := range []string{"V4 说明", "row-detail", "<details>"} {
+		if strings.Contains(html, banned) {
+			t.Errorf("html report must not contain %q (inlined notes only)", banned)
 		}
 	}
 	if strings.Contains(html, "<script>alert") {

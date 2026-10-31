@@ -174,6 +174,10 @@ describe('ddlCompareView behavior (D3 empty-vs-empty)', () => {
     // 提示级计入「提示」而排除出「结构不一致」。
     expect(body).toContain('结构不一致 0')
     expect(body).toContain('提示 1')
+    // v1.4 报告体验（用户 11:16 裁定）：差异原因内联在属性单元格
+    //（.dc-note），不再有展开列与「V4 说明」术语。
+    expect(body).toContain('仅提示（不判错）')
+    expect(body).not.toContain('V4 说明')
     // hint 徽标文案渲染（表行 + 类汇总行共用 verdictText）。
     expect(w.text()).toContain('提示')
     expect(w.text()).toContain('总体结论：通过')

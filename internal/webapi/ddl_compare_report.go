@@ -105,6 +105,7 @@ tr.row-warn td { background: #FDF7EE; }
 tr.row-warn td:first-child { box-shadow: inset 3px 0 0 #D97E00; }
 tr.row-hint td { background: #F2F5FA; }
 tr.row-hint td:first-child { box-shadow: inset 3px 0 0 #5873B0; }
+.cell-note { color: #6B7280; font-size: 12px; line-height: 1.5; margin-top: 2px; overflow-wrap: anywhere; }
 .badge-hint { background: rgba(88,115,176,0.10); color: #5873B0; }
 .overall-hint { color: #5873B0; }
 .wn { background: #FDF7EE; border: 1px solid #F0DFC2; border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; font-size: 13px; line-height: 1.8; color: #8A5A00; }
@@ -114,9 +115,6 @@ tr.row-hint td:first-child { box-shadow: inset 3px 0 0 #5873B0; }
 .names-3 .src { color: #E13C3C; }
 .names-3 .dst { color: #D97E00; }
 .names-3 .both { color: #0F9D8B; }
-tr.row-detail td { padding: 0 10px 8px 13px; }
-tr.row-detail details { background: #F6F7FB; border: 1px solid #E6E8F0; border-radius: 8px; padding: 8px 12px; font-size: 13px; line-height: 1.7; }
-tr.row-detail summary { cursor: pointer; color: #6B7280; font-size: 12px; user-select: none; }
 .tims-version { font-size: 11px; opacity: 0.85; }
 @media print { .names-3 { grid-template-columns: 1fr; } }
 </style>
@@ -188,14 +186,12 @@ tr.row-detail summary { cursor: pointer; color: #6B7280; font-size: 12px; user-s
 					pk = fmt.Sprintf("%s → %s", dcmpPK(td.PKDiff.Source), dcmpPK(td.PKDiff.Target))
 				}
 				status := dcmpTableStatus(td)
-				cs := dcmpAttr(td.CharsetDiff)
-				coll := dcmpAttr(td.CollationDiff)
+				// 差异原因内联在属性单元格内（v1.4 报告体验口径，用户
+				// 11:16 裁定：不再用展开行分隔表格，也不再用「V4 说明」
+				// 这类术语）——一行一表，原因以弱化小字随值呈现。
 				fmt.Fprintf(&sb, `<tr class="%s"><td class="num">%d</td><td>%s</td><td><span class="badge badge-%s">%s</span></td><td>%s</td><td>%s</td><td>%s</td></tr>`,
 					mcHTMLEsc(row), i+1, mcHTMLEsc(td.Table), mcHTMLEsc(string(td.Verdict)), mcHTMLEsc(status),
-					mcHTMLEsc(pk), mcHTMLEsc(cs), mcHTMLEsc(coll))
-				if note := dcmpAttrNote(td.CharsetDiff, td.CollationDiff); note != "" {
-					fmt.Fprintf(&sb, `<tr class="row-detail"><td colspan="6"><details><summary>V4 说明</summary>%s</details></td></tr>`, note)
-				}
+					mcHTMLEsc(pk), dcmpAttrCell(td.CharsetDiff), dcmpAttrCell(td.CollationDiff))
 			}
 			sb.WriteString(`</tbody></table></div>`)
 		case "privileges":
@@ -235,9 +231,11 @@ func dcmpTableStatus(td ddlcompare.TableDiff) string {
 	}
 }
 
-// dcmpAttr renders one attribute diff as "source → target" (equal folds
-// render plainly; absent on both sides → "—").
-func dcmpAttr(d *ddlcompare.AttrDiff) string {
+// dcmpAttrCell renders one attribute cell as escaped "source → target"
+// plus, for an unequal attribute carrying a reason, the note inlined as a
+// muted second line (v1.4: one row per table, no expand rows, no version
+// jargon — the reason travels with the value it explains).
+func dcmpAttrCell(d *ddlcompare.AttrDiff) string {
 	if d == nil {
 		return "—"
 	}
@@ -248,27 +246,11 @@ func dcmpAttr(d *ddlcompare.AttrDiff) string {
 	if tgt == "" {
 		tgt = "(无)"
 	}
-	return src + " → " + tgt
-}
-
-// dcmpAttrNote collects the V4 warn reasons of a table's charset/collation
-// diffs for the expand area.
-func dcmpAttrNote(cs, coll *ddlcompare.AttrDiff) string {
-	var lines []string
-	if cs != nil && !cs.Equal && cs.Note != "" {
-		lines = append(lines, "字符集："+cs.Note)
+	cell := mcHTMLEsc(src) + " → " + mcHTMLEsc(tgt)
+	if !d.Equal && d.Note != "" {
+		cell += `<div class="cell-note">` + mcHTMLEsc(d.Note) + `</div>`
 	}
-	if coll != nil && !coll.Equal && coll.Note != "" {
-		lines = append(lines, "排序规则："+coll.Note)
-	}
-	if len(lines) == 0 {
-		return ""
-	}
-	out := ""
-	for _, l := range lines {
-		out += "<div>" + mcHTMLEsc(l) + "</div>"
-	}
-	return out
+	return cell
 }
 
 // dcmpPrivilegesCard renders the privileges category (V1 分轨). Same-dialect

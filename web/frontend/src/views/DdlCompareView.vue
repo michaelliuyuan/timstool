@@ -330,24 +330,13 @@ function historyReportURL(id: string, format: 'html' | 'json') {
           <el-table-column label="字符集（源 → 目标）" min-width="150">
             <template #default="{ row }">
               <span :class="row.charset_diff && !row.charset_diff.equal ? 'dc-amber' : ''">{{ attrText(row.charset_diff) }}</span>
+              <div v-if="row.charset_diff && !row.charset_diff.equal && row.charset_diff.note" class="dc-note">{{ row.charset_diff.note }}</div>
             </template>
           </el-table-column>
           <el-table-column label="排序规则（源 → 目标）" min-width="180">
             <template #default="{ row }">
               <span :class="row.collation_diff && !row.collation_diff.equal ? 'dc-amber' : ''">{{ attrText(row.collation_diff) }}</span>
-            </template>
-          </el-table-column>
-          <el-table-column type="expand">
-            <template #default="{ row }">
-              <div v-if="row.charset_diff && !row.charset_diff.equal && row.charset_diff.note" class="dc-expand dc-amber">
-                字符集：{{ row.charset_diff.note }}
-              </div>
-              <div v-if="row.collation_diff && !row.collation_diff.equal && row.collation_diff.note" class="dc-expand dc-amber">
-                排序规则：{{ row.collation_diff.note }}
-              </div>
-              <div v-if="!(row.charset_diff && !row.charset_diff.equal && row.charset_diff.note) && !(row.collation_diff && !row.collation_diff.equal && row.collation_diff.note)" class="dc-expand">
-                无 V4 说明
-              </div>
+              <div v-if="row.collation_diff && !row.collation_diff.equal && row.collation_diff.note" class="dc-note">{{ row.collation_diff.note }}</div>
             </template>
           </el-table-column>
         </el-table>
@@ -482,6 +471,13 @@ function historyReportURL(id: string, format: 'html' | 'json') {
   font-size: 12px;
   line-height: 1.8;
   padding: 0 12px;
+}
+.dc-note {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--tims-text-2, #97a0b5);
+  margin-top: 2px;
+  overflow-wrap: anywhere;
 }
 .dc-names {
   border: 1px solid var(--el-border-color-light, #ebeef5);
