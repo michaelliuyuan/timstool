@@ -17,6 +17,7 @@ import (
 	"fmt"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/common/version"
 	"github.com/michaelliuyuan/timstool/internal/source"
 
 	// MySQL driver for *sql.DB (TiDB speaks the MySQL wire protocol).
@@ -71,9 +72,10 @@ func (s *Source) Close() error {
 	return s.db.Close()
 }
 
-// Version returns the tidb_version() string for the connection-test UI —
-// the full multi-line release block (Release Version / Edition / Git
-// Commit Hash ...), trimmed; the caller echoes it as-is.
+// Version returns the compact TiDB server version for the connection-test
+// UI — ShortTiDB reduces the tidb_version() release block to
+// "TiDB vX.Y.Z" (unparseable input falls back to the first line), same
+// S1-UI-07 discipline as the postgres adapter; the caller echoes it as-is.
 func (s *Source) Version(ctx context.Context) (string, error) {
 	if s.db == nil {
 		return "", fmt.Errorf("tidb source: not connected")
@@ -82,7 +84,7 @@ func (s *Source) Version(ctx context.Context) (string, error) {
 	if err := s.db.QueryRowContext(ctx, "SELECT tidb_version()").Scan(&v); err != nil {
 		return "", err
 	}
-	return v, nil
+	return version.ShortTiDB(v), nil
 }
 
 // --- not-implemented capabilities (friendly errors, nil-safe stubs) ---
