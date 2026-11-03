@@ -24,8 +24,11 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 // requireCapability is the prepared backend 400 double-guard for MS-03..MS-07:
 // it reads the SINGLE truth — the registry's capability bit via source.Capable
 // — so each interface task can swap its frozen `type != "postgres"` guard for
-// a capability read in one line (ruling seq 82: baseline only-decrease). Not
-// wired yet on purpose; the frozen guards are the MS-01 baseline.
+// a capability read in one line (ruling seq 82: baseline only-decrease).
+// MS-12 wires its first flow consumer: handleSourceTables reads CapSchema
+// (the retired tidb bare guard's capability successor — tidb is
+// DDL-export-only as a source, so its schema bit stays false and the
+// table-listing 400 behavior is preserved, now message-generalized).
 func (s *Server) requireCapability(w http.ResponseWriter, kind string, c source.Capability, msg string) bool {
 	ok, err := source.Capable(kind, c)
 	if err != nil || !ok {
@@ -178,10 +181,10 @@ func (s *Server) handleTestConnectionMulti(w http.ResponseWriter, r *http.Reques
 			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 			return
 		}
-		if e.Type == "tidb" {
-			s.writeError(w, http.StatusBadRequest, "source_ref: tidb 数据源不能用作源端")
-			return
-		}
+		// MS-12: the tidb-as-source bare guard is gone — the capability
+		// bit took over. A tidb ref legitimately reaches the multi-source
+		// connection test here (DDL export source flow; Implemented=true
+		// with the tidb adapter's Connect/Version behind it).
 		req.Source = e.Type
 		req.Fields = e.Fields
 	}
@@ -208,10 +211,9 @@ func (s *Server) handleSourceTables(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 			return
 		}
-		if e.Type == "tidb" {
-			s.writeError(w, http.StatusBadRequest, "source_ref: tidb 数据源不能用作源端")
-			return
-		}
+		// MS-12: the tidb-as-source bare guard is gone — the CapSchema
+		// read below is its capability successor (tidb is DDL-export-only
+		// as a source, schema stays false, so the 400 behavior survives).
 		srcType = e.Type
 		req.Fields = e.Fields
 	}
@@ -230,6 +232,13 @@ func (s *Server) handleSourceTables(w http.ResponseWriter, r *http.Request) {
 	}
 	if !meta.Implemented {
 		s.writeError(w, http.StatusBadRequest, meta.NotImplMsg)
+		return
+	}
+	// MS-12: capability gate (first requireCapability flow consumer) —
+	// table listing reads the adapter's SchemaReader, so the source kind
+	// must carry the schema bit. Preserves the pre-MS-12 tidb 400 (was the
+	// bare guard) for every DDL-export-only kind.
+	if !s.requireCapability(w, srcType, source.CapSchema, "该数据源类型不支持读取表清单（仅 PostgreSQL / MySQL）") {
 		return
 	}
 

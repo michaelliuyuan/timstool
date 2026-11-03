@@ -10,6 +10,11 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
+	"github.com/michaelliuyuan/timstool/internal/source"
+
+	// MS-12: the tidb source adapter registers its Open factory via init
+	// (testSource / handleSourceTables reach it through source.Open).
+	_ "github.com/michaelliuyuan/timstool/internal/source/tidb"
 )
 
 // pingTimeout bounds connection tests (F-06 item 3): a dead host must fail
@@ -20,12 +25,14 @@ func pingTimeout() (context.Context, context.CancelFunc) {
 }
 
 // sourceConnSpec is the MS-09 dispatch: the NORMALIZED source type picks the
-// driver and the DSN. mysql assembles the go-sql-driver DSN via DSNByType so
-// the MS-08d time_zone='+00:00' UTC session pin rides on the DSN; every other
-// kind (including empty/legacy, which SourceType normalizes to postgres) keeps
-// the pgx pair byte-identical to the old openPGTestConn(sc.DSN()) call shape.
+// driver and the DSN. MySQL-wire kinds (mysql, tidb — registry predicate,
+// five-pin #3) assemble the go-sql-driver DSN via DSNByType so the
+// MS-08d time_zone='+00:00' UTC session pin rides on the DSN; every other
+// kind (including empty/legacy, which SourceType normalizes to postgres)
+// keeps the pgx pair byte-identical to the old openPGTestConn(sc.DSN())
+// call shape.
 func sourceConnSpec(sc config.SourceConfig) (driver, dsn string) {
-	if sc.SourceType() == "mysql" {
+	if source.IsMySQLWire(sc.SourceType()) {
 		return "mysql", sc.DSNByType()
 	}
 	return "pgx", sc.DSN()

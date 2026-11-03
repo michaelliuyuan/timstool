@@ -17,7 +17,7 @@
 ## 近期更新
 
 - **时间戳水位补齐**（`e1cf148`）— Web「数据同步」组新增「时间戳水位补齐」页面：基于更新时间列的拉式批同步（PG→TiDB），每表配置水位列（自动探测可比较类型列 timestamp/date/int/bigint，含索引提示）、初始水位（留空 = MIN(col) 全量补齐）、批次大小、冲突策略（replace/ignore/error）；默认 `≥` 模式每轮重读边界时刻的行保证同秒迟到行不丢，严格模式用 `>` 跳过边界重读（同秒迟到行可能丢失，UI 有提示）；表级水位状态、累计行数、运行历史（run 级表级结果与耗时）全量记录，手动触发、可重跑。边界说明：源端 DELETE 不会被捕获（可用「数据比对」兜底核对）；不更新水位列的 UPDATE 会漏同步。适合无 CDC 权限或定时补齐场景。
-- **源端 DDL 一键导出**（`10ba895`）— Web 新增「DDL 导出」页面 + `export-ddl` CLI：按 schema 导出 PostgreSQL 原生 DDL，每个 schema 一个自包含目录（tables.sql / indexes.sql / views.sql / sequences.sql / functions.sql / procedures.sql / triggers.sql / types.sql + README.txt + manifest.json 对象计数与跳过清单），Web 端一键 zip 下载；勾选「TiDB 变体」额外生成 `tidb-tables.sql`（类型映射后的 CREATE TABLE 参考，含 `DDL 导出 tidb 版本`）。不支持的语句逐条跳过：服务端记 Warn 日志 + 响应头 `X-Tims-Skipped` 计数 + UI 跳过提示；选择 TiDB 变体但未勾选 tables 类型时 UI 预警。
+- **源端 DDL 一键导出**（`10ba895`）— Web 新增「DDL 导出」页面 + `export-ddl` CLI：按 schema 导出 postgres / mysql / tidb（MySQL-wire SHOW CREATE walk）DDL，每个 schema 一个自包含目录（tables.sql / indexes.sql / views.sql / sequences.sql / functions.sql / procedures.sql / triggers.sql / types.sql + README.txt + manifest.json 对象计数与跳过清单），Web 端一键 zip 下载；pg / mysql 源勾选「TiDB 变体」额外生成 `tidb-tables.sql`（类型映射后的 CREATE TABLE 参考，含 `DDL 导出 tidb 版本`）。不支持的语句逐条跳过：服务端记 Warn 日志 + 响应头 `X-Tims-Skipped` 计数 + UI 跳过提示；选择 TiDB 变体但未勾选 tables 类型时 UI 预警。
 - **统一数据源管理**（`c0a2467`）— 服务端统一数据源注册表：Web「数据源」页面集中管理 postgres / mysql / tidb 连接档案（创建/编辑/删除/测试连接），向导、数据比对、CDC、DDL 导出、兼容评估、水位补齐等页面改为**按引用选择数据源**，不再手填重复连接；密码**只写不读**（服务端保存，列表仅显示 `has_password`，彻底移出浏览器 localStorage），任务详情返回前脱敏；TiDB 数据源支持可选 `pd_addr` / `status_port`（严格校验格式与端口 + 自动归一化存储）；数据源页内嵌 Lightning 环境校验（`POST /api/v1/validate-lightning`）与迁移选项记忆（服务端持久化，跨浏览器/重启生效）。
 - **界面统一与体验优化**（S1-UI 系列）— 全站表单标准两列布局 + 数据源选择器优先 + 兼容评估/DDL 导出页接入「测试连接」（S1-UI-04）；任务详情总览改表级文字进度、导入进度按 checkpoint 已导入表数计算（S1-UI-05）；导航新增「数据同步」分组区分「CDC 实时同步」与「时间戳水位补齐」，两页共享「选哪个」对比卡片（S1-UI-06）；测试连接版本号精简（TiDB 只显示 release line，PG 不带 build 后缀）（S1-UI-07）；HTML 报告对齐 V2.2 设计规范。
 - **全量+增量衔接（cdc_chain）** — 向导新增「全量+增量衔接」选项（仅 PG 源）：任务启动前自动预建 publication + replication slot，全量期间源端 WAL 被 slot 保留；全量成功后自动拉起 CDC，并把记录的 slot 点位预置进 checkpoint，从该点位重放整个迁移窗口的变更，实现零丢失衔接（重放与全量重叠数据按 conflict_strategy=replace 幂等去重）。**校验降级**：链式任务若仅「数据校验」阶段未通过（全量期间源端持续写入导致的预期行数差异），任务仍按成功完成并正常衔接，差异由 CDC 重放收敛，稳定后可用「数据比对」核验；其他阶段失败仍按失败处理不衔接。注意全量期间源端 WAL 持续累积，`max_slot_wal_keep_size` 不要设置过小。
@@ -33,7 +33,7 @@
 
 - **多源异构架构** — 统一 Source 抽象层，支持 PostgreSQL（生产可用）、MySQL（开发中）、Oracle/SqlServer/DB2（Stub 规划中）→ TiDB
 - **兼容性评估** — 迁移前扫描不兼容对象（Trigger、Stored Function、特殊索引等），输出风险报告（`assess` 命令，支持 terminal/json 输出）
-- **源端 DDL 导出** — 按 schema 自包含目录导出 PG 原生 DDL（表/索引/视图/序列/函数/存储过程/触发器/类型 + manifest），可选 TiDB 类型映射变体；Web 一键 zip 下载或 `export-ddl` CLI
+- **源端 DDL 导出** — 按 schema 自包含目录导出 postgres / mysql / tidb（MySQL-wire SHOW CREATE walk）DDL（表/索引/视图/序列/函数/存储过程/触发器/类型 + manifest），非 tidb 源可选 TiDB 类型映射变体；Web 一键 zip 下载或 `export-ddl` CLI
 - **Schema Migration** — 自动采集 PG schema，类型映射 + DDL AST 转换，生成 TiDB 兼容 DDL，支持 `--dry-run` 预览
 - **Data Migration** — 基于 PG COPY 协议导出 + TiDB Lightning CLI 导入，实现高性能并行数据迁移；MySQL 源使用 Dumpling 导出；支持大表分片拆分
 - **Data Validation** — 四种校验模式（quick 行数对比 / sample 抽样验证 / checksum 分块哈希 / full 全量校验）确保数据一致性
@@ -223,7 +223,7 @@ timstool [command]
 Commands:
   all                一键执行完整迁移流程（precheck → schema → data → validate）
   assess             兼容性评估（迁移前扫描不兼容对象，输出风险报告）
-  export-ddl         源端 DDL 导出（按 schema 导出 PG 原生 DDL，可选 TiDB 变体）
+  export-ddl         源端 DDL 导出（postgres / mysql / tidb，MySQL-wire SHOW CREATE walk）
   precheck           预检与兼容性评估
   schema             Schema 迁移（--dry-run 仅预览 DDL）
   data               全量数据迁移
@@ -499,7 +499,7 @@ docker run -p 8080:8080 -v /data/timstool:/data timstool
 | **配置向导** | 5 步向导：数据源选择（从「数据源」档案引用或新建）→ 源端配置 → 目标端配置 → 选择表（支持搜索/全选） → 迁移选项（临时目录/Lightning 路径等服务端记忆预填） → 确认执行 |
 | **数据比对** | 独立数据比对（不执行迁移）：引用数据源或手填连接并测试，三种模式（快速行数 / 采样 / 分块校验）+ 表级选择；实时进度（WebSocket + 轮询）、取消、比对历史与表级差异报告（源/目标行数、差异行数、耗时、错误建议） |
 | **兼容评估** | 迁移前风险评估，展示不兼容对象清单和迁移建议（引用数据源 + 测试连接） |
-| **DDL 导出** | 源端 PostgreSQL DDL 一键导出：选择 schema 与对象类型，按 schema 自包含目录打包 zip 下载；可选 TiDB 类型映射变体（tidb-tables.sql）；跳过对象服务端 Warn + UI 提示 |
+| **DDL 导出** | 源端 DDL 一键导出（postgres / mysql / tidb，MySQL-wire SHOW CREATE walk）：选择 schema 与对象类型，按 schema 自包含目录打包 zip 下载；非 tidb 源可选 TiDB 类型映射变体（tidb-tables.sql）；跳过对象服务端 Warn + UI 提示 |
 | **任务监控** | 实时进度、表级详情（导出/导入行数、百分比）、吞吐量指标；导入进度按 checkpoint 已导入表数展示 |
 | **CDC 实时同步** | CDC 增量同步监控（LSN、吞吐、延迟），一键启停；连接卡片、启动预检与续传点位检查、无主键表 REPLICA IDENTITY 一键修复 |
 | **时间戳水位补齐** | 基于更新时间列的拉式批同步（PG→TiDB）：表级水位列（自动探测+索引提示）、初始水位（留空=全量补齐）、严格模式与冲突策略、表级状态/累计行数/运行历史，手动触发可重跑 |

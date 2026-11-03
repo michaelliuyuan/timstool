@@ -220,14 +220,26 @@ func (s SourceConfig) DSN() string {
 	return BuildPGDSN(s.Host, s.Port, s.User, s.Password, s.Database, s.SSLMode, nil)
 }
 
+// mysqlWireKind reports whether a source kind speaks the MySQL wire
+// protocol (mysql, tidb — MS-12). Local twin of source.IsMySQLWire,
+// NOT a call into it: this package sits BELOW the adapter packages whose
+// init()s populate the registry meta that predicate normalizes against
+// (a config-only binary links no adapters, so the registry lookup would
+// wrongly resolve "mysql" as unknown). The kind set is spelled out here
+// and pinned by the TestSourceDSNByType anchors.
+func mysqlWireKind(kind string) bool {
+	return kind == "mysql" || kind == "tidb"
+}
+
 // DSNByType returns the source DSN dispatched on the NORMALIZED source type
-// (MS-08): postgres keeps the legacy PG DSN (byte-identical to DSN()); mysql
-// assembles the go-sql-driver DSN (schema == database on MySQL - the driver
-// connects to Database; SSLMode is a PG-only concept and is ignored). Unknown
-// types are unreachable behind the webapi capability guard (srcCapable) and
-// default to the PG shape here.
+// (MS-08): postgres keeps the legacy PG DSN (byte-identical to DSN()); the
+// MySQL-wire kinds (mysql, tidb — MS-12) assemble the go-sql-driver DSN
+// (schema == database on the MySQL wire - the driver connects to Database;
+// SSLMode is a PG-only concept and is ignored). Unknown types are
+// unreachable behind the webapi capability guard (srcCapable) and default
+// to the PG shape here.
 func (s SourceConfig) DSNByType() string {
-	if s.SourceType() == "mysql" {
+	if mysqlWireKind(s.SourceType()) {
 		// time_zone='+00:00' pins the SESSION clock to UTC (same shape as
 		// incremental.go incTargetDSN): DATETIME scans then land as UTC
 		// time.Time, aligning the MySQL source with the PG source and the

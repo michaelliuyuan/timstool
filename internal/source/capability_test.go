@@ -70,15 +70,20 @@ func TestCapabilityMatrixSnapshot(t *testing.T) {
 		t.Error("mysql capability \"cdc\" = false; want true since MS-11")
 	}
 
-	// Ruling seq 82 ①: tidb is a registered kind with EVERY bit false —
-	// target-only today; the flip point is tidb_meta.go and must never be
-	// flipped without removing the three tidb-as-source 400 guards too.
+	// MS-12: tidb is a DDL-export-only source — ddl_export flipped ON
+	// (SHOW CREATE walk on the MySQL wire; the flip point tidb_meta.go
+	// and its paired guard removals landed together); every other bit
+	// stays false so the six non-target flows keep their 400s.
 	td, err := source.Describe("tidb")
 	if err != nil {
 		t.Fatalf("describe tidb: %v", err)
 	}
-	if td.Capabilities != (source.Capabilities{}) {
-		t.Errorf("tidb capabilities = %+v, want all-false (target-only status quo)", td.Capabilities)
+	if !td.Capabilities.DDLExport {
+		t.Error("tidb capability \"ddl_export\" = false; want true since MS-12")
+	}
+	if td.Capabilities.Schema || td.Capabilities.Data || td.Capabilities.CDC ||
+		td.Capabilities.Compare || td.Capabilities.Watermark || td.Capabilities.Assess {
+		t.Errorf("tidb non-DDLExport capabilities = %+v, want all false (DDL-export-only source)", td.Capabilities)
 	}
 
 	or, err := source.Describe("oracle")
@@ -135,11 +140,12 @@ func TestCapableSingleTruth(t *testing.T) {
 // Only-decrease: MS-03..MS-07 each swap their guards for capability reads and
 // prune their fixture lines; MS-12 asserts the map is empty.
 var typeBranchFixture = map[string]int{
-	// config-level legacy default + MS-08 DSNByType driver-DSN dispatch
-	// (routing, not feature gating - the capability guard stays in webapi)
-	// + MS-11 pen 3: the MySQL CDC v1 config rules (server_id required,
-	// sync_ddl rejected — sanctioned dispatch, ruling seq 953).
-	"internal/common/config/config.go": 3,
+	// config-level legacy default + MS-12 pen: DSNByType's dispatch now
+	// reads the local mysqlWireKind helper (mysql+tidb — the helper body
+	// is not a compare-line, pruned from the count) + MS-11 pen 3: the
+	// MySQL CDC v1 config rules (server_id required, sync_ddl rejected —
+	// sanctioned dispatch, ruling seq 953).
+	"internal/common/config/config.go": 2,
 	// MS-08 source-dialect/driver assembly dispatch (NewValidator/
 	// srcDriverName/sourceSchema - legitimate routing, not gating).
 	"internal/validator/validator.go": 1,
@@ -166,13 +172,16 @@ var typeBranchFixture = map[string]int{
 	// cdc_chain guard (M4) + assess guard (MS-06). MS-09 lifted the
 	// /config/test-connection postgres-only source_ref gate (pure
 	// connectivity endpoint, gate removal per ruling — not a type branch).
+	// MS-12: the migration-task tidb-as-source guard stays (DDL export is
+	// Web-only; the source_handler pair was removed with the flip).
 	"internal/webapi/server.go": 3,
-	// tidb-as-source guards (kept until the tidb flip point).
-	"internal/webapi/source_handler.go": 2,
-	// MS-09 sourceConnSpec driver/DSN dispatch (mysql -> DSNByType with the
-	// MS-08d UTC pin, everything else pgx byte-identical — routing, not
-	// gating; the capability guards stay at the handlers).
-	"internal/webapi/dbconn.go": 1,
+	// MS-12: source_handler's two tidb-as-source guards and dbconn's
+	// driver dispatch were removed with the capability flip (predicate
+	// reads took over — entries pruned, only-decrease). ddl_compare's two
+	// SOURCE-side MS-12 scope guards use the source.IsTiDB predicate
+	// (tidb is export-only; DDL compare keeps mysql+postgres until a
+	// dedicated round) — predicate calls are invisible to the raw-compare
+	// regex by design, so they carry no fixture line.
 	// MS-11 pen 3: `timstool cdc` MySQL routing to the binlog runner
 	// (sanctioned dispatch, ruling seq 953 — PG path untouched).
 	"cmd/cdc.go": 1,
@@ -185,8 +194,6 @@ var typeBranchFixture = map[string]int{
 	// sanctioned dispatch (single SourceType()=="mysql" branch, mirrors the
 	// mutex-guard shape; PG never hits the gate).
 	"internal/webapi/cdc_handler.go": 1,
-	// R4 (MC-11, ruling seq 320): compare_handler's M6 datasource-ref type
-	// check routed through source.IsMongoDB — pruned 1→0 (only-decrease).
 }
 
 // Ruling pattern (seq 82): catches .Type/srcType/SourceType() compares plus

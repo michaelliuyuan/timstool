@@ -136,19 +136,51 @@ func (e *Exporter) mysqlRenderObjects(ctx context.Context, schema, typ, listQuer
 	return b.String(), written
 }
 
-// mysqlSchemaFiles renders one MySQL database. Degrades (recorded in
-// MS10C-DIALECT-MAP.md, not silently dropped):
-//   - indexes.sql: MySQL indexes are part of SHOW CREATE TABLE output
-//     (no standalone index namespace) — a note file is written instead;
-//   - sequences/types: MySQL has no such object types — note files;
+// mysqlSchemaFiles renders one MySQL-wire database (mysql or tidb
+// dialect; the shared SHOW CREATE walk). Shared degrades (recorded in
+// MS10C-DIALECT-MAP.md / MS12-TIDB-DIALECT-MAP.md, never silently
+// dropped):
+//   - indexes.sql: MySQL-wire indexes are part of SHOW CREATE TABLE
+//     output (no standalone index namespace) — a note file is written;
 //   - tidb-tables.sql: since MS-10c2 the TiDB conversion is rendered via
 //     the source adapter's CIR path (information_schema walk + type
 //     mapper + target renderer); the old PG-catalog skip is gone.
+//
+// TiDB-dialect boundaries (MS-12, e.tidbSource):
+//   - sequences are REAL objects: information_schema.TABLES
+//     TABLE_TYPE='SEQUENCE' listing + SHOW CREATE SEQUENCE;
+//   - functions/procedures/triggers/types degrade to TiDB note files
+//     (no stored programs / triggers / user-defined types in TiDB);
+//   - tidb-tables.sql is never generated (the source already is TiDB);
+//     IncludeTiDB is ignored and ledger-noted;
+//   - placement policies / resource groups are not exported (v1 ruling);
+//     both are ledger-noted per schema in the manifest.
 func (e *Exporter) mysqlSchemaFiles(ctx context.Context, schemaName string) (map[string]string, error) {
 	files := map[string]string{}
 	t := e.opts.Types
+	tidb := e.tidbSource
+
+	if tidb {
+		// Manifest ledger notes (direct append — informational coverage
+		// notes, not error skips; no per-schema Warn spam): the two
+		// DBA-managed object classes that exist on the server but are
+		// deliberately out of scope in v1.
+		e.manifest.Skipped = append(e.manifest.Skipped,
+			SkippedObject{Schema: schemaName, Type: "placement-policy", Object: schemaName,
+				Reason: "TiDB placement policies are not exported in v1 (DBA-managed; MS12-TIDB-DIALECT-MAP.md)"},
+			SkippedObject{Schema: schemaName, Type: "resource-group", Object: schemaName,
+				Reason: "TiDB resource groups are not exported in v1 (DBA-managed; MS12-TIDB-DIALECT-MAP.md)"})
+		if e.opts.IncludeTiDB {
+			e.manifest.Skipped = append(e.manifest.Skipped,
+				SkippedObject{Schema: schemaName, Type: "tidb-tables.sql", Object: schemaName,
+					Reason: "source is TiDB — tidb-tables.sql conversion reference is not generated; IncludeTiDB ignored (MS12-TIDB-DIALECT-MAP.md)"})
+		}
+	}
 
 	if t.Tables {
+		// TABLE_TYPE='BASE TABLE' keeps TiDB sequences (TABLE_TYPE=
+		// 'SEQUENCE') out of tables.sql on the tidb dialect; they render
+		// into sequences.sql below.
 		ddl, n := e.mysqlRenderObjects(ctx, schemaName, "table", `
 SELECT TABLE_NAME FROM information_schema.TABLES
 WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
@@ -158,7 +190,11 @@ ORDER BY TABLE_NAME`, "SHOW CREATE TABLE %s.%s", 1)
 	}
 
 	if t.Indexes {
-		files["indexes.sql"] = "-- MySQL: indexes have no standalone namespace; they are part of the\n-- SHOW CREATE TABLE output in tables.sql (MS-10c dialect map).\n"
+		if tidb {
+			files["indexes.sql"] = "-- TiDB: indexes have no standalone namespace; they are part of the\n-- SHOW CREATE TABLE output in tables.sql (MS-12 dialect map).\n"
+		} else {
+			files["indexes.sql"] = "-- MySQL: indexes have no standalone namespace; they are part of the\n-- SHOW CREATE TABLE output in tables.sql (MS-10c dialect map).\n"
+		}
 	}
 
 	if t.Views {
@@ -171,41 +207,74 @@ ORDER BY TABLE_NAME`, "SHOW CREATE VIEW %s.%s", 1)
 	}
 
 	if t.Sequences {
-		files["sequences.sql"] = "-- MySQL: no sequence objects (AUTO_INCREMENT lives in the table DDL;\n-- see MS10C-DIALECT-MAP.md).\n"
+		if tidb {
+			// Real export (decision ①, TE-104 column shape = hard gate):
+			// sequences are listed from information_schema.TABLES
+			// (TABLE_TYPE='SEQUENCE') and rendered verbatim via SHOW
+			// CREATE SEQUENCE. ddlCol=1 pins the (Sequence, Create
+			// Sequence) result shape; a server that returns a different
+			// shape fails LOUDLY per object (showCreate's column-count
+			// guard) and lands in the skip ledger — never a silent
+			// mis-parse.
+			ddl, n := e.mysqlRenderObjects(ctx, schemaName, "sequence", `
+SELECT TABLE_NAME FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'SEQUENCE'
+ORDER BY TABLE_NAME`, "SHOW CREATE SEQUENCE %s.%s", 1)
+			files["sequences.sql"] = ddl
+			e.countN(schemaName, "sequences.sql", n)
+		} else {
+			files["sequences.sql"] = "-- MySQL: no sequence objects (AUTO_INCREMENT lives in the table DDL;\n-- see MS10C-DIALECT-MAP.md).\n"
+		}
 	}
 
 	if t.Functions {
-		ddl, n := e.mysqlRenderObjects(ctx, schemaName, "function", `
+		if tidb {
+			files["functions.sql"] = tidbNoteFile("stored-function")
+		} else {
+			ddl, n := e.mysqlRenderObjects(ctx, schemaName, "function", `
 SELECT ROUTINE_NAME FROM information_schema.ROUTINES
 WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'FUNCTION'
 ORDER BY ROUTINE_NAME`, "SHOW CREATE FUNCTION %s.%s", 2)
-		files["functions.sql"] = ddl
-		e.countN(schemaName, "functions.sql", n)
+			files["functions.sql"] = ddl
+			e.countN(schemaName, "functions.sql", n)
+		}
 	}
 
 	if t.Procedures {
-		ddl, n := e.mysqlRenderObjects(ctx, schemaName, "procedure", `
+		if tidb {
+			files["procedures.sql"] = tidbNoteFile("stored-procedure")
+		} else {
+			ddl, n := e.mysqlRenderObjects(ctx, schemaName, "procedure", `
 SELECT ROUTINE_NAME FROM information_schema.ROUTINES
 WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'PROCEDURE'
 ORDER BY ROUTINE_NAME`, "SHOW CREATE PROCEDURE %s.%s", 2)
-		files["procedures.sql"] = ddl
-		e.countN(schemaName, "procedures.sql", n)
+			files["procedures.sql"] = ddl
+			e.countN(schemaName, "procedures.sql", n)
+		}
 	}
 
 	if t.Triggers {
-		ddl, n := e.mysqlRenderObjects(ctx, schemaName, "trigger", `
+		if tidb {
+			files["triggers.sql"] = tidbNoteFile("trigger")
+		} else {
+			ddl, n := e.mysqlRenderObjects(ctx, schemaName, "trigger", `
 SELECT TRIGGER_NAME FROM information_schema.TRIGGERS
 WHERE TRIGGER_SCHEMA = ?
 ORDER BY TRIGGER_NAME`, "SHOW CREATE TRIGGER %s.%s", 2)
-		files["triggers.sql"] = ddl
-		e.countN(schemaName, "triggers.sql", n)
+			files["triggers.sql"] = ddl
+			e.countN(schemaName, "triggers.sql", n)
+		}
 	}
 
 	if t.Types {
-		files["types.sql"] = "-- MySQL: no user-defined type objects (see MS10C-DIALECT-MAP.md).\n"
+		if tidb {
+			files["types.sql"] = tidbNoteFile("user-defined-type")
+		} else {
+			files["types.sql"] = "-- MySQL: no user-defined type objects (see MS10C-DIALECT-MAP.md).\n"
+		}
 	}
 
-	if e.opts.IncludeTiDB && t.Tables {
+	if e.opts.IncludeTiDB && t.Tables && !tidb {
 		// Error path: the skip ledger entry is the whole record — no empty
 		// tidb-tables.sql file lands in the zip (an empty file reads as
 		// "zero tables converted", MS-10c2 adversarial note 1).
@@ -217,6 +286,13 @@ ORDER BY TRIGGER_NAME`, "SHOW CREATE TRIGGER %s.%s", 2)
 	}
 
 	return files, nil
+}
+
+// tidbNoteFile renders the TiDB note file for an object class TiDB does
+// not have (stored functions / procedures / triggers / user-defined
+// types) — the mysql sequence/types notes' TiDB twin (MS-12 dialect map).
+func tidbNoteFile(objects string) string {
+	return "-- TiDB: no " + objects + " objects (see MS12-TIDB-DIALECT-MAP.md).\n"
 }
 
 // mysqlTiDBTables renders the TiDB-converted CREATE TABLE script for a

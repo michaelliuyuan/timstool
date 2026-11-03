@@ -147,8 +147,13 @@ func (s *Server) handleDDLCompareSchemas(w http.ResponseWriter, r *http.Request)
 	switch req.Side {
 	case "source":
 		// Source eligibility mirrors DDL export (mysql+postgres): the same
-		// metadata walk feeds both features.
-		if !srcCapable(e.Type, source.CapDDLExport) {
+		// metadata walk feeds both features. MS-12 scope guard: tidb now
+		// carries CapDDLExport (export-only source), but DDL COMPARE keeps
+		// its pre-MS-12 surface (mysql+postgres) — the compare-side
+		// consumption of the tidb walk awaits its own dedicated live round
+		// (the same pairing discipline as the server.go migration-task
+		// guard; ledger-noted in capability_test.go typeBranchFixture).
+		if !srcCapable(e.Type, source.CapDDLExport) || source.IsTiDB(e.Type) {
 			s.writeError(w, http.StatusBadRequest, "ref: 该数据源类型不能作为 DDL 对比的源端（支持 MySQL / PostgreSQL）")
 			return
 		}
@@ -242,7 +247,10 @@ func (s *Server) handleDDLCompareRun(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "source_ref: "+err.Error())
 		return
 	}
-	if !srcCapable(srcEntry.Type, source.CapDDLExport) {
+	// MS-12 scope guard (probe-site twin of the source-side gate above):
+	// tidb is a DDL-EXPORT-only source — DDL compare keeps rejecting it
+	// until a dedicated compare round lands.
+	if !srcCapable(srcEntry.Type, source.CapDDLExport) || source.IsTiDB(srcEntry.Type) {
 		s.writeError(w, http.StatusBadRequest, "source_ref: 该数据源类型不能作为 DDL 对比的源端（支持 MySQL / PostgreSQL）")
 		return
 	}

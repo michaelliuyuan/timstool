@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import apiClient from '../api'
 import PageHeader from '../components/PageHeader.vue'
@@ -7,15 +7,24 @@ import DataSourcePicker from '../components/DataSourcePicker.vue'
 import { useDataSources } from '../composables/useDataSources'
 
 // F-02: connection comes from a saved datasource (postgres / mysql since
-// MS-10c, server-side credentials) or the legacy inline form (PG-only).
-// The localStorage memory is retired — passwords must not persist.
+// MS-10c, tidb since MS-12, server-side credentials) or the legacy inline
+// form (PG-only). The localStorage memory is retired — passwords must not
+// persist.
 
 const sourceRef = ref('')
-const { load: loadDataSources } = useDataSources()
-// MS-10c: the picker accepts postgres + mysql; the manual inline form
-// stays PG-only (a MySQL source must come in as a datasource reference —
-// the AssessView precedent). Commit 9: the section divider is generic
-// (「源数据库」) — the type is carried by the picker, not the label.
+const { load: loadDataSources, get: getDataSource } = useDataSources()
+// MS-10c: the picker accepts postgres + mysql; MS-12 adds tidb (the
+// MySQL-wire SHOW CREATE walk serves both datasource kinds). The manual
+// inline form stays PG-only (a MySQL/TiDB source must come in as a
+// datasource reference — the AssessView precedent). Commit 9: the section
+// divider is generic (「源数据库」) — the type is carried by the picker,
+// not the label.
+
+// MS-12: a TiDB source already IS TiDB — the tidb-tables.sql conversion
+// reference is meaningless there, so the IncludeTiDB switch hides (the
+// server ignores the flag for tidb sources and records it in the
+// manifest ledger; docs/MS12-TIDB-DIALECT-MAP.md note on tidb-tables.sql).
+const sourceIsTiDB = computed(() => getDataSource(sourceRef.value)?.type === 'tidb')
 
 // P1-1: one-shot migration — the retired localStorage key historically stored
 // the inline sourceForm including a plaintext password; drop it so the value
@@ -152,15 +161,15 @@ async function exportDDL() {
       </template>
       <el-form :model="sourceForm" label-width="120px" size="default">
         <el-form-item label="数据源">
-          <DataSourcePicker v-model="sourceRef" :types="['postgres', 'mysql']" />
+          <DataSourcePicker v-model="sourceRef" :types="['postgres', 'mysql', 'tidb']" />
         </el-form-item>
         <!-- v1: the legacy inline form stays PG-only (MS-10c scope) — a
-             MySQL source must come in as a datasource reference above. -->
+             MySQL/TiDB source must come in as a datasource reference above. -->
         <template v-if="!sourceRef">
           <el-divider content-position="left">源数据库</el-divider>
           <el-form-item>
             <div style="font-size: var(--tims-font-sm); color: var(--el-text-color-secondary); line-height: 1.6;">
-              手工连接仅支持 PostgreSQL；MySQL 源请使用上方数据源引用。
+              手工连接仅支持 PostgreSQL；MySQL / TiDB 源请使用上方数据源引用。
             </div>
           </el-form-item>
           <el-row :gutter="24">
@@ -230,7 +239,9 @@ async function exportDDL() {
             </div>
           </el-col>
         </el-row>
-        <el-form-item label="TiDB 版">
+        <!-- MS-12: hidden for a TiDB source (sourceIsTiDB) — the source
+             already is TiDB, the conversion reference does not apply. -->
+        <el-form-item v-if="!sourceIsTiDB" label="TiDB 版">
           <el-switch v-model="includeTiDB" />
           <span style="margin-left: 12px; font-size: var(--tims-font-sm); color: var(--tims-text-2);">
             同时导出 TiDB 转换版 tidb-tables.sql（参考脚本）
@@ -238,6 +249,11 @@ async function exportDDL() {
           <el-text v-if="includeTiDB && !selectedTypes.includes('tables')" type="warning" size="small" style="display: block; margin-top: 4px;">
             未勾选「表」类型，TiDB 转换版不会导出
           </el-text>
+        </el-form-item>
+        <el-form-item v-else label="TiDB 版">
+          <span style="font-size: var(--tims-font-sm); color: var(--tims-text-2);">
+            TiDB 源无需转换版——tidb-tables.sql 不生成（源已是 TiDB，见 MS12-TIDB-DIALECT-MAP.md）
+          </span>
         </el-form-item>
         <el-form-item>
           <el-button type="primary" @click="exportDDL" :loading="exporting">

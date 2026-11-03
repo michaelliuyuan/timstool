@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/schema"
+	"github.com/michaelliuyuan/timstool/internal/source"
 	"go.uber.org/zap"
 )
 
@@ -45,8 +46,12 @@ type Options struct {
 	// MaxObjects caps total exported objects across schemas (0 = default 20000).
 	MaxObjects int
 	// SourceType dispatches the exporter dialect: "" (legacy default) and
-	// "postgres" keep the byte-identical PG catalog walk; "mysql" routes to
-	// the SHOW CREATE based walk in exporter_mysql.go (MS-10c).
+	// "postgres" keep the byte-identical PG catalog walk; the MySQL-wire
+	// kinds ("mysql" and "tidb", MS-10c + MS-12) route to the SHOW CREATE
+	// based walk in exporter_mysql.go — with per-kind dialect boundaries
+	// (tidb: sequences are real objects, stored programs/triggers/types
+	// are note files, tidb-tables.sql is not generated) recorded in
+	// docs/MS10C-DIALECT-MAP.md / docs/MS12-TIDB-DIALECT-MAP.md.
 	SourceType string
 }
 
@@ -80,6 +85,20 @@ type Exporter struct {
 	// pg_proc.prokind exists only on PG 11+ (BUG-0934): legacy servers need
 	// queries without that column and have no procedures at all.
 	pgVersion int
+	// tidbSource (MS-12) marks a tidb-dialect run: parsed once here so
+	// the per-object branches inside the shared SHOW CREATE walk read a
+	// bool instead of re-branching on the raw type string (five-pin #3 —
+	// the kind truth lives in the registry predicates).
+	tidbSource bool
+}
+
+// isMySQLWireDDL reports whether an export run walks a MySQL-wire source
+// (mysql, tidb): the SHOW CREATE walk in exporter_mysql.go serves both
+// kinds. Delegates to the registry predicate IsMySQLWire — no raw string
+// compares at the call sites (five-pin #3); "" normalizes to postgres and
+// keeps the byte-identical PG walk.
+func isMySQLWireDDL(sourceType string) bool {
+	return source.IsMySQLWire(sourceType)
 }
 
 // serverVersionNum probes (once) and caches SHOW server_version_num; a
@@ -99,17 +118,22 @@ func (e *Exporter) serverVersionNum(ctx context.Context) int {
 }
 
 // NewExporter creates an exporter bound to an open connection. The
-// "public" schema default is PG-only: MySQL has no PG-style schema layer
-// (a "schema" is a database there), so a MySQL run keeps exactly the
-// caller-supplied list.
+// "public" schema default is PG-only: the MySQL wire (mysql, tidb) has no
+// PG-style schema layer (a "schema" is a database there), so a
+// MySQL-wire run keeps exactly the caller-supplied list.
 func NewExporter(db *sql.DB, opts Options) *Exporter {
 	if opts.MaxObjects <= 0 {
 		opts.MaxObjects = defaultMaxObjects
 	}
-	if len(opts.Schemas) == 0 && opts.SourceType != "mysql" {
+	if len(opts.Schemas) == 0 && !isMySQLWireDDL(opts.SourceType) {
 		opts.Schemas = []string{"public"}
 	}
-	return &Exporter{db: db, opts: opts, manifest: Manifest{GeneratedAt: time.Now(), Counts: ObjectCounts{}}}
+	return &Exporter{
+		db:         db,
+		opts:       opts,
+		manifest:   Manifest{GeneratedAt: time.Now(), Counts: ObjectCounts{}},
+		tidbSource: source.IsTiDB(opts.SourceType),
+	}
 }
 
 // ListSchemas returns all non-system schemas of the connected database.
@@ -118,10 +142,10 @@ func ListSchemas(ctx context.Context, db *sql.DB) ([]string, error) {
 }
 
 // ListSchemasFor dispatches on the normalized source type: PG keeps the
-// information_schema.schemata walk; MySQL lists non-system databases via
-// SHOW DATABASES (MS-10c).
+// information_schema.schemata walk; the MySQL-wire kinds (mysql, tidb)
+// list non-system databases via SHOW DATABASES (MS-10c + MS-12).
 func ListSchemasFor(ctx context.Context, db *sql.DB, sourceType string) ([]string, error) {
-	if sourceType == "mysql" {
+	if isMySQLWireDDL(sourceType) {
 		return listMySQLDatabases(ctx, db)
 	}
 	rows, err := db.QueryContext(ctx, `
@@ -214,7 +238,7 @@ func (e *Exporter) renderRows(ctx context.Context, label string, query string, a
 
 // schemaFiles renders every selected file for one schema.
 func (e *Exporter) schemaFiles(ctx context.Context, schemaName string) (map[string]string, error) {
-	if e.opts.SourceType == "mysql" {
+	if isMySQLWireDDL(e.opts.SourceType) {
 		return e.mysqlSchemaFiles(ctx, schemaName)
 	}
 	files := map[string]string{}
@@ -780,10 +804,13 @@ func ParsePGArray(s string) []string {
 }
 
 // readmeFile renders the per-schema README. The PG variant ("" legacy
-// default and "postgres") is byte-frozen; "mysql" routes to the SHOW
-// CREATE walk's README (MS-10c2).
+// default and "postgres") is byte-frozen; the MySQL-wire kinds route to
+// their SHOW CREATE walk READMEs (MS-10c2 / MS-12).
 func readmeFile(schema, sourceType string) string {
-	if sourceType == "mysql" {
+	if source.IsTiDB(sourceType) {
+		return readmeFileTiDB(schema)
+	}
+	if isMySQLWireDDL(sourceType) {
 		return readmeFileMySQL(schema)
 	}
 	var b strings.Builder
@@ -818,6 +845,37 @@ func readmeFileMySQL(schema string) string {
 	b.WriteString("- TIMESTAMP/DATETIME literals reflect the exporting session's time zone; MySQL 5.7 is the minimum supported server.\n")
 	b.WriteString("- tidb-tables.sql (if present) is a TiDB-converted reference script rendered from information_schema via the MySQL type mapper, not native MySQL DDL.\n")
 	b.WriteString("- manifest.json lists exported object counts, any skipped objects, and per-type 1:1 passthrough ledger entries.\n\n")
+	b.WriteString("Schema: " + schema + "\n")
+	return b.String()
+}
+
+// readmeFileTiDB is the TiDB-source README (MS-12, per
+// docs/MS12-TIDB-DIALECT-MAP.md): apply order follows the SHOW CREATE
+// walk with sequences first (a table DEFAULT may reference a sequence);
+// the verbatim discipline (AUTO_RANDOM & friends, byte-for-byte), the
+// PRE_SPLIT_REGIONS non-echo boundary (ruling 裁2a) and the
+// replay-target-version floor with the VECTOR fold (ruling 裁2b) are the
+// load-bearing notes. No PG wording appears anywhere in this template.
+func readmeFileTiDB(schema string) string {
+	var b strings.Builder
+	b.WriteString("# DDL Export\n\n")
+	b.WriteString("Recommended apply order per schema (native TiDB DDL):\n")
+	b.WriteString("sequences.sql -> tables.sql -> views.sql\n\n")
+	b.WriteString("Notes:\n")
+	b.WriteString("- tables.sql contains SHOW CREATE TABLE output verbatim: columns, all indexes and TiDB-specific clauses (AUTO_RANDOM, SHARD_ROW_ID_BITS, CLUSTERED, TTL, ...) are preserved byte-for-byte and never rewritten.\n")
+	b.WriteString("- PRE_SPLIT_REGIONS is NOT echoed by SHOW CREATE TABLE (one-time physical split hint): its absence from tables.sql is a faithful export, not a defect. If replay needs pre-split regions, add PRE_SPLIT_REGIONS manually — the export does not promise that clause.\n")
+	b.WriteString("- Replay requirement: the target TiDB version must be >= the source TiDB version (a TiDB-specific clause only parses on versions that understand it; a newer source carrying VECTOR indexes additionally requires the vector-index feature enabled on the replay target).\n")
+	b.WriteString("- Replay must preserve /*T!*/ comments: run the mysql CLI with --comments (a driver that sends statement text verbatim is fine as-is), otherwise the client strips the TiDB-specific clauses (TTL, SHARD_ROW_ID_BITS, AUTO_RANDOM, CLUSTERED).\n")
+	b.WriteString("- sequences.sql is a real export: sequences are listed from information_schema.TABLES (TABLE_TYPE='SEQUENCE') and rendered via SHOW CREATE SEQUENCE (TiDB v5.0+; sequences are the floor feature).\n")
+	b.WriteString("- views.sql DEFINER clauses are exported as-is; restoring may require the referenced accounts to exist.\n")
+	b.WriteString("- functions.sql, procedures.sql, triggers.sql and types.sql are note files: TiDB has no stored programs, triggers or user-defined types (see MS12-TIDB-DIALECT-MAP.md).\n")
+	b.WriteString("- indexes.sql is a note file: TiDB indexes have no standalone namespace; they are part of the SHOW CREATE TABLE output in tables.sql.\n")
+	b.WriteString("- Placement policies and resource groups are not exported (DBA-managed; noted in manifest.json — see MS12-TIDB-DIALECT-MAP.md).\n")
+	b.WriteString("- tidb-tables.sql is not generated for a TiDB source (the source already is TiDB); the IncludeTiDB option is ignored and noted in manifest.json.\n")
+	b.WriteString("- System schemas (INFORMATION_SCHEMA, PERFORMANCE_SCHEMA, METRICS_SCHEMA, mysql, sys) are excluded.\n")
+	b.WriteString("- TIMESTAMP/DATETIME literals reflect the exporting session's time zone (pinned to UTC).\n")
+	b.WriteString("- The export walks ordered listings, not a single consistent snapshot: concurrent DDL between object reads can interleave.\n")
+	b.WriteString("- manifest.json lists exported object counts, any skipped objects, and per-type coverage notes.\n\n")
 	b.WriteString("Schema: " + schema + "\n")
 	return b.String()
 }

@@ -260,8 +260,10 @@ func TestDatasources_DDLAndAssessRefTypeGate(t *testing.T) {
 	// MS-10c: DDL export no longer 400-rejects a mysql ref (SHOW CREATE
 	// exporter dialect flipped); the unreachable-host shape surfaces as a
 	// connect error (5xx) instead of the capability 400 — the assess
-	// mirror (MS-10b). The capability gate itself is anchored on tidb,
-	// which stays target-only.
+	// mirror (MS-10b). MS-12: the tidb ref follows the same shape (DDL
+	// export is the one flow where tidb is a legal source); the
+	// capability gate itself is now anchored on the assess mirror below.
+	// 127.0.0.1:1 fails fast (connection refused) so the leg stays quick.
 	w, req := doReq("POST", "/api/v1/datasources", `{
 		"name": "my", "type": "mysql",
 		"fields": {"host": "10.0.0.3", "port": 3306, "user": "root", "password": "pw", "database": "d"}
@@ -277,15 +279,15 @@ func TestDatasources_DDLAndAssessRefTypeGate(t *testing.T) {
 
 	w, req = doReq("POST", "/api/v1/datasources", `{
 		"name": "td", "type": "tidb",
-		"fields": {"host": "10.0.0.4", "port": 4000, "user": "root", "password": "pw", "database": "d"}
+		"fields": {"host": "127.0.0.1", "port": 1, "user": "root", "password": "pw", "database": "d"}
 	}`)
 	s.handleCreateDataSource(w, req)
 	tdID := dsBody(t, w)["id"].(string)
 
 	w, req = doReq("POST", "/api/v1/ddl-export/schemas", fmt.Sprintf(`{"source_ref": %q}`, tdID))
 	s.handleDDLSchemas(w, req)
-	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "不支持 DDL 导出") {
-		t.Fatalf("ddl tidb ref: %d %s", w.Code, w.Body.String())
+	if w.Code == http.StatusBadRequest {
+		t.Fatalf("ddl tidb ref must not 400 on capability (MS-12), got: %d %s", w.Code, w.Body.String())
 	}
 
 	w, req = doReq("POST", "/api/v1/assess", fmt.Sprintf(`{"source_ref": %q}`, tdID))
@@ -327,6 +329,20 @@ func TestDDLExportSrcTypeDispatch(t *testing.T) {
 	}
 	if !strings.Contains(dsn, "time_zone=") {
 		t.Fatalf("mysql DDL DSN missing the UTC session pin: %s", dsn)
+	}
+
+	// Ref-resolved tidb (MS-12): the SAME mysql driver pair (TiDB speaks
+	// the MySQL wire), 4000 fallback from the datasource type registry,
+	// and the same UTC session pin — the SHOW CREATE walk is shared with
+	// mysql down to the DSN shape.
+	req = ddlExportRequest{Host: "h", Database: "d", srcType: "tidb"}
+	sc = req.source()
+	driver, dsn = sourceConnSpec(sc)
+	if driver != "mysql" || sc.Port != 4000 {
+		t.Fatalf("tidb form: driver=%s port=%d, want mysql/4000", driver, sc.Port)
+	}
+	if !strings.Contains(dsn, "time_zone=") {
+		t.Fatalf("tidb DDL DSN missing the UTC session pin: %s", dsn)
 	}
 
 	// Explicit port wins over the fallback for both kinds.
