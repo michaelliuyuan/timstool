@@ -49,9 +49,11 @@ type Options struct {
 	// "postgres" keep the byte-identical PG catalog walk; the MySQL-wire
 	// kinds ("mysql" and "tidb", MS-10c + MS-12) route to the SHOW CREATE
 	// based walk in exporter_mysql.go — with per-kind dialect boundaries
-	// (tidb: sequences are real objects, stored programs/triggers/types
-	// are note files, tidb-tables.sql is not generated) recorded in
-	// docs/MS10C-DIALECT-MAP.md / docs/MS12-TIDB-DIALECT-MAP.md.
+	// (tidb: sequences and stored programs/triggers are real exports
+	// since MS-12c, degrading to a ledger-noted note file where the
+	// server lacks a class; types are note files; tidb-tables.sql is not
+	// generated) recorded in docs/MS10C-DIALECT-MAP.md /
+	// docs/MS12-TIDB-DIALECT-MAP.md.
 	SourceType string
 }
 
@@ -851,24 +853,27 @@ func readmeFileMySQL(schema string) string {
 
 // readmeFileTiDB is the TiDB-source README (MS-12, per
 // docs/MS12-TIDB-DIALECT-MAP.md): apply order follows the SHOW CREATE
-// walk with sequences first (a table DEFAULT may reference a sequence);
-// the verbatim discipline (AUTO_RANDOM & friends, byte-for-byte), the
-// PRE_SPLIT_REGIONS non-echo boundary (ruling 裁2a) and the
-// replay-target-version floor with the VECTOR fold (ruling 裁2b) are the
-// load-bearing notes. No PG wording appears anywhere in this template.
+// walk with sequences first (a table DEFAULT may reference a sequence)
+// and stored programs/triggers after tables and views (they may
+// reference both); the verbatim discipline (AUTO_RANDOM & friends,
+// byte-for-byte), the PRE_SPLIT_REGIONS non-echo boundary (ruling 裁2a)
+// and the replay-target-version floor with the VECTOR fold (ruling 裁2b)
+// are the load-bearing notes. No PG wording appears anywhere in this
+// template.
 func readmeFileTiDB(schema string) string {
 	var b strings.Builder
 	b.WriteString("# DDL Export\n\n")
 	b.WriteString("Recommended apply order per schema (native TiDB DDL):\n")
-	b.WriteString("sequences.sql -> tables.sql -> views.sql\n\n")
+	b.WriteString("sequences.sql -> tables.sql -> views.sql -> functions.sql -> procedures.sql -> triggers.sql\n\n")
 	b.WriteString("Notes:\n")
 	b.WriteString("- tables.sql contains SHOW CREATE TABLE output verbatim: columns, all indexes and TiDB-specific clauses (AUTO_RANDOM, SHARD_ROW_ID_BITS, CLUSTERED, TTL, ...) are preserved byte-for-byte and never rewritten.\n")
 	b.WriteString("- PRE_SPLIT_REGIONS is NOT echoed by SHOW CREATE TABLE (one-time physical split hint): its absence from tables.sql is a faithful export, not a defect. If replay needs pre-split regions, add PRE_SPLIT_REGIONS manually — the export does not promise that clause.\n")
 	b.WriteString("- Replay requirement: the target TiDB version must be >= the source TiDB version (a TiDB-specific clause only parses on versions that understand it; a newer source carrying VECTOR indexes additionally requires the vector-index feature enabled on the replay target).\n")
 	b.WriteString("- Replay must preserve /*T!*/ comments: run the mysql CLI with --comments (a driver that sends statement text verbatim is fine as-is), otherwise the client strips the TiDB-specific clauses (TTL, SHARD_ROW_ID_BITS, AUTO_RANDOM, CLUSTERED).\n")
 	b.WriteString("- sequences.sql is a real export: sequences are listed from information_schema.TABLES (TABLE_TYPE='SEQUENCE') and rendered via SHOW CREATE SEQUENCE (TiDB v5.0+; sequences are the floor feature).\n")
-	b.WriteString("- views.sql DEFINER clauses are exported as-is; restoring may require the referenced accounts to exist.\n")
-	b.WriteString("- functions.sql, procedures.sql, triggers.sql and types.sql are note files: TiDB has no stored programs, triggers or user-defined types (see MS12-TIDB-DIALECT-MAP.md).\n")
+	b.WriteString("- views.sql, functions.sql, procedures.sql and triggers.sql carry DEFINER clauses as-is; restoring may require the referenced accounts to exist.\n")
+	b.WriteString("- functions.sql, procedures.sql and triggers.sql are real exports when the server exposes the class (Pingkai/Enterprise stored programs via tidb_enable_procedure; triggers since TiDB v5.0). A server without a class degrades to a note file plus a manifest.json skipped entry — never a silent empty export. Replaying BEGIN...END bodies requires delimiter handling on the receiving side (mysql CLI: DELIMITER ;; before, DELIMITER ; after).\n")
+	b.WriteString("- types.sql is a note file: TiDB has no user-defined type objects (see MS12-TIDB-DIALECT-MAP.md).\n")
 	b.WriteString("- indexes.sql is a note file: TiDB indexes have no standalone namespace; they are part of the SHOW CREATE TABLE output in tables.sql.\n")
 	b.WriteString("- Placement policies and resource groups are not exported (DBA-managed; noted in manifest.json — see MS12-TIDB-DIALECT-MAP.md).\n")
 	b.WriteString("- tidb-tables.sql is not generated for a TiDB source (the source already is TiDB); the IncludeTiDB option is ignored and noted in manifest.json.\n")

@@ -27,6 +27,26 @@ func qiB(ident string) string {
 	return "`" + strings.ReplaceAll(ident, "`", "``") + "`"
 }
 
+// Shared information_schema listings for the stored-program classes: the
+// MySQL and TiDB walks run the IDENTICAL queries (MS-12c — the TiDB
+// catalog is column-for-column isomorphic per the 2026-11-03 live probe
+// on Pingkai TiDB v7.1.9, schema ddl_te_test: information_schema.ROUTINES/
+// TRIGGERS name the objects, SHOW CREATE carries the DDL at idx2).
+const (
+	functionListQuery = `
+SELECT ROUTINE_NAME FROM information_schema.ROUTINES
+WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'FUNCTION'
+ORDER BY ROUTINE_NAME`
+	procedureListQuery = `
+SELECT ROUTINE_NAME FROM information_schema.ROUTINES
+WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'PROCEDURE'
+ORDER BY ROUTINE_NAME`
+	triggerListQuery = `
+SELECT TRIGGER_NAME FROM information_schema.TRIGGERS
+WHERE TRIGGER_SCHEMA = ?
+ORDER BY TRIGGER_NAME`
+)
+
 // listMySQLDatabases returns non-system databases (SHOW DATABASES), sorted
 // for a deterministic zip regardless of server collation ordering.
 func listMySQLDatabases(ctx context.Context, db *sql.DB) ([]string, error) {
@@ -121,6 +141,14 @@ func (e *Exporter) mysqlRenderObjects(ctx context.Context, schema, typ, listQuer
 		e.skip(schema, typ+".sql", schema, err.Error())
 		return "", 0
 	}
+	return e.mysqlRenderNames(ctx, schema, typ, names, showFmt, ddlCol)
+}
+
+// mysqlRenderNames renders an already-listed name set via SHOW CREATE
+// (ddlCol); a per-object failure skips that object only (log + manifest)
+// and the walk continues — shared by the MySQL walk and the MS-12c TiDB
+// stored-program walk.
+func (e *Exporter) mysqlRenderNames(ctx context.Context, schema, typ string, names []string, showFmt string, ddlCol int) (string, int) {
 	var b strings.Builder
 	written := 0
 	for _, name := range names {
@@ -149,8 +177,13 @@ func (e *Exporter) mysqlRenderObjects(ctx context.Context, schema, typ, listQuer
 // TiDB-dialect boundaries (MS-12, e.tidbSource):
 //   - sequences are REAL objects: information_schema.TABLES
 //     TABLE_TYPE='SEQUENCE' listing + SHOW CREATE SEQUENCE;
-//   - functions/procedures/triggers/types degrade to TiDB note files
-//     (no stored programs / triggers / user-defined types in TiDB);
+//   - functions/procedures/triggers are REAL exports since MS-12c: the
+//     same information_schema + SHOW CREATE walk as MySQL (Pingkai/
+//     Enterprise TiDB supports stored programs — tidb_enable_procedure —
+//     and triggers exist since community TiDB v5.0). A server without a
+//     class degrades to a note file PLUS a manifest ledger entry —
+//     never a silent empty export;
+//   - types degrade to a TiDB note file (no user-defined types in TiDB);
 //   - tidb-tables.sql is never generated (the source already is TiDB);
 //     IncludeTiDB is ignored and ledger-noted;
 //   - placement policies / resource groups are not exported (v1 ruling);
@@ -229,12 +262,16 @@ ORDER BY TABLE_NAME`, "SHOW CREATE SEQUENCE %s.%s", 1)
 
 	if t.Functions {
 		if tidb {
-			files["functions.sql"] = tidbNoteFile("stored-function")
+			// MS-12c: real export — objects that exist must never be
+			// silently dropped (tidbRenderStoredPrograms owns the
+			// ledgered degrade contract for servers without the class).
+			ddl, n := e.tidbRenderStoredPrograms(ctx, schemaName, "function", "stored-function",
+				functionListQuery, "SHOW CREATE FUNCTION %s.%s", 2)
+			files["functions.sql"] = ddl
+			e.countN(schemaName, "functions.sql", n)
 		} else {
-			ddl, n := e.mysqlRenderObjects(ctx, schemaName, "function", `
-SELECT ROUTINE_NAME FROM information_schema.ROUTINES
-WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'FUNCTION'
-ORDER BY ROUTINE_NAME`, "SHOW CREATE FUNCTION %s.%s", 2)
+			ddl, n := e.mysqlRenderObjects(ctx, schemaName, "function",
+				functionListQuery, "SHOW CREATE FUNCTION %s.%s", 2)
 			files["functions.sql"] = ddl
 			e.countN(schemaName, "functions.sql", n)
 		}
@@ -242,12 +279,13 @@ ORDER BY ROUTINE_NAME`, "SHOW CREATE FUNCTION %s.%s", 2)
 
 	if t.Procedures {
 		if tidb {
-			files["procedures.sql"] = tidbNoteFile("stored-procedure")
+			ddl, n := e.tidbRenderStoredPrograms(ctx, schemaName, "procedure", "stored-procedure",
+				procedureListQuery, "SHOW CREATE PROCEDURE %s.%s", 2)
+			files["procedures.sql"] = ddl
+			e.countN(schemaName, "procedures.sql", n)
 		} else {
-			ddl, n := e.mysqlRenderObjects(ctx, schemaName, "procedure", `
-SELECT ROUTINE_NAME FROM information_schema.ROUTINES
-WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'PROCEDURE'
-ORDER BY ROUTINE_NAME`, "SHOW CREATE PROCEDURE %s.%s", 2)
+			ddl, n := e.mysqlRenderObjects(ctx, schemaName, "procedure",
+				procedureListQuery, "SHOW CREATE PROCEDURE %s.%s", 2)
 			files["procedures.sql"] = ddl
 			e.countN(schemaName, "procedures.sql", n)
 		}
@@ -255,12 +293,13 @@ ORDER BY ROUTINE_NAME`, "SHOW CREATE PROCEDURE %s.%s", 2)
 
 	if t.Triggers {
 		if tidb {
-			files["triggers.sql"] = tidbNoteFile("trigger")
+			ddl, n := e.tidbRenderStoredPrograms(ctx, schemaName, "trigger", "trigger",
+				triggerListQuery, "SHOW CREATE TRIGGER %s.%s", 2)
+			files["triggers.sql"] = ddl
+			e.countN(schemaName, "triggers.sql", n)
 		} else {
-			ddl, n := e.mysqlRenderObjects(ctx, schemaName, "trigger", `
-SELECT TRIGGER_NAME FROM information_schema.TRIGGERS
-WHERE TRIGGER_SCHEMA = ?
-ORDER BY TRIGGER_NAME`, "SHOW CREATE TRIGGER %s.%s", 2)
+			ddl, n := e.mysqlRenderObjects(ctx, schemaName, "trigger",
+				triggerListQuery, "SHOW CREATE TRIGGER %s.%s", 2)
 			files["triggers.sql"] = ddl
 			e.countN(schemaName, "triggers.sql", n)
 		}
@@ -288,9 +327,40 @@ ORDER BY TRIGGER_NAME`, "SHOW CREATE TRIGGER %s.%s", 2)
 	return files, nil
 }
 
+// tidbRenderStoredPrograms (MS-12c) runs the REAL SHOW CREATE walk for one
+// stored-program class on a TiDB source — the identical information_schema
+// listing and SHOW CREATE shapes as the MySQL walk (live probe 2026-11-03
+// on Pingkai TiDB v7.1.9-0.2, schema ddl_te_test: information_schema.
+// ROUTINES/TRIGGERS name the objects; SHOW CREATE FUNCTION/PROCEDURE/
+// TRIGGER carry the DDL at idx2, column-for-column isomorphic with MySQL).
+// The MS-12-era note files assumed "TiDB has no stored programs /
+// triggers" and were written without even querying — falsified on that
+// box (tidb_enable_procedure=ON; triggers exist since community v5.0):
+// real objects were silently dropped out of both the counts and the skip
+// ledger. Degrade contract: only a FAILING listing (server without the
+// class, e.g. community TiDB exposes no information_schema.ROUTINES)
+// degrades — to a note file PLUS a manifest ledger entry carrying the
+// actual error, never a silent empty export. A successful listing with
+// zero objects writes a self-describing "none found" note (zero objects
+// is a result, not a skip — no ledger noise). Per-object SHOW failures
+// skip per object via the shared mysqlRenderNames loop.
+func (e *Exporter) tidbRenderStoredPrograms(ctx context.Context, schema, typ, class, listQuery, showFmt string, ddlCol int) (string, int) {
+	names, err := e.mysqlObjectNames(ctx, typ, listQuery, schema)
+	if err != nil {
+		e.skip(schema, typ, schema, "TiDB server does not expose "+class+
+			" objects — catalog listing failed: "+err.Error()+" (see MS12-TIDB-DIALECT-MAP.md)")
+		return "-- TiDB: " + class + " export unavailable on this server — see manifest.json (skipped) and MS12-TIDB-DIALECT-MAP.md.\n", 0
+	}
+	ddl, n := e.mysqlRenderNames(ctx, schema, typ, names, showFmt, ddlCol)
+	if len(names) == 0 {
+		return "-- TiDB: no " + class + " objects found (catalog listing returned none; see MS12-TIDB-DIALECT-MAP.md).\n", 0
+	}
+	return ddl, n
+}
+
 // tidbNoteFile renders the TiDB note file for an object class TiDB does
-// not have (stored functions / procedures / triggers / user-defined
-// types) — the mysql sequence/types notes' TiDB twin (MS-12 dialect map).
+// not have (user-defined types) — the mysql sequence/types notes' TiDB
+// twin (MS-12 dialect map).
 func tidbNoteFile(objects string) string {
 	return "-- TiDB: no " + objects + " objects (see MS12-TIDB-DIALECT-MAP.md).\n"
 }
