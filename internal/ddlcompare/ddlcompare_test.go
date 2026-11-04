@@ -854,7 +854,7 @@ func TestCollectMySQLTableMetaPKBeyondInitialCap(t *testing.T) {
 	}
 	s := &capScript{rules: []capRule{
 		{contains: "TABLE_COLLATION", cols: []string{"TABLE_NAME", "TABLE_COLLATION"}, rows: tabRows},
-		{contains: "COLUMN_KEY = 'PRI'", cols: []string{"TABLE_NAME", "COLUMN_NAME"}, rows: pkRows},
+		{contains: "INDEX_NAME = 'PRIMARY'", cols: []string{"TABLE_NAME", "COLUMN_NAME"}, rows: pkRows},
 	}}
 	db := newCapDB(t, s)
 	snap, _, err := CollectMySQL(context.Background(), db, "db")
@@ -868,6 +868,91 @@ func TestCollectMySQLTableMetaPKBeyondInitialCap(t *testing.T) {
 		if !reflect.DeepEqual(tm.PK, want[tm.Name]) {
 			t.Errorf("table %s PK = %v, want %v (F1 pointer-aliasing regression)", tm.Name, tm.PK, want[tm.Name])
 		}
+	}
+}
+
+// TestCollectMySQLPrimaryKeyHardSemantics pins BUG-DDLCMP-PSEUDO-PRI: the
+// PK set is collected from information_schema.STATISTICS
+// INDEX_NAME='PRIMARY' (the reserved index name ⇔ a real primary key on
+// BOTH MySQL and TiDB, same口径 as validator DetectTableKey) — never from
+// the COLUMNS COLUMN_KEY='PRI' view, which MySQL 8.0 poisons with a
+// pseudo-PRI on the first NOT NULL unique-index column of a PK-less table
+// (measured 8.0.26; 5.7 reports UNI; TiDB never promotes). The MySQL walk
+// is shared by the MySQL source and the TiDB target, so the same dataset
+// must yield identical PK verdicts on both invocations.
+func TestCollectMySQLPrimaryKeyHardSemantics(t *testing.T) {
+	tableRows := [][]driver.Value{
+		{"t_pseudo", "utf8mb4_general_ci"},   // no PK + NOT NULL UNIQUE(JSID)
+		{"t_nullable", "utf8mb4_general_ci"}, // no PK + nullable UNIQUE
+		{"t_true", "utf8mb4_general_ci"},     // real PK(id)
+		{"t_comp", "utf8mb4_general_ci"},     // composite PK(b,a), table column order (a,b)
+	}
+	// What information_schema.COLUMNS serves on MySQL 8.0.26 (rows in
+	// ORDINAL_POSITION order): the pseudo-PRI poison on t_pseudo, the
+	// table-column order (a,b) on t_comp, nothing on the nullable-unique
+	// table. Under the old query this fed [JSID] and [a b] into the
+	// snapshot — the「JSID→无主键」false fail.
+	columnsRows := [][]driver.Value{
+		{"t_pseudo", "JSID"},
+		{"t_comp", "a"}, {"t_comp", "b"},
+		{"t_true", "id"},
+	}
+	// What information_schema.STATISTICS serves (rows in SEQ_IN_INDEX
+	// order): only real PRIMARY indexes, index-internal order (b,a) on
+	// t_comp, no row at all for the unique-index-only tables.
+	statisticsRows := [][]driver.Value{
+		{"t_true", "id"},
+		{"t_comp", "b"}, {"t_comp", "a"},
+	}
+	// ⑤ the walk is shared: run it as the MySQL source AND as the TiDB
+	// target — same dataset, same assertions (subtests also keep the
+	// cap driver registrations unique).
+	for _, walk := range []string{"mysql-source-walk", "tidb-target-walk"} {
+		t.Run(walk, func(t *testing.T) {
+			s := &capScript{rules: []capRule{
+				{contains: "TABLE_COLLATION", cols: []string{"TABLE_NAME", "TABLE_COLLATION"}, rows: tableRows},
+				{contains: "COLUMN_KEY = 'PRI'", cols: []string{"TABLE_NAME", "COLUMN_NAME"}, rows: columnsRows},
+				{contains: "INDEX_NAME = 'PRIMARY'", cols: []string{"TABLE_NAME", "COLUMN_NAME"}, rows: statisticsRows},
+			}}
+			db := newCapDB(t, s)
+			snap, _, err := CollectMySQL(context.Background(), db, "db")
+			if err != nil {
+				t.Fatal(err)
+			}
+			// query-shape guard: the PK probe must be the STATISTICS
+			// query, and the pseudo-PRI COLUMNS view must never be
+			// queried at all.
+			q := s.hits["INDEX_NAME = 'PRIMARY'"]
+			if !strings.Contains(q, "information_schema.STATISTICS") || !strings.Contains(q, "SEQ_IN_INDEX") {
+				t.Errorf("PK query must read STATISTICS ordered by SEQ_IN_INDEX: %s", q)
+			}
+			if old, probed := s.hits["COLUMN_KEY = 'PRI'"]; probed {
+				t.Errorf("collector must not query the pseudo-PRI COLUMNS view: %s", old)
+			}
+			byName := map[string]TableMeta{}
+			for _, tm := range snap.Tables {
+				byName[tm.Name] = tm
+			}
+			// ① defect detector: no PK + NOT NULL UNIQUE(JSID) → PK
+			// empty (old code ingested the pseudo-PRI → [JSID]).
+			if pk := byName["t_pseudo"].PK; len(pk) != 0 {
+				t.Errorf("pseudo-PRI JSID must NOT enter the PK set (got %v)", pk)
+			}
+			// ② nullable unique index → PK empty.
+			if pk := byName["t_nullable"].PK; len(pk) != 0 {
+				t.Errorf("nullable-unique table must keep an empty PK (got %v)", pk)
+			}
+			// ④ real PK regression: unchanged.
+			if pk := byName["t_true"].PK; !reflect.DeepEqual(pk, []string{"id"}) {
+				t.Errorf("true PK = %v, want [id]", pk)
+			}
+			// ③ composite PK(b,a) over table columns (a,b) →
+			// SEQ_IN_INDEX order b,a (the old ORDINAL_POSITION probe
+			// concatenated a,b).
+			if pk := byName["t_comp"].PK; !reflect.DeepEqual(pk, []string{"b", "a"}) {
+				t.Errorf("composite PK = %v, want [b a] (SEQ_IN_INDEX order)", pk)
+			}
+		})
 	}
 }
 

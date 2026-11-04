@@ -157,11 +157,27 @@ func mysqlTableMeta(ctx context.Context, db *sql.DB, database string) ([]TableMe
 		return nil, err
 	}
 
+	// BUG-DDLCMP-PSEUDO-PRI: the PK set is read from
+	// information_schema.STATISTICS INDEX_NAME='PRIMARY' — PRIMARY is the
+	// reserved index name on BOTH MySQL and TiDB and appears there ⇔ the
+	// table has a real primary key. The previous COLUMNS.COLUMN_KEY='PRI'
+	// probe was poisoned on MySQL 8.0: for a PK-less table whose first
+	// unique index column is NOT NULL, COLUMNS pseudo-reports PRI
+	// (InnoDB clustering-promotion emulation; measured on 8.0.26, 5.7
+	// says UNI) while TiDB never promotes — the shared MySQL walk serves
+	// both sides, so the pseudo-PRI column (e.g. JSID) leaked into the
+	// MySQL snapshot's PK set and every MySQL↔TiDB compare of such tables
+	// false-failed with「JSID→无主键」. STATISTICS carries no such
+	// dialect drift (same口径 as validator DetectTableKey). Ordering is
+	// SEQ_IN_INDEX (index-internal order), NOT ORDINAL_POSITION (table
+	// column order): for a composite PK(b, a) over table columns (a, b)
+	// the old probe concatenated a,b — both sides equally wrong, masking
+	// the semantic error — while the true key order is b,a.
 	pkRows, err := db.QueryContext(ctx, `
 		SELECT TABLE_NAME, COLUMN_NAME
-		FROM information_schema.COLUMNS
-		WHERE TABLE_SCHEMA = ? AND COLUMN_KEY = 'PRI'
-		ORDER BY TABLE_NAME, ORDINAL_POSITION`, database)
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = ? AND INDEX_NAME = 'PRIMARY'
+		ORDER BY TABLE_NAME, SEQ_IN_INDEX`, database)
 	if err != nil {
 		return nil, err
 	}
