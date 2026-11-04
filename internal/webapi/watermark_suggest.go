@@ -295,6 +295,17 @@ func wmFilterCatalogSubset(cols []wmCatalogColumn, tables []string) (kept []wmCa
 	return kept, missing
 }
 
+// wmSuggestTablesLimit caps the optional tables subset of the suggest
+// endpoint — deliberately NOT the columns-batch incColumnsBatchLimit: that
+// cap exists because the batch endpoint binds one IN-list round trip per
+// table and must bound SQL fan-out, while this subset is only filtered in
+// memory (wmFilterCatalogSubset) and the catalog query is a single
+// whole-schema round trip regardless of subset size, so the batch cap's
+// motivation does not apply here. The 1MB body cap remains the physical
+// backstop (BUG-WM-SUGGEST-CAP: compare pages selecting >200 tables must
+// not bounce off a mis-copied limit).
+const wmSuggestTablesLimit = 5000
+
 // handleSuggestWatermark: POST /incremental/suggest-watermark {source_ref, tables?}
 // → top-5 unified watermark column candidates for the whole source schema,
 // or — when the optional tables subset is present — scored over exactly that
@@ -312,11 +323,12 @@ func (s *Server) handleSuggestWatermark(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusBadRequest, "source_ref is required")
 		return
 	}
-	// Optional table subset: identifiers, duplicates and the batch cap are
-	// vetted exactly like the columns-batch endpoint (same rules, same
-	// limit) — one shared convention, no second dialect of validation.
-	if len(req.Tables) > incColumnsBatchLimit {
-		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("tables 数超过上限 %d", incColumnsBatchLimit))
+	// Optional table subset: identifiers and duplicates are vetted exactly
+	// like the columns-batch endpoint (same rules); only the count cap is
+	// endpoint-specific — see wmSuggestTablesLimit above for why it is NOT
+	// incColumnsBatchLimit.
+	if len(req.Tables) > wmSuggestTablesLimit {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("tables 数超过上限 %d", wmSuggestTablesLimit))
 		return
 	}
 	if len(req.Tables) > 0 {

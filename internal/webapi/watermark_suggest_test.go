@@ -370,8 +370,9 @@ func TestWMSuggestSubsetScoringDenominator(t *testing.T) {
 }
 
 // TestSuggestWatermarkEndpointTablesValidation: the optional tables subset
-// is vetted (identifier allow-list, duplicates, batch cap) BEFORE any
-// datasource/DB work — same rules as columns-batch, no DB needed.
+// is vetted (identifier allow-list, duplicates, count cap) BEFORE any
+// datasource/DB work — identifier/duplicate rules same as columns-batch,
+// no DB needed.
 func TestSuggestWatermarkEndpointTablesValidation(t *testing.T) {
 	s, _ := newTestServer(t)
 
@@ -391,7 +392,10 @@ func TestSuggestWatermarkEndpointTablesValidation(t *testing.T) {
 		}
 	}
 
-	tooMany := make([]string, incColumnsBatchLimit+1)
+	// Over-limit: wmSuggestTablesLimit+1 legal names hit the SUGGEST-side
+	// cap — pinned to the new constant, not incColumnsBatchLimit
+	// (BUG-WM-SUGGEST-CAP).
+	tooMany := make([]string, wmSuggestTablesLimit+1)
 	for i := range tooMany {
 		tooMany[i] = fmt.Sprintf("t%d", i)
 	}
@@ -400,6 +404,40 @@ func TestSuggestWatermarkEndpointTablesValidation(t *testing.T) {
 	s.handleSuggestWatermark(w, req)
 	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "上限") {
 		t.Errorf("over-limit: got %d %s, want 400 上限", w.Code, w.Body.String())
+	}
+}
+
+// TestSuggestWatermarkTablesCapBoundary anchors the suggest-side table cap
+// (BUG-WM-SUGGEST-CAP): the count gate is wmSuggestTablesLimit (5000), NOT
+// the columns-batch 200 — the subset is filtered in memory after one
+// whole-schema catalog round trip, so the batch endpoint's SQL-fan-out
+// motivation does not apply. Shape method: legal DISTINCT names at or below
+// the cap pass the count gate (and the identifier/duplicate gates) and die
+// LATER at resolveDataSourceRef("nope") — that 400 must name source_ref and
+// must NOT mention 上限, proving the count gate let the tables through.
+// Above the cap, the 400 names 上限. 201 is pinned explicitly: it is the
+// old mis-copied limit + 1 and must pass.
+func TestSuggestWatermarkTablesCapBoundary(t *testing.T) {
+	s, _ := newTestServer(t)
+	post := func(n int) (int, string) {
+		tables := make([]string, n)
+		for i := range tables {
+			tables[i] = fmt.Sprintf("t%d", i)
+		}
+		b, _ := json.Marshal(map[string]interface{}{"source_ref": "nope", "tables": tables})
+		w, req := doReq("POST", "/api/v1/incremental/suggest-watermark", string(b))
+		s.handleSuggestWatermark(w, req)
+		return w.Code, w.Body.String()
+	}
+	for _, n := range []int{201, wmSuggestTablesLimit} {
+		code, body := post(n)
+		if code != http.StatusBadRequest || !strings.Contains(body, "source_ref") || strings.Contains(body, "上限") {
+			t.Errorf("%d tables: got %d %s, want 400 source_ref error WITHOUT 上限 (count gate passed)", n, code, body)
+		}
+	}
+	code, body := post(wmSuggestTablesLimit + 1)
+	if code != http.StatusBadRequest || !strings.Contains(body, "上限") {
+		t.Errorf("%d tables: got %d %s, want 400 containing 上限", wmSuggestTablesLimit+1, code, body)
 	}
 }
 
