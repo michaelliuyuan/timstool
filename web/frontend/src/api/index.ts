@@ -392,6 +392,11 @@ export interface CompareTask {
   tables_done: number
   tables_total: number
   current_table?: string
+  /** #t95 P1 chunk progress (checksum mode): 1-based chunk ordinal + upper-bound count. */
+  current_chunk?: number
+  total_chunks?: number
+  /** #t95 P1 heartbeat: no progress within possibly_stuck_timeout (any progress clears it). */
+  possibly_stuck?: boolean
   error?: string
   created_at: string
   started_at?: string

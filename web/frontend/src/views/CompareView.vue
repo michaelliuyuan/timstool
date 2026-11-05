@@ -685,6 +685,12 @@ function connectWS() {
         activeTask.value.tables_done = data.tables_done ?? activeTask.value.tables_done
         activeTask.value.tables_total = data.tables_total ?? activeTask.value.tables_total
         activeTask.value.current_table = data.current_table ?? ''
+        // #t95 P1: chunk progress + possibly_stuck heartbeat ride the same
+        // broadcast — the UI can show 「正在校验 X，chunk i/N」 and tell a
+        // slow run from a stuck one.
+        activeTask.value.current_chunk = data.current_chunk ?? activeTask.value.current_chunk
+        activeTask.value.total_chunks = data.total_chunks ?? activeTask.value.total_chunks
+        activeTask.value.possibly_stuck = data.possibly_stuck ?? activeTask.value.possibly_stuck
         activeTask.value.status = data.status ?? activeTask.value.status
         if (data.status && data.status !== 'running') {
           await refreshTasks()
@@ -823,6 +829,13 @@ const progressPct = computed(() => {
   const t = activeTask.value
   if (!t || !t.tables_total) return 0
   return Math.round((t.tables_done / t.tables_total) * 100)
+})
+
+// #t95 P1: chunk i/N shows only for checksum-mode tasks that actually carry
+// chunk progress (quick/sample modes and pre-P1 tasks never emit the fields).
+const showChunkProgress = computed(() => {
+  const t = activeTask.value
+  return !!t && t.mode === 'checksum' && t.total_chunks != null && t.total_chunks > 0
 })
 
 function statusTag(s: string) {
@@ -1324,8 +1337,18 @@ onUnmounted(() => {
       />
       <div v-if="activeTask.status === 'running'" style="color: var(--tims-text-2); margin-bottom: 12px;">
         比对进度：{{ activeTask.tables_done }} / {{ activeTask.tables_total || '?' }} 张表
-        <span v-if="activeTask.current_table">（当前：{{ activeTask.current_table }}）</span>
+        <span v-if="activeTask.current_table">
+          （当前：{{ activeTask.current_table }}<template v-if="showChunkProgress">，chunk {{ activeTask.current_chunk }}/{{ activeTask.total_chunks }}</template>）
+        </span>
       </div>
+      <el-alert
+        v-if="activeTask.status === 'running' && activeTask.possibly_stuck"
+        type="warning"
+        :closable="false"
+        style="margin-bottom: 12px;"
+        :title="'疑似卡住：长时间无进度（阈值可配 possibly_stuck_timeout）'"
+        :description="activeTask.current_table ? `当前卡在：${activeTask.current_table}${showChunkProgress ? `，chunk ${activeTask.current_chunk}/${activeTask.total_chunks}` : ''}` : ''"
+      />
       <el-alert v-if="activeTask.error" type="error" :closable="false" :title="activeTask.error" style="margin-bottom: 12px;" />
 
       <template v-if="activeReport">
