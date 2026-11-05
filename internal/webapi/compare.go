@@ -871,6 +871,7 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 			"type": "compare", "status": task.Status,
 			"tables_done": done, "tables_total": total, "current_table": tr.TableName,
 			"current_chunk": task.CurrentChunk, "total_chunks": task.TotalChunks,
+			"possibly_stuck": task.PossiblyStuck,
 		})
 	})
 	// #t95 P1: chunk-level progress (checksum mode) — the UI shows
@@ -889,6 +890,7 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 		s.BroadcastProgress(task.ID, map[string]interface{}{
 			"type": "compare", "status": task.Status,
 			"current_table": table, "current_chunk": task.CurrentChunk, "total_chunks": task.TotalChunks,
+			"possibly_stuck": task.PossiblyStuck,
 		})
 	})
 
