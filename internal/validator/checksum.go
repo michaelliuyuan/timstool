@@ -586,7 +586,8 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 		fetched++
 	}
 	if err := rows.Err(); err != nil {
-		return "", nil, false, 0, fmt.Errorf("iterate chunk rows: %w", err)
+		return "", nil, false, 0, fmt.Errorf("iterate chunk rows: %w",
+			annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 	}
 
 	sort.Strings(rowHashes)
@@ -682,7 +683,8 @@ func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, ta
 		fetched++
 	}
 	if err := rows.Err(); err != nil {
-		return "", nil, false, 0, fmt.Errorf("iterate chunk rows: %w", err)
+		return "", nil, false, 0, fmt.Errorf("iterate chunk rows: %w",
+			annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 	}
 
 	sort.Strings(rowHashes)

@@ -66,9 +66,11 @@ func TestDefaultConfig(t *testing.T) {
 	}
 }
 
-// P0-2 anchor: QueryTimeoutDuration falls back to 5m on empty or unparseable
-// values (an operator typo must never collapse the knob to a zero timeout)
-// and parses a valid duration verbatim.
+// P0-2/B1-A anchor: QueryTimeoutDuration falls back to 5m on empty or
+// unparseable values (an operator typo must never collapse the knob to a
+// zero timeout), parses a valid duration verbatim, and clamps parseable
+// sub-second values (0 / negative / tiny) to 1s — WithTimeout(0) fails
+// every query instantly, silently turning the run into all-timeouts.
 func TestCompareQueryTimeoutDuration(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -76,7 +78,9 @@ func TestCompareQueryTimeoutDuration(t *testing.T) {
 	}{
 		{"", 5 * time.Minute},
 		{"bad", 5 * time.Minute},
-		{"0", 0}, // explicit zero stays explicit
+		{"0", time.Second},     // explicit zero → clamped to 1s
+		{"-5s", time.Second},   // negative → clamped to 1s
+		{"100ms", time.Second}, // sub-second → clamped to 1s
 		{"30s", 30 * time.Second},
 		{"2m", 2 * time.Minute},
 		{"1h", time.Hour},

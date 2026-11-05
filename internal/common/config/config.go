@@ -130,7 +130,10 @@ type CompareConfig struct {
 // QueryTimeoutDuration parses the compare query-timeout knob: empty or
 // unparseable strings fall back to 5 minutes (mirrors the defensive
 // fallback pattern of MigrationConfig.ReadTimeoutDuration — an operator
-// typo must never collapse the knob to a zero timeout).
+// typo must never collapse the knob to a zero timeout). Parseable but
+// sub-second values (0 / negative / tiny) are clamped to 1s (#t95 B1 A):
+// context.WithTimeout(0) fails every query instantly, silently turning
+// every compare into an all-timeout run.
 func (c CompareConfig) QueryTimeoutDuration() time.Duration {
 	if c.QueryTimeout == "" {
 		return 5 * time.Minute
@@ -138,6 +141,9 @@ func (c CompareConfig) QueryTimeoutDuration() time.Duration {
 	d, err := time.ParseDuration(c.QueryTimeout)
 	if err != nil {
 		return 5 * time.Minute
+	}
+	if d < time.Second {
+		return time.Second
 	}
 	return d
 }
