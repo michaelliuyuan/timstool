@@ -92,6 +92,13 @@ type CompareConfig struct {
 	// back to 5m (see QueryTimeoutDuration).
 	QueryTimeout string `yaml:"query_timeout" json:"queryTimeout"`
 
+	// PossiblyStuckTimeout is the no-progress heartbeat threshold for a
+	// running standalone compare task (#t95 P1): when no per-table/per-chunk
+	// progress event lands within the window, the task is flagged
+	// possibly_stuck so the UI can tell a slow run from a stuck one. Empty
+	// or unparseable → 5m default (see PossiblyStuckTimeoutDuration).
+	PossiblyStuckTimeout string `yaml:"possibly_stuck_timeout" json:"possiblyStuckTimeout"`
+
 	// Watermark scopes the comparison to rows whose watermark column is
 	// within bounds on BOTH sides (#t3), eliminating the permanent-diff
 	// illusion caused by ongoing source writes + sync lag. nil = unfiltered
@@ -130,6 +137,21 @@ func (c CompareConfig) QueryTimeoutDuration() time.Duration {
 	}
 	d, err := time.ParseDuration(c.QueryTimeout)
 	if err != nil {
+		return 5 * time.Minute
+	}
+	return d
+}
+
+// PossiblyStuckTimeoutDuration parses the possibly-stuck heartbeat knob:
+// empty, unparseable or non-positive values fall back to 5 minutes (same
+// defensive pattern as QueryTimeoutDuration — an operator typo must never
+// collapse the knob to a zero timeout that flags every task instantly).
+func (c CompareConfig) PossiblyStuckTimeoutDuration() time.Duration {
+	if c.PossiblyStuckTimeout == "" {
+		return 5 * time.Minute
+	}
+	d, err := time.ParseDuration(c.PossiblyStuckTimeout)
+	if err != nil || d <= 0 {
 		return 5 * time.Minute
 	}
 	return d

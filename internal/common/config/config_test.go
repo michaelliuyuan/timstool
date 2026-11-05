@@ -88,6 +88,29 @@ func TestCompareQueryTimeoutDuration(t *testing.T) {
 	}
 }
 
+// #t95 P1 anchor: PossiblyStuckTimeoutDuration falls back to 5m on empty,
+// unparseable or NON-POSITIVE values — unlike QueryTimeout (where 0 is a
+// legal "no timeout" reading), a zero heartbeat threshold would flag every
+// running task as stuck on the first scan, so it is rejected outright.
+func TestComparePossiblyStuckTimeoutDuration(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"", 5 * time.Minute},
+		{"bad", 5 * time.Minute},
+		{"0", 5 * time.Minute},
+		{"-1s", 5 * time.Minute},
+		{"30s", 30 * time.Second},
+		{"2m", 2 * time.Minute},
+	}
+	for _, c := range cases {
+		if got := (CompareConfig{PossiblyStuckTimeout: c.in}).PossiblyStuckTimeoutDuration(); got != c.want {
+			t.Errorf("PossiblyStuckTimeoutDuration(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
 func TestCDCConfigDefault(t *testing.T) {
 	cdc := DefaultConfig().CDC
 	if !cdc.Enable {

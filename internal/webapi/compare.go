@@ -38,49 +38,55 @@ const (
 
 // CompareTaskRequest is the POST /compare/tasks body.
 type CompareTaskRequest struct {
-	Name              string                  `json:"name"`
-	Source            config.SourceConfig     `json:"source"`
-	Target            config.TargetConfig     `json:"target"`
-	SourceRef         string                  `json:"source_ref"` // datasource id (F-02)
-	TargetRef         string                  `json:"target_ref"` // datasource id (tidb)
-	Mode              string                  `json:"mode"`       // quick | sample | checksum (= watermark.base_mode when watermark active)
-	SampleRatio       float64                 `json:"sample_ratio"`
-	ChecksumChunkSize int64                   `json:"checksum_chunk_size"`
-	ChecksumParallel  int                     `json:"checksum_parallel"`          // deprecated (#t4): kept for compat, folded into Concurrency
-	Parallel          int                     `json:"parallel"`                   // deprecated (#t4): kept for compat, folded into Concurrency
-	Concurrency       int                     `json:"concurrency"`                // #t4 unified budget 1-8 (0 = derive from legacy knobs)
-	QueryTimeout      string                  `json:"query_timeout"`              // #t94 per-query deadline (empty = validator default 5m)
-	Tables            []string                `json:"tables"`                     // empty = all tables
-	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`        // #t3 optional filter group
-	TableWatermarks   []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override per-table filters (P1A)
-	IgnoreColumns     []string                `json:"ignore_columns,omitempty"`   // #ignore value-comparison exclusion list
+	Name                 string                  `json:"name"`
+	Source               config.SourceConfig     `json:"source"`
+	Target               config.TargetConfig     `json:"target"`
+	SourceRef            string                  `json:"source_ref"` // datasource id (F-02)
+	TargetRef            string                  `json:"target_ref"` // datasource id (tidb)
+	Mode                 string                  `json:"mode"`       // quick | sample | checksum (= watermark.base_mode when watermark active)
+	SampleRatio          float64                 `json:"sample_ratio"`
+	ChecksumChunkSize    int64                   `json:"checksum_chunk_size"`
+	ChecksumParallel     int                     `json:"checksum_parallel"`          // deprecated (#t4): kept for compat, folded into Concurrency
+	Parallel             int                     `json:"parallel"`                   // deprecated (#t4): kept for compat, folded into Concurrency
+	Concurrency          int                     `json:"concurrency"`                // #t4 unified budget 1-8 (0 = derive from legacy knobs)
+	QueryTimeout         string                  `json:"query_timeout"`              // #t94 per-query deadline (empty = validator default 5m)
+	Tables               []string                `json:"tables"`                     // empty = all tables
+	Watermark            *config.WatermarkFilter `json:"watermark,omitempty"`        // #t3 optional filter group
+	TableWatermarks      []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override per-table filters (P1A)
+	IgnoreColumns        []string                `json:"ignore_columns,omitempty"`   // #ignore value-comparison exclusion list
+	PossiblyStuckTimeout string                  `json:"possibly_stuck_timeout"`     // #t95 P1 heartbeat threshold (empty = validator default 5m)
 }
 
 // CompareTask is the persisted (password-redacted) compare task state.
 type CompareTask struct {
-	ID                string                  `json:"id"`
-	Name              string                  `json:"name"`
-	Status            string                  `json:"status"`
-	Source            config.SourceConfig     `json:"source"` // password redacted on disk
-	Target            config.TargetConfig     `json:"target"` // password redacted on disk
-	Mode              string                  `json:"mode"`
-	SampleRatio       float64                 `json:"sample_ratio"`
-	ChecksumChunkSize int64                   `json:"checksum_chunk_size"`
-	ChecksumParallel  int                     `json:"checksum_parallel"` // deprecated (#t4)
-	Parallel          int                     `json:"parallel"`          // deprecated (#t4)
-	Concurrency       int                     `json:"concurrency"`       // #t4 unified budget (effective value, 0 = auto)
-	QueryTimeout      string                  `json:"query_timeout"`     // #t94 per-query deadline (empty = validator default 5m)
-	Tables            []string                `json:"tables"`
-	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`
-	TableWatermarks   []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override per-table filters
-	IgnoreColumns     []string                `json:"ignore_columns,omitempty"`
-	TablesDone        int                     `json:"tables_done"`
-	TablesTotal       int                     `json:"tables_total"`
-	CurrentTable      string                  `json:"current_table,omitempty"`
-	Error             string                  `json:"error,omitempty"`
-	CreatedAt         time.Time               `json:"created_at"`
-	StartedAt         *time.Time              `json:"started_at,omitempty"`
-	FinishedAt        *time.Time              `json:"finished_at,omitempty"`
+	ID                   string                  `json:"id"`
+	Name                 string                  `json:"name"`
+	Status               string                  `json:"status"`
+	Source               config.SourceConfig     `json:"source"` // password redacted on disk
+	Target               config.TargetConfig     `json:"target"` // password redacted on disk
+	Mode                 string                  `json:"mode"`
+	SampleRatio          float64                 `json:"sample_ratio"`
+	ChecksumChunkSize    int64                   `json:"checksum_chunk_size"`
+	ChecksumParallel     int                     `json:"checksum_parallel"` // deprecated (#t4)
+	Parallel             int                     `json:"parallel"`          // deprecated (#t4)
+	Concurrency          int                     `json:"concurrency"`       // #t4 unified budget (effective value, 0 = auto)
+	QueryTimeout         string                  `json:"query_timeout"`     // #t94 per-query deadline (empty = validator default 5m)
+	Tables               []string                `json:"tables"`
+	Watermark            *config.WatermarkFilter `json:"watermark,omitempty"`
+	TableWatermarks      []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override per-table filters
+	IgnoreColumns        []string                `json:"ignore_columns,omitempty"`
+	TablesDone           int                     `json:"tables_done"`
+	TablesTotal          int                     `json:"tables_total"`
+	CurrentTable         string                  `json:"current_table,omitempty"`
+	CurrentChunk         int                     `json:"current_chunk,omitempty"`          // #t95 P1: 1-based chunk ordinal (checksum mode)
+	TotalChunks          int                     `json:"total_chunks,omitempty"`           // #t95 P1: chunk count upper bound (checksum mode)
+	PossiblyStuck        bool                    `json:"possibly_stuck,omitempty"`         // #t95 P1: no progress within possibly_stuck_timeout
+	LastProgressAt       time.Time               `json:"last_progress_at,omitempty"`       // #t95 P1: last per-table/per-chunk progress event
+	PossiblyStuckTimeout string                  `json:"possibly_stuck_timeout,omitempty"` // #t95 P1: heartbeat threshold (empty = 5m)
+	Error                string                  `json:"error,omitempty"`
+	CreatedAt            time.Time               `json:"created_at"`
+	StartedAt            *time.Time              `json:"started_at,omitempty"`
+	FinishedAt           *time.Time              `json:"finished_at,omitempty"`
 }
 
 // compareState guards the single-running-compare invariant and serializes
@@ -652,24 +658,25 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	task := &CompareTask{
-		ID:                uuid.New().String()[:8],
-		Name:              req.Name,
-		Status:            CompareStatusRunning,
-		Source:            req.Source,
-		Target:            req.Target,
-		Mode:              req.Mode,
-		SampleRatio:       req.SampleRatio,
-		ChecksumChunkSize: req.ChecksumChunkSize,
-		ChecksumParallel:  req.ChecksumParallel,
-		Parallel:          req.Parallel,
-		Concurrency:       conc,
-		QueryTimeout:      strings.TrimSpace(req.QueryTimeout),
-		Tables:            req.Tables,
-		Watermark:         req.Watermark,
-		TableWatermarks:   req.TableWatermarks,
-		IgnoreColumns:     req.IgnoreColumns,
-		CreatedAt:         now,
-		StartedAt:         &now, // M2: set before the goroutine spawns (no data race on the response)
+		ID:                   uuid.New().String()[:8],
+		Name:                 req.Name,
+		Status:               CompareStatusRunning,
+		Source:               req.Source,
+		Target:               req.Target,
+		Mode:                 req.Mode,
+		SampleRatio:          req.SampleRatio,
+		ChecksumChunkSize:    req.ChecksumChunkSize,
+		ChecksumParallel:     req.ChecksumParallel,
+		Parallel:             req.Parallel,
+		Concurrency:          conc,
+		QueryTimeout:         strings.TrimSpace(req.QueryTimeout),
+		Tables:               req.Tables,
+		Watermark:            req.Watermark,
+		TableWatermarks:      req.TableWatermarks,
+		IgnoreColumns:        req.IgnoreColumns,
+		PossiblyStuckTimeout: strings.TrimSpace(req.PossiblyStuckTimeout),
+		CreatedAt:            now,
+		StartedAt:            &now, // M2: set before the goroutine spawns (no data race on the response)
 	}
 	if err := s.persistCompareTask(task); err != nil {
 		s.compare.mu.Unlock()
@@ -722,15 +729,16 @@ func buildCompareRunParams(task *CompareTask, reportFile string) (float64, commo
 		ReportFile:  reportFile,
 	}
 	compareCfg := config.CompareConfig{
-		CompareMode:       mode,
-		SampleRatio:       sampleRatio,
-		ChecksumChunkSize: task.ChecksumChunkSize,
-		ChecksumParallel:  task.ChecksumParallel,
-		Concurrency:       task.Concurrency,
-		QueryTimeout:      task.QueryTimeout,
-		Watermark:         task.Watermark,
-		TableWatermarks:   task.TableWatermarks,
-		IgnoreColumns:     task.IgnoreColumns,
+		CompareMode:          mode,
+		SampleRatio:          sampleRatio,
+		ChecksumChunkSize:    task.ChecksumChunkSize,
+		ChecksumParallel:     task.ChecksumParallel,
+		Concurrency:          task.Concurrency,
+		QueryTimeout:         task.QueryTimeout,
+		Watermark:            task.Watermark,
+		TableWatermarks:      task.TableWatermarks,
+		IgnoreColumns:        task.IgnoreColumns,
+		PossiblyStuckTimeout: task.PossiblyStuckTimeout,
 	}
 	return sampleRatio, opts, compareCfg
 }
@@ -751,12 +759,65 @@ func compareAllTablesSkipped(rpt *reporter.Report) bool {
 	return true
 }
 
+// compareHeartbeatTick is the possibly-stuck scan cadence (#t95 P1). A
+// package var so unit tests can shrink it (10ms) without touching the
+// default 2s production cadence.
+var compareHeartbeatTick = 2 * time.Second
+
+// compareHeartbeat flags a running standalone compare task as possibly_stuck
+// when NO progress event lands within the threshold (#t95 P1): a slow-but-
+// moving run stays green, a stalled one is called out so the UI can tell
+// 「慢」from「卡」. Any subsequent per-table/per-chunk progress event clears
+// the flag. Stops on ctx cancel or once the task leaves the running state.
+func (s *Server) compareHeartbeat(ctx context.Context, task *CompareTask, taskMu *sync.Mutex, threshold time.Duration) {
+	ticker := time.NewTicker(compareHeartbeatTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			taskMu.Lock()
+			if task.Status != CompareStatusRunning {
+				taskMu.Unlock()
+				return
+			}
+			status := task.Status
+			stuck := time.Since(task.LastProgressAt) > threshold
+			if stuck && !task.PossiblyStuck {
+				task.PossiblyStuck = true
+				if err := s.persistCompareTask(task); err != nil {
+					zap.L().Warn("failed to persist possibly-stuck flag", zap.Error(err))
+				}
+				taskMu.Unlock()
+				zap.L().Warn("compare task possibly stuck (no progress within threshold)",
+					zap.String("compare_id", task.ID),
+					zap.Duration("threshold", threshold))
+				s.BroadcastProgress(task.ID, map[string]interface{}{
+					"type": "compare", "status": status, "possibly_stuck": true,
+				})
+			} else {
+				taskMu.Unlock()
+			}
+		}
+	}
+}
+
 func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 	logger := zap.L()
 	logger.Info("starting standalone comparison",
 		zap.String("compare_id", task.ID), zap.String("mode", task.Mode))
 
 	var taskMu sync.Mutex // serializes progress updates to task/persist/WS
+
+	// #t95 P1: seed the heartbeat baseline before any work unit can land a
+	// progress event; every per-table/per-chunk callback refreshes it.
+	taskMu.Lock()
+	task.LastProgressAt = time.Now()
+	task.PossiblyStuck = false
+	task.CurrentChunk = 0
+	task.TotalChunks = 0
+	taskMu.Unlock()
 
 	finish := func(status, errMsg string) {
 		taskMu.Lock()
@@ -792,17 +853,45 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 		task.TablesDone = done
 		task.TablesTotal = total
 		task.CurrentTable = tr.TableName
+		// #t95 P1: every progress event is a heartbeat — clears a stale
+		// possibly_stuck flag and refreshes LastProgressAt.
+		task.PossiblyStuck = false
+		task.LastProgressAt = time.Now()
 		if err := s.persistCompareTask(task); err != nil {
 			logger.Warn("failed to persist compare progress", zap.Error(err))
 		}
 		s.BroadcastProgress(task.ID, map[string]interface{}{
 			"type": "compare", "status": task.Status,
 			"tables_done": done, "tables_total": total, "current_table": tr.TableName,
+			"current_chunk": task.CurrentChunk, "total_chunks": task.TotalChunks,
+		})
+	})
+	// #t95 P1: chunk-level progress (checksum mode) — the UI shows
+	// 「正在校验 X，chunk i/N」; quick/sample modes never fire it.
+	v.OnChunkProgress(func(table string, idx, total int) {
+		taskMu.Lock()
+		defer taskMu.Unlock()
+		task.CurrentTable = table
+		task.CurrentChunk = idx + 1
+		task.TotalChunks = total
+		task.PossiblyStuck = false
+		task.LastProgressAt = time.Now()
+		if err := s.persistCompareTask(task); err != nil {
+			logger.Warn("failed to persist compare chunk progress", zap.Error(err))
+		}
+		s.BroadcastProgress(task.ID, map[string]interface{}{
+			"type": "compare", "status": task.Status,
+			"current_table": table, "current_chunk": task.CurrentChunk, "total_chunks": task.TotalChunks,
 		})
 	})
 
 	_, validateOpts, compareCfg := buildCompareRunParams(task,
 		filepath.Join(s.compareDir(task.ID), "report.json"))
+	// #t95 P1: possibly-stuck heartbeat — flags the task when NO progress
+	// event lands within the threshold (slow-but-moving stays green).
+	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
+	defer heartbeatCancel()
+	go s.compareHeartbeat(heartbeatCtx, task, &taskMu, compareCfg.PossiblyStuckTimeoutDuration())
 	// Row-diff drill: standalone compare tasks get the per-task diff
 	// directory (failed checksum tables stream their row-level detail
 	// there; the summary rides report.json). Empty for every other

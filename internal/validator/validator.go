@@ -41,6 +41,13 @@ type Validator struct {
 	// implementations must be safe for concurrent use.
 	onTableDone func(done, total int, tr reporter.TableReport)
 
+	// onChunkProgress is an optional per-chunk progress callback (checksum
+	// mode only): table name, 0-based chunk ordinal, total chunk bound. Fired
+	// once each window's double-sided hash comparison settles, from the chunk
+	// goroutines (#t95 P1). quick/sample modes have no chunks and never
+	// trigger it. Implementations must be safe for concurrent use.
+	onChunkProgress func(table string, idx, total int)
+
 	// diffDetailDir enables the row-diff drill-down for FAILED checksum
 	// tables when non-empty (the standalone /compare path points it at
 	// compare/{id}/diff/). Empty — the orchestrator/CLI default — keeps the
@@ -208,6 +215,14 @@ func (s concSem) acquire(ctx context.Context) (func(), error) {
 // RunWithDSNs). Safe to call before starting a run.
 func (v *Validator) OnTableDone(fn func(done, total int, tr reporter.TableReport)) {
 	v.onTableDone = fn
+}
+
+// OnChunkProgress registers a per-chunk progress callback used by the
+// checksum mode of Run (and RunWithDSNs). quick/sample modes have no chunks
+// and never fire it; no registered callback leaves behavior unchanged.
+// Safe to call before starting a run.
+func (v *Validator) OnChunkProgress(fn func(table string, idx, total int)) {
+	v.onChunkProgress = fn
 }
 
 // RunWithDSNs runs a standalone comparison against explicit DSNs instead of

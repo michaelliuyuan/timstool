@@ -522,7 +522,27 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context, pipelineCfg PipelineCon
 					log.Warn("source-cir: pinned validate target pool failed, falling back to data pool", zap.Error(err))
 				}
 			}
+			// #t95 P0-5: drive per-table validate progress through the
+			// checkpoint. ValidateMigration now runs tables on a fixed
+			// parallel pool; each completed table marks tables_done on the
+			// fly, so a 300+-table validate no longer sits at 0/312 until
+			// the very end (the perceived "卡死" symptom). Failed tables
+			// mark red promptly. Hook is cleared immediately after the
+			// validate seam returns.
+			target.SetTableValidatedHook(func(tv target.TableValidation, terr error) {
+				if o.cpMgr == nil {
+					return
+				}
+				if terr != nil {
+					o.cpMgr.GetOrCreateTable(tv.Name, 0)
+					_ = o.cpMgr.MarkTableFailed(tv.Name, terr.Error())
+					return
+				}
+				o.cpMgr.GetOrCreateTable(tv.Name, tv.SourceRows)
+				_ = o.cpMgr.MarkTableCompleted(tv.Name, tv.SourceRows)
+			})
 			vr, verr := cirValidateMigration(ctx, srcValDB, tgtValDB, cir, sampleSize)
+			target.SetTableValidatedHook(nil)
 			if verr != nil {
 				log.Warn("source-cir: validation error", zap.Error(verr))
 				validateSuccess = false

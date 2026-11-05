@@ -8,10 +8,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql" // lazy *sql.DB handle for the target seam
 
+	"github.com/michaelliuyuan/timstool/internal/common/checkpoint"
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/source"
 	"github.com/michaelliuyuan/timstool/internal/target"
@@ -252,5 +255,67 @@ func TestRunSourceCIRRoutingPreconditions(t *testing.T) {
 	pg := config.Config{Source: config.SourceConfig{}}
 	if got := (&Orchestrator{cfg: pg}).cfg.Source.SourceType(); got != "postgres" {
 		t.Fatalf("empty SourceType = %q, want postgres (legacy default)", got)
+	}
+}
+
+// TestRunSourceCIRValidateWiresPerTableHook (#t95 P0-5): during the CIR
+// validate phase the orchestrator installs the per-table validated hook
+// (so ValidateMigration's parallel tables mark tables_done on the fly) and
+// clears it once the validate seam returns. With a cpMgr the hook drives
+// completed/failed checkpoint marks — a completed table reports its real
+// rows, a failed table reports its error.
+func TestRunSourceCIRValidateWiresPerTableHook(t *testing.T) {
+	var c cirCounters
+	restore := installCIRSeams(&c)
+	defer restore()
+
+	dir := t.TempDir()
+	mgr, err := checkpoint.NewManager(filepath.Join(dir, "cp"))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	prev := cirValidateMigration
+	cirValidateMigration = func(ctx context.Context, sdb, tdb *sql.DB, s *source.Schema, n int) (*target.ValidationReport, error) {
+		c.validate++
+		if target.TableValidatedHook() == nil {
+			t.Errorf("per-table validated hook not installed during CIR validate")
+			return &target.ValidationReport{TotalTables: 2, AllPassed: true}, nil
+		}
+		// Drive the hook the way the real ValidateMigration does: one
+		// completed table, one failed table.
+		target.TableValidatedHook()(target.TableValidation{Name: "t1", SourceRows: 7, Passed: true}, nil)
+		target.TableValidatedHook()(target.TableValidation{Name: "t2"}, errors.New("simulated validate failure"))
+		return &target.ValidationReport{TotalTables: 2, FailedTables: 1, AllPassed: false}, nil
+	}
+	defer func() { cirValidateMigration = prev }()
+
+	o := &Orchestrator{cfg: config.Config{
+		Source: config.SourceConfig{Type: "mysql", Host: "h", Database: "db"},
+		Target: config.TargetConfig{Host: "t"},
+	}, cpMgr: mgr}
+
+	results, err := o.runSourceCIR(context.Background(), PipelineConfig{})
+	if err != nil {
+		t.Fatalf("runSourceCIR: %v", err)
+	}
+	if len(results) != 4 {
+		t.Fatalf("results = %v, want all four phases", results)
+	}
+	last := results[len(results)-1]
+	if last.Phase != PhaseValidate || last.Success {
+		t.Fatalf("last result = %+v, want validate/Success=false", last)
+	}
+	if target.TableValidatedHook() != nil {
+		t.Fatalf("per-table validated hook not cleared after runSourceCIR")
+	}
+
+	tc1 := mgr.GetAllTables()["t1"]
+	if tc1 == nil || tc1.State != checkpoint.StateCompleted || tc1.RowsDone != 7 {
+		t.Fatalf("t1 checkpoint = %+v, want completed/7 rows", tc1)
+	}
+	tc2 := mgr.GetAllTables()["t2"]
+	if tc2 == nil || tc2.State != checkpoint.StateFailed || !strings.Contains(tc2.Error, "simulated validate failure") {
+		t.Fatalf("t2 checkpoint = %+v, want failed with simulated error", tc2)
 	}
 }

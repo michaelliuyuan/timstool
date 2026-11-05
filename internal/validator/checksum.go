@@ -265,6 +265,12 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 
 			atomic.AddInt32(&chunksRan, 1)
 			atomic.AddInt64(&coveredRows, int64(pgFetched))
+			// #t95 P1: per-chunk progress (checksum mode only) — fired once
+			// THIS window's PG+TiDB hashes settled, so the UI can show
+			// 「正在校验 X，chunk i/N」 and prove the task is moving.
+			if v.onChunkProgress != nil {
+				v.onChunkProgress(table, idx, numChunks)
+			}
 
 			if pgHash != tidbHash {
 				mu.Lock()

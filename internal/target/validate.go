@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/source"
@@ -38,50 +39,145 @@ type TableValidation struct {
 // (its signature is frozen — orchestrator binds it via cirValidateMigration).
 var queryTimeout = 5 * time.Minute
 
+// validateParallel bounds the per-table concurrency of ValidateMigration
+// (#t95 P0-5): the CIR validate phase used to walk every table serially, so
+// a 300+-table migration sat in validate with no tables_done movement and
+// looked stuck. Both source and TiDB pools are capped at 8 conns, so the
+// default of 4 keeps per-table concurrency safely under pool capacity.
+var validateParallel = 4
+
+// tableValidatedHook is an optional per-table completion hook installed by
+// the orchestrator before a CIR validate run: fired EXACTLY once per table
+// after its count (+sample) verdict is final — success or a fatal error —
+// so checkpoint progress (tables_done) climbs during the validate phase
+// instead of jumping at the very end (#t95 P0-5). nil = no hook. Must be
+// safe for concurrent calls (table goroutines fire it in parallel).
+var tableValidatedHook func(TableValidation, error)
+
+// SetTableValidatedHook installs (fn) or clears (nil) the per-table
+// completion hook consumed by ValidateMigration.
+func SetTableValidatedHook(fn func(TableValidation, error)) {
+	tableValidatedHook = fn
+}
+
+// TableValidatedHook returns the currently installed per-table hook (nil
+// when none) — the orchestrator CIR tests assert the wiring is live during
+// validate and cleared afterwards.
+func TableValidatedHook() func(TableValidation, error) {
+	return tableValidatedHook
+}
+
 // ValidateMigration checks row-count parity AND value-level consistency (sampled
 // rows compared by normalized string values) for each CIR table — the core data
 // consistency check (#t82). Source-agnostic: reads from any *sql.DB (the source
 // adapter's DB) + the TiDB target. sampleSize controls how many rows per table
 // are value-compared (0 → default 10).
 func ValidateMigration(ctx context.Context, sourceDB, tidbDB *sql.DB, schema *source.Schema, sampleSize int) (*ValidationReport, error) {
-	rpt := &ValidationReport{}
-	for _, t := range schema.Tables {
-		tv := TableValidation{Name: t.Name}
-		srcN, err := countRows(ctx, sourceDB, t.Name)
-		if err != nil {
-			return nil, fmt.Errorf("validate: count source %q: %w", t.Name, err)
-		}
-		tgtN, err := countRows(ctx, tidbDB, t.Name)
-		if err != nil {
-			return nil, fmt.Errorf("validate: count target %q: %w", t.Name, err)
-		}
-		tv.SourceRows = srcN
-		tv.TargetRows = tgtN
-		tv.Passed = srcN == tgtN
+	// #t95 P0-5: per-table validation runs on a fixed concurrency pool
+	// (validateParallel, default 4) instead of serially — a 300+-table CIR
+	// migration used to sit in validate with no tables_done movement. Each
+	// table is ONE work unit. Results are collected into their original
+	// schema positions, so the report order stays deterministic regardless
+	// of completion order. ctx cancellation makes queued goroutines return
+	// without touching the DB.
+	results := make([]TableValidation, len(schema.Tables))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, validateParallel)
+	var (
+		failedMu sync.Mutex
+		failed   int
+		errMu    sync.Mutex
+		firstErr error
+	)
 
-		// Value-level sample comparison only when explicitly requested (sampleSize > 0).
-		// Row-count parity alone is the default (ValidateRowCounts passes 0).
-		if sampleSize > 0 && srcN > 0 && srcN == tgtN {
-			checked, mismatches, err := compareSample(ctx, sourceDB, tidbDB, t.Name, sampleSize)
-			if err == nil {
-				tv.SampleChecked = checked
-				tv.SampleMismatches = mismatches
-				if mismatches > 0 {
-					tv.Passed = false
+	for i, t := range schema.Tables {
+		wg.Add(1)
+		go func(i int, t source.Table) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = ctx.Err()
+				}
+				errMu.Unlock()
+				return
+			}
+			defer func() { <-sem }()
+
+			tv, terr := validateTable(ctx, sourceDB, tidbDB, t.Name, sampleSize)
+			if terr != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = terr
+				}
+				errMu.Unlock()
+			} else {
+				results[i] = tv
+				if !tv.Passed {
+					failedMu.Lock()
+					failed++
+					failedMu.Unlock()
 				}
 			}
-			// If compareSample errors (e.g. ORDER BY not supported), skip silently
-			// — row-count is still checked.
-		}
+			// #t95 P0-5: per-table completion hook (checkpoint progress) —
+			// fired even for a failed table so the UI marks it red promptly.
+			if tableValidatedHook != nil {
+				tableValidatedHook(tv, terr)
+			}
+		}(i, t)
+	}
+	wg.Wait()
 
-		if !tv.Passed {
-			rpt.FailedTables++
-		}
-		rpt.Tables = append(rpt.Tables, tv)
-		rpt.TotalTables++
+	if firstErr != nil {
+		// The report contract is unchanged: ANY table-level failure aborts
+		// the whole validation (nil report + error), exactly like the serial
+		// implementation.
+		return nil, firstErr
+	}
+
+	rpt := &ValidationReport{
+		Tables:       results,
+		TotalTables:  len(results),
+		FailedTables: failed,
 	}
 	rpt.AllPassed = rpt.FailedTables == 0
 	return rpt, nil
+}
+
+// validateTable runs the count (+optional sample) comparison for ONE table.
+// The error contract mirrors the serial implementation: a count failure
+// aborts the table with the same "validate: count ..." message.
+func validateTable(ctx context.Context, sourceDB, tidbDB *sql.DB, name string, sampleSize int) (TableValidation, error) {
+	tv := TableValidation{Name: name}
+	srcN, err := countRows(ctx, sourceDB, name)
+	if err != nil {
+		return tv, fmt.Errorf("validate: count source %q: %w", name, err)
+	}
+	tgtN, err := countRows(ctx, tidbDB, name)
+	if err != nil {
+		return tv, fmt.Errorf("validate: count target %q: %w", name, err)
+	}
+	tv.SourceRows = srcN
+	tv.TargetRows = tgtN
+	tv.Passed = srcN == tgtN
+
+	// Value-level sample comparison only when explicitly requested (sampleSize > 0).
+	// Row-count parity alone is the default (ValidateRowCounts passes 0).
+	if sampleSize > 0 && srcN > 0 && srcN == tgtN {
+		checked, mismatches, err := compareSample(ctx, sourceDB, tidbDB, name, sampleSize)
+		if err == nil {
+			tv.SampleChecked = checked
+			tv.SampleMismatches = mismatches
+			if mismatches > 0 {
+				tv.Passed = false
+			}
+		}
+		// If compareSample errors (e.g. ORDER BY not supported), skip silently
+		// — row-count is still checked.
+	}
+	return tv, nil
 }
 
 // ValidateRowCounts is a convenience wrapper for row-count-only validation.
