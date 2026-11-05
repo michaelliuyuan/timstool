@@ -361,6 +361,28 @@ func TestCompareTask_BuildRunParamsSampleRatio(t *testing.T) {
 	}
 }
 
+// P0-2 anchor: query_timeout must reach the validator's CompareConfig (the
+// validator's QueryTimeoutDuration() then binds it per query); an empty
+// task keeps the empty value (the validator falls back to its 5m default).
+func TestCompareTask_BuildRunParamsQueryTimeout(t *testing.T) {
+	_, _, cfg := buildCompareRunParams(&CompareTask{QueryTimeout: "90s"}, "")
+	if cfg.QueryTimeout != "90s" {
+		t.Fatalf("query_timeout not propagated to CompareConfig: %+v", cfg)
+	}
+	_, _, cfg = buildCompareRunParams(&CompareTask{}, "")
+	if cfg.QueryTimeout != "" {
+		t.Fatalf("empty query_timeout must stay empty (validator binds its 5m default), got %q", cfg.QueryTimeout)
+	}
+	// The JSON wire name is query_timeout on the request face.
+	var req CompareTaskRequest
+	if err := json.Unmarshal([]byte(`{"query_timeout":"3m"}`), &req); err != nil {
+		t.Fatalf("decode CompareTaskRequest: %v", err)
+	}
+	if req.QueryTimeout != "3m" {
+		t.Fatalf("request query_timeout = %q, want 3m", req.QueryTimeout)
+	}
+}
+
 func TestCompareTask_RecoverStaleRunning(t *testing.T) {
 	s, _ := newTestServer(t)
 	dir := s.compareDir("stale01")

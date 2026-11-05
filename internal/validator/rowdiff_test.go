@@ -210,7 +210,10 @@ func (s *sideScript) respondNullScan(query string) (driver.Rows, error) {
 // the bound args — PG form ($N, one number per key column, watermark
 // placeholders first) or positional ? (values repeated per OR-chain
 // occurrence: v1 | v1 v2 | v1 v2 v3 …) — and rows are filtered to those
-// whose key tuple is strictly greater, preserving script order.
+// whose key tuple is strictly greater, preserving script order. The P0-1
+// checksum CHUNK windows now take the same keyset shape; like the legacy
+// respondOffsetWindow they honor chunkOverride (poisons only the small
+// chunk windows — the drill windows stay on the real dataset).
 func (s *sideScript) respondKeysetWindow(query string, args []driver.NamedValue) (driver.Rows, error) {
 	m := limitOnlyRe.FindStringSubmatch(query)
 	if m == nil {
@@ -218,6 +221,11 @@ func (s *sideScript) respondKeysetWindow(query string, args []driver.NamedValue)
 	}
 	var limit int
 	fmt.Sscanf(m[1], "%d", &limit)
+
+	src := s.data
+	if limit < 50000 && s.chunkOverride != nil {
+		src = s.chunkOverride
+	}
 
 	ob := orderByRe.FindStringSubmatch(query)
 	if ob == nil {
@@ -264,7 +272,7 @@ func (s *sideScript) respondKeysetWindow(query string, args []driver.NamedValue)
 	}
 
 	win := make([][]driver.Value, 0, limit)
-	for _, row := range s.data {
+	for _, row := range src {
 		if seekTuple != nil && !keyTupleGreater(row, keyIdxs, seekTuple) {
 			continue
 		}
@@ -490,14 +498,56 @@ func (s *sideScript) argsFor(substr string) [][]driver.Value {
 }
 
 // drillWindowQueries returns the side's KEYSET drill windows in order:
-// SELECT * … ORDER BY … LIMIT N — no OFFSET (chunk windows), no LIMIT 1
-// (content probes), no metadata probes.
+// SELECT * … ORDER BY … LIMIT N — no OFFSET (legacy chunk windows), no LIMIT 1
+// (content probes). Since P0-1 the checksum CHUNK windows also page by
+// keyset (LIMIT = the chunk size), so this set mixes chunk and drill windows
+// when the two LIMITs differ — use drillWindowsLimit to scope to one size.
 func (s *sideScript) drillWindowQueries() []string {
 	var out []string
 	for _, q := range s.sawQueries("SELECT *") {
 		if strings.Contains(q, "ORDER BY") && !strings.Contains(q, "OFFSET") && !strings.Contains(q, "LIMIT 1") {
 			out = append(out, q)
 		}
+	}
+	return out
+}
+
+// drillWindowsLimit returns the side's keyset windows (drillWindowQueries
+// shape) whose LIMIT equals exactly limit — scopes DRILL windows away from
+// the P0-1 chunk windows (chunk size vs the injected rowDiffWindow).
+func (s *sideScript) drillWindowsLimit(limit int) []string {
+	var out []string
+	for _, q := range s.drillWindowQueries() {
+		if m := limitOnlyRe.FindStringSubmatch(q); m != nil {
+			var n int
+			fmt.Sscanf(m[1], "%d", &n)
+			if n == limit {
+				out = append(out, q)
+			}
+		}
+	}
+	return out
+}
+
+// argsForLimit returns the bound-argument lists of every recorded query
+// containing substr AND carrying exactly LIMIT limit (index-aligned with
+// the window shape) — scopes DRILL seek args away from the chunk windows.
+func (s *sideScript) argsForLimit(substr string, limit int) [][]driver.Value {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out [][]driver.Value
+	for i, q := range s.queries {
+		if !strings.Contains(q, substr) {
+			continue
+		}
+		if m := limitOnlyRe.FindStringSubmatch(q); m != nil {
+			var n int
+			fmt.Sscanf(m[1], "%d", &n)
+			if n != limit {
+				continue
+			}
+		}
+		out = append(out, s.argLog[i])
 	}
 	return out
 }

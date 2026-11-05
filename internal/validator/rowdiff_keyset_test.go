@@ -461,8 +461,9 @@ func TestRowDiffNullKeyPreScanBeyondFirstWindow(t *testing.T) {
 			t.Fatalf("no detail CSV expected, got %v", csvs)
 		}
 		// the src hit aborts BEFORE any drill window (short-circuit: the
-		// dst side is not probed after the abort) — the seek never gets a
-		// chance to silently drop the NULL row
+		// dst side is not probed after the abort) — no DRILL seek window
+		// (LIMIT 50000) ever fires. (Chunk windows legitimately carry keyset
+		// seeks since P0-1; only the drill windows must not.)
 		if got := len(src.sawQueries("IS NULL")); got != 1 {
 			t.Fatalf("expected exactly 1 NULL pre-scan on src, got %d: %v", got, src.sawQueries("IS NULL"))
 		}
@@ -470,8 +471,10 @@ func TestRowDiffNullKeyPreScanBeyondFirstWindow(t *testing.T) {
 			t.Fatalf("abort on src hit must short-circuit before dst, saw %d", got)
 		}
 		for _, s := range []*sideScript{src, dst} {
-			if got := len(s.sawQueries(" > ")); got != 0 {
-				t.Fatalf("pre-scan abort must precede every seek window, saw %d: %v", got, s.sawQueries(" > "))
+			for _, q := range s.sawQueries(" > ") {
+				if strings.Contains(q, "LIMIT 50000") {
+					t.Fatalf("pre-scan abort must precede every drill window, saw %s", q)
+				}
 			}
 		}
 		if !strings.Contains(src.sawQueries("IS NULL")[0], `"name" IS NULL`) {

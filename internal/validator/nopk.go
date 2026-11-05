@@ -68,18 +68,21 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 	}
 
 	// Query TiDB for the full table first so we can build a unified skip set.
+	// P0-2: query-level deadline on the full-table scan.
+	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+	defer cancel()
 	var tidbRows *sql.Rows
 	var err error
-	if wm := v.wmFilterFor(ctx); wm != nil {
-		tidbRows, err = tidbConn.QueryContext(ctx,
+	if wm := v.wmFilterFor(qctx); wm != nil {
+		tidbRows, err = tidbConn.QueryContext(qctx,
 			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
-		tidbRows, err = tidbConn.QueryContext(ctx,
+		tidbRows, err = tidbConn.QueryContext(qctx,
 			fmt.Sprintf("SELECT * FROM %s", v.tgtDialect.QuoteIdent(table)))
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("hash group: query TiDB: %v", err)
+		tr.Error = fmt.Sprintf("hash group: query TiDB: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 		return tr
 	}
 	defer tidbRows.Close()
@@ -404,19 +407,21 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 	sort.Strings(pgHashes)
 	pgAggregate := fmt.Sprintf("%x", md5.Sum([]byte(strings.Join(pgHashes, ","))))
 
-	// Query TiDB full table
+	// Query TiDB full table. P0-2: query-level deadline on the full-table scan.
+	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+	defer cancel()
 	var tidbRows *sql.Rows
 	var err error
-	if wm := v.wmFilterFor(ctx); wm != nil {
-		tidbRows, err = tidbConn.QueryContext(ctx,
+	if wm := v.wmFilterFor(qctx); wm != nil {
+		tidbRows, err = tidbConn.QueryContext(qctx,
 			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
-		tidbRows, err = tidbConn.QueryContext(ctx,
+		tidbRows, err = tidbConn.QueryContext(qctx,
 			fmt.Sprintf("SELECT * FROM %s", v.tgtDialect.QuoteIdent(table)))
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("aggregate hash: query TiDB: %v", err)
+		tr.Error = fmt.Sprintf("aggregate hash: query TiDB: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 		return tr
 	}
 	defer tidbRows.Close()
@@ -510,19 +515,21 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 		pgBuckets[bucket] = append(pgBuckets[bucket], h)
 	}
 
-	// Query TiDB full table and assign to buckets
+	// Query TiDB full table and assign to buckets. P0-2: query-level deadline.
+	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+	defer cancel()
 	var tidbRows *sql.Rows
 	var err error
-	if wm := v.wmFilterFor(ctx); wm != nil {
-		tidbRows, err = tidbConn.QueryContext(ctx,
+	if wm := v.wmFilterFor(qctx); wm != nil {
+		tidbRows, err = tidbConn.QueryContext(qctx,
 			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
-		tidbRows, err = tidbConn.QueryContext(ctx,
+		tidbRows, err = tidbConn.QueryContext(qctx,
 			fmt.Sprintf("SELECT * FROM %s", v.tgtDialect.QuoteIdent(table)))
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("bucket compare: query TiDB: %v", err)
+		tr.Error = fmt.Sprintf("bucket compare: query TiDB: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 		return tr
 	}
 	defer tidbRows.Close()

@@ -163,6 +163,54 @@ func (c *scriptConn) ExecContext(context.Context, string, []driver.NamedValue) (
 	return driver.RowsAffected(0), nil
 }
 
+// chunkScriptRows is the scripted single-column (id) dataset served to the
+// checksum chunk windows of the A5 anchor: 200000 consecutive ids so the
+// 50000-row KEYSET cursor pages exactly 4 windows (the "4 chunks" suggestion
+// anchor). Served lazily by scriptConn.serveChunkWindow honoring the cursor
+// seek — window 0 is the first 50000 ids, every later window starts at the
+// previous window's last id (id > seek), mirroring the real keyset paging.
+var chunkScriptRows = func() [][]driver.Value {
+	out := make([][]driver.Value, 200000)
+	for i := range out {
+		out[i] = []driver.Value{int64(i + 1)} // ids 1..200000
+	}
+	return out
+}()
+
+// serveChunkWindow renders one keyset chunk window (SELECT * … ORDER BY "id"
+// LIMIT n [WHERE ("id" > seek)]): the seek is the LAST bound argument (PG
+// single-key $1 form), the window is the consecutive slice [seek, seek+limit)
+// of the consecutive-id dataset.
+func (c *scriptConn) serveChunkWindow(q string, args []driver.NamedValue) (driver.Rows, error) {
+	m := limitOnlyRe.FindStringSubmatch(q)
+	if m == nil {
+		return nil, fmt.Errorf("chunk window without LIMIT: %s", q)
+	}
+	var limit int
+	fmt.Sscanf(m[1], "%d", &limit)
+	seek := -1
+	if strings.Contains(q, " > ") {
+		if len(args) == 0 {
+			return nil, fmt.Errorf("seek window without args: %s", q)
+		}
+		switch v := args[len(args)-1].Value.(type) {
+		case int64:
+			seek = int(v)
+		default:
+			return nil, fmt.Errorf("unexpected seek type %T: %v", v, v)
+		}
+	}
+	lo := 0
+	if seek >= 0 {
+		lo = seek // id > seek ⇔ index >= seek (ids are index+1)
+	}
+	hi := lo + limit
+	if hi > len(chunkScriptRows) {
+		hi = len(chunkScriptRows)
+	}
+	return &scriptRows{cols: []string{"id"}, data: chunkScriptRows[lo:hi]}, nil
+}
+
 func (c *scriptConn) QueryContext(ctx context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
 	c.meter.enter()
 	defer c.meter.exit()
@@ -176,9 +224,9 @@ func (c *scriptConn) QueryContext(ctx context.Context, q string, args []driver.N
 		return &scriptRows{cols: []string{"column_name"}, data: [][]driver.Value{{"id"}}}, nil
 	}
 	if strings.Contains(q, "SELECT * FROM") {
-		// Chunk scans (and any sample scans): empty result set 鈥?both sides
-		// hash to the same value.
-		return &scriptRows{cols: []string{"id"}, data: nil}, nil
+		// Chunk windows: serve keyset-windowed ids so the cursor pages 4
+		// chunks (the "4 chunks" anchor); both sides hash the same dataset.
+		return c.serveChunkWindow(q, args)
 	}
 	// information_schema column checks (watermark precheck), pg_indexes, etc.
 	return &scriptRows{cols: []string{"x"}, data: nil}, nil

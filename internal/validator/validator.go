@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"regexp"
@@ -139,6 +140,17 @@ func (v *Validator) parallelism() int {
 		return v.parallelOverride
 	}
 	return v.cfg.Migration.Parallel
+}
+
+// annotateQueryTimeout (P0-2) renames a context-deadline query failure with
+// the query-timeout disclosure so the report says WHICH knob fired (and its
+// duration) instead of a bare "context deadline exceeded" — ops can triage a
+// slow query as a timeout. Non-deadline errors pass through unchanged.
+func annotateQueryTimeout(err error, d time.Duration) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("query timeout (%s): %w", d, err)
+	}
+	return err
 }
 
 // MaxConcBudget is the hard cap for the unified concurrency budget. Both DB
@@ -509,6 +521,11 @@ func (v *Validator) validateTableUnit(ctx context.Context, pgDB *sql.DB, tidbCon
 func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string) reporter.TableReport {
 	tr := reporter.TableReport{TableName: table, Status: reporter.StatusPass}
 
+	// P0-2: the four COUNT queries share one query-level deadline; a timeout
+	// fails THIS table (never the run).
+	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+	defer cancel()
+
 	schema := v.sourceSchema()
 	if schema == "" {
 		schema = "public"
@@ -516,33 +533,33 @@ func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn
 
 	var sourceCount int64
 	var err error
-	wm := v.wmFilterFor(ctx)
+	wm := v.wmFilterFor(qctx)
 	if wm != nil {
-		err = pgDB.QueryRowContext(ctx,
+		err = pgDB.QueryRowContext(qctx,
 			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s WHERE %s",
 				v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wmArgs(wm)...).Scan(&sourceCount)
 	} else {
-		err = pgDB.QueryRowContext(ctx,
+		err = pgDB.QueryRowContext(qctx,
 			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table))).Scan(&sourceCount)
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("source count: %v", err)
+		tr.Error = fmt.Sprintf("source count: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 		return tr
 	}
 
 	var targetCount int64
 	if wm != nil {
-		err = tidbConn.QueryRowContext(ctx,
+		err = tidbConn.QueryRowContext(qctx,
 			fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s",
 				v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...).Scan(&targetCount)
 	} else {
-		err = tidbConn.QueryRowContext(ctx,
+		err = tidbConn.QueryRowContext(qctx,
 			fmt.Sprintf("SELECT COUNT(*) FROM %s", v.tgtDialect.QuoteIdent(table))).Scan(&targetCount)
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("target count: %v", err)
+		tr.Error = fmt.Sprintf("target count: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 		return tr
 	}
 
@@ -636,22 +653,27 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		sampleSize = 1000
 	}
 
+	// P0-2: query-level deadline for the sample scans (PG window + TiDB
+	// point/positional queries); a hung sample query fails this table.
+	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+	defer cancel()
+
 	offset := sampleOffset(tr.SourceRows, sampleSize)
 
-	wm := v.wmFilterFor(ctx)
+	wm := v.wmFilterFor(qctx)
 	var pgRows *sql.Rows
 	if wm != nil {
 		pgQuery := fmt.Sprintf("SELECT * FROM %s.%s WHERE %s ORDER BY 1 LIMIT %d OFFSET %d",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm), sampleSize, offset)
-		pgRows, err = pgDB.QueryContext(ctx, pgQuery, wmArgs(wm)...)
+		pgRows, err = pgDB.QueryContext(qctx, pgQuery, wmArgs(wm)...)
 	} else {
 		pgQuery := fmt.Sprintf("SELECT * FROM %s.%s ORDER BY 1 LIMIT %d OFFSET %d",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), sampleSize, offset)
-		pgRows, err = pgDB.QueryContext(ctx, pgQuery)
+		pgRows, err = pgDB.QueryContext(qctx, pgQuery)
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("sample source: %v", err)
+		tr.Error = fmt.Sprintf("sample source: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 		return tr
 	}
 	defer pgRows.Close()
@@ -837,13 +859,13 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 
 		var tidbRows *sql.Rows
 		if len(tidbArgs) > 0 {
-			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery, tidbArgs...)
+			tidbRows, err = tidbConn.QueryContext(qctx, tidbQuery, tidbArgs...)
 		} else {
-			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery)
+			tidbRows, err = tidbConn.QueryContext(qctx, tidbQuery)
 		}
 		if err != nil {
 			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("sample target: %v", err)
+			tr.Error = fmt.Sprintf("sample target: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 			return tr
 		}
 		defer tidbRows.Close()
@@ -1037,15 +1059,15 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 		if wm != nil {
 			tidbQuery := fmt.Sprintf("SELECT * FROM %s WHERE %s LIMIT %d OFFSET %d",
 				v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm), sampleSize, offset)
-			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery, wmArgs(wm)...)
+			tidbRows, err = tidbConn.QueryContext(qctx, tidbQuery, wmArgs(wm)...)
 		} else {
 			tidbQuery := fmt.Sprintf("SELECT * FROM %s LIMIT %d OFFSET %d",
 				v.tgtDialect.QuoteIdent(table), sampleSize, offset)
-			tidbRows, err = tidbConn.QueryContext(ctx, tidbQuery)
+			tidbRows, err = tidbConn.QueryContext(qctx, tidbQuery)
 		}
 		if err != nil {
 			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("sample target: %v", err)
+			tr.Error = fmt.Sprintf("sample target: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 			return tr
 		}
 		defer tidbRows.Close()
@@ -1111,20 +1133,25 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, ratio float64, tr reporter.TableReport, schema string) reporter.TableReport {
 	logger := zap.L()
 
+	// P0-2: query-level deadline on the full-table scan — a hung hash_group
+	// query fails this table, never the run.
+	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+	defer cancel()
+
 	// Hash group is an exact strategy 鈥?query the full PG table, not a sample.
 	// Sampling would cause mismatches because TiDB is also queried in full.
 	var pgRows *sql.Rows
 	var err error
-	if wm := v.wmFilterFor(ctx); wm != nil {
-		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
+	if wm := v.wmFilterFor(qctx); wm != nil {
+		pgRows, err = pgDB.QueryContext(qctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
-		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
+		pgRows, err = pgDB.QueryContext(qctx, fmt.Sprintf("SELECT * FROM %s.%s",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table)))
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("sample source (no-PK): %v", err)
+		tr.Error = fmt.Sprintf("sample source (no-PK): %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 		return tr
 	}
 	defer pgRows.Close()
@@ -1178,18 +1205,22 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 
 // validateNoPKWithAggregate wraps full-table PG query + aggregate hash validation.
 func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, tr reporter.TableReport, schema string) reporter.TableReport {
+	// P0-2: query-level deadline on the full-table scan.
+	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+	defer cancel()
+
 	var pgRows *sql.Rows
 	var err error
-	if wm := v.wmFilterFor(ctx); wm != nil {
-		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
+	if wm := v.wmFilterFor(qctx); wm != nil {
+		pgRows, err = pgDB.QueryContext(qctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
-		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
+		pgRows, err = pgDB.QueryContext(qctx, fmt.Sprintf("SELECT * FROM %s.%s",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table)))
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("aggregate hash: query %s: %v", v.srcLabel(), err)
+		tr.Error = fmt.Sprintf("aggregate hash: query %s: %v", v.srcLabel(), annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 		return tr
 	}
 	defer pgRows.Close()
@@ -1237,18 +1268,22 @@ func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB,
 
 // validateNoPKWithBucket wraps full-table PG query + bucket validation.
 func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, tr reporter.TableReport, schema string) reporter.TableReport {
+	// P0-2: query-level deadline on the full-table scan.
+	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+	defer cancel()
+
 	var pgRows *sql.Rows
 	var err error
-	if wm := v.wmFilterFor(ctx); wm != nil {
-		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
+	if wm := v.wmFilterFor(qctx); wm != nil {
+		pgRows, err = pgDB.QueryContext(qctx, fmt.Sprintf("SELECT * FROM %s.%s WHERE %s",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
 	} else {
-		pgRows, err = pgDB.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s.%s",
+		pgRows, err = pgDB.QueryContext(qctx, fmt.Sprintf("SELECT * FROM %s.%s",
 			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table)))
 	}
 	if err != nil {
 		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("bucket compare: query %s: %v", v.srcLabel(), err)
+		tr.Error = fmt.Sprintf("bucket compare: query %s: %v", v.srcLabel(), annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 		return tr
 	}
 	defer pgRows.Close()

@@ -49,6 +49,7 @@ type CompareTaskRequest struct {
 	ChecksumParallel  int                     `json:"checksum_parallel"`          // deprecated (#t4): kept for compat, folded into Concurrency
 	Parallel          int                     `json:"parallel"`                   // deprecated (#t4): kept for compat, folded into Concurrency
 	Concurrency       int                     `json:"concurrency"`                // #t4 unified budget 1-8 (0 = derive from legacy knobs)
+	QueryTimeout      string                  `json:"query_timeout"`              // #t94 per-query deadline (empty = validator default 5m)
 	Tables            []string                `json:"tables"`                     // empty = all tables
 	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`        // #t3 optional filter group
 	TableWatermarks   []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override per-table filters (P1A)
@@ -68,6 +69,7 @@ type CompareTask struct {
 	ChecksumParallel  int                     `json:"checksum_parallel"` // deprecated (#t4)
 	Parallel          int                     `json:"parallel"`          // deprecated (#t4)
 	Concurrency       int                     `json:"concurrency"`       // #t4 unified budget (effective value, 0 = auto)
+	QueryTimeout      string                  `json:"query_timeout"`     // #t94 per-query deadline (empty = validator default 5m)
 	Tables            []string                `json:"tables"`
 	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`
 	TableWatermarks   []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override per-table filters
@@ -185,6 +187,7 @@ type compareOptionsBody struct {
 	ChecksumParallel  int                     `json:"checksum_parallel"`          // deprecated (#t4)
 	Parallel          int                     `json:"parallel"`                   // deprecated (#t4)
 	Concurrency       int                     `json:"concurrency"`                // #t4 present-and-0 clears to auto
+	QueryTimeout      string                  `json:"query_timeout"`              // #t94 per-query deadline (empty = validator default 5m)
 	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`        // present-and-null clears
 	IgnoreColumns     []string                `json:"ignore_columns,omitempty"`   // #ignore present-and-empty clears
 	TableWatermarks   []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override present-and-empty clears
@@ -427,6 +430,7 @@ func (s *Server) handlePutCompareOptions(w http.ResponseWriter, r *http.Request)
 	apply("checksum_parallel", func() { merged.ChecksumParallel = req.ChecksumParallel })
 	apply("parallel", func() { merged.Parallel = req.Parallel })
 	apply("concurrency", func() { merged.Concurrency = req.Concurrency })
+	apply("query_timeout", func() { merged.QueryTimeout = strings.TrimSpace(req.QueryTimeout) })
 	// #t3: present-and-null CLEARS the saved watermark group; present with
 	// a body validates + normalizes it; absent keeps the saved value.
 	if _, ok := presence["watermark"]; ok {
@@ -659,6 +663,7 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 		ChecksumParallel:  req.ChecksumParallel,
 		Parallel:          req.Parallel,
 		Concurrency:       conc,
+		QueryTimeout:      strings.TrimSpace(req.QueryTimeout),
 		Tables:            req.Tables,
 		Watermark:         req.Watermark,
 		TableWatermarks:   req.TableWatermarks,
@@ -722,6 +727,7 @@ func buildCompareRunParams(task *CompareTask, reportFile string) (float64, commo
 		ChecksumChunkSize: task.ChecksumChunkSize,
 		ChecksumParallel:  task.ChecksumParallel,
 		Concurrency:       task.Concurrency,
+		QueryTimeout:      task.QueryTimeout,
 		Watermark:         task.Watermark,
 		TableWatermarks:   task.TableWatermarks,
 		IgnoreColumns:     task.IgnoreColumns,

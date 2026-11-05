@@ -85,6 +85,13 @@ type CompareConfig struct {
 	// to [1,8] (both pools are capped at 8).
 	Concurrency int `yaml:"concurrency" json:"concurrency"`
 
+	// QueryTimeout bounds every compare query (row counts, chunk hashes,
+	// samples, no-PK scans, quick estimates): a query that outlives it fails
+	// only that chunk/table — the run never deadlocks (wg.Wait() stays
+	// bounded) and later tables proceed. Empty or unparseable values fall
+	// back to 5m (see QueryTimeoutDuration).
+	QueryTimeout string `yaml:"query_timeout" json:"queryTimeout"`
+
 	// Watermark scopes the comparison to rows whose watermark column is
 	// within bounds on BOTH sides (#t3), eliminating the permanent-diff
 	// illusion caused by ongoing source writes + sync lag. nil = unfiltered
@@ -111,6 +118,21 @@ type CompareConfig struct {
 	// IGNORED (the task-level base algorithm applies to every table); it
 	// exists only because the filter group is reused verbatim.
 	TableWatermarks []TableWatermark `yaml:"table_watermarks,omitempty" json:"table_watermarks,omitempty"`
+}
+
+// QueryTimeoutDuration parses the compare query-timeout knob: empty or
+// unparseable strings fall back to 5 minutes (mirrors the defensive
+// fallback pattern of MigrationConfig.ReadTimeoutDuration — an operator
+// typo must never collapse the knob to a zero timeout).
+func (c CompareConfig) QueryTimeoutDuration() time.Duration {
+	if c.QueryTimeout == "" {
+		return 5 * time.Minute
+	}
+	d, err := time.ParseDuration(c.QueryTimeout)
+	if err != nil {
+		return 5 * time.Minute
+	}
+	return d
 }
 
 // WatermarkFilter is the compare-side watermark filter group. Column passes
@@ -445,6 +467,7 @@ func DefaultConfig() *Config {
 			NoPKTableThreshold: 1000000,
 			ChecksumChunkSize:  50000,
 			ChecksumParallel:   4,
+			QueryTimeout:       "5m",
 		},
 		Logging: LoggingConfig{
 			Level:  "info",

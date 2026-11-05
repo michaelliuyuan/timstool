@@ -9,13 +9,19 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/michaelliuyuan/timstool/internal/common/reporter"
 	"go.uber.org/zap"
 )
 
-// validateChecksumChunked computes row hashes for each chunk of the table
-// in parallel, then compares PG and TiDB chunk by chunk.
+// validateChecksumChunked computes row hashes for each keyset chunk of the
+// table and compares PG and TiDB chunk by chunk. Chunk boundaries are NOT
+// pre-cut by OFFSET (P0-1): each window pages by a strict-greater keyset
+// seek over the previous window's last native key values, so cost stays flat
+// on deep tables. Windows within one table are CHAINED (window i+1's
+// boundary is window i's last key), but every window is exactly ONE #t4
+// budget unit — concurrent TABLES interleave freely across the global sem.
 //
 // #t4: connection orchestration is single-layer. The caller holds NO budget
 // slot; this function acquires one for the count phase and one per chunk via
@@ -123,6 +129,10 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	}
 
 	totalRows := tr.SourceRows
+	// numChunks is the COUNT-derived UPPER BOUND of windows (the old OFFSET
+	// cut). The cursor scan below stops at the actual last window (a short
+	// source window), so the number of windows that RUN is what the
+	// suggestion reports — never more than this bound.
 	numChunks := int(totalRows / chunkSize)
 	if totalRows%chunkSize > 0 {
 		numChunks++
@@ -131,87 +141,192 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 		numChunks = 1
 	}
 
+	// The key columns driving the keyset cursor (shared by the seek and the
+	// post-scan NULL coverage guardrail).
+	keyCols := splitKeyColumns(orderByCols)
+
 	logger := zap.L()
-	logger.Info("checksum mode: chunked parallel hash",
+	logger.Info("checksum mode: chunked keyset hash",
 		zap.String("table", table),
 		zap.Int64("total_rows", totalRows),
 		zap.Int("chunks", numChunks),
 		zap.Int64("chunk_size", chunkSize))
 
-	// Build chunk boundaries using the key column
-	chunks := make([]chunkRange, numChunks)
-	for i := 0; i < numChunks; i++ {
-		chunks[i] = chunkRange{
-			offset: int64(i) * chunkSize,
-			limit:  chunkSize,
-		}
-		// Adjust last chunk
-		if i == numChunks-1 {
-			chunks[i].limit = totalRows - chunks[i].offset
-		}
-	}
-
-	// Process chunks in parallel — each chunk is ONE global work unit: both
-	// the PG pool-backed query and the dedicated TiDB conn happen inside the
-	// slot (#t4).
+	// P0-1: keyset cursor pagination replaces the OFFSET pre-cut. Chunk
+	// boundaries are discovered at runtime: window 0 fetches the first
+	// chunkSize rows; every later window re-fetches with a strict-greater
+	// seek over the previous window's LAST NATIVE key values (single-key
+	// `pk > $last`; composite reuses rowDiffSeek's OR chain), plus the
+	// watermark predicate AND'd on — flat cost on deep tables (TiDB's deep
+	// OFFSET = whole-table cop scan disappears). The scan ends when a source
+	// window returns fewer than chunkSize rows (行数<chunkSize 即止).
+	//
+	// Concurrency model: windows are CHAINED (window i+1's boundary is
+	// window i's last key, so they cannot run in parallel), but each window
+	// remains exactly ONE #t4 budget unit — the PG+TiDB double-sided queries
+	// share a single slot, and slots are released between windows, so
+	// concurrent TABLES interleave freely across the global sem (a table's
+	// window 2 may run while another table's window 1 runs). NULL keys are
+	// detected in-flight (hash first, then stop): a NULL key makes the seek
+	// three-valued-logic UNKNOWN, so the honest stop fails the table instead
+	// of silently dropping every row after it (the drill's leader ruling 1
+	// applies to the chunk phase too).
 	var mu sync.Mutex
 	var mismatchDetails []string
 	var hashMismatch bool
 	var noComparable bool
 	var wg sync.WaitGroup
+	var chunksRan int32
+	var coveredRows int64
 
-	for i, chunk := range chunks {
+	// boundaries[i] carries window i's seek (previous window's last native
+	// key values; window 0 has none). stop aborts the tail goroutines once
+	// a short window, a NULL key or a chunk error ends the scan — wg.Wait()
+	// stays bounded (#t94 P0-2: a hung query can never pin the scan).
+	boundaries := make([]chan []interface{}, numChunks)
+	for i := range boundaries {
+		boundaries[i] = make(chan []interface{}, 1)
+	}
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	stopScan := func() { stopOnce.Do(func() { close(stop) }) }
+
+	for i := 0; i < numChunks; i++ {
 		wg.Add(1)
-		go func(idx int, ch chunkRange) {
+		go func(idx int) {
 			defer wg.Done()
+
+			var seek []interface{}
+			if idx > 0 {
+				select {
+				case seek = <-boundaries[idx]:
+				case <-stop:
+					return // the scan ended earlier; no boundary will arrive
+				}
+			}
 
 			release, aerr := sem.acquire(ctx)
 			if aerr != nil {
 				mu.Lock()
 				mismatchDetails = append(mismatchDetails, fmt.Sprintf("chunk %d: cancelled: %v", idx, aerr))
 				mu.Unlock()
+				stopScan()
 				return
 			}
 			defer release()
 
-			pgHash, err := v.computeChunkHashPG(ctx, pgDB, schema, table, orderByCols, ch, igEff)
+			pgHash, pgLast, pgNull, pgFetched, err := v.computeChunkHashPG(ctx, pgDB, schema, table, orderByCols, seek, chunkSize, igEff)
 			if err != nil {
 				if errors.Is(err, ErrNoComparableCols) {
 					mu.Lock()
 					noComparable = true
 					mu.Unlock()
-					return
+				} else {
+					mu.Lock()
+					mismatchDetails = append(mismatchDetails, fmt.Sprintf("chunk %d: %s error: %v", idx, v.srcLabel(), err))
+					mu.Unlock()
 				}
-				mu.Lock()
-				mismatchDetails = append(mismatchDetails, fmt.Sprintf("chunk %d: %s error: %v", idx, v.srcLabel(), err))
-				mu.Unlock()
+				stopScan()
 				return
 			}
 
-			tidbHash, err := v.computeChunkHashTiDB(ctx, tidbDB, table, orderByCols, ch, igEff)
+			tidbHash, _, tidbNull, _, err := v.computeChunkHashTiDB(ctx, tidbDB, table, orderByCols, seek, chunkSize, igEff)
 			if err != nil {
 				if errors.Is(err, ErrNoComparableCols) {
 					mu.Lock()
 					noComparable = true
 					mu.Unlock()
-					return
+				} else {
+					mu.Lock()
+					mismatchDetails = append(mismatchDetails, fmt.Sprintf("chunk %d: TiDB error: %v", idx, err))
+					mu.Unlock()
 				}
-				mu.Lock()
-				mismatchDetails = append(mismatchDetails, fmt.Sprintf("chunk %d: TiDB error: %v", idx, err))
-				mu.Unlock()
+				stopScan()
 				return
 			}
+
+			atomic.AddInt32(&chunksRan, 1)
+			atomic.AddInt64(&coveredRows, int64(pgFetched))
 
 			if pgHash != tidbHash {
 				mu.Lock()
 				hashMismatch = true
+				// rows %d-%d is derived from the chunk ordinal and size (the
+				// cursor's actual key range is reported via the drill).
 				mismatchDetails = append(mismatchDetails, fmt.Sprintf("chunk %d (rows %d-%d): hash mismatch src=%s tidb=%s",
-					idx, ch.offset, ch.offset+ch.limit, truncate(pgHash, 12), truncate(tidbHash, 12)))
+					idx, int64(idx)*chunkSize, (int64(idx)+1)*chunkSize, truncate(pgHash, 12), truncate(tidbHash, 12)))
 				mu.Unlock()
 			}
-		}(i, chunk)
+
+			// NULL key seen in a window: the seek cannot advance past it
+			// (UNKNOWN on NULL), so the honest stop fails the table with a
+			// disclosure rather than silently dropping the tail rows.
+			if pgNull || tidbNull {
+				mu.Lock()
+				mismatchDetails = append(mismatchDetails,
+					fmt.Sprintf("chunk %d: key column contains NULL, keyset cursor cannot advance past it", idx))
+				mu.Unlock()
+				stopScan()
+				return
+			}
+
+			// Short source window = the last one; stop the tail goroutines.
+			if int64(pgFetched) < chunkSize {
+				stopScan()
+				return
+			}
+			if idx+1 < numChunks {
+				boundaries[idx+1] <- pgLast
+			}
+		}(i)
 	}
 	wg.Wait()
+
+	// P0-1 NULL-key coverage guardrail (post-scan): the keyset seek is
+	// three-valued-logic UNKNOWN on NULL keys, so a nullable unique-index
+	// key with NULL rows silently drops every post-NULL window — the chunk
+	// hashes could match and PASS while rows go unchecked (the drill's
+	// leader ruling 1 applied to the chunk phase). The in-flight NULL check
+	// only fires when a NULL row lands INSIDE a fetched window; a NULL past
+	// the first boundary is excluded by the seek and never surfaces. Detect
+	// the blind spot via the coverage discrepancy (windows covered fewer
+	// rows than the count phase counted — a NULL-keyed table always does),
+	// then attribute it with the drill's NULL pre-scan (one #t4 unit per
+	// side, same watermark predicate). A NULL hit re-runs the table as
+	// hash_group (correct multiset comparison) with the NULL disclosure; no
+	// NULL hit = the short windows were just data movement — the scan
+	// verdict stands.
+	if keyInfo != nil && !keyInfo.HasPK && !noComparable && atomic.LoadInt64(&coveredRows) < tr.SourceRows {
+		if v.rowDiffNullKeyScan(ctx, pgDB, tidbDB, sem, schema, table, keyCols) {
+			logger.Info("checksum mode: nullable unique key has NULL rows, re-run as hash_group",
+				zap.String("table", table))
+			rel, aerr := sem.acquire(ctx)
+			if aerr != nil {
+				tr.Status = reporter.StatusFail
+				tr.Error = fmt.Sprintf("checksum: cancelled before hash_group re-run: %v", aerr)
+				return tr
+			}
+			conn, cerr := v.getTiDBConn(ctx, tidbDB)
+			if cerr != nil {
+				rel()
+				tr.Status = reporter.StatusFail
+				tr.Error = fmt.Sprintf("checksum: get TiDB connection: %v", cerr)
+				return tr
+			}
+			out := v.validateSamplingWithHashGroup(ctx, pgDB, conn, table, 1.0, tr, schema)
+			conn.Close()
+			rel()
+			// The NULL disclosure replaces the generic no-key note: the
+			// table DID have an alignment key — it was just unsafe to page.
+			if out.Status == reporter.StatusFail {
+				out.RowDiffs = &reporter.RowDiffSummary{
+					KeyColumns: append([]string(nil), keyCols...),
+					Note:       rowDiffNullNote,
+				}
+			}
+			return out
+		}
+	}
 
 	// #ignore: every comparable column excluded ⇒ no evidence ⇒ runtime
 	// skip with a warning note (never a FAIL).
@@ -235,7 +350,7 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	}
 
 	tr.Suggestion = fmt.Sprintf("checksum mode: %d chunks × %d rows, %d mismatches",
-		numChunks, chunkSize, len(mismatchDetails))
+		atomic.LoadInt32(&chunksRan), chunkSize, len(mismatchDetails))
 	if len(igProtected) > 0 {
 		tr.Suggestion = "主键列不可排除: " + strings.Join(igProtected, ", ") + "；" + tr.Suggestion
 	}
@@ -250,11 +365,6 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	}
 
 	return tr
-}
-
-type chunkRange struct {
-	offset int64
-	limit  int64
 }
 
 // resolveIgnoreSet resolves the effective user-exclusion set for one table
@@ -286,39 +396,107 @@ func quoteOrderByCols(orderBy string, quote func(string) string) string {
 	return strings.Join(quoted, ", ")
 }
 
-// computeChunkHashPG computes an aggregate hash for a chunk of PG rows.
-// With a watermark filter active the chunk rows are the FILTERED universe
-// (validateRowCount already counted with the same predicate, so chunk
-// boundaries derived from that count stay consistent on both sides). ig is
-// the PK-resolved user ignore set (nil = none): hits join the float/JSON
-// skip channel — value hashing only, chunk ordering is untouched.
-func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema, table, orderBy string, ch chunkRange, ig map[string]bool) (string, error) {
-	var rows *sql.Rows
-	var err error
-	if wm := v.wmFilterFor(ctx); wm != nil {
-		query := fmt.Sprintf("SELECT * FROM %s.%s WHERE %s ORDER BY %s LIMIT %d OFFSET %d",
-			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm), quoteOrderByCols(orderBy, v.srcDialect.QuoteIdent), ch.limit, ch.offset)
-		rows, err = pgDB.QueryContext(ctx, query, wmArgs(wm)...)
-	} else {
-		query := fmt.Sprintf("SELECT * FROM %s.%s ORDER BY %s LIMIT %d OFFSET %d",
-			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), quoteOrderByCols(orderBy, v.srcDialect.QuoteIdent), ch.limit, ch.offset)
-		rows, err = pgDB.QueryContext(ctx, query)
+// chunkSeekPredicate renders the WHERE clause pieces for one chunk window
+// (P0-1 keyset cursor): the optional watermark predicate plus the exclusive
+// strict-greater seek chain over the previous window's last native key
+// values. It mirrors the row-diff drill's composition (rowdiff.go:598-622):
+// WM first, seek second, joined by AND; PG sources number the seek
+// placeholders CONTINUOUSLY after the watermark's ($N), MySQL/TiDB bind
+// positional ? per occurrence. Returns the AND-joined WHERE fragment and the
+// bound arguments (watermark args first, seek args after).
+func (v *Validator) chunkSeekPredicate(dialectPlaceholders bool, quote func(string) string,
+	wmFrag string, wmA []interface{}, orderBy string, seek []interface{}) (string, []interface{}) {
+	conds := make([]string, 0, 2)
+	args := append([]interface{}{}, wmA...)
+	if wmFrag != "" {
+		conds = append(conds, wmFrag)
 	}
+	if seek != nil {
+		seekChain := newRowDiffSeek(dialectPlaceholders, len(wmA))
+		quotedKeys := make([]string, 0, 2)
+		for _, k := range splitKeyColumns(orderBy) {
+			quotedKeys = append(quotedKeys, quote(k))
+		}
+		conds = append(conds, "("+seekChain.chain(quotedKeys, seek)+")")
+		args = append(args, seekChain.args...)
+	}
+	if len(conds) == 0 {
+		return "", args
+	}
+	return " WHERE " + strings.Join(conds, " AND "), args
+}
+
+// computeChunkHashPG computes an aggregate hash for a keyset chunk of PG
+// rows (P0-1). With a watermark filter active the chunk rows are the
+// FILTERED universe (validateRowCount already counted with the same
+// predicate, so the cursor stays on the same filtered scope). ig is the
+// PK-resolved user ignore set (nil = none): hits join the float/JSON skip
+// channel — value hashing only, chunk ordering is untouched.
+//
+// Returns the aggregate hash, the LAST row's NATIVE key values (the next
+// window's seek position; nil on a short/empty window), whether any KEY
+// column value was NULL in the window (the cursor cannot advance past NULL —
+// caller must stop), and the number of scanned rows. P0-2: the query runs
+// under a context.WithTimeout so a hung database fails only this chunk.
+func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema, table, orderBy string, seek []interface{}, limit int64, ig map[string]bool) (string, []interface{}, bool, int, error) {
+	// P0-2: query-level timeout — a hung source query fails this chunk
+	// (annotated "query timeout"), never the whole run.
+	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+	defer cancel()
+
+	keyNames := splitKeyColumns(orderBy)
+	quotedKeys := make([]string, len(keyNames))
+	for i, k := range keyNames {
+		quotedKeys[i] = v.srcDialect.QuoteIdent(k)
+	}
+
+	var wmFrag string
+	var wmA []interface{}
+	if wm := v.wmFilterFor(qctx); wm != nil {
+		wmFrag = v.srcDialect.WmPredicateFragment(wm)
+		wmA = wmArgs(wm)
+	}
+	// PG sources use $N placeholders numbered after the watermark's;
+	// MySQL sources bind positional ?.
+	pgPlaceholders := false
+	if _, ok := v.srcDialect.(postgresDialect); ok {
+		pgPlaceholders = true
+	}
+	where, args := v.chunkSeekPredicate(pgPlaceholders, v.srcDialect.QuoteIdent, wmFrag, wmA, orderBy, seek)
+
+	query := fmt.Sprintf("SELECT * FROM %s.%s%s ORDER BY %s LIMIT %d",
+		v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), where, strings.Join(quotedKeys, ", "), limit)
+	rows, err := pgDB.QueryContext(qctx, query, args...)
 	if err != nil {
-		return "", err
+		return "", nil, false, 0, annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration())
 	}
 	defer rows.Close()
 
 	cols, _ := rows.ColumnTypes()
 	if cols == nil {
-		return "", fmt.Errorf("no column types")
+		return "", nil, false, 0, fmt.Errorf("no column types")
 	}
 
 	// Shared hash plan (row-diff drill uses the SAME builder — one
 	// implementation, no drift).
 	hashIdxs, err := buildChunkHashPlan(cols, ig)
 	if err != nil {
-		return "", err
+		return "", nil, false, 0, err
+	}
+
+	// Key column indices: the cursor's last-key capture reads the key from
+	// the row itself (same resolution as the row-diff drill, rowdiff.go:643).
+	lowerName := make(map[string]int, len(cols))
+	for i, c := range cols {
+		lowerName[strings.ToLower(c.Name())] = i
+	}
+	keyIdxs := make([]int, 0, len(keyNames))
+	for _, kc := range keyNames {
+		idx, ok := lowerName[strings.ToLower(kc)]
+		if !ok {
+			return "", nil, false, 0, fmt.Errorf("key column %q missing on %s side", kc, v.srcLabel())
+		}
+		keyIdxs = append(keyIdxs, idx)
 	}
 
 	values := make([]interface{}, len(cols))
@@ -328,55 +506,95 @@ func (v *Validator) computeChunkHashPG(ctx context.Context, pgDB *sql.DB, schema
 	}
 
 	var rowHashes []string
+	var lastKey []interface{}
+	nullKey := false
+	fetched := 0
 	for rows.Next() {
 		if err := rows.Scan(ptrs...); err != nil {
-			return "", fmt.Errorf("scan row in chunk: %w", err)
+			return "", nil, false, 0, fmt.Errorf("scan row in chunk: %w", err)
 		}
 		rowHashes = append(rowHashes, rowMD5(values, hashIdxs))
+		// Cursor advance: capture the last row's NATIVE key values (never
+		// normalized strings — int64 stays int64, mirroring the drill).
+		lastKey = make([]interface{}, len(keyIdxs))
+		for i, k := range keyIdxs {
+			if values[k] == nil {
+				nullKey = true
+			}
+			lastKey[i] = sanitizeNativeValue(values[k])
+		}
+		fetched++
 	}
 	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("iterate chunk rows: %w", err)
+		return "", nil, false, 0, fmt.Errorf("iterate chunk rows: %w", err)
 	}
 
 	sort.Strings(rowHashes)
-	return fmt.Sprintf("%x", md5.Sum([]byte(strings.Join(rowHashes, ",")))), nil
+	return fmt.Sprintf("%x", md5.Sum([]byte(strings.Join(rowHashes, ",")))), lastKey, nullKey, fetched, nil
 }
 
-// computeChunkHashTiDB computes an aggregate hash for a chunk of TiDB rows.
-// It gets its own dedicated connection with UTC timezone for parallel goroutines.
-// ig mirrors the PG-side ignore set so both sides hash the same columns.
-func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, table, orderBy string, ch chunkRange, ig map[string]bool) (string, error) {
+// computeChunkHashTiDB computes an aggregate hash for a keyset chunk of TiDB
+// rows (P0-1). It gets its own dedicated connection with UTC timezone for
+// parallel goroutines. ig mirrors the PG-side ignore set so both sides hash
+// the same columns. Same return contract as computeChunkHashPG.
+func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, table, orderBy string, seek []interface{}, limit int64, ig map[string]bool) (string, []interface{}, bool, int, error) {
+	// P0-2: query-level timeout (the dedicated conn acquisition and the
+	// window query share one deadline).
+	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+	defer cancel()
+
 	// Get dedicated connection with UTC timezone for this goroutine.
-	conn, err := v.getTiDBConn(ctx, tidbDB)
+	conn, err := v.getTiDBConn(qctx, tidbDB)
 	if err != nil {
-		return "", fmt.Errorf("get TiDB conn for chunk: %w", err)
+		return "", nil, false, 0, annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration())
 	}
 	defer conn.Close()
 
-	var rows *sql.Rows
-	if wm := v.wmFilterFor(ctx); wm != nil {
-		query := fmt.Sprintf("SELECT * FROM %s WHERE %s ORDER BY %s LIMIT %d OFFSET %d",
-			v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm), quoteOrderByCols(orderBy, v.tgtDialect.QuoteIdent), ch.limit, ch.offset)
-		rows, err = conn.QueryContext(ctx, query, wmArgs(wm)...)
-	} else {
-		query := fmt.Sprintf("SELECT * FROM %s ORDER BY %s LIMIT %d OFFSET %d",
-			v.tgtDialect.QuoteIdent(table), quoteOrderByCols(orderBy, v.tgtDialect.QuoteIdent), ch.limit, ch.offset)
-		rows, err = conn.QueryContext(ctx, query)
+	keyNames := splitKeyColumns(orderBy)
+	quotedKeys := make([]string, len(keyNames))
+	for i, k := range keyNames {
+		quotedKeys[i] = v.tgtDialect.QuoteIdent(k)
 	}
+
+	var wmFrag string
+	var wmA []interface{}
+	if wm := v.wmFilterFor(qctx); wm != nil {
+		wmFrag = v.tgtDialect.WmPredicateFragment(wm)
+		wmA = wmArgs(wm)
+	}
+	// TiDB always binds positional ? (never $N).
+	where, args := v.chunkSeekPredicate(false, v.tgtDialect.QuoteIdent, wmFrag, wmA, orderBy, seek)
+
+	query := fmt.Sprintf("SELECT * FROM %s%s ORDER BY %s LIMIT %d",
+		v.tgtDialect.QuoteIdent(table), where, strings.Join(quotedKeys, ", "), limit)
+	rows, err := conn.QueryContext(qctx, query, args...)
 	if err != nil {
-		return "", err
+		return "", nil, false, 0, annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration())
 	}
 	defer rows.Close()
 
 	cols, _ := rows.ColumnTypes()
 	if cols == nil {
-		return "", fmt.Errorf("no column types")
+		return "", nil, false, 0, fmt.Errorf("no column types")
 	}
 
 	// Shared hash plan (row-diff drill uses the SAME builder).
 	hashIdxs, err := buildChunkHashPlan(cols, ig)
 	if err != nil {
-		return "", err
+		return "", nil, false, 0, err
+	}
+
+	lowerName := make(map[string]int, len(cols))
+	for i, c := range cols {
+		lowerName[strings.ToLower(c.Name())] = i
+	}
+	keyIdxs := make([]int, 0, len(keyNames))
+	for _, kc := range keyNames {
+		idx, ok := lowerName[strings.ToLower(kc)]
+		if !ok {
+			return "", nil, false, 0, fmt.Errorf("key column %q missing on %s side", kc, v.sideLabel(true))
+		}
+		keyIdxs = append(keyIdxs, idx)
 	}
 
 	values := make([]interface{}, len(cols))
@@ -386,18 +604,29 @@ func (v *Validator) computeChunkHashTiDB(ctx context.Context, tidbDB *sql.DB, ta
 	}
 
 	var rowHashes []string
+	var lastKey []interface{}
+	nullKey := false
+	fetched := 0
 	for rows.Next() {
 		if err := rows.Scan(ptrs...); err != nil {
-			return "", fmt.Errorf("scan row in chunk: %w", err)
+			return "", nil, false, 0, fmt.Errorf("scan row in chunk: %w", err)
 		}
 		rowHashes = append(rowHashes, rowMD5(values, hashIdxs))
+		lastKey = make([]interface{}, len(keyIdxs))
+		for i, k := range keyIdxs {
+			if values[k] == nil {
+				nullKey = true
+			}
+			lastKey[i] = sanitizeNativeValue(values[k])
+		}
+		fetched++
 	}
 	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("iterate chunk rows: %w", err)
+		return "", nil, false, 0, fmt.Errorf("iterate chunk rows: %w", err)
 	}
 
 	sort.Strings(rowHashes)
-	return fmt.Sprintf("%x", md5.Sum([]byte(strings.Join(rowHashes, ",")))), nil
+	return fmt.Sprintf("%x", md5.Sum([]byte(strings.Join(rowHashes, ",")))), lastKey, nullKey, fetched, nil
 }
 
 // buildChunkHashPlan is the single shared hash-column plan of the checksum

@@ -3,6 +3,7 @@ package target
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -29,6 +30,13 @@ type TableValidation struct {
 	SampleChecked    int    `json:"sample_checked"`
 	SampleMismatches int    `json:"sample_mismatches"`
 }
+
+// queryTimeout bounds every validation query (count + value-sample scans,
+// #t94 P0-2): a hung query fails the current table's validation entry
+// instead of stalling the whole migration validation forever. A package
+// default because target.ValidateMigration has no compare-config plumbing
+// (its signature is frozen — orchestrator binds it via cirValidateMigration).
+var queryTimeout = 5 * time.Minute
 
 // ValidateMigration checks row-count parity AND value-level consistency (sampled
 // rows compared by normalized string values) for each CIR table — the core data
@@ -82,8 +90,14 @@ func ValidateRowCounts(ctx context.Context, sourceDB, tidbDB *sql.DB, schema *so
 }
 
 func countRows(ctx context.Context, db *sql.DB, table string) (int64, error) {
+	// P0-2: query-level deadline — a hung COUNT fails only this table.
+	qctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
 	var n int64
-	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+QuoteIdent(table)).Scan(&n); err != nil {
+	if err := db.QueryRowContext(qctx, "SELECT COUNT(*) FROM "+QuoteIdent(table)).Scan(&n); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return 0, fmt.Errorf("query timeout (%s): %w", queryTimeout, err)
+		}
 		return 0, err
 	}
 	return n, nil
@@ -119,9 +133,15 @@ func compareNormalized(srcRows, tgtRows [][]string) (checked, mismatches int) {
 }
 
 func queryNormalizedRows(ctx context.Context, db *sql.DB, table string, limit int) ([][]string, error) {
+	// P0-2: query-level deadline on the value-sample scan.
+	qctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
 	q := fmt.Sprintf("SELECT * FROM %s ORDER BY 1 LIMIT %d", QuoteIdent(table), limit)
-	rows, err := db.QueryContext(ctx, q)
+	rows, err := db.QueryContext(qctx, q)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("query timeout (%s): %w", queryTimeout, err)
+		}
 		return nil, err
 	}
 	defer rows.Close()

@@ -24,30 +24,35 @@ func (v *Validator) validateQuick(ctx context.Context, pgDB *sql.DB, tidbConn *s
 		schema = "public"
 	}
 
+	// P0-2: query-level deadline on the estimate/exact-count probes — a hung
+	// quick-mode query fails this table, never the run.
+	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+	defer cancel()
+
 	// PG: use pg_stat_user_tables for fast row count estimation
-	pgCount, err := v.srcDialect.EstimateRows(ctx, pgDB, schema, table)
+	pgCount, err := v.srcDialect.EstimateRows(qctx, pgDB, schema, table)
 	if err != nil {
 		logger.Warn("quick mode: pg_stat estimate failed, falling back to COUNT(*)",
 			zap.String("table", table), zap.Error(err))
 		// Fallback to exact COUNT(*)
-		pgCount, err = v.srcDialect.CountExact(ctx, pgDB, schema, table)
+		pgCount, err = v.srcDialect.CountExact(qctx, pgDB, schema, table)
 		if err != nil {
 			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("quick: %s count: %v", v.srcLabel(), err)
+			tr.Error = fmt.Sprintf("quick: %s count: %v", v.srcLabel(), annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 			return tr
 		}
 	}
 
 	// TiDB: use SHOW TABLE STATUS for fast row count estimation
-	tidbCount, err := v.tgtDialect.EstimateRows(ctx, tidbConn, schema, table)
+	tidbCount, err := v.tgtDialect.EstimateRows(qctx, tidbConn, schema, table)
 	if err != nil {
 		logger.Warn("quick mode: SHOW TABLE STATUS failed, falling back to COUNT(*)",
 			zap.String("table", table), zap.Error(err))
 		// Fallback to exact COUNT(*)
-		tidbCount, err = v.tgtDialect.CountExact(ctx, tidbConn, schema, table)
+		tidbCount, err = v.tgtDialect.CountExact(qctx, tidbConn, schema, table)
 		if err != nil {
 			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("quick: TiDB count: %v", err)
+			tr.Error = fmt.Sprintf("quick: TiDB count: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 			return tr
 		}
 	}

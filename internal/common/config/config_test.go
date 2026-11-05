@@ -61,6 +61,31 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.CDC.Enable != true {
 		t.Error("cdc should be enabled by default (49e073b: enable CDC incremental sync by default)")
 	}
+	if got := cfg.Compare.QueryTimeout; got != "5m" {
+		t.Errorf("compare.query_timeout default = %q, want 5m", got)
+	}
+}
+
+// P0-2 anchor: QueryTimeoutDuration falls back to 5m on empty or unparseable
+// values (an operator typo must never collapse the knob to a zero timeout)
+// and parses a valid duration verbatim.
+func TestCompareQueryTimeoutDuration(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"", 5 * time.Minute},
+		{"bad", 5 * time.Minute},
+		{"0", 0}, // explicit zero stays explicit
+		{"30s", 30 * time.Second},
+		{"2m", 2 * time.Minute},
+		{"1h", time.Hour},
+	}
+	for _, c := range cases {
+		if got := (CompareConfig{QueryTimeout: c.in}).QueryTimeoutDuration(); got != c.want {
+			t.Errorf("QueryTimeoutDuration(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
 }
 
 func TestCDCConfigDefault(t *testing.T) {

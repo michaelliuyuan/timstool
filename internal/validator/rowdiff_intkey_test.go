@@ -73,10 +73,11 @@ func TestRowDiffIntKeyNumericOrderPaging(t *testing.T) {
 			t.Fatalf("sample keys = %v, want 5 samples led by 3", rd.SampleKeys)
 		}
 
-		// 11 rows per side in windows of 5 → exactly 3 windows each,
+		// 11 rows per side in windows of 5 → exactly 3 DRILL windows each
+		// (scoped by LIMIT 5 — the P0-1 chunk windows carry the chunk size),
 		// every post-first window a fresh seek, never OFFSET.
 		for _, s := range []*sideScript{src, dst} {
-			wq := s.drillWindowQueries()
+			wq := s.drillWindowsLimit(5)
 			if len(wq) != 3 {
 				t.Fatalf("expected exactly 3 drill windows, got %d: %v", len(wq), wq)
 			}
@@ -91,7 +92,7 @@ func TestRowDiffIntKeyNumericOrderPaging(t *testing.T) {
 		// then 11 — the 11 boundary sits exactly on the crossing).
 		boundaries := func(s *sideScript) map[int64]bool {
 			out := map[int64]bool{}
-			for _, args := range s.argsFor(" > ") {
+			for _, args := range s.argsForLimit(" > ", 5) {
 				for _, v := range args {
 					i, ok := v.(int64)
 					if !ok {
@@ -191,13 +192,16 @@ func TestRowDiffIntKeyCrossEndKindDriftAborts(t *testing.T) {
 		t.Fatalf("no content.json expected, got %v", js)
 	}
 	// Detection rides the first windows (both sides fetched once); the
-	// abort precedes every seek window.
+	// abort precedes every DRILL seek window (chunk windows page by keyset
+	// since P0-1, but the drill must never seek past the drift abort).
 	for _, s := range []*sideScript{src, dst} {
-		if got := len(s.drillWindowQueries()); got != 1 {
-			t.Fatalf("drift abort must fire on the first window, saw %d: %v", got, s.drillWindowQueries())
+		if got := len(s.drillWindowsLimit(50000)); got != 1 {
+			t.Fatalf("drift abort must fire on the first drill window, saw %d: %v", got, s.drillWindowsLimit(50000))
 		}
-		if got := len(s.sawQueries(" > ")); got != 0 {
-			t.Fatalf("no seek window may follow the drift abort, saw %v", s.sawQueries(" > "))
+		for _, q := range s.drillWindowsLimit(50000) {
+			if strings.Contains(q, " > ") {
+				t.Fatalf("no drill seek window may follow the drift abort, saw %s", q)
+			}
 		}
 	}
 }
