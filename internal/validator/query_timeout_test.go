@@ -33,6 +33,10 @@ type hangConn struct {
 	// blockOnSeek: block the FIRST query containing the seek " > ".
 	blockOnSeek bool
 	blocked     atomic.Bool
+	// blockOnNullScan: block the FIRST NULL pre-scan query (contains
+	// "IS NULL") — the M2 guardrail probe must be bounded too.
+	blockOnNullScan bool
+	nullBlocked     atomic.Bool
 }
 
 func (c *hangConn) Prepare(string) (driver.Stmt, error) { return nil, fmt.Errorf("unsupported") }
@@ -44,6 +48,16 @@ func (c *hangConn) ExecContext(context.Context, string, []driver.NamedValue) (dr
 
 func (c *hangConn) QueryContext(ctx context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
 	if c.blockOnSeek && strings.Contains(q, " > ") && c.blocked.CompareAndSwap(false, true) {
+		c.script.logQuery(q, args)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(10 * time.Second):
+			return nil, fmt.Errorf("timeout driver: ctx never cancelled (test bug)")
+		}
+	}
+	if c.blockOnNullScan && strings.Contains(q, "IS NULL") && c.nullBlocked.CompareAndSwap(false, true) {
+		c.script.logQuery(q, args)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -55,17 +69,22 @@ func (c *hangConn) QueryContext(ctx context.Context, q string, args []driver.Nam
 }
 
 type hangConnector struct {
-	script      *sideScript
-	blockOnSeek bool
+	script          *sideScript
+	blockOnSeek     bool
+	blockOnNullScan bool
 }
 
 func (h *hangConnector) Connect(context.Context) (driver.Conn, error) {
-	return &hangConn{script: h.script, blockOnSeek: h.blockOnSeek}, nil
+	return &hangConn{script: h.script, blockOnSeek: h.blockOnSeek, blockOnNullScan: h.blockOnNullScan}, nil
 }
 func (h *hangConnector) Driver() driver.Driver { return fakeDriver{} }
 
 func (s *sideScript) openHang(blockOnSeek bool) *sql.DB {
 	return sql.OpenDB(&hangConnector{script: s, blockOnSeek: blockOnSeek})
+}
+
+func (s *sideScript) openHangNullScan() *sql.DB {
+	return sql.OpenDB(&hangConnector{script: s, blockOnNullScan: true})
 }
 
 // TestChecksumChunkQueryTimeoutNoHang (T1): chunk size 2 over 5 rows → 3
@@ -99,11 +118,12 @@ func TestChecksumChunkQueryTimeoutNoHang(t *testing.T) {
 		t.Fatalf("table error must disclose the query timeout, got %q", tr.Error)
 	}
 
-	// Window 0 ran normally on both sides; the hung window 1 never reached
-	// the TiDB side (the PG failure stops the chain before it), and window 2
-	// never ran at all.
-	if got := len(src.sawQueries("SELECT *")); got != 1 {
-		t.Fatalf("expected only window 0 on src before the hang, got %d: %v", got, src.sawQueries("SELECT *"))
+	// Window 0 ran normally on both sides; window 1's PG seek query was
+	// ATTEMPTED (logged by the blocking driver before it hung) but never
+	// completed — the PG failure stops the chain before the TiDB side, and
+	// window 2 never ran at all.
+	if got := len(src.sawQueries("SELECT *")); got != 2 {
+		t.Fatalf("expected window 0 + the hung window-1 attempt on src, got %d: %v", got, src.sawQueries("SELECT *"))
 	}
 	if got := len(dst.sawQueries("SELECT *")); got != 1 {
 		t.Fatalf("expected only window 0 on dst (window 1 never reached), got %d: %v", got, dst.sawQueries("SELECT *"))

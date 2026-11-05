@@ -102,14 +102,7 @@ func (s *sideScript) datasetCols() ([]string, []string) {
 var orderByRe = regexp.MustCompile("ORDER BY ((?:\"[A-Za-z0-9_]+\"|`[A-Za-z0-9_]+`)(?:, (?:\"[A-Za-z0-9_]+\"|`[A-Za-z0-9_]+`))*)")
 
 func (s *sideScript) respond(query string, args []driver.NamedValue) (driver.Rows, error) {
-	s.mu.Lock()
-	s.queries = append(s.queries, query)
-	logged := make([]driver.Value, len(args))
-	for i, a := range args {
-		logged[i] = a.Value
-	}
-	s.argLog = append(s.argLog, logged)
-	s.mu.Unlock()
+	s.logQuery(query, args)
 
 	switch {
 	case strings.Contains(query, "COUNT(*)"):
@@ -137,6 +130,12 @@ func (s *sideScript) respond(query string, args []driver.NamedValue) (driver.Row
 	case strings.Contains(query, "IS NULL"):
 		return s.respondNullScan(query)
 	case strings.Contains(query, "SELECT *"):
+		// Full-table scan (no LIMIT/OFFSET) = the hash_group/aggregate
+		// full re-scan: serve the whole scripted dataset.
+		if !strings.Contains(query, "LIMIT") && !strings.Contains(query, "OFFSET") {
+			cols, colTypes := s.datasetCols()
+			return &scriptedRows{cols: cols, colTypes: colTypes, rows: s.data}, nil
+		}
 		// LIMIT 1 alone = content-probe point query; a chunk window can be
 		// "LIMIT 1 OFFSET n" (last short chunk) and must take the OFFSET path.
 		if strings.Contains(query, "LIMIT 1") && !strings.Contains(query, "OFFSET") {
@@ -148,6 +147,20 @@ func (s *sideScript) respond(query string, args []driver.NamedValue) (driver.Row
 		return s.respondKeysetWindow(query, args)
 	}
 	return nil, fmt.Errorf("unexpected query: %s", query)
+}
+
+// logQuery records a served query (and its bound args) for the sawQueries /
+// argsFor assertions. A blocking driver wrapper (hangConn) calls it too so
+// a hung query is still attributed to the right side.
+func (s *sideScript) logQuery(query string, args []driver.NamedValue) {
+	s.mu.Lock()
+	s.queries = append(s.queries, query)
+	logged := make([]driver.Value, len(args))
+	for i, a := range args {
+		logged[i] = a.Value
+	}
+	s.argLog = append(s.argLog, logged)
+	s.mu.Unlock()
 }
 
 // respondOffsetWindow serves the legacy chunk-window shape (LIMIT n
@@ -481,6 +494,21 @@ func (s *sideScript) sawQueries(substr string) []string {
 		}
 	}
 	return out
+}
+
+// sawFullScan reports whether a full-table SELECT * (no LIMIT/OFFSET — the
+// hash_group/aggregate re-run shape) was issued on this side. The M1/M2
+// guardrail re-run must issue one on both sides; the chunk windows all carry
+// LIMIT, so this is unambiguous re-run evidence.
+func (s *sideScript) sawFullScan() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, q := range s.queries {
+		if strings.Contains(q, "SELECT *") && !strings.Contains(q, "LIMIT") && !strings.Contains(q, "OFFSET") {
+			return true
+		}
+	}
+	return false
 }
 
 // argsFor returns the bound-argument lists of every recorded query

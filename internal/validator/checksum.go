@@ -28,6 +28,15 @@ import (
 // the shared global sem, so no goroutine ever waits on the sem while holding
 // a connection (the old table-level × chunk-level nesting deadlocked when
 // outer workers held all 8 pool conns waiting for inner chunks).
+//
+// drillCtx bounds the row-diff drill's own queries (its NULL pre-scan and
+// window fetches use the ctx directly — M2, adversarial review d5f0be9): a
+// sick DB after a chunk mismatch must degrade the drill with a cancellation
+// note, never hang the whole run on a diagnostic path.
+func (v *Validator) drillCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+}
+
 func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *sql.DB, table string, sem concSem) reporter.TableReport {
 	tr := reporter.TableReport{TableName: table, Status: reporter.StatusPass}
 
@@ -64,7 +73,9 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 			if schema == "" {
 				schema = "public"
 			}
-			v.maybeDrillRowDiffs(ctx, pgDB, tidbDB, sem, schema, table, &tr, nil, nil, "")
+			dctx, dcancel := v.drillCtx(ctx)
+			defer dcancel()
+			v.maybeDrillRowDiffs(dctx, pgDB, tidbDB, sem, schema, table, &tr, nil, nil, "")
 		}
 		return tr
 	}
@@ -178,6 +189,13 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	var wg sync.WaitGroup
 	var chunksRan int32
 	var coveredRows int64
+	// nullSeen records that a NULL key row was FETCHED inside a window (vs
+	// being excluded by the seek). A small table fully covered in window 0
+	// with NULL rows hits the in-flight NULL check at covered==count — the
+	// guardrail must still re-run as hash_group (minor4, adversarial
+	// review d5f0be9), so the NULL is attributed as the trigger instead of
+	// being appended as a chunk mismatch that fails an identical table.
+	var nullSeen int32
 
 	// boundaries[i] carries window i's seek (previous window's last native
 	// key values; window 0 has none). stop aborts the tail goroutines once
@@ -259,13 +277,13 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 			}
 
 			// NULL key seen in a window: the seek cannot advance past it
-			// (UNKNOWN on NULL), so the honest stop fails the table with a
-			// disclosure rather than silently dropping the tail rows.
+			// (UNKNOWN on NULL), so the scan must stop — but the verdict is
+			// the guardrail's (it re-runs as hash_group when covered<count
+			// OR a NULL row was fetched, minor4). Recording the flag here
+			// instead of appending a mismatch keeps an identical table
+			// (NULL rows on both sides) from failing on the NULL alone.
 			if pgNull || tidbNull {
-				mu.Lock()
-				mismatchDetails = append(mismatchDetails,
-					fmt.Sprintf("chunk %d: key column contains NULL, keyset cursor cannot advance past it", idx))
-				mu.Unlock()
+				atomic.StoreInt32(&nullSeen, 1)
 				stopScan()
 				return
 			}
@@ -282,50 +300,84 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	}
 	wg.Wait()
 
-	// P0-1 NULL-key coverage guardrail (post-scan): the keyset seek is
+	// P0-1 coverage guardrail (post-scan): the keyset seek is
 	// three-valued-logic UNKNOWN on NULL keys, so a nullable unique-index
 	// key with NULL rows silently drops every post-NULL window — the chunk
 	// hashes could match and PASS while rows go unchecked (the drill's
 	// leader ruling 1 applied to the chunk phase). The in-flight NULL check
 	// only fires when a NULL row lands INSIDE a fetched window; a NULL past
-	// the first boundary is excluded by the seek and never surfaces. Detect
-	// the blind spot via the coverage discrepancy (windows covered fewer
-	// rows than the count phase counted — a NULL-keyed table always does),
-	// then attribute it with the drill's NULL pre-scan (one #t4 unit per
-	// side, same watermark predicate). A NULL hit re-runs the table as
-	// hash_group (correct multiset comparison) with the NULL disclosure; no
-	// NULL hit = the short windows were just data movement — the scan
-	// verdict stands.
-	if keyInfo != nil && !keyInfo.HasPK && !noComparable && atomic.LoadInt64(&coveredRows) < tr.SourceRows {
-		if v.rowDiffNullKeyScan(ctx, pgDB, tidbDB, sem, schema, table, keyCols) {
-			logger.Info("checksum mode: nullable unique key has NULL rows, re-run as hash_group",
-				zap.String("table", table))
-			rel, aerr := sem.acquire(ctx)
-			if aerr != nil {
-				tr.Status = reporter.StatusFail
-				tr.Error = fmt.Sprintf("checksum: cancelled before hash_group re-run: %v", aerr)
-				return tr
-			}
-			conn, cerr := v.getTiDBConn(ctx, tidbDB)
-			if cerr != nil {
-				rel()
-				tr.Status = reporter.StatusFail
-				tr.Error = fmt.Sprintf("checksum: get TiDB connection: %v", cerr)
-				return tr
-			}
-			out := v.validateSamplingWithHashGroup(ctx, pgDB, conn, table, 1.0, tr, schema)
-			conn.Close()
-			rel()
-			// The NULL disclosure replaces the generic no-key note: the
-			// table DID have an alignment key — it was just unsafe to page.
-			if out.Status == reporter.StatusFail {
-				out.RowDiffs = &reporter.RowDiffSummary{
-					KeyColumns: append([]string(nil), keyCols...),
-					Note:       rowDiffNullNote,
-				}
-			}
-			return out
+	// the first boundary is excluded by the seek and never surfaces.
+	// Detect the blind spot via the coverage discrepancy (windows covered
+	// fewer rows than the count phase counted — a NULL-keyed table always
+	// does), then attribute it with the drill's NULL pre-scan (one #t4 unit
+	// per side, same watermark predicate).
+	//
+	// M1 (adversarial review d5f0be9): a coverage shortfall is NEVER
+	// trusted as benign "data movement". A key that is not actually
+	// table-level unique (e.g. a PG PARTIAL unique index, whose WHERE
+	// clause is mis-parsed by parseIndexColumns as the key column) makes
+	// the strict-greater seek silently drop duplicate boundary values on
+	// BOTH sides while the window hashes still align — covered < count with
+	// a diff inside the dropped rows would PASS silently. The only
+	// trustworthy verdict is the full hash_group comparison, so ANY
+	// coverage shortfall re-runs the table exactly. The NULL pre-scan still
+	// attributes NULL keys for the disclosure.
+	//
+	// M2 (adversarial review d5f0be9): the guardrail's OWN queries run
+	// under the query-timeout ctx — the NULL pre-scan (a LIMIT 1 probe on
+	// the very DB whose chunk scan just ended early) and the re-run's
+	// connection acquisition must fail the table, never hang the run. The
+	// hash_group re-run itself keeps its per-query timeouts (it takes the
+	// run ctx; validateSamplingWithHashGroup wraps every query itself), so
+	// a legitimately large re-run is not capped by a single guardrail
+	// deadline.
+	//
+	// Minor4 (adversarial review d5f0be9): a NULL row FETCHED in a window
+	// (covered == count, small table fully in window 0) also triggers the
+	// re-run — the in-flight NULL check only records nullSeen now, so an
+	// identical table (NULL rows on both sides) PASSes via the honest
+	// hash_group comparison instead of failing on the NULL disclosure.
+	if keyInfo != nil && !keyInfo.HasPK && !noComparable &&
+		(atomic.LoadInt64(&coveredRows) < tr.SourceRows || atomic.LoadInt32(&nullSeen) == 1) {
+		guardCtx, guardCancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+		defer guardCancel()
+
+		nullHit := v.rowDiffNullKeyScan(guardCtx, pgDB, tidbDB, sem, schema, table, keyCols)
+
+		reason := "chunk coverage below count (data moved, or key not table-level unique)"
+		if nullHit {
+			reason = "nullable unique key has NULL rows"
 		}
+		logger.Info("checksum mode: "+reason+", re-run as hash_group",
+			zap.String("table", table))
+
+		rel, aerr := sem.acquire(guardCtx)
+		if aerr != nil {
+			tr.Status = reporter.StatusFail
+			tr.Error = fmt.Sprintf("checksum: cancelled before hash_group re-run: %v", aerr)
+			return tr
+		}
+		conn, cerr := v.getTiDBConn(guardCtx, tidbDB)
+		if cerr != nil {
+			rel()
+			tr.Status = reporter.StatusFail
+			tr.Error = fmt.Sprintf("checksum: get TiDB connection: %v", cerr)
+			return tr
+		}
+		out := v.validateSamplingWithHashGroup(ctx, pgDB, conn, table, 1.0, tr, schema)
+		conn.Close()
+		rel()
+		// The NULL disclosure replaces the generic no-key note: the table
+		// DID have an alignment key — it was just unsafe to page. A
+		// non-NULL coverage shortfall keeps the hash_group mismatch details
+		// (the honest full-comparison verdict).
+		if nullHit && out.Status == reporter.StatusFail {
+			out.RowDiffs = &reporter.RowDiffSummary{
+				KeyColumns: append([]string(nil), keyCols...),
+				Note:       rowDiffNullNote,
+			}
+		}
+		return out
 	}
 
 	// #ignore: every comparable column excluded ⇒ no evidence ⇒ runtime
@@ -361,7 +413,9 @@ func (v *Validator) validateChecksumChunked(ctx context.Context, pgDB, tidbDB *s
 	// only re-fail inside the drill. No slot is held here (all chunk units
 	// released above); the drill takes its own per-window units (#t4).
 	if tr.Status == reporter.StatusFail && hashMismatch {
-		v.maybeDrillRowDiffs(ctx, pgDB, tidbDB, sem, schema, table, &tr, keyInfo, igEff, orderByCols)
+		dctx, dcancel := v.drillCtx(ctx)
+		defer dcancel()
+		v.maybeDrillRowDiffs(dctx, pgDB, tidbDB, sem, schema, table, &tr, keyInfo, igEff, orderByCols)
 	}
 
 	return tr

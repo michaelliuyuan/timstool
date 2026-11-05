@@ -16,8 +16,10 @@ package validator
 
 import (
 	"context"
+	"database/sql/driver"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 	"github.com/michaelliuyuan/timstool/internal/common/reporter"
@@ -240,5 +242,171 @@ func TestChecksumChunkKeysetNullKeyFallback(t *testing.T) {
 	rd := tr.RowDiffs
 	if rd == nil || !strings.Contains(rd.Note, "NULL") {
 		t.Fatalf("hash_group re-run must carry the NULL disclosure, got %+v", rd)
+	}
+}
+
+// TestChecksumChunkCoverageDiscrepancyNoNullReRuns (M1, NOT-NULL
+// predicate-column variant): a coverage shortfall WITHOUT a NULL hit is NOT
+// benign "data movement". A PG PARTIAL unique index whose WHERE predicate is
+// mis-parsed by parseIndexColumns as the key column (last paren group →
+// predicate column, here NOT-NULL `status`) makes the strict-greater seek
+// silently drop duplicate boundary values on BOTH sides while the window
+// hashes still align — covered < count with a diff inside the dropped rows
+// would PASS silently. The guardrail must re-run the table as hash_group
+// (full multiset comparison) and surface the diff.
+func TestChecksumChunkCoverageDiscrepancyNoNullReRuns(t *testing.T) {
+	// PARENTHESIZED predicate: parseIndexColumns grabs the LAST paren group
+	// "(status = 1)" → UniqueColumns=[status] — a NOT-NULL column whose
+	// values legitimately repeat outside the partial predicate. This is the
+	// TRUE silent form (no NULLs → pre-fix guardrail found nothing).
+	uk := "CREATE UNIQUE INDEX uk_email ON t1 USING btree (email) WHERE (status = 1)"
+	// Duplicate status value across the chunkSize=2 boundary: window 0
+	// fetches [1,1],[2,1] (lastKey 1), window 1 seeks status > 1 and DROPS
+	// row 3 (status 1) on BOTH sides — windows still match, covered 4 <
+	// count 5. The dropped row's value differs between sides; only a full
+	// hash_group re-run can see it.
+	src := &sideScript{count: 5, uniqueIdxDef: uk, dataCols: []string{"id", "email", "status", "val"}, dataColTypes: []string{"int8", "text", "int8", "text"},
+		data: [][]driver.Value{
+			{int64(1), "a@x", int64(1), "x"}, {int64(2), "b@x", int64(1), "x"}, {int64(3), "c@x", int64(1), "x"}, {int64(4), "d@x", int64(2), "x"}, {int64(5), "e@x", int64(3), "x"},
+		}}
+	dst := &sideScript{count: 5, uniqueIdxDef: uk, dataCols: []string{"id", "email", "status", "val"}, dataColTypes: []string{"int8", "text", "int8", "text"},
+		data: [][]driver.Value{
+			{int64(1), "a@x", int64(1), "x"}, {int64(2), "b@x", int64(1), "x"}, {int64(3), "c@x", int64(1), "DIFF"}, {int64(4), "d@x", int64(2), "x"}, {int64(5), "e@x", int64(3), "x"},
+		}}
+
+	v := NewValidator(config.Config{Compare: config.CompareConfig{ChecksumChunkSize: 2}})
+	tr := v.validateChecksumChunked(context.Background(), src.open(), dst.open(), "t1", make(concSem, 4))
+
+	if tr.Status != reporter.StatusFail {
+		t.Fatalf("coverage-discrepancy table with a diff in dropped rows must FAIL, got %s err=%q", tr.Status, tr.Error)
+	}
+	if !strings.Contains(tr.Error, "hash group") {
+		t.Fatalf("the re-run verdict must be the hash_group full comparison, got %q", tr.Error)
+	}
+	// No NULL involved: the re-run must NOT carry the NULL disclosure.
+	if rd := tr.RowDiffs; rd != nil && rd.Note != "" {
+		t.Fatalf("non-NULL coverage shortfall must not get the NULL disclosure, got %+v", rd)
+	}
+	// hash_group re-run evidence: a full-table SELECT * (no LIMIT) must have
+	// been issued on both sides — the window shapes all carry LIMIT.
+	if !src.sawFullScan() {
+		t.Fatal("M1-b fallback must re-run the source table as a full-table scan (hash_group evidence)")
+	}
+	if !dst.sawFullScan() {
+		t.Fatal("M1-b fallback must re-run the target table as a full-table scan (hash_group evidence)")
+	}
+}
+
+// TestChecksumChunkCoverageDiscrepancyExprIndex (M1, expression-index
+// auxiliary variant): `UNIQUE (lower(email))` mis-parses to [email] — the
+// detected key is the raw column while the real uniqueness is on the
+// expression. Raw email values are still bytewise-distinct (case variants
+// sort apart), so the seek pages them all and the honest window comparison
+// must still catch a real diff — the detection confusion must never yield a
+// silent PASS.
+func TestChecksumChunkCoverageDiscrepancyExprIndex(t *testing.T) {
+	uk := "CREATE UNIQUE INDEX uk_email ON t1 USING btree (lower(email))"
+	src := &sideScript{count: 5, uniqueIdxDef: uk, dataCols: []string{"id", "email", "val"}, dataColTypes: []string{"int8", "text", "text"},
+		data: [][]driver.Value{
+			{int64(1), "aa", "x"}, {int64(2), "AA", "x"}, {int64(3), "ab", "x"}, {int64(4), "bb", "x"}, {int64(5), "cc", "x"},
+		}}
+	dst := &sideScript{count: 5, uniqueIdxDef: uk, dataCols: []string{"id", "email", "val"}, dataColTypes: []string{"int8", "text", "text"},
+		data: [][]driver.Value{
+			{int64(1), "aa", "x"}, {int64(2), "AA", "x"}, {int64(3), "ab", "DIFF"}, {int64(4), "bb", "x"}, {int64(5), "cc", "x"},
+		}}
+
+	v := NewValidator(config.Config{Compare: config.CompareConfig{ChecksumChunkSize: 2}})
+	tr := v.validateChecksumChunked(context.Background(), src.open(), dst.open(), "t1", make(concSem, 4))
+
+	if tr.Status != reporter.StatusFail {
+		t.Fatalf("expression-index table with a real diff must FAIL (never silent pass), got %s err=%q", tr.Status, tr.Error)
+	}
+}
+
+// TestChecksumChunkPartialIndexNullPredicate (M1, NULL-predicate variant):
+// `WHERE (deleted_at IS NULL)` mis-parses to [deleted_at] — a NULLABLE
+// predicate column. This variant is caught by the pre-existing NULL path
+// (NULL pre-scan hits → hash_group + NULL disclosure); it locks that path so
+// the two M1 forms stay distinguishable.
+func TestChecksumChunkPartialIndexNullPredicate(t *testing.T) {
+	uk := "CREATE UNIQUE INDEX uk_email ON t1 USING btree (email) WHERE (deleted_at IS NULL)"
+	// deleted_at holds NULL rows → the seek drops them (covered < count);
+	// the NULL pre-scan attributes the shortfall.
+	src := &sideScript{count: 3, uniqueIdxDef: uk, dataCols: []string{"id", "email", "deleted_at"}, dataColTypes: []string{"int8", "text", "text"},
+		data: [][]driver.Value{
+			{int64(1), "a@x", nil}, {int64(2), "b@x", "2024-01-01"}, {int64(3), "c@x", nil},
+		}}
+	dst := &sideScript{count: 3, uniqueIdxDef: uk, dataCols: []string{"id", "email", "deleted_at"}, dataColTypes: []string{"int8", "text", "text"},
+		data: [][]driver.Value{
+			{int64(1), "a@x", nil}, {int64(2), "b@x", "2024-01-01"}, {int64(3), "c@x", nil},
+		}}
+
+	v := NewValidator(config.Config{Compare: config.CompareConfig{ChecksumChunkSize: 2}})
+	tr := v.validateChecksumChunked(context.Background(), src.open(), dst.open(), "t1", make(concSem, 4))
+
+	// Identical table with NULL key rows must PASS via the honest hash_group
+	// re-run (minor4 semantics) — never fail on the NULL alone.
+	if tr.Status != reporter.StatusPass {
+		t.Fatalf("identical NULL-keyed partial-index table must pass via hash_group re-run, got %s err=%q", tr.Status, tr.Error)
+	}
+	if !src.sawFullScan() {
+		t.Fatal("NULL-predicate variant must re-run as a full-table scan (hash_group evidence)")
+	}
+}
+
+// TestChecksumChunkCoveredEqualsCountNullPass (minor4): a small table fully
+// covered in window 0 with a NULL key row — covered == count, so the
+// in-flight NULL check fires but the guardrail must still re-run as
+// hash_group and PASS (identical) instead of failing on the NULL alone.
+func TestChecksumChunkCoveredEqualsCountNullPass(t *testing.T) {
+	uk := "CREATE UNIQUE INDEX uk_name ON t1 (name)"
+	same := rowsOf([2]any{int64(1), "aa"}, [2]any{int64(2), nil})
+	src := &sideScript{count: 2, uniqueIdxDef: uk, data: same}
+	dst := &sideScript{count: 2, uniqueIdxDef: uk, data: same}
+
+	v := NewValidator(config.Config{Compare: config.CompareConfig{ChecksumChunkSize: 2}})
+	tr := v.validateChecksumChunked(context.Background(), src.open(), dst.open(), "t1", make(concSem, 4))
+
+	if tr.Status != reporter.StatusPass {
+		t.Fatalf("identical small NULL-keyed table must pass via hash_group re-run, got %s err=%q", tr.Status, tr.Error)
+	}
+	if !src.sawFullScan() {
+		t.Fatal("covered==count + NULL must still re-run as a full-table scan (hash_group evidence)")
+	}
+}
+
+// TestChecksumGuardrailNullScanBounded (M2): the guardrail's NULL pre-scan
+// (and the hash_group re-run connection) runs under the query-timeout ctx —
+// a sick DB whose chunk scan ended early must fail the table, never hang
+// the run on the guardrail's own probe.
+func TestChecksumGuardrailNullScanBounded(t *testing.T) {
+	uk := "CREATE UNIQUE INDEX uk_name ON t1 (name)"
+	// count 3 / chunkSize 2: window 0 fetches 2 rows, window 1 seeks and
+	// returns 0 (the NULL row is excluded) → covered 2 < count 3 → guardrail
+	// fires and runs the NULL pre-scan.
+	src := &sideScript{count: 3, uniqueIdxDef: uk,
+		data: rowsOf([2]any{int64(1), "aa"}, [2]any{int64(2), "bb"}, [2]any{int64(3), nil})}
+	dst := &sideScript{count: 3, uniqueIdxDef: uk,
+		data: rowsOf([2]any{int64(1), "aa"}, [2]any{int64(2), "bb"}, [2]any{int64(3), "cc"})}
+
+	v := NewValidator(config.Config{Compare: config.CompareConfig{
+		ChecksumChunkSize: 2,
+		QueryTimeout:      "100ms",
+	}})
+
+	start := time.Now()
+	// The src NULL pre-scan query blocks until the guardrail's own ctx
+	// deadline fires — the run must return bounded, never hang.
+	tr := v.validateChecksumChunked(context.Background(), src.openHangNullScan(), dst.open(), "t1", make(concSem, 4))
+	elapsed := time.Since(start)
+
+	if elapsed > 5*time.Second {
+		t.Fatalf("guardrail NULL pre-scan hung (%.1fs): the query-timeout ctx did not bound it", elapsed.Seconds())
+	}
+	if tr.Status != reporter.StatusFail {
+		t.Fatalf("a coverage-discrepancy table must fail, got %s err=%q", tr.Status, tr.Error)
+	}
+	if got := len(src.sawQueries("IS NULL")); got == 0 {
+		t.Fatal("guardrail must have attempted the NULL pre-scan on src")
 	}
 }
