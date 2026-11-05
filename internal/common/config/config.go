@@ -142,19 +142,31 @@ func (c CompareConfig) QueryTimeoutDuration() time.Duration {
 	return d
 }
 
-// PossiblyStuckTimeoutDuration parses the possibly-stuck heartbeat knob:
-// empty, unparseable or non-positive values fall back to 5 minutes (same
-// defensive pattern as QueryTimeoutDuration — an operator typo must never
-// collapse the knob to a zero timeout that flags every task instantly).
+// PossiblyStuckTimeoutDuration parses the possibly-stuck heartbeat knob and
+// clamps it against the compare query timeout (#t95 B1 R2): a no-progress
+// window that is not strictly larger than the query timeout can misfire on a
+// slow-but-healthy run — a single table's count+sample (two queries) or a
+// single chunk's dual-end hash can legitimately approach 2×query_timeout
+// without any progress event, so the threshold is raised to 2×query_timeout
+// whenever it would otherwise be ≤ query_timeout. Empty, unparseable or
+// non-positive values fall back to 5m first (same defensive pattern as
+// QueryTimeoutDuration — an operator typo must never collapse the knob to a
+// zero timeout that flags every task instantly).
 func (c CompareConfig) PossiblyStuckTimeoutDuration() time.Duration {
-	if c.PossiblyStuckTimeout == "" {
-		return 5 * time.Minute
+	ps := 5 * time.Minute
+	if c.PossiblyStuckTimeout != "" {
+		if d, err := time.ParseDuration(c.PossiblyStuckTimeout); err == nil && d > 0 {
+			ps = d
+		}
 	}
-	d, err := time.ParseDuration(c.PossiblyStuckTimeout)
-	if err != nil || d <= 0 {
-		return 5 * time.Minute
+	qt := c.QueryTimeoutDuration()
+	if qt <= 0 {
+		qt = 5 * time.Minute
 	}
-	return d
+	if ps <= qt {
+		ps = 2 * qt
+	}
+	return ps
 }
 
 // WatermarkFilter is the compare-side watermark filter group. Column passes

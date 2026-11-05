@@ -2,6 +2,7 @@ package webapi
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
@@ -17,7 +18,9 @@ import (
 
 // TestCompareHeartbeatFlagsStuckTask (①): no progress within the threshold
 // → possibly_stuck lands on the task (persisted via the server) within a
-// bounded time.
+// bounded time, and the #t95 B1-R2 broadcast carries the chunk progress as
+// evidence (current_chunk/total_chunks/current_table) so a PossiblyStuck
+// flag is never read in isolation.
 func TestCompareHeartbeatFlagsStuckTask(t *testing.T) {
 	s, _ := newTestServer(t)
 	prev := compareHeartbeatTick
@@ -28,6 +31,10 @@ func TestCompareHeartbeatFlagsStuckTask(t *testing.T) {
 		ID:             "abc12345",
 		Status:         CompareStatusRunning,
 		LastProgressAt: time.Now().Add(-1 * time.Minute), // stalled well past threshold
+		// R2 evidence: the task was mid-chunk when it stalled.
+		CurrentTable: "orders",
+		CurrentChunk: 7,
+		TotalChunks:  42,
 	}
 	var mu sync.Mutex
 	done := make(chan struct{})
@@ -51,6 +58,29 @@ func TestCompareHeartbeatFlagsStuckTask(t *testing.T) {
 			t.Fatalf("possibly_stuck flag never set within 5s")
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+
+	// The stuck broadcast must carry the chunk evidence (R2). The hub
+	// goroutine is not running under newTestServer, so the payload is still
+	// in the buffered broadcast channel — drain and assert it.
+	select {
+	case data := <-s.hub.broadcast:
+		var m map[string]interface{}
+		if err := json.Unmarshal(data, &m); err != nil {
+			t.Fatalf("bad broadcast JSON: %v", err)
+		}
+		if m["possibly_stuck"] != true {
+			t.Fatalf("broadcast possibly_stuck = %v, want true", m["possibly_stuck"])
+		}
+		if m["current_chunk"] != float64(7) || m["total_chunks"] != float64(42) {
+			t.Fatalf("broadcast chunk evidence = chunk %v / total %v, want 7/42",
+				m["current_chunk"], m["total_chunks"])
+		}
+		if m["current_table"] != "orders" {
+			t.Fatalf("broadcast current_table = %v, want orders", m["current_table"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("stuck broadcast never emitted")
 	}
 
 	cancel()

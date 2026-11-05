@@ -789,12 +789,19 @@ func (s *Server) compareHeartbeat(ctx context.Context, task *CompareTask, taskMu
 				if err := s.persistCompareTask(task); err != nil {
 					zap.L().Warn("failed to persist possibly-stuck flag", zap.Error(err))
 				}
+				// #t95 B1 R2: carry the chunk progress as evidence so a
+				// PossiblyStuck=true flag is never read in isolation — the
+				// UI can show which chunk the task stalled on. Values are
+				// captured under the lock (no race with progress writers).
+				chunk, total := task.CurrentChunk, task.TotalChunks
+				curTable := task.CurrentTable
 				taskMu.Unlock()
 				zap.L().Warn("compare task possibly stuck (no progress within threshold)",
 					zap.String("compare_id", task.ID),
 					zap.Duration("threshold", threshold))
 				s.BroadcastProgress(task.ID, map[string]interface{}{
 					"type": "compare", "status": status, "possibly_stuck": true,
+					"current_table": curTable, "current_chunk": chunk, "total_chunks": total,
 				})
 			} else {
 				taskMu.Unlock()

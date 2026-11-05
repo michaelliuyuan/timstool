@@ -88,25 +88,36 @@ func TestCompareQueryTimeoutDuration(t *testing.T) {
 	}
 }
 
-// #t95 P1 anchor: PossiblyStuckTimeoutDuration falls back to 5m on empty,
-// unparseable or NON-POSITIVE values — unlike QueryTimeout (where 0 is a
-// legal "no timeout" reading), a zero heartbeat threshold would flag every
-// running task as stuck on the first scan, so it is rejected outright.
+// #t95 P1/B1-R2 anchor: PossiblyStuckTimeoutDuration falls back to 5m on
+// empty, unparseable or NON-POSITIVE values (a zero heartbeat threshold
+// would flag every running task as stuck on the first scan), then clamps
+// against the compare query timeout: a threshold ≤ query_timeout is raised
+// to 2×query_timeout, because a slow-but-healthy run (single table
+// count+sample, or a single chunk's dual-end hash) can legitimately
+// approach 2×query_timeout without any progress event — an unclamped
+// threshold would misfire PossiblyStuck on a healthy long table.
 func TestComparePossiblyStuckTimeoutDuration(t *testing.T) {
 	cases := []struct {
 		in   string
+		qt   string
 		want time.Duration
 	}{
-		{"", 5 * time.Minute},
-		{"bad", 5 * time.Minute},
-		{"0", 5 * time.Minute},
-		{"-1s", 5 * time.Minute},
-		{"30s", 30 * time.Second},
-		{"2m", 2 * time.Minute},
+		{"", "", 10 * time.Minute},       // default 5m vs qt default 5m → clamped 2×5m
+		{"bad", "", 10 * time.Minute},    // unparseable → 5m default → clamped
+		{"0", "", 10 * time.Minute},      // non-positive → 5m default → clamped
+		{"-1s", "", 10 * time.Minute},    // non-positive → 5m default → clamped
+		{"30s", "5m", 10 * time.Minute},  // explicit 30s ≤ qt 5m → clamped
+		{"2m", "5m", 10 * time.Minute},   // 2m ≤ qt 5m → clamped
+		{"5m", "5m", 10 * time.Minute},   // boundary: equal to qt → clamped
+		{"8m", "5m", 8 * time.Minute},    // > qt → kept verbatim
+		{"15m", "5m", 15 * time.Minute},  // > qt → kept verbatim
+		{"5m", "30s", 5 * time.Minute},   // > qt 30s → kept
+		{"10s", "30s", 60 * time.Second}, // ≤ qt 30s → clamped 2×30s
 	}
 	for _, c := range cases {
-		if got := (CompareConfig{PossiblyStuckTimeout: c.in}).PossiblyStuckTimeoutDuration(); got != c.want {
-			t.Errorf("PossiblyStuckTimeoutDuration(%q) = %v, want %v", c.in, got, c.want)
+		cfg := CompareConfig{PossiblyStuckTimeout: c.in, QueryTimeout: c.qt}
+		if got := cfg.PossiblyStuckTimeoutDuration(); got != c.want {
+			t.Errorf("PossiblyStuckTimeoutDuration(in=%q, qt=%q) = %v, want %v", c.in, c.qt, got, c.want)
 		}
 	}
 }
