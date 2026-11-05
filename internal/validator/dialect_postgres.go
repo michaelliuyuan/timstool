@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"unicode"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 )
@@ -141,6 +142,16 @@ func (postgresDialect) DetectTableKey(ctx context.Context, q dialectQueryer, sch
 		if err := uidxRows.Scan(&def); err != nil {
 			return nil, fmt.Errorf("scan unique index def: %w", err)
 		}
+		// #t95 B1 (dialect root-cause for the M1-b cost): a partial unique
+		// index (WHERE predicate) or an expression index (lower(email),
+		// (a-b), casts) does NOT give table-level uniqueness on PLAIN
+		// columns — using it as the keyset seek key would silently drop
+		// rows outside the predicate / mis-align the cursor. Reject both so
+		// the table falls into the no-PK path (hash_group + guardrail); the
+		// M1-b covered<count guardrail stays as correctness double-insurance.
+		if !usableTableUniqueIndex(def) {
+			continue
+		}
 		cols := parseIndexColumns(def)
 		if len(cols) > 0 {
 			info.HasUniqueIndex = true
@@ -150,6 +161,91 @@ func (postgresDialect) DetectTableKey(ctx context.Context, q dialectQueryer, sch
 	}
 
 	return info, nil
+}
+
+// usableTableUniqueIndex reports whether a pg_get_indexdef output is a
+// TABLE-LEVEL unique constraint on PLAIN columns that a keyset seek can
+// safely advance on (#t95 B1). Rejected:
+//
+//   - partial indexes (a "WHERE" predicate): uniqueness holds only within
+//     the predicate's row subset — a strict-greater seek over the whole
+//     table silently drops rows outside it;
+//   - expression indexes (lower(email), (a-b), casts): uniqueness holds on
+//     the EXPRESSION, not the raw column(s) parseIndexColumns would name —
+//     the cursor would mis-align.
+func usableTableUniqueIndex(def string) bool {
+	if strings.Contains(strings.ToUpper(def), " WHERE ") {
+		return false
+	}
+	list := indexColumnList(def)
+	if list == "" {
+		return false
+	}
+	// A nested paren inside the top-level column list marks an expression
+	// index ((a-b), lower(email), ...) — the list must be plain identifiers.
+	if strings.ContainsAny(list, "()") {
+		return false
+	}
+	cols := parseIndexColumns(def)
+	if len(cols) == 0 {
+		return false
+	}
+	for _, c := range cols {
+		if !plainIndexColumn(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// indexColumnList extracts the TOP-LEVEL column list of a CREATE
+// [UNIQUE] INDEX ... ON <table> ... (cols) statement — the first
+// parenthesized group after the " ON " clause, matched to its closing paren
+// (so nested expression parens stay inside the list). Empty when the shape
+// is unexpected.
+func indexColumnList(def string) string {
+	idx := strings.Index(strings.ToUpper(def), " ON ")
+	if idx < 0 {
+		return ""
+	}
+	rest := def[idx+4:]
+	open := strings.Index(rest, "(")
+	if open < 0 {
+		return ""
+	}
+	depth := 0
+	end := -1
+	for i := open; i < len(rest); i++ {
+		switch rest[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				end = i
+				break
+			}
+		}
+	}
+	if end < 0 {
+		return ""
+	}
+	return rest[open+1 : end]
+}
+
+// plainIndexColumn matches a bare identifier — the shape parseIndexColumns
+// already reduced to (quotes/ASC/DESC/NULLS stripped). Anything else (a
+// cast remnant like "a::text", an operator, etc.) is not a seekable key.
+func plainIndexColumn(col string) bool {
+	if col == "" {
+		return false
+	}
+	for _, r := range col {
+		if !(r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)) {
+			return false
+		}
+	}
+	return true
 }
 
 // AdjustDSN relocates appendPGDSNUTC (wmfilter.go :97-103) - P-INC-TZ
