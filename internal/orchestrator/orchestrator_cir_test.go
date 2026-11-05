@@ -8,9 +8,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql" // lazy *sql.DB handle for the target seam
 
@@ -22,8 +26,13 @@ import (
 
 // fakeCIRSource is a source.Source that reports one table and touches
 // nothing else. It implements DB() with a lazy handle (the validate wiring
-// requires the dbConn probe; every consumer seam is replaced).
-type fakeCIRSource struct{ closed bool }
+// requires the dbConn probe; every consumer seam is replaced). table names
+// the single reported table; empty → "t1" (concurrency anchors pass distinct
+// names so each run's checkpoint stays distinguishable).
+type fakeCIRSource struct {
+	closed bool
+	table  string
+}
 
 func (f *fakeCIRSource) Name() string                      { return "mysql" }
 func (f *fakeCIRSource) Connect(ctx context.Context) error { return nil }
@@ -45,10 +54,14 @@ func (f *fakeCIRSource) DB() *sql.DB {
 }
 
 func (f *fakeCIRSource) ReadSchema(ctx context.Context, opts source.Filter) (*source.Schema, error) {
+	name := f.table
+	if name == "" {
+		name = "t1"
+	}
 	return &source.Schema{
 		Catalog: "db",
 		Tables: []source.Table{{
-			Schema: "db", Name: "t1",
+			Schema: "db", Name: name,
 			Columns: []source.Column{{Name: "id", SourceType: "bigint", TiDBType: "BIGINT"}},
 			PK:      []string{"id"},
 		}},
@@ -317,5 +330,94 @@ func TestRunSourceCIRValidateWiresPerTableHook(t *testing.T) {
 	tc2 := mgr.GetAllTables()["t2"]
 	if tc2 == nil || tc2.State != checkpoint.StateFailed || !strings.Contains(tc2.Error, "simulated validate failure") {
 		t.Fatalf("t2 checkpoint = %+v, want failed with simulated error", tc2)
+	}
+}
+
+// TestRunSourceCIRConcurrentValidateHooksIsolated (#t95 R1, red-team): two
+// CIR migrations running concurrently must never cross-write each other's
+// checkpoint through the package-level per-table validated hook. Each run
+// drives the validate seam with its own single table (atomic-distinct
+// names) and a sleep that holds the hook window open — pre-fix, run A's
+// callbacks hit B's hook (landing in B's cpMgr) and A's clear silences B.
+// Post-fix the install→validate→clear segment is serialized, so each run's
+// table is completed (rows=7) in exactly its own cpMgr — disjoint, no
+// cross-pollution.
+func TestRunSourceCIRConcurrentValidateHooksIsolated(t *testing.T) {
+	var c cirCounters
+	restore := installCIRSeams(&c)
+	defer restore()
+
+	prev := cirValidateMigration
+	cirValidateMigration = func(ctx context.Context, sdb, tdb *sql.DB, s *source.Schema, n int) (*target.ValidationReport, error) {
+		// Hold the hook window open so the two runs genuinely overlap
+		// (widen the pre-fix race into a deterministic cross-write).
+		time.Sleep(30 * time.Millisecond)
+		if hook := target.TableValidatedHook(); hook != nil {
+			for _, tb := range s.Tables {
+				hook(target.TableValidation{Name: tb.Name, SourceRows: 7, Passed: true}, nil)
+			}
+		}
+		return &target.ValidationReport{TotalTables: len(s.Tables), AllPassed: true}, nil
+	}
+	defer func() { cirValidateMigration = prev }()
+
+	var seq int32
+	prevOpen := cirOpenSource
+	cirOpenSource = func(kind string, cfg source.SourceConfig) (source.Source, error) {
+		n := atomic.AddInt32(&seq, 1)
+		return &fakeCIRSource{table: fmt.Sprintf("tbl%d", n)}, nil
+	}
+	defer func() { cirOpenSource = prevOpen }()
+
+	dirs := []string{filepath.Join(t.TempDir(), "cp"), filepath.Join(t.TempDir(), "cp")}
+	var wg sync.WaitGroup
+	mgrs := make([]*checkpoint.Manager, 2)
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			mgr, err := checkpoint.NewManager(dirs[i])
+			if err != nil {
+				errs[i] = fmt.Errorf("NewManager: %w", err)
+				return
+			}
+			o := &Orchestrator{cfg: config.Config{
+				Source: config.SourceConfig{Type: "mysql", Host: "h", Database: "db"},
+				Target: config.TargetConfig{Host: "t"},
+			}, cpMgr: mgr}
+			_, err = o.runSourceCIR(context.Background(), PipelineConfig{
+				SkipPrecheck: true, SkipSchema: true, SkipData: true,
+			})
+			mgrs[i], errs[i] = mgr, err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+
+	namesByRun := make([]map[string]bool, 2)
+	for i, mgr := range mgrs {
+		namesByRun[i] = map[string]bool{}
+		for name, tc := range mgr.GetAllTables() {
+			namesByRun[i][name] = true
+			if tc == nil || tc.State != checkpoint.StateCompleted || tc.RowsDone != 7 {
+				t.Fatalf("run %d table %q checkpoint = %+v, want completed/7 rows", i, name, tc)
+			}
+		}
+	}
+	for i, names := range namesByRun {
+		if len(names) != 1 {
+			t.Fatalf("run %d tables = %v, want exactly its own table (cross-write or lost progress)", i, names)
+		}
+	}
+	for n := range namesByRun[0] {
+		if namesByRun[1][n] {
+			t.Fatalf("table %q landed in both runs' checkpoints — hook cross-write (R1)", n)
+		}
 	}
 }

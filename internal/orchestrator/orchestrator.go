@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/michaelliuyuan/timstool/internal/api"
@@ -62,6 +63,38 @@ func cirPrecheckProbe(ctx context.Context, src source.Source) error {
 	}
 	zap.L().Info("source-cir precheck: source reachable", zap.String("version", version))
 	return nil
+}
+
+// cirValidateHookMu serializes the per-table validated hook's
+// install→call→clear segment (#t95 R1, red-team). tableValidatedHook in
+// internal/target is a package-level single slot; without serialization two
+// concurrent CIR migrations would cross-write each other's checkpoint —
+// task A's table callbacks would hit B's hook and land in B's cpMgr, and
+// A's clear would then silence B's progress. The mutex is held across the
+// whole segment so exactly one migration drives the hook at a time. defer
+// guarantees both the clear and the unlock even if the validate seam panics.
+var cirValidateHookMu sync.Mutex
+
+// cirValidateWithHook installs the per-table validated progress hook around
+// the CIR validate seam and clears it on return. Returns the seam's report
+// and error unchanged (signature untouched).
+func cirValidateWithHook(ctx context.Context, o *Orchestrator, srcValDB, tgtValDB *sql.DB, cir *source.Schema, sampleSize int) (*target.ValidationReport, error) {
+	cirValidateHookMu.Lock()
+	defer cirValidateHookMu.Unlock()
+	target.SetTableValidatedHook(func(tv target.TableValidation, terr error) {
+		if o.cpMgr == nil {
+			return
+		}
+		if terr != nil {
+			o.cpMgr.GetOrCreateTable(tv.Name, 0)
+			_ = o.cpMgr.MarkTableFailed(tv.Name, terr.Error())
+			return
+		}
+		o.cpMgr.GetOrCreateTable(tv.Name, tv.SourceRows)
+		_ = o.cpMgr.MarkTableCompleted(tv.Name, tv.SourceRows)
+	})
+	defer target.SetTableValidatedHook(nil)
+	return cirValidateMigration(ctx, srcValDB, tgtValDB, cir, sampleSize)
 }
 
 type Orchestrator struct {
@@ -527,22 +560,9 @@ func (o *Orchestrator) runSourceCIR(ctx context.Context, pipelineCfg PipelineCon
 			// parallel pool; each completed table marks tables_done on the
 			// fly, so a 300+-table validate no longer sits at 0/312 until
 			// the very end (the perceived "卡死" symptom). Failed tables
-			// mark red promptly. Hook is cleared immediately after the
-			// validate seam returns.
-			target.SetTableValidatedHook(func(tv target.TableValidation, terr error) {
-				if o.cpMgr == nil {
-					return
-				}
-				if terr != nil {
-					o.cpMgr.GetOrCreateTable(tv.Name, 0)
-					_ = o.cpMgr.MarkTableFailed(tv.Name, terr.Error())
-					return
-				}
-				o.cpMgr.GetOrCreateTable(tv.Name, tv.SourceRows)
-				_ = o.cpMgr.MarkTableCompleted(tv.Name, tv.SourceRows)
-			})
-			vr, verr := cirValidateMigration(ctx, srcValDB, tgtValDB, cir, sampleSize)
-			target.SetTableValidatedHook(nil)
+			// mark red promptly. The install→validate→clear segment is
+			// serialized inside cirValidateWithHook (R1) — see there.
+			vr, verr := cirValidateWithHook(ctx, o, srcValDB, tgtValDB, cir, sampleSize)
 			if verr != nil {
 				log.Warn("source-cir: validation error", zap.Error(verr))
 				validateSuccess = false
