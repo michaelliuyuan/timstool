@@ -30,27 +30,16 @@ func (d tidbDialect) Qualify(schema, table string) string {
 // escapeSQLLike :90-96). An error means "estimate unavailable" (query error
 // only, matching quick.go :54-64); a Rows value that fails to parse yields
 // 0+nil, preserving quick.go :67-72 semantics - the fallback decision belongs
-// to the main flow.
-func (d tidbDialect) EstimateRows(ctx context.Context, q dialectQueryer, schema, table string) (int64, error) {
-	var tidbCount sql.NullInt64
-	var tidbName, tidbEngine, tidbVersion sql.NullString
-	var tidbRowFormat, tidbRows, tidbAvgRowLen, tidbDataLen, tidbMaxDataLen, tidbIndexLen, tidbAutoInc, tidbCreateTime, tidbUpdateTime, tidbCheckTime, tidbCollation, tidbChecksum, tidbCreateOpts, tidbComment sql.NullString
-	err := q.QueryRowContext(ctx,
-		fmt.Sprintf("SHOW TABLE STATUS LIKE '%s'", escapeSQLLike(table))).Scan(
-		&tidbName, &tidbEngine, &tidbVersion, &tidbRowFormat, &tidbRows,
-		&tidbAvgRowLen, &tidbDataLen, &tidbMaxDataLen, &tidbIndexLen,
-		&tidbAutoInc, &tidbCreateTime, &tidbUpdateTime, &tidbCheckTime,
-		&tidbCollation, &tidbChecksum, &tidbCreateOpts, &tidbComment)
+// to the main flow. A7: the row is scanned via scanShowTableStatusRows by
+// column NAME (the fixed-dest Scan errored on real 18-column results since
+// #t95).
+func (tidbDialect) EstimateRows(ctx context.Context, q dialectQueryer, schema, table string) (int64, error) {
+	rows, err := q.QueryContext(ctx,
+		fmt.Sprintf("SHOW TABLE STATUS LIKE '%s'", escapeSQLLike(table)))
 	if err != nil {
 		return 0, err
 	}
-	if tidbRows.Valid {
-		var val int64
-		if _, err := fmt.Sscanf(tidbRows.String, "%d", &val); err == nil {
-			tidbCount = sql.NullInt64{Int64: val, Valid: true}
-		}
-	}
-	return tidbCount.Int64, nil
+	return scanShowTableStatusRows(rows)
 }
 
 // CountExact relocates the TiDB exact-count shape (quick.go :58-59,

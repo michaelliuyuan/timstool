@@ -75,6 +75,23 @@ type CompareConfig struct {
 	// legacy fallback when Concurrency is unset.
 	ChecksumParallel int `yaml:"checksum_parallel" json:"checksumParallel"`
 
+	// ChunkedCountThreshold routes row counting to the chunked keyset
+	// engine (BUG-CMP-COUNT-P1): when max(source, target) row ESTIMATE
+	// reaches this threshold, counts run as per-PK-range chunk COUNTs
+	// instead of ONE whole-table COUNT(*) — a tens-of-millions-row
+	// whole-table scan is exactly the query that outruns any deadline.
+	// 0 = disabled (whole-table path); negative falls back to the 5M
+	// default (operator typo defense). DefaultConfig pre-fills 5,000,000,
+	// so a config file without the key gets the default while an explicit
+	// 0 keeps the legacy behavior.
+	ChunkedCountThreshold int64 `yaml:"chunked_count_threshold" json:"chunkedCountThreshold"`
+
+	// ChunkedCountTarget is the target row count per chunk in the chunked
+	// count engine: the source keyset boundary scan carves PK windows of
+	// this size, and every chunk COUNT stays a small range query. <= 0 →
+	// 1,000,000 default.
+	ChunkedCountTarget int64 `yaml:"chunked_count_target" json:"chunkedCountTarget"`
+
 	// Concurrency is the unified total-concurrency budget (#t4): the number
 	// of database query work units (table validations and checksum chunks
 	// alike) that may execute at the same time across BOTH pools. It is also
@@ -501,15 +518,17 @@ func DefaultConfig() *Config {
 			ChunkParallel:       4,
 		},
 		Compare: CompareConfig{
-			CompareMode:        "sample",
-			SampleRatio:        0.01,
-			SampleRows:         20,
-			NoPKStrategy:       "auto",
-			NoPKBucketCount:    100,
-			NoPKTableThreshold: 1000000,
-			ChecksumChunkSize:  50000,
-			ChecksumParallel:   4,
-			QueryTimeout:       "30m",
+			CompareMode:           "sample",
+			SampleRatio:           0.01,
+			SampleRows:            20,
+			NoPKStrategy:          "auto",
+			NoPKBucketCount:       100,
+			NoPKTableThreshold:    1000000,
+			ChecksumChunkSize:     50000,
+			ChecksumParallel:      4,
+			QueryTimeout:          "30m",
+			ChunkedCountThreshold: 5000000,
+			ChunkedCountTarget:    1000000,
 		},
 		Logging: LoggingConfig{
 			Level:  "info",

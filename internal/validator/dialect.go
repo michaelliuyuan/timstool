@@ -3,6 +3,8 @@ package validator
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"strings"
 
 	"github.com/michaelliuyuan/timstool/internal/common/config"
 )
@@ -29,6 +31,53 @@ import (
 type dialectQueryer interface {
 	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
+
+// scanShowTableStatusRows extracts the Rows estimate from a SHOW TABLE
+// STATUS result set by COLUMN NAME, immune to column-count drift across
+// MySQL/TiDB versions (A7: real dialects return more columns than the
+// legacy fixed-dest Scan accepted - MySQL 8.x and TiDB both return 18 - so
+// every estimate errored since #t95 and callers silently fell back). The
+// QueryRow-era contract is preserved: no result row -> sql.ErrNoRows;
+// missing/NULL/unparseable Rows column -> (0, nil); iteration/scan error
+// -> (0, err). A "Rows" column match is case-insensitive (EqualFold).
+func scanShowTableStatusRows(rows *sql.Rows) (int64, error) {
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return 0, err
+	}
+	idx := -1
+	for i, c := range cols {
+		if strings.EqualFold(c, "Rows") {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return 0, nil
+	}
+	vals := make([]sql.NullString, len(cols))
+	dest := make([]interface{}, len(vals))
+	for i := range vals {
+		dest[i] = &vals[i]
+	}
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return 0, err
+		}
+		return 0, sql.ErrNoRows
+	}
+	if err := rows.Scan(dest...); err != nil {
+		return 0, err
+	}
+	if v := vals[idx]; v.Valid {
+		var n int64
+		if _, err := fmt.Sscanf(v.String, "%d", &n); err == nil {
+			return n, nil
+		}
+	}
+	return 0, nil
 }
 
 // CompareDialect abstracts the SOURCE-side database specifics of the compare

@@ -618,17 +618,37 @@ func (v *Validator) validateTableUnit(ctx context.Context, pgDB *sql.DB, tidbCon
 }
 
 func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string) reporter.TableReport {
+	schema := v.sourceSchema()
+	if schema == "" {
+		schema = "public"
+	}
+
+	// BUG-CMP-COUNT-P1 C2: estimate-driven routing at the top of the count
+	// path — a table whose max(source, target) row ESTIMATE reaches the
+	// configured chunked-count threshold counts via chunked PK ranges
+	// instead of ONE whole-table COUNT. A nil return (threshold disabled,
+	// or estimate below it) keeps this path byte-identical to the legacy
+	// single-COUNT behavior (small-table zero regression red line).
+	if ctr := v.maybeCountChunked(ctx, pgDB, tidbConn, table, schema); ctr != nil {
+		return *ctr
+	}
+
+	return v.wholeTableCount(ctx, pgDB, tidbConn, table, schema)
+}
+
+// wholeTableCount is the legacy row count (moved verbatim from
+// validateRowCount when BUG-CMP-COUNT-P1 added the chunked routing head):
+// ONE COUNT per side under the P0 timeout+retry machinery. Both the small-
+// table path and the chunked engine's no-PK fallback land here, so the
+// "source/target count:" and "row count mismatch:" report strings have a
+// single implementation.
+func (v *Validator) wholeTableCount(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table, schema string) reporter.TableReport {
 	tr := reporter.TableReport{TableName: table, Status: reporter.StatusPass}
 
 	// P0-2 + P0-A2 (BUG-CMP-COUNT-P0): each count runs under its own
 	// query-level deadline; a timeout-class failure retries twice with
 	// backoff (fresh deadline per attempt), then fails THIS table (never
 	// the run) with the unchanged "source/target count:" disclosure.
-
-	schema := v.sourceSchema()
-	if schema == "" {
-		schema = "public"
-	}
 
 	var sourceQuery string
 	var sourceArgs []any

@@ -32,25 +32,18 @@ func (d mysqlDialect) Qualify(schema, table string) string {
 
 // EstimateRows mirrors the tidbDialect SHOW TABLE STATUS estimate, scoped to
 // the source schema via SHOW TABLE STATUS FROM (the connection database may
-// differ from the compare schema). An error means "estimate unavailable" -
-// the fallback decision belongs to the main flow (ruling seq 202-2). Parse
-// failures yield 0+nil, preserving the legacy semantics.
+// differ from the compare schema). An error means "estimate unavailable" - the
+// fallback decision belongs to the main flow (ruling seq 202-2). Parse
+// failures yield 0+nil, preserving the legacy semantics. A7: the row is
+// scanned via scanShowTableStatusRows by column NAME (the fixed-dest Scan
+// errored on real 18-column results since #t95).
 func (d mysqlDialect) EstimateRows(ctx context.Context, q dialectQueryer, schema, table string) (int64, error) {
-	var name, engine, rowFormat, rows, avgRowLen, dataLen, maxDataLen, indexLen, autoInc, createTime, updateTime, checkTime, collation, checksum, createOpts, comment sql.NullString
-	err := q.QueryRowContext(ctx,
-		fmt.Sprintf("SHOW TABLE STATUS FROM %s LIKE '%s'", d.QuoteIdent(schema), escapeSQLLike(table))).Scan(
-		&name, &engine, &rowFormat, &rows, &avgRowLen, &dataLen, &maxDataLen, &indexLen,
-		&autoInc, &createTime, &updateTime, &checkTime, &collation, &checksum, &createOpts, &comment)
+	rows, err := q.QueryContext(ctx,
+		fmt.Sprintf("SHOW TABLE STATUS FROM %s LIKE '%s'", d.QuoteIdent(schema), escapeSQLLike(table)))
 	if err != nil {
 		return 0, err
 	}
-	if rows.Valid {
-		var val int64
-		if _, err := fmt.Sscanf(rows.String, "%d", &val); err == nil {
-			return val, nil
-		}
-	}
-	return 0, nil
+	return scanShowTableStatusRows(rows)
 }
 
 // CountExact mirrors tidbDialect.CountExact with two-part source

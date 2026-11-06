@@ -64,6 +64,60 @@ func TestDefaultConfig(t *testing.T) {
 	if got := cfg.Compare.QueryTimeout; got != "30m" {
 		t.Errorf("compare.query_timeout default = %q, want 30m (BUG-CMP-COUNT-P0 P0-A1)", got)
 	}
+	if got := cfg.Compare.ChunkedCountThreshold; got != 5000000 {
+		t.Errorf("compare.chunked_count_threshold default = %d, want 5000000 (BUG-CMP-COUNT-P1 C1)", got)
+	}
+	if got := cfg.Compare.ChunkedCountTarget; got != 1000000 {
+		t.Errorf("compare.chunked_count_target default = %d, want 1000000 (BUG-CMP-COUNT-P1 C1)", got)
+	}
+}
+
+// BUG-CMP-COUNT-P1 C1 anchors: the chunked-count knobs ride Load's
+// DefaultConfig-then-unmarshal pattern — an absent key keeps the 5M/1M
+// defaults, an explicit 0 stays 0 (the operator opt-out that keeps the
+// whole-table path), and custom values pass through verbatim.
+func TestLoadChunkedCountKnobs(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		return path
+	}
+
+	t.Run("absent keys keep defaults", func(t *testing.T) {
+		cfg, err := Load(write(t, "source:\n  host: db\n"))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.Compare.ChunkedCountThreshold != 5000000 || cfg.Compare.ChunkedCountTarget != 1000000 {
+			t.Fatalf("absent keys = %d/%d, want 5000000/1000000",
+				cfg.Compare.ChunkedCountThreshold, cfg.Compare.ChunkedCountTarget)
+		}
+	})
+	t.Run("explicit zero disables", func(t *testing.T) {
+		cfg, err := Load(write(t, "compare:\n  chunked_count_threshold: 0\n"))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.Compare.ChunkedCountThreshold != 0 {
+			t.Fatalf("explicit 0 = %d, want 0 (disabled)", cfg.Compare.ChunkedCountThreshold)
+		}
+		if cfg.Compare.ChunkedCountTarget != 1000000 {
+			t.Fatalf("target must keep its default, got %d", cfg.Compare.ChunkedCountTarget)
+		}
+	})
+	t.Run("custom values pass through", func(t *testing.T) {
+		cfg, err := Load(write(t, "compare:\n  chunked_count_threshold: 12345\n  chunked_count_target: 200000\n"))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.Compare.ChunkedCountThreshold != 12345 || cfg.Compare.ChunkedCountTarget != 200000 {
+			t.Fatalf("custom = %d/%d, want 12345/200000",
+				cfg.Compare.ChunkedCountThreshold, cfg.Compare.ChunkedCountTarget)
+		}
+	})
 }
 
 // P0-2/B1-A anchor: QueryTimeoutDuration falls back to 30m on empty or

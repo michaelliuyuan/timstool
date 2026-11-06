@@ -743,6 +743,32 @@ func buildCompareRunParams(task *CompareTask, reportFile string) (float64, commo
 	return sampleRatio, opts, compareCfg
 }
 
+// inheritChunkedCountKnobs (BUG-CMP-COUNT-P1 A6) copies ONLY the two
+// chunked-count knobs from the live config.yaml snapshot onto the compare
+// task's override. The override is built field-by-field from task-level
+// knobs, so the new keys would otherwise arrive as the zero value — and 0
+// means DISABLED, silently turning chunked counting off on the UI path.
+// config.Load's DefaultConfig prefill means a snapshot from a file
+// without the keys carries 5M/1M; an explicit 0 in the file propagates as
+// the runtime opt-out (including the UI). A snapshot failure (config file
+// not wired on this server / read error) falls back to the explicit
+// DefaultConfig values — never the zero value — with a Warn. No other
+// Compare field is touched: the file's other knobs must not suddenly
+// influence task-scoped compare behavior.
+func inheritChunkedCountKnobs(cc *config.CompareConfig, snapshot func() (*config.Config, error), logger *zap.Logger) {
+	cfg, err := snapshot()
+	if err != nil {
+		def := config.DefaultConfig()
+		cc.ChunkedCountThreshold = def.Compare.ChunkedCountThreshold
+		cc.ChunkedCountTarget = def.Compare.ChunkedCountTarget
+		logger.Warn("compare task: config.yaml snapshot unavailable, chunked-count knobs fall back to defaults",
+			zap.Error(err))
+		return
+	}
+	cc.ChunkedCountThreshold = cfg.Compare.ChunkedCountThreshold
+	cc.ChunkedCountTarget = cfg.Compare.ChunkedCountTarget
+}
+
 // compareAllTablesSkipped reports whether a finished report skipped EVERY
 // table (watermark-active run where every table hit a residual skip path —
 // no comparable columns, or all of them excluded): the run produced no
@@ -896,6 +922,16 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 
 	_, validateOpts, compareCfg := buildCompareRunParams(task,
 		filepath.Join(s.compareDir(task.ID), "report.json"))
+	// BUG-CMP-COUNT-P1 A6: inherit ONLY the two chunked-count knobs from
+	// the live config.yaml (cdcCfgSnapshot is the existing concurrency-safe
+	// read seam, MS-11e E2). buildCompareRunParams builds the compare
+	// override field-by-field from task-level knobs, so without this the
+	// new keys would arrive as the zero value — and 0 means DISABLED,
+	// silently turning chunked counting off on the exact UI path the bug
+	// was reported from. A snapshot failure (config file not wired / read
+	// error) falls back to the explicit DefaultConfig values — never the
+	// zero value.
+	inheritChunkedCountKnobs(&compareCfg, s.cdcCfgSnapshot, logger)
 	// #t95 P1: possibly-stuck heartbeat — flags the task when NO progress
 	// event lands within the threshold (slow-but-moving stays green).
 	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
