@@ -49,7 +49,7 @@ type CompareTaskRequest struct {
 	ChecksumParallel     int                     `json:"checksum_parallel"`          // deprecated (#t4): kept for compat, folded into Concurrency
 	Parallel             int                     `json:"parallel"`                   // deprecated (#t4): kept for compat, folded into Concurrency
 	Concurrency          int                     `json:"concurrency"`                // #t4 unified budget 1-8 (0 = derive from legacy knobs)
-	QueryTimeout         string                  `json:"query_timeout"`              // #t94 per-query deadline (empty = validator default 5m)
+	QueryTimeout         string                  `json:"query_timeout"`              // #t94 per-query deadline (empty = validator default 30m)
 	Tables               []string                `json:"tables"`                     // empty = all tables
 	Watermark            *config.WatermarkFilter `json:"watermark,omitempty"`        // #t3 optional filter group
 	TableWatermarks      []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override per-table filters (P1A)
@@ -70,7 +70,7 @@ type CompareTask struct {
 	ChecksumParallel     int                     `json:"checksum_parallel"` // deprecated (#t4)
 	Parallel             int                     `json:"parallel"`          // deprecated (#t4)
 	Concurrency          int                     `json:"concurrency"`       // #t4 unified budget (effective value, 0 = auto)
-	QueryTimeout         string                  `json:"query_timeout"`     // #t94 per-query deadline (empty = validator default 5m)
+	QueryTimeout         string                  `json:"query_timeout"`     // #t94 per-query deadline (empty = validator default 30m)
 	Tables               []string                `json:"tables"`
 	Watermark            *config.WatermarkFilter `json:"watermark,omitempty"`
 	TableWatermarks      []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override per-table filters
@@ -193,7 +193,7 @@ type compareOptionsBody struct {
 	ChecksumParallel  int                     `json:"checksum_parallel"`          // deprecated (#t4)
 	Parallel          int                     `json:"parallel"`                   // deprecated (#t4)
 	Concurrency       int                     `json:"concurrency"`                // #t4 present-and-0 clears to auto
-	QueryTimeout      string                  `json:"query_timeout"`              // #t94 per-query deadline (empty = validator default 5m)
+	QueryTimeout      string                  `json:"query_timeout"`              // #t94 per-query deadline (empty = validator default 30m)
 	Watermark         *config.WatermarkFilter `json:"watermark,omitempty"`        // present-and-null clears
 	IgnoreColumns     []string                `json:"ignore_columns,omitempty"`   // #ignore present-and-empty clears
 	TableWatermarks   []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override present-and-empty clears

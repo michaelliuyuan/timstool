@@ -131,16 +131,16 @@ func TestChecksumChunkQueryTimeoutNoHang(t *testing.T) {
 }
 
 // TestChecksumChunkQueryTimeoutBindsDefault (T2 companion): with an EMPTY
-// query_timeout the validator falls back to the 5m default — the same
-// scripted run completes (no timeout fires) and passes.
+// query_timeout the validator falls back to the 30m default (BUG-CMP-COUNT-P0
+// P0-A1) — the same scripted run completes (no timeout fires) and passes.
 func TestChecksumChunkQueryTimeoutBindsDefault(t *testing.T) {
 	same := rowsOf([2]any{int64(1), "a"}, [2]any{int64(2), "a"}, [2]any{int64(3), "a"}, [2]any{int64(4), "a"}, [2]any{int64(5), "a"})
 	src := &sideScript{count: 5, pkCols: []string{"id"}, data: same}
 	dst := &sideScript{count: 5, data: same}
 
 	v := NewValidator(config.Config{Compare: config.CompareConfig{ChecksumChunkSize: 2}})
-	if d := v.compareCfg().QueryTimeoutDuration(); d != 5*time.Minute {
-		t.Fatalf("empty query_timeout must bind the 5m default, got %v", d)
+	if d := v.compareCfg().QueryTimeoutDuration(); d != 30*time.Minute {
+		t.Fatalf("empty query_timeout must bind the 30m default (BUG-CMP-COUNT-P0 P0-A1), got %v", d)
 	}
 	tr := v.validateChecksumChunked(context.Background(), src.open(), dst.open(), "t1", make(concSem, 4))
 	if tr.Status != reporter.StatusPass {

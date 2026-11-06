@@ -89,7 +89,7 @@ type CompareConfig struct {
 	// samples, no-PK scans, quick estimates): a query that outlives it fails
 	// only that chunk/table — the run never deadlocks (wg.Wait() stays
 	// bounded) and later tables proceed. Empty or unparseable values fall
-	// back to 5m (see QueryTimeoutDuration).
+	// back to 30m (see QueryTimeoutDuration).
 	QueryTimeout string `yaml:"query_timeout" json:"queryTimeout"`
 
 	// PossiblyStuckTimeout is the no-progress heartbeat threshold for a
@@ -128,19 +128,21 @@ type CompareConfig struct {
 }
 
 // QueryTimeoutDuration parses the compare query-timeout knob: empty or
-// unparseable strings fall back to 5 minutes (mirrors the defensive
+// unparseable strings fall back to 30 minutes (mirrors the defensive
 // fallback pattern of MigrationConfig.ReadTimeoutDuration — an operator
 // typo must never collapse the knob to a zero timeout). Parseable but
 // sub-second values (0 / negative / tiny) are clamped to 1s (#t95 B1 A):
 // context.WithTimeout(0) fails every query instantly, silently turning
-// every compare into an all-timeout run.
+// every compare into an all-timeout run. The 30m default is BUG-CMP-COUNT-P0
+// P0-A1: a 50M-row InnoDB COUNT(*) full-index scan can outrun the old 5m
+// deadline on cold data.
 func (c CompareConfig) QueryTimeoutDuration() time.Duration {
 	if c.QueryTimeout == "" {
-		return 5 * time.Minute
+		return 30 * time.Minute
 	}
 	d, err := time.ParseDuration(c.QueryTimeout)
 	if err != nil {
-		return 5 * time.Minute
+		return 30 * time.Minute
 	}
 	if d < time.Second {
 		return time.Second
@@ -507,7 +509,7 @@ func DefaultConfig() *Config {
 			NoPKTableThreshold: 1000000,
 			ChecksumChunkSize:  50000,
 			ChecksumParallel:   4,
-			QueryTimeout:       "5m",
+			QueryTimeout:       "30m",
 		},
 		Logging: LoggingConfig{
 			Level:  "info",

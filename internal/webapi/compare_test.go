@@ -371,7 +371,7 @@ func TestCompareTask_BuildRunParamsQueryTimeout(t *testing.T) {
 	}
 	_, _, cfg = buildCompareRunParams(&CompareTask{}, "")
 	if cfg.QueryTimeout != "" {
-		t.Fatalf("empty query_timeout must stay empty (validator binds its 5m default), got %q", cfg.QueryTimeout)
+		t.Fatalf("empty query_timeout must stay empty (validator binds its 30m default), got %q", cfg.QueryTimeout)
 	}
 	// The JSON wire name is query_timeout on the request face.
 	var req CompareTaskRequest

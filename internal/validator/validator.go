@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net"
 	"regexp"
 	"sort"
 	"strconv"
@@ -59,6 +60,12 @@ type Validator struct {
 	// docs/MS03-DIALECT-MAP.md). Defaults preserve the pre-MS-03 behavior.
 	srcDialect CompareDialect
 	tgtDialect TargetDialect
+
+	// countRetryBackoffFn is the injectable seam behind the COUNT retry
+	// backoff (BUG-CMP-COUNT-P0 P0-A2): nil = production backoffs (30s
+	// before the 1st retry, 2m before the 2nd); tests substitute a
+	// zero-wait function so retry anchors run without sleeping.
+	countRetryBackoffFn func(retry int) time.Duration
 }
 
 // NewValidator assembles the validator with dialects dispatched on the
@@ -158,6 +165,83 @@ func annotateQueryTimeout(err error, d time.Duration) error {
 		return fmt.Errorf("query timeout (%s): %w", d, err)
 	}
 	return err
+}
+
+// countMaxRetries is the hard cap of COUNT retries after a timeout-class
+// failure (BUG-CMP-COUNT-P0 P0-A2): 2 retries → at most 3 attempts per
+// count. Non-timeout errors never retry (fail fast — a syntax error or a
+// missing table will not heal).
+const countMaxRetries = 2
+
+// isTimeoutClassError reports whether a COUNT failure is timeout-class:
+// a fired context deadline (app-level query_timeout) or a driver/network
+// i/o timeout (net.Error with Timeout(), e.g. go-sql-driver / pgx read
+// deadlines). Only these are worth retrying — the table may simply be
+// huge and cold (a 50M-row InnoDB COUNT(*) outrunning the deadline is
+// the exact incident that spawned P0-A2).
+func isTimeoutClassError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return false
+}
+
+// countRetryBackoff returns the wait before retry N (1-based: 1 = before
+// the first retry, 2 = before the second). Production: 30s then 2m — an
+// escalating pause that yields the source some breathing room without
+// letting a doomed count pin the table for long. The seam field overrides
+// it (zero-wait in tests).
+func (v *Validator) countRetryBackoff(retry int) time.Duration {
+	if v.countRetryBackoffFn != nil {
+		return v.countRetryBackoffFn(retry)
+	}
+	if retry <= 1 {
+		return 30 * time.Second
+	}
+	return 2 * time.Minute
+}
+
+// countQueryer is the one-method seam shared by *sql.DB (source pool) and
+// *sql.Conn (dedicated TiDB conn) so the retry loop serves both sides.
+type countQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// countWithTimeoutRetry runs ONE count query under a FRESH per-attempt
+// query-timeout deadline, retrying timeout-class failures up to
+// countMaxRetries times with backoff (BUG-CMP-COUNT-P0 P0-A2). A fresh
+// deadline per attempt is structural: after a fired deadline the old ctx
+// is dead, so reusing it would fail every retry instantly. Non-timeout
+// errors return immediately; after the final timeout the LAST error is
+// returned for the caller to annotate (report string shape unchanged).
+func (v *Validator) countWithTimeoutRetry(ctx context.Context, q countQueryer, table, side, query string, args ...any) (int64, error) {
+	for attempt := 0; ; attempt++ {
+		qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+		var n int64
+		err := q.QueryRowContext(qctx, query, args...).Scan(&n)
+		cancel()
+		if err == nil {
+			return n, nil
+		}
+		if attempt >= countMaxRetries || !isTimeoutClassError(err) {
+			return 0, err
+		}
+		wait := v.countRetryBackoff(attempt + 1)
+		zap.L().Warn("compare count timed out, retrying with backoff",
+			zap.String("table", table), zap.String("side", side),
+			zap.Int("attempt", attempt+1), zap.Duration("backoff", wait), zap.Error(err))
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			// Run is being torn down (cancel/shutdown): keep the LAST
+			// timeout error so the report keeps its shape.
+			return 0, err
+		}
+	}
 }
 
 // MaxConcBudget is the hard cap for the unified concurrency budget. Both DB
@@ -536,42 +620,44 @@ func (v *Validator) validateTableUnit(ctx context.Context, pgDB *sql.DB, tidbCon
 func (v *Validator) validateRowCount(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string) reporter.TableReport {
 	tr := reporter.TableReport{TableName: table, Status: reporter.StatusPass}
 
-	// P0-2: the four COUNT queries share one query-level deadline; a timeout
-	// fails THIS table (never the run).
-	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
-	defer cancel()
+	// P0-2 + P0-A2 (BUG-CMP-COUNT-P0): each count runs under its own
+	// query-level deadline; a timeout-class failure retries twice with
+	// backoff (fresh deadline per attempt), then fails THIS table (never
+	// the run) with the unchanged "source/target count:" disclosure.
 
 	schema := v.sourceSchema()
 	if schema == "" {
 		schema = "public"
 	}
 
-	var sourceCount int64
-	var err error
-	wm := v.wmFilterFor(qctx)
+	var sourceQuery string
+	var sourceArgs []any
+	wm := v.wmFilterFor(ctx)
 	if wm != nil {
-		err = pgDB.QueryRowContext(qctx,
-			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s WHERE %s",
-				v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm)), wmArgs(wm)...).Scan(&sourceCount)
+		sourceQuery = fmt.Sprintf("SELECT COUNT(*) FROM %s.%s WHERE %s",
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table), v.srcDialect.WmPredicateFragment(wm))
+		sourceArgs = wmArgs(wm)
 	} else {
-		err = pgDB.QueryRowContext(qctx,
-			fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table))).Scan(&sourceCount)
+		sourceQuery = fmt.Sprintf("SELECT COUNT(*) FROM %s.%s",
+			v.srcDialect.QuoteIdent(schema), v.srcDialect.QuoteIdent(table))
 	}
+	sourceCount, err := v.countWithTimeoutRetry(ctx, pgDB, table, "source", sourceQuery, sourceArgs...)
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("source count: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
 		return tr
 	}
 
-	var targetCount int64
+	var targetQuery string
+	var targetArgs []any
 	if wm != nil {
-		err = tidbConn.QueryRowContext(qctx,
-			fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s",
-				v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...).Scan(&targetCount)
+		targetQuery = fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s",
+			v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm))
+		targetArgs = wmArgs(wm)
 	} else {
-		err = tidbConn.QueryRowContext(qctx,
-			fmt.Sprintf("SELECT COUNT(*) FROM %s", v.tgtDialect.QuoteIdent(table))).Scan(&targetCount)
+		targetQuery = fmt.Sprintf("SELECT COUNT(*) FROM %s", v.tgtDialect.QuoteIdent(table))
 	}
+	targetCount, err := v.countWithTimeoutRetry(ctx, tidbConn, table, "target", targetQuery, targetArgs...)
 	if err != nil {
 		tr.Status = reporter.StatusFail
 		tr.Error = fmt.Sprintf("target count: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))

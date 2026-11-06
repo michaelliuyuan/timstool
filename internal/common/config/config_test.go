@@ -61,23 +61,24 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.CDC.Enable != true {
 		t.Error("cdc should be enabled by default (49e073b: enable CDC incremental sync by default)")
 	}
-	if got := cfg.Compare.QueryTimeout; got != "5m" {
-		t.Errorf("compare.query_timeout default = %q, want 5m", got)
+	if got := cfg.Compare.QueryTimeout; got != "30m" {
+		t.Errorf("compare.query_timeout default = %q, want 30m (BUG-CMP-COUNT-P0 P0-A1)", got)
 	}
 }
 
-// P0-2/B1-A anchor: QueryTimeoutDuration falls back to 5m on empty or
+// P0-2/B1-A anchor: QueryTimeoutDuration falls back to 30m on empty or
 // unparseable values (an operator typo must never collapse the knob to a
 // zero timeout), parses a valid duration verbatim, and clamps parseable
 // sub-second values (0 / negative / tiny) to 1s — WithTimeout(0) fails
 // every query instantly, silently turning the run into all-timeouts.
+// BUG-CMP-COUNT-P0 P0-A1: the fallback (and DefaultConfig) moved 5m → 30m.
 func TestCompareQueryTimeoutDuration(t *testing.T) {
 	cases := []struct {
 		in   string
 		want time.Duration
 	}{
-		{"", 5 * time.Minute},
-		{"bad", 5 * time.Minute},
+		{"", 30 * time.Minute},
+		{"bad", 30 * time.Minute},
 		{"0", time.Second},     // explicit zero → clamped to 1s
 		{"-5s", time.Second},   // negative → clamped to 1s
 		{"100ms", time.Second}, // sub-second → clamped to 1s
@@ -106,10 +107,13 @@ func TestComparePossiblyStuckTimeoutDuration(t *testing.T) {
 		qt   string
 		want time.Duration
 	}{
-		{"", "", 10 * time.Minute},       // default 5m vs qt default 5m → clamped 2×5m
-		{"bad", "", 10 * time.Minute},    // unparseable → 5m default → clamped
-		{"0", "", 10 * time.Minute},      // non-positive → 5m default → clamped
-		{"-1s", "", 10 * time.Minute},    // non-positive → 5m default → clamped
+		// BUG-CMP-COUNT-P0 P0-A1 follow-through: with an EMPTY qt the query
+		// timeout now binds its 30m default, so the ps 5m default is clamped
+		// to 2×30m = 60m (clamp logic untouched — only the qt default moved).
+		{"", "", 60 * time.Minute},       // ps default 5m vs qt default 30m → clamped 2×30m
+		{"bad", "", 60 * time.Minute},    // unparseable ps → 5m default → clamped
+		{"0", "", 60 * time.Minute},      // non-positive ps → 5m default → clamped
+		{"-1s", "", 60 * time.Minute},    // non-positive ps → 5m default → clamped
 		{"30s", "5m", 10 * time.Minute},  // explicit 30s ≤ qt 5m → clamped
 		{"2m", "5m", 10 * time.Minute},   // 2m ≤ qt 5m → clamped
 		{"5m", "5m", 10 * time.Minute},   // boundary: equal to qt → clamped

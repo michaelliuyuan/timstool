@@ -860,6 +860,20 @@ function diffHeat(n: number | undefined): string {
   return 'diff-high'
 }
 
+// BUG-CMP-COUNT-P0 P0-B: a FAILED table with an error never produced
+// trustworthy counts — the backend leaves source/target/diff rows at
+// their zero values, which used to render a misleading「0 行 / 无差异」
+// (the exact illusion that misrouted this incident to "empty table").
+// Such rows render「—」instead. Pass rows (and warn/skip with no error)
+// keep their numbers; the summary totals keep the raw sums (disclosed
+// caveat — the server stays the single source of truth).
+function countCellsUnknown(t: { status?: string; error?: string }): boolean {
+  return t.status === 'fail' && !!t.error
+}
+function countCell(t: { status?: string; error?: string }, key: 'source_rows' | 'target_rows' | 'diff_rows'): unknown {
+  return countCellsUnknown(t) ? '—' : (t as Record<string, unknown>)[key]
+}
+
 // ---- 行级差异（row-diff drill）: failed checksum tables carry a bounded
 // summary (three-class counts + sample keys) in row_diffs; the full detail
 // downloads as CSV via the read-only rowdiff route. ----
@@ -1024,8 +1038,17 @@ function exportCsv() {
     ['表名', '状态', '源行数', '目标行数', '差异行数', '耗时', '错误', '建议'].map(csvCell).join(','),
   )
   for (const t of r.tables) {
+    // BUG-CMP-COUNT-P0 P0-B: failed+error rows export「—」for all three
+    // count cells (same rule as the on-screen table) — never a fake 0.
+    const unknown = countCellsUnknown(t)
     lines.push(
-      [t.table_name, t.status, t.source_rows, t.target_rows, t.diff_rows, t.duration, t.error, t.suggestion]
+      [
+        t.table_name, t.status,
+        unknown ? '—' : t.source_rows,
+        unknown ? '—' : t.target_rows,
+        unknown ? '—' : t.diff_rows,
+        t.duration, t.error, t.suggestion,
+      ]
         .map(csvCell).join(','),
     )
   }
@@ -1463,11 +1486,16 @@ onUnmounted(() => {
               <el-tag :type="tableStatusTag(row.status)" size="small">{{ tableStatusText(row.status) }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="source_rows" label="源行数" width="110" align="right" class-name="tims-num-col" />
-          <el-table-column prop="target_rows" label="目标行数" width="110" align="right" class-name="tims-num-col" />
+          <el-table-column prop="source_rows" label="源行数" width="110" align="right" class-name="tims-num-col">
+            <template #default="{ row }">{{ countCell(row, 'source_rows') }}</template>
+          </el-table-column>
+          <el-table-column prop="target_rows" label="目标行数" width="110" align="right" class-name="tims-num-col">
+            <template #default="{ row }">{{ countCell(row, 'target_rows') }}</template>
+          </el-table-column>
           <el-table-column label="差异行数" width="100" align="right">
             <template #default="{ row }">
-              <span class="tims-num" :class="diffHeat(row.diff_rows)">{{ row.diff_rows }}</span>
+              <span v-if="countCellsUnknown(row)">—</span>
+              <span v-else class="tims-num" :class="diffHeat(row.diff_rows)">{{ row.diff_rows }}</span>
             </template>
           </el-table-column>
           <el-table-column prop="duration" label="耗时" width="90" class-name="hide-sm" />
