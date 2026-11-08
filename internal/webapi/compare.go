@@ -199,6 +199,15 @@ type compareOptionsBody struct {
 	TableWatermarks   []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override present-and-empty clears
 }
 
+// checksumChunkSizeFloorError is the shared #97 rejection message for all
+// three webapi intake points (compare create / compare options PUT /
+// migration task create); the floor matches the page control's :min and the
+// released parameter contract, 0/absent keeps the runtime default.
+func checksumChunkSizeFloorError(got int64) string {
+	return fmt.Sprintf("checksum_chunk_size: 每窗口行数，不得小于 %d（当前 %d；0 或缺省 = 默认 %d）",
+		config.MinChecksumChunkSize, got, config.DefaultChecksumChunkSize)
+}
+
 // normalizeWatermarkFilter validates and canonicalizes a watermark filter
 // group (#t3): column passes the same identifier allow-list as incremental
 // table/column names; op defaults to "<="; base_mode defaults to checksum.
@@ -432,7 +441,21 @@ func (s *Server) handlePutCompareOptions(w http.ResponseWriter, r *http.Request)
 	})
 	apply("mode", func() { merged.Mode = req.Mode })
 	apply("sample_ratio", func() { merged.SampleRatio = req.SampleRatio })
-	apply("checksum_chunk_size", func() { merged.ChecksumChunkSize = req.ChecksumChunkSize })
+	// #97: the saved profile is exactly where a raw-API typo would live
+	// long-term (options archive), so the same floor as the create path
+	// applies; present-and-0 resets to the default window size (same
+	// clear-by-0 semantics as concurrency).
+	if _, ok := presence["checksum_chunk_size"]; ok && req.ChecksumChunkSize != 0 && req.ChecksumChunkSize < config.MinChecksumChunkSize {
+		s.writeError(w, http.StatusBadRequest, checksumChunkSizeFloorError(req.ChecksumChunkSize))
+		return
+	}
+	apply("checksum_chunk_size", func() {
+		if req.ChecksumChunkSize == 0 {
+			merged.ChecksumChunkSize = config.DefaultChecksumChunkSize
+		} else {
+			merged.ChecksumChunkSize = req.ChecksumChunkSize
+		}
+	})
 	apply("checksum_parallel", func() { merged.ChecksumParallel = req.ChecksumParallel })
 	apply("parallel", func() { merged.Parallel = req.Parallel })
 	apply("concurrency", func() { merged.Concurrency = req.Concurrency })
@@ -642,6 +665,13 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 	// panicked the whole web process. Same message/semantics as PUT :236.
 	if req.SampleRatio < 0 || req.SampleRatio > 1 {
 		s.writeError(w, http.StatusBadRequest, "sample_ratio must be within [0,1]")
+		return
+	}
+	// #97: checksum window floor — an explicit 1-999 value is the unit
+	// confusion the released parameter contract calls out (批大小/字节/按库);
+	// 0/absent keeps the runtime default.
+	if req.ChecksumChunkSize != 0 && req.ChecksumChunkSize < config.MinChecksumChunkSize {
+		s.writeError(w, http.StatusBadRequest, checksumChunkSizeFloorError(req.ChecksumChunkSize))
 		return
 	}
 	conc := validator.ResolveConcurrency(req.Concurrency, req.Parallel, req.ChecksumParallel)

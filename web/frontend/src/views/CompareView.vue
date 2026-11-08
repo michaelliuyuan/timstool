@@ -596,7 +596,7 @@ function applyCompareOptions(opts: CompareOptions) {
   }
   const num = (v: number | undefined) => (v !== undefined && v !== null ? v : null)
   const sr = num(opts.sample_ratio); if (sr !== null) form.sample_ratio = sr
-  const cs = num(opts.checksum_chunk_size); if (cs !== null) form.checksum_chunk_size = cs
+  const cs = num(opts.checksum_chunk_size); if (cs !== null && cs >= 1000) form.checksum_chunk_size = cs
   // #t4: unified budget; legacy saves map through the same max() the backend uses.
   const c = num(opts.concurrency)
   if (c !== null && c > 0) {
@@ -1276,7 +1276,12 @@ onUnmounted(() => {
           <el-input-number v-model="form.sample_ratio" :min="0.001" :max="1" :step="0.01" />
         </el-form-item>
         <el-form-item v-if="form.mode === 'checksum' || (form.mode === 'watermark' && wmConfig.base_mode === 'checksum')" label="分块大小">
-          <el-input-number v-model="form.checksum_chunk_size" :min="1000" :step="10000" />
+          <div style="width: 100%;">
+            <el-input-number v-model="form.checksum_chunk_size" :min="1000" :step="10000" />
+            <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-top: 6px;">
+              单位为每窗口行数（非批大小/字节数）：默认 50000、最小 1000。表按该行数切窗逐块校验，值越小进度更新越细，但窗口数与查询次数越多。
+            </div>
+          </div>
         </el-form-item>
         <el-form-item label="排除字段">
           <div style="width: 100%;">

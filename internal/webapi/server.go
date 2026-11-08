@@ -1420,6 +1420,13 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("batch_size 必须在 1-%d 之间（当前 %d）", config.MaxBatchSize, cfg.Migration.BatchSize))
 		return
 	}
+	// #97: same checksum window floor as the compare paths — an explicit
+	// 1-999 value is the unit-confusion typo (批大小/字节/按库); 0/absent
+	// keeps the runtime default.
+	if req.Opts.ChecksumChunkSize != 0 && req.Opts.ChecksumChunkSize < config.MinChecksumChunkSize {
+		s.writeError(w, http.StatusBadRequest, checksumChunkSizeFloorError(req.Opts.ChecksumChunkSize))
+		return
+	}
 	// F-12: shape defense — the migration compare knobs (cfg.Compare) fed the
 	// PG-pipeline validate (runValidate) with the same unclamped ratio; gate
 	// here too, aligned with the compare create path and PUT options.

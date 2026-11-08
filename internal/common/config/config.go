@@ -251,6 +251,17 @@ const (
 	MaxBatchSize = 1000000
 )
 
+// #97 checksum window knobs: the "分块大小" (checksum_chunk_size) unit is
+// ROWS PER WINDOW — the page control clamps at MinChecksumChunkSize and the
+// released parameter contract fixes the same floor for the API (a 1-999
+// value is the classic 批大小/字节/按库 confusion). 0/absent means "use the
+// default window size" at every webapi intake; the validator keeps its own
+// <=0 fallback for legacy persisted values.
+const (
+	MinChecksumChunkSize     = 1000
+	DefaultChecksumChunkSize = 50000
+)
+
 // BuildPGDSN assembles a libpq URL with CORRECTLY escaped userinfo (F-06
 // item 4): url.UserPassword percent-encodes specials (@ : / ? # % space & =
 // + etc.) in user/password, unlike fmt.Sprintf concatenation which a single
@@ -524,7 +535,7 @@ func DefaultConfig() *Config {
 			NoPKStrategy:          "auto",
 			NoPKBucketCount:       100,
 			NoPKTableThreshold:    1000000,
-			ChecksumChunkSize:     50000,
+			ChecksumChunkSize:     DefaultChecksumChunkSize,
 			ChecksumParallel:      4,
 			QueryTimeout:          "30m",
 			ChunkedCountThreshold: 5000000,

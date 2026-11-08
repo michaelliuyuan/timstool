@@ -826,7 +826,7 @@ function prevStep() {
           </el-form-item>
           <el-form-item v-if="form.opts.compare_mode === 'checksum'" label="分块大小">
             <el-input-number v-model="form.opts.checksum_chunk_size" :min="1000" :step="10000" />
-            <span style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-left: 8px;">每块的行数</span>
+            <span style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-left: 8px;">每窗口行数（非批大小/字节数），默认 50000、最小 1000</span>
           </el-form-item>
           <el-divider>跳过阶段（高级）</el-divider>
           <el-form-item label="跳过预检">
