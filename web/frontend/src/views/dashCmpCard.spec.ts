@@ -39,9 +39,9 @@ describe('FEAT-DASH-CMP-CARD ②: 「最近数据对比任务」历史卡', () =
     expect(s).toContain(`router.push('/compare')`)
   })
 
-  it('列结构：ID/任务名/模式/状态/表进度/时间/操作（报告+查看）', () => {
+  it('列结构：ID/任务名/类型/状态/进度·耗时/时间/操作（FEAT-DASH-UNIFY 统一模板）', () => {
     const s = src('DashboardView.vue')
-    for (const label of ['任务 ID', '任务名', '模式', '状态', '表进度', '时间', '操作']) {
+    for (const label of ['任务 ID', '任务名', '类型', '状态', '进度·耗时', '时间', '操作']) {
       expect(s).toContain(`label="${label}"`)
     }
     expect(s).toContain('{{ row.tables_done }}/{{ row.tables_total }}')
@@ -55,9 +55,9 @@ describe('FEAT-DASH-CMP-CARD ②: 「最近数据对比任务」历史卡', () =
     expect(s).toContain('tims-pill--hint">水位</span>')
   })
 
-  it('状态胶囊四档（running/completed/failed/cancelled）；completed 不误红（D2=v2）', () => {
+  it('状态胶囊四档（running/completed/failed/cancelled）；completed 不误红（D2=v2）；running=info 蓝档（UNIFY D②）', () => {
     const s = src('DashboardView.vue')
-    expect(s).toContain("running: { cls: 'tims-pill--muted', text: '运行中' },")
+    expect(s).toContain("running: { cls: 'tims-pill--info', text: '运行中' },")
     expect(s).toContain("completed: { cls: 'tims-pill--muted', text: '已完成' },")
     expect(s).toContain("failed: { cls: 'tims-pill--fail', text: '失败' },")
     expect(s).toContain("cancelled: { cls: 'tims-pill--muted', text: '已取消' },")
@@ -89,10 +89,10 @@ describe('FEAT-DASH-CMP-CARD ③: CompareView query 钩子', () => {
 })
 
 describe('FEAT-DASH-CMP-CARD ④: 递版与既有面零回归', () => {
-  it('package.json 递版 3.23.4', () => {
+  it('package.json 递版（FEAT-DASH-UNIFY 后 = 3.23.5）', () => {
     const p = readFileSync(resolve(__dirname, '../../package.json'), 'utf8')
-    expect(p).toContain('"version": "3.23.4"')
-    expect(p).not.toContain('"version": "3.23.3"')
+    expect(p).toContain('"version": "3.23.5"')
+    expect(p).not.toContain('"version": "3.23.4"')
   })
 
   it('既有四指标卡四档 label 原样在位（第五卡纯增）', () => {

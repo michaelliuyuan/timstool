@@ -284,6 +284,10 @@ button, input, optgroup, select, textarea {
 /* 中性运行态/未决档（运行中/已创建等非结论状态）：灰底胶囊，不参与四档结论
    语义（leader 裁定①：Dashboard 运行态不得误落 fail 红档）。 */
 .tims-pill--muted { background: #f4f4f5; color: var(--tims-tag-info-text); }
+/* FEAT-DASH-UNIFY D②：运行态专属 info 蓝档（#2c6bb3 on #ecf5ff 实测 4.94:1 AA 过；红队勘正：原 EP 标准蓝 3.82:1 掉档已弃）——
+   「运行中」可视化区分于 muted 中性档与 pass 结论档；不占 hint 跨方言提示语义
+   （裁定②：hint 蓝仅跨方言提示），亦不触碰裁定①③（运行态/完成态不落红档）。 */
+.tims-pill--info { background: #ecf5ff; color: #2c6bb3; }
 
 /* --- v3.20 方案A：el-tag 全站胶囊化（状态胶囊系统化）---
    圆角收敛 999px、去描边、四档底色走 soft 系 + AA 深字。info 档回归灰档

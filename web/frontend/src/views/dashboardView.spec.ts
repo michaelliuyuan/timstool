@@ -80,9 +80,9 @@ describe('v3.20 方案A: Dashboard 数据面红线（零后端改动）', () => 
 // bf 返修（leader 15:06 裁定①③）：Dashboard 运行态按任务 status 分流——
 // 运行中/未决不再误落 fail 红档；结论胶囊仅由 completed 且有 result 驱动。
 describe('裁定①③: Dashboard 运行态分流（运行中不误红）', () => {
-  it('Mongo 卡：running→muted「运行中」/ failed→fail「失败」/ 仅 completed+result 落结论四档', () => {
+  it('Mongo 卡：running→info「运行中」/ failed→fail「失败」/ 仅 completed+result 落结论四档', () => {
     const s = src('DashboardView.vue')
-    expect(s).toContain(`running: { cls: 'tims-pill--muted', text: '运行中' },`)
+    expect(s).toContain(`running: { cls: 'tims-pill--info', text: '运行中' },`)
     expect(s).toContain(`failed: { cls: 'tims-pill--fail', text: '失败' },`)
     expect(s).toContain(`if (t.status === 'completed')`)
     expect(s).toContain('mongoOverallPill(o), text: mongoOverallText(o)')
@@ -91,11 +91,11 @@ describe('裁定①③: Dashboard 运行态分流（运行中不误红）', () =
     expect(s).not.toContain(`(o || '运行中')`)
   })
 
-  it('DDL 历史结论列：仅 error/failed 落红「失败」；running 落 muted「运行中」', () => {
+  it('DDL 历史状态列：仅 error/failed 落红「失败」；running 落 info「运行中」（UNIFY D②）', () => {
     const s = src('DashboardView.vue')
     expect(s).toContain(`v-else-if="row.error || row.status === 'failed'"`)
     expect(s).toContain(`v-else-if="row.status === 'running'"`)
-    expect(s).toContain('tims-pill tims-pill--muted">运行中')
+    expect(s).toContain('tims-pill tims-pill--info">运行中')
     expect(s).toContain('tims-pill tims-pill--fail">失败')
   })
 })

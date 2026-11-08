@@ -12,6 +12,8 @@ import PageHeader from '../components/PageHeader.vue'
 // MongoDB 对比空状态示例卡。
 // FEAT-DASH-CMP-CARD：第五聚合源 /api/v1/compare/tasks（数据对比独立
 // 任务体系，纯 FE 只读接入）——第五指标卡 + 最近数据对比历史卡。
+// FEAT-DASH-UNIFY：两历史卡七列同构（任务ID/任务名/类型/状态/进度·耗时/
+// 时间/操作）+ 非表格卡节奏对齐 + 成果速览条 + 八项细节统一。纯 FE。
 
 const router = useRouter()
 
@@ -85,9 +87,10 @@ function openDdlReport(id: string, format: 'html' | 'json') {
 }
 
 // ---- MongoDB 对比卡：有记录给最近一条结论，无记录渲染空状态（示例卡） ----
+const mongoTasks = computed(() => tasks.value.filter((t) => isCompareTask(t)))
 const latestMongo = computed(() => {
-  const sorted = tasks.value
-    .filter((t) => isCompareTask(t))
+  const sorted = mongoTasks.value
+    .slice()
     .sort((a, b) => (b.finished_at || b.created_at || '').localeCompare(a.finished_at || a.created_at || ''))
   return sorted[0] || null
 })
@@ -99,7 +102,7 @@ const mongoOverallPill = (o?: string): string =>
 const mongoOverallText = (o?: string): string =>
   o === 'equal' ? '一致' : o === 'ttl_skip' ? 'TTL 跳过' : o === 'diff' ? '存在差异' : o === 'error' ? '错误' : '—'
 const MONGO_STATUS_PILL: Record<string, { cls: string; text: string }> = {
-  running: { cls: 'tims-pill--muted', text: '运行中' },
+  running: { cls: 'tims-pill--info', text: '运行中' },
   failed: { cls: 'tims-pill--fail', text: '失败' },
   created: { cls: 'tims-pill--muted', text: '已创建' },
   paused: { cls: 'tims-pill--muted', text: '已暂停' },
@@ -131,8 +134,9 @@ const cmpSub = computed(() => {
 const CMP_MODE_TEXT: Record<string, string> = { quick: '快速', sample: '采样', checksum: '校验和' }
 const cmpModeText = (m: string) => CMP_MODE_TEXT[m] || m
 // 状态胶囊按任务 status 诚实呈现（结论级胶囊 D2 已裁 v2：completed 不误红）。
+// FEAT-DASH-UNIFY D②：运行态统一 info 蓝档（与 muted 灰/结论四档分离，不回退红档）。
 const CMP_STATUS_PILL: Record<string, { cls: string; text: string }> = {
-  running: { cls: 'tims-pill--muted', text: '运行中' },
+  running: { cls: 'tims-pill--info', text: '运行中' },
   completed: { cls: 'tims-pill--muted', text: '已完成' },
   failed: { cls: 'tims-pill--fail', text: '失败' },
   cancelled: { cls: 'tims-pill--muted', text: '已取消' },
@@ -183,6 +187,17 @@ const cmpReportURL = (id: string) => `/api/v1/compare/tasks/${id}/report?format=
       </div>
     </div>
 
+    <!-- FEAT-DASH-UNIFY C：成果速览高亮条（数字全部来自既有只读聚合源，零后端零新接口） -->
+    <div class="dash-hl" data-testid="dash-highlights">
+      <span class="dash-hl-label">成果速览</span>
+      <span class="dash-hl-cap">表级耗时</span>
+      <span class="dash-hl-cap">水位增量</span>
+      <span class="dash-hl-item">数据对比 <b>{{ compareTasks.length }}</b> 次</span>
+      <span class="dash-hl-item">DDL 校验 <b>{{ ddlTasks.length }}</b> 次</span>
+      <span class="dash-hl-item">迁移 <b>{{ tasks.length }}</b> 批</span>
+      <span class="dash-hl-item">Mongo 比对 <b>{{ mongoTasks.length }}</b> 次</span>
+    </div>
+
     <!-- ② 迁移管线条：源 → 目标（最近一次 DDL 对比口径；PG 蓝 / TiDB 红连接器徽章） -->
     <el-card v-if="latestDdl" shadow="never" class="dash-card" data-testid="dash-pipeline">
       <template #header>
@@ -212,79 +227,86 @@ const cmpReportURL = (id: string) => `/api/v1/compare/tasks/${id}/report?format=
           </span>
         </div>
         <span class="tims-pill" :class="verdictPill(latestDdl.overall)">{{ verdictText(latestDdl.overall) }}</span>
-        <el-button link type="primary" @click="openDdlReport(latestDdl.id, 'html')">查看报告 →</el-button>
+        <el-button link type="primary" @click="openDdlReport(latestDdl.id, 'html')">详情 →</el-button>
       </div>
     </el-card>
 
-    <!-- ③ 最近 5 条 DDL 对比历史 -->
+    <!-- ③ 最近 5 条 DDL 对比历史（FEAT-DASH-UNIFY A：与数据对比卡同构七列模板） -->
     <el-card shadow="never" class="dash-card" data-testid="dash-ddl-history">
       <template #header>
         <div style="display: flex; align-items: center; justify-content: space-between;">
-          <span style="font-weight: 600;">最近 DDL 对比任务</span>
+          <span style="font-weight: 600;">最近 DDL 对比任务<span class="dash-card-sub">结构差异校验</span></span>
           <el-button size="small" @click="router.push('/ddl-compare')">全部历史</el-button>
         </div>
       </template>
       <div v-if="recentDdl.length > 0" class="tims-table-scroll">
-        <el-table stripe :data="recentDdl" size="small">
+        <el-table stripe :data="recentDdl" size="small" class="dash-tbl">
           <el-table-column label="任务 ID" width="110">
             <template #default="{ row }"><span class="tims-mono">{{ row.id }}</span></template>
           </el-table-column>
-          <el-table-column label="任务名" min-width="180" show-overflow-tooltip>
+          <el-table-column label="任务名" min-width="220" show-overflow-tooltip>
             <template #default="{ row }">{{ row.name || '（未命名）' }}</template>
           </el-table-column>
-          <el-table-column label="链路" min-width="180">
+          <el-table-column label="类型" width="150">
             <template #default="{ row }">
               {{ metaOf(row.source_type).short }} → {{ metaOf(row.target_type).short }}
             </template>
           </el-table-column>
-          <el-table-column label="结论" width="90">
+          <el-table-column label="状态" width="90">
             <template #default="{ row }">
               <span v-if="row.overall" class="tims-pill" :class="verdictPill(row.overall)">{{ verdictText(row.overall) }}</span>
               <!-- 裁定③：仅 error/failed 落红「失败」；运行中/未决走中性胶囊，不再误红兜底。 -->
               <el-tooltip v-else-if="row.error || row.status === 'failed'" :content="row.error || '失败'" placement="top">
                 <span class="tims-pill tims-pill--fail">失败</span>
               </el-tooltip>
-              <span v-else-if="row.status === 'running'" class="tims-pill tims-pill--muted">运行中</span>
+              <span v-else-if="row.status === 'running'" class="tims-pill tims-pill--info">运行中</span>
               <span v-else class="tims-pill tims-pill--muted">—</span>
             </template>
           </el-table-column>
-          <el-table-column label="耗时" width="90" class-name="hide-sm">
+          <el-table-column label="进度·耗时" width="110" class-name="hide-sm">
             <template #default="{ row }"><span class="dash-muted tims-mono">{{ row.duration || '—' }}</span></template>
           </el-table-column>
-          <el-table-column label="时间" width="140" class-name="hide-sm">
-            <template #default="{ row }"><span class="dash-muted">{{ fmtTime(row.created_at) }}</span></template>
+          <el-table-column label="时间" width="150" align="right" class-name="hide-sm">
+            <template #default="{ row }"><span class="dash-muted tims-mono">{{ fmtTime(row.created_at) }}</span></template>
           </el-table-column>
-          <el-table-column label="报告" width="110">
+          <el-table-column label="操作" width="150">
             <template #default="{ row }">
+              <!-- 报告 HTML/JSON 直链仅 completed；JSON 收组进操作列（功能保留） -->
               <template v-if="row.status === 'completed'">
-                <el-link type="primary" :href="apiClient.ddlCompareReportURL(row.id, 'html')" target="_blank">HTML</el-link>
-                <el-link type="primary" style="margin-left: 8px;" :href="apiClient.ddlCompareReportURL(row.id, 'json')" target="_blank">JSON</el-link>
+                <el-link type="primary" :href="apiClient.ddlCompareReportURL(row.id, 'html')" target="_blank">报告</el-link>
+                <el-link type="primary" class="dash-act" :href="apiClient.ddlCompareReportURL(row.id, 'json')" target="_blank">JSON</el-link>
               </template>
               <span v-else class="dash-muted">—</span>
+              <el-button size="small" link type="primary" class="dash-act" @click="router.push('/ddl-compare')">查看</el-button>
             </template>
           </el-table-column>
         </el-table>
       </div>
-      <el-empty v-else description="还没有 DDL 对比记录；在「DDL 对比」页发起一次结构对比即可在这里看到结果" />
+      <div v-else class="tims-empty">
+        <el-icon class="tims-empty-icon" :size="42"><Document /></el-icon>
+        <div class="tims-empty-title">尚无 DDL 对比记录</div>
+        <div class="tims-empty-sub">发起一次结构对比即可在这里看到结果</div>
+        <el-button type="primary" size="small" style="margin-top: 4px;" @click="router.push('/ddl-compare')">去发起对比</el-button>
+      </div>
     </el-card>
 
-    <!-- ④ 最近 5 条数据对比历史（FEAT-DASH-CMP-CARD ②，镜像 DDL 历史卡结构） -->
+    <!-- ④ 最近 5 条数据对比历史（FEAT-DASH-CMP-CARD ②；FEAT-DASH-UNIFY A：与 DDL 卡同构七列模板） -->
     <el-card shadow="never" class="dash-card" data-testid="dash-cmp-history">
       <template #header>
         <div style="display: flex; align-items: center; justify-content: space-between;">
-          <span style="font-weight: 600;">最近数据对比任务</span>
+          <span style="font-weight: 600;">最近数据对比任务<span class="dash-card-sub">数据一致性校验</span></span>
           <el-button size="small" @click="router.push('/compare')">全部历史</el-button>
         </div>
       </template>
       <div v-if="recentCmp.length > 0" class="tims-table-scroll">
-        <el-table stripe :data="recentCmp" size="small">
+        <el-table stripe :data="recentCmp" size="small" class="dash-tbl">
           <el-table-column label="任务 ID" width="110">
             <template #default="{ row }"><span class="tims-mono">{{ row.id }}</span></template>
           </el-table-column>
-          <el-table-column label="任务名" min-width="160" show-overflow-tooltip>
+          <el-table-column label="任务名" min-width="220" show-overflow-tooltip>
             <template #default="{ row }">{{ row.name || '（未命名）' }}</template>
           </el-table-column>
-          <el-table-column label="模式" width="120">
+          <el-table-column label="类型" width="150">
             <template #default="{ row }">
               {{ cmpModeText(row.mode) }}
               <!-- #t3 水位过滤组存在才挂「水位」tag（absent = 未过滤比对） -->
@@ -296,18 +318,18 @@ const cmpReportURL = (id: string) => `/api/v1/compare/tasks/${id}/report?format=
               <span class="tims-pill" :class="cmpStatusPill(row).cls">{{ cmpStatusPill(row).text }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="表进度" width="90" class-name="hide-sm">
+          <el-table-column label="进度·耗时" width="110" class-name="hide-sm">
             <template #default="{ row }"><span class="dash-muted tims-mono">{{ row.tables_done }}/{{ row.tables_total }}</span></template>
           </el-table-column>
-          <el-table-column label="时间" width="140" class-name="hide-sm">
-            <template #default="{ row }"><span class="dash-muted">{{ fmtTime(row.created_at) }}</span></template>
+          <el-table-column label="时间" width="150" align="right" class-name="hide-sm">
+            <template #default="{ row }"><span class="dash-muted tims-mono">{{ fmtTime(row.created_at) }}</span></template>
           </el-table-column>
-          <el-table-column label="操作" width="130">
+          <el-table-column label="操作" width="150">
             <template #default="{ row }">
               <!-- 报告 HTML 直链仅 completed（未完成任务无 report.json） -->
               <el-link v-if="row.status === 'completed'" type="primary" :href="cmpReportURL(row.id)" target="_blank">报告</el-link>
               <span v-else class="dash-muted">—</span>
-              <el-button size="small" link type="primary" style="margin-left: 8px;" @click="router.push(`/compare?task=${row.id}`)">查看</el-button>
+              <el-button size="small" link type="primary" class="dash-act" @click="router.push(`/compare?task=${row.id}`)">查看</el-button>
             </template>
           </el-table-column>
         </el-table>
@@ -323,7 +345,10 @@ const cmpReportURL = (id: string) => `/api/v1/compare/tasks/${id}/report?format=
     <!-- ⑤ MongoDB 对比卡：空状态示例（插画 + 引导按钮）；有记录时显示最近一条 -->
     <el-card shadow="never" class="dash-card" data-testid="dash-mongo-card">
       <template #header>
-        <span style="font-weight: 600;">MongoDB 对比<span class="dash-card-sub">集合级数据一致性比对</span></span>
+        <div style="display: flex; align-items: center; justify-content: space-between;">
+          <span style="font-weight: 600;">MongoDB 对比<span class="dash-card-sub">集合级数据一致性比对</span></span>
+          <el-button size="small" @click="router.push('/tasks')">全部历史</el-button>
+        </div>
       </template>
       <div v-if="latestMongo" class="dash-mongo-latest">
         <span class="tims-pill" :class="mongoLatestPill.cls">{{ mongoLatestPill.text }}</span>
@@ -399,11 +424,47 @@ const cmpReportURL = (id: string) => `/api/v1/compare/tasks/${id}/report?format=
   font-size: 20px;
 }
 .dash-muted { color: var(--tims-text-2); }
+/* FEAT-DASH-UNIFY A/D⑤：两历史表行高统一 34px（line-height 20 + 上下 padding 7） */
+.dash-tbl :deep(td.el-table__cell) { padding-top: 7px; padding-bottom: 7px; }
+.dash-tbl :deep(.el-table__cell .cell) { line-height: 20px; }
+/* FEAT-DASH-UNIFY D④/D⑧：操作列同款间距（行级=报告/JSON/查看） */
+.dash-act { margin-left: 8px; }
+/* FEAT-DASH-UNIFY C：成果速览高亮条 */
+.dash-hl {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 18px;
+  padding: 10px 14px;
+  border: 1px solid var(--tims-border);
+  border-radius: 10px;
+  background: #fbfcfe;
+}
+.dash-hl-label {
+  font-size: var(--tims-font-xs);
+  font-weight: 600;
+  color: var(--tims-text-2);
+  letter-spacing: 0.5px;
+}
+.dash-hl-cap {
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: var(--tims-font-xs);
+  font-weight: 600;
+  background: var(--tims-teal-soft);
+  color: var(--tims-tag-success-text);
+}
+.dash-hl-item { font-size: var(--tims-font-xs); color: var(--tims-text-2); }
+.dash-hl-item b { font-family: var(--tims-font-mono); font-weight: 600; }
+/* FEAT-DASH-UNIFY B：Mongo 最近一条行与表格行同节奏（min-height 34） */
 .dash-mongo-latest {
   display: flex;
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+  min-height: 34px;
+  padding: 7px 2px;
 }
 .dash-mongo-name { font-weight: 600; }
 </style>
