@@ -128,7 +128,7 @@ func TestDataCompareReport_HTML(t *testing.T) {
 		"采样比对完成：3/4 表通过", // summary line
 		"<h2>统计</h2>", "通过", "失败", "警告", "跳过", "差异行数",
 		"<h2>表详情</h2>",
-		`<th>#</th><th>表名</th><th>状态</th><th class="colnum">源端行数</th><th class="colnum">目标行数</th><th class="colnum">差异</th><th>行级差异</th><th>备注</th>`, // unit-11 A: 8 columns
+		`<th>#</th><th>表名</th><th>状态</th><th class="colnum">源端行数</th><th class="colnum">目标行数</th><th class="colnum">差异</th><th class="colnum">耗时</th><th>行级差异</th><th>备注</th>`, // unit-11 A + FEAT-CMP-TBL-DURATION: 9 columns
 		`<td class="num">1</td><td>public.orders</td>`, // original # survives the failure-first sort
 		`<td class="num">4</td><td>public.bad</td>`,    // fail row keeps engine # 4
 		`<tr class="row-fail">`,                        // unit-11 D: fail tint
@@ -139,7 +139,7 @@ func TestDataCompareReport_HTML(t *testing.T) {
 		`<td class="num diff-pos">1</td>`,                                         // diff>0 red class
 		"run a checksum compare on public.users",                                  // 备注 cell (≤40 runes → whole)
 		"connect refused",                                                         // 错误全文 in the expand area (C)
-		`<tr class="row-detail"><td colspan="8"><details><summary>诊断详情</summary>`, // C expand row structure
+		`<tr class="row-detail"><td colspan="9"><details><summary>诊断详情</summary>`, // C expand row structure (9-column span)
 		"tr.row-detail details > *:not(summary) { display: block !important; }",   // C print force-open
 		"tr.row-detail details::details-content { display: block !important; content-visibility: visible !important; }",
 		`<span class="tims-version">V3.19.36</span>`, // version badge
@@ -157,8 +157,9 @@ func TestDataCompareReport_HTML(t *testing.T) {
 		pos(`<td class="num">1</td><td>public.orders</td>`) < pos(`<td class="num">3</td><td>public.logs</td>`)) {
 		t.Error("表详情 must render failure-first (失败→警告→通过/跳过) with original # order")
 	}
-	// The dropped columns must be gone (unit-11 A).
-	for _, gone := range []string{"<th>耗时</th>", "<th>错误</th>", "<th>建议</th>"} {
+	// The dropped columns must be gone (unit-11 A). 耗时 is back
+	// (FEAT-CMP-TBL-DURATION) and must NOT be in this list.
+	for _, gone := range []string{"<th>错误</th>", "<th>建议</th>"} {
 		if strings.Contains(body, gone) {
 			t.Errorf("dropped column header still rendered: %q", gone)
 		}
@@ -567,5 +568,57 @@ func TestDataCompareReport_TableDetailPills(t *testing.T) {
 	}
 	if n := strings.Count(body, strings.Repeat("查", 80)); n != 1 {
 		t.Errorf("full suggestion count=%d want 1 (expand area only)", n)
+	}
+}
+
+// TestDataCompareReport_TableDurationColumn (FEAT-CMP-TBL-DURATION C2): the
+// per-table 耗时 column is restored on the html face — tables WITH a duration
+// render it verbatim between 差异 and 行级差异; tables WITHOUT one (old
+// report.json files — TableReport.Duration is omitempty and the compare path
+// never filled it before this feature) render the honest「—」, and the
+// expand-row colspan matches the 9-column layout.
+func TestDataCompareReport_TableDurationColumn(t *testing.T) {
+	s, _ := newTestServer(t)
+	id := dcTaskFixture(t, s, dcReport(), nil)
+
+	rec := dcReportGet(t, s, id, "html")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// New-report face: the two tables the fixture stamps durations on
+	// render them verbatim in a num cell.
+	for _, want := range []string{
+		`<td class="num">10.200s</td>`,
+		`<td class="num">5.000s</td>`,
+		`<th class="colnum">耗时</th>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("html missing %q", want)
+		}
+	}
+	// Old-report compat: the two fixture tables WITHOUT durations
+	// (public.logs skip / public.bad fail) render the honest dash cell —
+	// an old report.json decodes with Duration="" and must not break the
+	// column count or render a blank cell.
+	for _, row := range []string{`<td>public.logs</td>`, `<td>public.bad</td>`} {
+		i := strings.Index(body, row)
+		if i < 0 {
+			t.Fatalf("row %q not rendered", row)
+		}
+		seg := body[i:]
+		if j := strings.Index(seg, "</tr>"); j >= 0 {
+			seg = seg[:j]
+		}
+		if !strings.Contains(seg, `<td class="num">—</td>`) {
+			t.Errorf("old-report row %s lacks the honest「—」duration cell", row)
+		}
+		if strings.Contains(seg, `class="num"></td>`) {
+			t.Errorf("old-report row %s renders a blank duration cell", row)
+		}
+	}
+	// Exactly one 耗时 column header (restored once, not duplicated).
+	if n := strings.Count(body, "<th>耗时</th>") + strings.Count(body, `<th class="colnum">耗时</th>`); n != 1 {
+		t.Errorf("耗时 header count=%d want 1", n)
 	}
 }

@@ -655,6 +655,14 @@ const loadingReport = ref(false)
 let ws: WebSocket | null = null
 let pollTimer: number | undefined
 
+// FEAT-CMP-TBL-DURATION: 已完成表 live list (表名/状态/耗时). Accumulated from
+// the OnTableDone WS broadcasts (each carries table_status/table_duration for
+// the table named by current_table); newest first, bounded height (收拢式防刷屏).
+// Deliberately NOT part of the persisted task schema — refresh resets it and
+// report.json stays the persistent truth (D2 ruling).
+interface DoneTableEntry { name: string; status: string; duration?: string }
+const doneTables = ref<DoneTableEntry[]>([])
+
 async function refreshTasks() {
   try {
     const { data } = await apiClient.listCompares()
@@ -692,6 +700,15 @@ function connectWS() {
         activeTask.value.total_chunks = data.total_chunks ?? activeTask.value.total_chunks
         activeTask.value.possibly_stuck = data.possibly_stuck ?? activeTask.value.possibly_stuck
         activeTask.value.status = data.status ?? activeTask.value.status
+        // FEAT-CMP-TBL-DURATION: table-done broadcasts carry table_status —
+        // chunk-progress and terminal broadcasts don't, so the field is the
+        // gate. Each hit lights the finished table's 耗时 immediately.
+        if (data.table_status && data.current_table) {
+          const entry: DoneTableEntry = { name: data.current_table, status: data.table_status, duration: data.table_duration }
+          if (!doneTables.value.some(e => e.name === entry.name)) {
+            doneTables.value.unshift(entry)
+          }
+        }
         if (data.status && data.status !== 'running') {
           await refreshTasks()
           await loadReport(data.task_id)
@@ -780,6 +797,7 @@ async function startCompare() {
     })
     activeTask.value = data
     activeReport.value = null
+    doneTables.value = [] // FEAT-CMP-TBL-DURATION: fresh run, fresh live list
     ElMessage.success('比对任务已发起')
     saveCompareParams() // silent params memory (fire-and-forget)
     await refreshTasks()
@@ -806,6 +824,7 @@ async function cancelActive() {
 async function viewTask(t: CompareTask) {
   activeTask.value = t
   activeReport.value = null
+  doneTables.value = [] // FEAT-CMP-TBL-DURATION: live list is per-watch-session (refresh-restart accepted, D2)
   if (t.status === 'completed') await loadReport(t.id)
 }
 
@@ -1364,6 +1383,20 @@ onUnmounted(() => {
           （当前：{{ activeTask.current_table }}<template v-if="showChunkProgress">，chunk {{ activeTask.current_chunk }}/{{ activeTask.total_chunks }}</template>）
         </span>
       </div>
+      <!-- FEAT-CMP-TBL-DURATION: 已完成表 live list — each finished table lights
+           its 耗时 the moment the WS table-done broadcast lands. Bounded height
+           + newest first keeps a 100-table run from flooding the panel; the
+           report table below stays the full/persistent face. -->
+      <div v-if="activeTask.status === 'running' && doneTables.length" class="done-tables-box">
+        <div class="done-tables-head">已完成表（{{ doneTables.length }}，最新在前）</div>
+        <div class="done-tables-list">
+          <div v-for="t in doneTables" :key="t.name" class="done-tables-row">
+            <span class="done-tables-name">{{ t.name }}</span>
+            <el-tag size="small" :type="tableStatusTag(t.status)">{{ tableStatusText(t.status) }}</el-tag>
+            <span class="tims-num done-tables-dur">{{ t.duration || '—' }}</span>
+          </div>
+        </div>
+      </div>
       <el-alert
         v-if="activeTask.status === 'running' && activeTask.possibly_stuck"
         type="warning"
@@ -1667,6 +1700,40 @@ onUnmounted(() => {
   color: var(--tims-brand);
   background: rgba(226, 82, 66, 0.08);
   font-family: var(--tims-font-mono);
+}
+/* FEAT-CMP-TBL-DURATION: 已完成表 live list — 收拢式防刷屏（限高滚动，最新在前） */
+.done-tables-box {
+  margin-bottom: 12px;
+  border: 1px solid rgba(0, 0, 0, 0.10);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+.done-tables-head {
+  color: var(--tims-text-2);
+  font-size: var(--tims-font-xs);
+  margin-bottom: 6px;
+}
+.done-tables-list {
+  max-height: 168px;
+  overflow-y: auto;
+}
+.done-tables-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: var(--tims-font-sm);
+}
+.done-tables-name {
+  flex: 1;
+  font-family: var(--tims-font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.done-tables-dur {
+  min-width: 72px;
+  text-align: right;
 }
 
 @media (max-width: 900px) {

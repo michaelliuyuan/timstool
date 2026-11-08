@@ -284,19 +284,24 @@ tr.row-detail details::details-content { display: block !important; content-visi
 	}
 	sb.WriteString(`</div></div>`)
 
-	// Per-table detail (unit-11 A–F): 8 columns — # | 表名 | 状态 | 源端行数
-	// | 目标行数 | 差异 | 行级差异 | 备注. 耗时 is gone (task-level duration
-	// lives in the overview card), 错误/建议全文/明细文件名 moved into the
-	// per-row native <details> expand area (zero JS). Rows sort
-	// failure-first (失败 → 警告 → 通过/跳过) with the engine's original #
-	// kept for traceability; failed rows get the light-red tint + 3px left
-	// bar. Numbers render thousand-separated, right-aligned, diff>0 red.
+	// Per-table detail (unit-11 A–F): 9 columns — # | 表名 | 状态 | 源端行数
+	// | 目标行数 | 差异 | 耗时 | 行级差异 | 备注. FEAT-CMP-TBL-DURATION
+	// restores the per-table 耗时 column now that the compare engine fills
+	// TableReport.Duration (the column was dropped in unit-11 because the
+	// compare path never populated it — see reporter.go's own HTML face,
+	// which always kept it). Null-safe: tables from OLD report.json files
+	// (no duration key — the field is omitempty) render「—」like every other
+	// honest blank. 错误/建议全文/明细文件名 moved into the per-row native
+	// <details> expand area (zero JS). Rows sort failure-first
+	// (失败 → 警告 → 通过/跳过) with the engine's original # kept for
+	// traceability; failed rows get the light-red tint + 3px left bar.
+	// Numbers render thousand-separated, right-aligned, diff>0 red.
 	// The 行级差异 cell carries the three count pills (内容 n red / 仅源 n
 	// orange / 仅目标 n grey) or the honest-abort note in brief; the full
 	// engine sentences stay byte-identical in the expand area.
 	if len(rpt.Tables) > 0 {
 		sb.WriteString(`<div class="card"><h2>表详情</h2><table><thead><tr>`)
-		sb.WriteString(`<th>#</th><th>表名</th><th>状态</th><th class="colnum">源端行数</th><th class="colnum">目标行数</th><th class="colnum">差异</th><th>行级差异</th><th>备注</th>`)
+		sb.WriteString(`<th>#</th><th>表名</th><th>状态</th><th class="colnum">源端行数</th><th class="colnum">目标行数</th><th class="colnum">差异</th><th class="colnum">耗时</th><th>行级差异</th><th>备注</th>`)
 		sb.WriteString(`</tr></thead><tbody>`)
 		order := make([]int, len(rpt.Tables))
 		for i := range order {
@@ -315,6 +320,13 @@ tr.row-detail details::details-content { display: block !important; content-visi
 			diffHTML := `<td class="num">—</td>`
 			if t.DiffRows != 0 {
 				diffHTML = fmt.Sprintf(`<td class="num diff-pos">%s</td>`, mcHTMLEsc(dcComma(t.DiffRows)))
+			}
+			// FEAT-CMP-TBL-DURATION: per-table wall clock (D1=A). Empty
+			// for pre-feature report.json files → honest「—」, never a
+			// blank cell (reporter.ToHTML durStr precedent).
+			durHTML := `<td class="num">—</td>`
+			if t.Duration != "" {
+				durHTML = fmt.Sprintf(`<td class="num">%s</td>`, mcHTMLEsc(t.Duration))
 			}
 			rdCell := "—"
 			var det []string
@@ -346,10 +358,10 @@ tr.row-detail details::details-content { display: block !important; content-visi
 				det = append(det, fmt.Sprintf(`<div><span class="det-label">错误全文</span>%s</div>`, mcHTMLEsc(t.Error)))
 			}
 			fmt.Fprintf(&sb,
-				`<tr%s><td class="num">%d</td><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%s</td><td class="num">%s</td>%s<td>%s</td><td>%s</td></tr>`,
-				rowClass, idx+1, mcHTMLEsc(t.TableName), mcHTMLEsc(badgeClass), mcHTMLEsc(dcStatusCN(string(t.Status))), mcHTMLEsc(dcComma(t.SourceRows)), mcHTMLEsc(dcComma(t.TargetRows)), diffHTML, rdCell, mcHTMLEsc(dcBrief(t.Suggestion)))
+				`<tr%s><td class="num">%d</td><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%s</td><td class="num">%s</td>%s%s<td>%s</td><td>%s</td></tr>`,
+				rowClass, idx+1, mcHTMLEsc(t.TableName), mcHTMLEsc(badgeClass), mcHTMLEsc(dcStatusCN(string(t.Status))), mcHTMLEsc(dcComma(t.SourceRows)), mcHTMLEsc(dcComma(t.TargetRows)), diffHTML, durHTML, rdCell, mcHTMLEsc(dcBrief(t.Suggestion)))
 			if len(det) > 0 {
-				fmt.Fprintf(&sb, `<tr class="row-detail"><td colspan="8"><details><summary>诊断详情</summary>%s</details></td></tr>`, strings.Join(det, ""))
+				fmt.Fprintf(&sb, `<tr class="row-detail"><td colspan="9"><details><summary>诊断详情</summary>%s</details></td></tr>`, strings.Join(det, ""))
 			}
 		}
 		sb.WriteString(`</tbody></table></div>`)

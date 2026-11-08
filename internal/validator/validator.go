@@ -37,6 +37,12 @@ type Validator struct {
 	compareOverride  *config.CompareConfig
 	parallelOverride int
 
+	// srcDriverOverride lets in-package tests swap the source driver NAME
+	// Run() opens (the real "pgx"/"mysql" drivers are always registered by
+	// the blank imports, so a scripted driver needs its own name). Empty —
+	// the production default — keeps srcDriverName() byte-identical.
+	srcDriverOverride string
+
 	// onTableDone is an optional per-table progress callback (tables done so
 	// far, total tables, latest table report). Called from worker goroutines;
 	// implementations must be safe for concurrent use.
@@ -99,6 +105,9 @@ func (v *Validator) srcLabel() string {
 // dispatched on the assembled dialect (pgx for PG, mysql for MySQL/TiDB
 // wire).
 func (v *Validator) srcDriverName() string {
+	if v.srcDriverOverride != "" {
+		return v.srcDriverOverride
+	}
 	if _, ok := v.srcDialect.(mysqlDialect); ok {
 		return "mysql"
 	}
@@ -415,6 +424,20 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 		go func(tableName string) {
 			defer wg.Done()
 
+			// FEAT-CMP-TBL-DURATION (D1=A): wall clock for THIS table's
+			// whole processing window — started at goroutine entry (queue
+			// wait for the budget slots counts on purpose: a table stuck
+			// waiting IS the slow table users need to spot), stopped at
+			// the AddTableReport collection seam below. One seam covers
+			// every mode (quick/sample/checksum) and every ending
+			// (pass/fail/wm-precheck fail/unknown mode) because every
+			// branch funnels into that collection. Pure sidecar timing:
+			// judgment semantics, query text and retries are untouched,
+			// and TableReport.Duration is a pre-existing omitempty field
+			// (report.json schema unchanged; the migration report's own
+			// filling path in migrator.go is not involved).
+			tableStart := time.Now()
+
 			// #wm-override (P1A): resolve THIS table's effective filter —
 			// override entry → global group → none — once, before anything
 			// else; every downstream consumer (precheck, mode body via the
@@ -511,6 +534,12 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 					tr.Suggestion = note + "；" + tr.Suggestion
 				}
 			}
+
+			// FEAT-CMP-TBL-DURATION: stop the table clock at the one
+			// collection seam — after the (in-memory, nanosecond) note
+			// stamps, before the report append, so the stamped value is
+			// exactly what report.json and OnTableDone both carry.
+			tr.Duration = reporter.FormatDuration(time.Since(tableStart))
 
 			mu.Lock()
 			rpt.AddTableReport(tr)

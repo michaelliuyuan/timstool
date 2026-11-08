@@ -836,6 +836,22 @@ func (s *Server) compareHeartbeat(ctx context.Context, task *CompareTask, taskMu
 	}
 }
 
+// tableDoneProgress builds the OnTableDone WS broadcast payload
+// (FEAT-CMP-TBL-DURATION): the per-table-done event now also carries the
+// finished table's status + duration so the running panel can light each
+// table's 耗时 the moment it completes. The persisted CompareTask schema is
+// deliberately untouched — WS push only; report.json stays the persistent
+// truth and a page refresh resetting the live list is accepted (D2).
+func tableDoneProgress(task *CompareTask, done, total int, tr reporter.TableReport) map[string]interface{} {
+	return map[string]interface{}{
+		"type": "compare", "status": task.Status,
+		"tables_done": done, "tables_total": total, "current_table": tr.TableName,
+		"current_chunk": task.CurrentChunk, "total_chunks": task.TotalChunks,
+		"possibly_stuck": task.PossiblyStuck,
+		"table_status":   string(tr.Status), "table_duration": tr.Duration,
+	}
+}
+
 func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 	logger := zap.L()
 	logger.Info("starting standalone comparison",
@@ -893,12 +909,7 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 		if err := s.persistCompareTask(task); err != nil {
 			logger.Warn("failed to persist compare progress", zap.Error(err))
 		}
-		s.BroadcastProgress(task.ID, map[string]interface{}{
-			"type": "compare", "status": task.Status,
-			"tables_done": done, "tables_total": total, "current_table": tr.TableName,
-			"current_chunk": task.CurrentChunk, "total_chunks": task.TotalChunks,
-			"possibly_stuck": task.PossiblyStuck,
-		})
+		s.BroadcastProgress(task.ID, tableDoneProgress(task, done, total, tr))
 	})
 	// #t95 P1: chunk-level progress (checksum mode) — the UI shows
 	// 「正在校验 X，chunk i/N」; quick/sample modes never fire it.
