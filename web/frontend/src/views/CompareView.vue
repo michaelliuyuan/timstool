@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRoute } from 'vue-router'
 import apiClient from '../api'
 import type { CompareTask, CompareReport, CompareOptions, CreateCompareRequest, CompareRowDiffs, CompareRowDiffContentEntry } from '../api'
 import ConnectionForm from '../components/ConnectionForm.vue'
@@ -12,6 +13,8 @@ import { reconcileModel } from '../composables/reconcileModel'
 
 // Standalone data comparison (独立数据比对): configure source + target, pick
 // tables and a compare mode, run the validator directly — no migration.
+
+const route = useRoute()
 
 const { sources, load: loadSources, getSource, capable, implementedKinds } = useSourceSchema()
 const { load: loadDataSources, get: getDataSource } = useDataSources()
@@ -1114,6 +1117,13 @@ onMounted(async () => {
   // disabled until this completes so the fill can't race user input.
   await loadSavedConnection()
   await refreshTasks()
+  // FEAT-DASH-CMP-CARD ③: deep link from dashboard — /compare?task=<id>
+  // auto-selects that task in the history (silent no-op on stale ids; route
+  // optional-chained so router-less mounts in the vitest harness stay green).
+  const qid = route?.query?.task
+  const wanted = qid == null ? '' : String(Array.isArray(qid) ? qid[0] : qid)
+  const hit = wanted ? tasks.value.find((t) => t.id === wanted) : undefined
+  if (hit) await viewTask(hit)
   connectWS()
   pollTimer = window.setInterval(() => {
     if (activeTask.value?.status === 'running') refreshTasks()
