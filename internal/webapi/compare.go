@@ -191,6 +191,12 @@ var errCompareCredsLost = errors.New("凭据不随任务持久化，请重新提
 // ones fail explicitly with errCompareCredsLost (the password red line means
 // they can never be recovered silently).
 func (s *Server) recoverStaleCompares() {
+	// M1: a crash can leave row-hash spool temp files behind (the run that
+	// would have cleaned them died). No compare can be running during
+	// recovery, so the whole task-level spool tree is stale — purge it.
+	if err := os.RemoveAll(filepath.Join(s.dataDir, "spool")); err != nil {
+		zap.L().Warn("failed to purge stale compare spool dir", zap.Error(err))
+	}
 	entries, err := os.ReadDir(filepath.Join(s.dataDir, "compare"))
 	if err != nil {
 		return
@@ -1283,6 +1289,10 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 	// there; the summary rides report.json). Empty for every other
 	// validator caller — the feature is compare-only by design.
 	validateOpts.DiffDetailDir = filepath.Join(s.compareDir(task.ID), "diff")
+	// M1 row-hash spool: per-task temp dir under <dataDir>/spool; the
+	// validator removes it when the run settles (any ending), and startup
+	// recovery purges leftovers from crashes.
+	validateOpts.SpoolRoot = filepath.Join(s.dataDir, "spool", task.ID)
 	// MS-08: DSNByType dispatches on the source type (PG keeps the legacy
 	// postgresql:// DSN byte-identically; MySQL assembles the driver DSN).
 	report, err := v.RunWithDSNs(ctx, task.Source.DSNByType(), task.Target.DSN(),

@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"database/sql"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
@@ -32,17 +33,61 @@ type tidbColMapping struct {
 	name    string
 }
 
+// M1 spool: the three no-PK/degraded strategies below stream BOTH sides
+// (the caller hands over the already-open PG full-table cursor; the TiDB
+// full-table query opens exactly as before), hash each row with the same
+// normalizeValue + computeRowHash* pipeline, and count the hashes through
+// a disk-backed spool instead of whole-table in-memory maps. Verdict
+// semantics, mismatch messages and suggestions are preserved
+// set-for-set; detail ordering is deterministic ascending-hash where the
+// legacy maps iterated in Go-map random order (byte-identical output for
+// ≤1 mismatch by construction). The lockstep (hash, count) walk replaces
+// the legacy per-side map lookups (see rowhashspool.go).
+
+// hashGroupMaxDetails caps the mismatch detail list rendered into the
+// error message (legacy maxShow). The cap is applied INSIDE the walk
+// callback so memory stays O(1) in the mismatch count (review 阻断1: the
+// accumulator was the last unbounded structure on the spool path).
+const hashGroupMaxDetails = 10
+
+// tidbPeekColumns fetches TiDB column metadata with a zero-row probe so
+// the unified skip/trim sets can be built BEFORE the PG scan streams (the
+// legacy code obtained the same metadata from the full TiDB query after PG
+// was already materialized). Types are identical to the full query's.
+func (v *Validator) tidbPeekColumns(ctx context.Context, tidbConn *sql.Conn, table, errPrefix string) ([]*sql.ColumnType, error) {
+	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+	defer cancel()
+	rows, err := tidbConn.QueryContext(qctx,
+		fmt.Sprintf("SELECT * FROM %s WHERE 1=0", v.tgtDialect.QuoteIdent(table)))
+	if err != nil {
+		return nil, fmt.Errorf("%squery TiDB: %v", errPrefix, annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
+	}
+	defer rows.Close()
+	cols, _ := rows.ColumnTypes()
+	if cols == nil {
+		return nil, fmt.Errorf("%sfailed to get TiDB column types", errPrefix)
+	}
+	return cols, nil
+}
+
+// (spool disclosure rendering lives in rowhashspool.go: spoolSuffixFor)
+
 // validateHashGroup performs hash-group-based validation for tables without
 // a reliable unique key. It computes a hash of each row's values (sorted by
 // column name for cross-DB consistency) and compares the multiset of hashes
-// between PG and TiDB.
-func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, tr reporter.TableReport, pgCols []*sql.ColumnType, pgData [][]string, skipCols map[int]bool) reporter.TableReport {
+// between PG and TiDB. M1: both sides stream through a bounded-memory
+// row-hash spool (semantics identical to the legacy in-memory maps).
+func (v *Validator) validateHashGroup(ctx context.Context, tidbConn *sql.Conn, table string, tr reporter.TableReport, pgCols []*sql.ColumnType, pgRows *sql.Rows, skipCols map[int]bool) reporter.TableReport {
 	logger := zap.L()
 	logger.Info("using hash group validation for no-PK table", zap.String("table", table))
 
-	schema := v.cfg.Source.Schema
-	if schema == "" {
-		schema = "public"
+	// Peek TiDB column metadata (zero-row probe) so the unified skip/trim
+	// sets are known before the PG scan streams its hashes.
+	tidbCols, err := v.tidbPeekColumns(ctx, tidbConn, table, "hash group: ")
+	if err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = err.Error()
+		return tr
 	}
 
 	// Build ordered list of PG column names for consistent hashing.
@@ -65,33 +110,6 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 			continue
 		}
 		hashCols = append(hashCols, colMapping{pgIdx: idx, name: name})
-	}
-
-	// Query TiDB for the full table first so we can build a unified skip set.
-	// P0-2: query-level deadline on the full-table scan.
-	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
-	defer cancel()
-	var tidbRows *sql.Rows
-	var err error
-	if wm := v.wmFilterFor(qctx); wm != nil {
-		tidbRows, err = tidbConn.QueryContext(qctx,
-			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
-	} else {
-		tidbRows, err = tidbConn.QueryContext(qctx,
-			fmt.Sprintf("SELECT * FROM %s", v.tgtDialect.QuoteIdent(table)))
-	}
-	if err != nil {
-		tr.Status = reporter.StatusFail
-		tr.Error = fmt.Sprintf("hash group: query TiDB: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
-		return tr
-	}
-	defer tidbRows.Close()
-
-	tidbCols, _ := tidbRows.ColumnTypes()
-	if tidbCols == nil {
-		tr.Status = reporter.StatusFail
-		tr.Error = "hash group: failed to get TiDB column types"
-		return tr
 	}
 
 	// Build TiDB column name -> index mapping
@@ -179,29 +197,86 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 		zap.Int("skipped_cols", len(unifiedSkipCols)),
 		zap.Int("trim_cols", len(trimCols)))
 
-	// Debug: log first PG row hash details
-	if len(pgData) > 0 && len(hashCols) > 0 {
-		row := pgData[0]
-		var parts []string
-		for _, hc := range hashCols {
-			val := "\\N"
-			if hc.pgIdx < len(row) {
-				val = row[hc.pgIdx]
-			}
-			if trimCols[strings.ToLower(hc.name)] {
-				val = trimTrailingWhitespace(val)
-			}
-			parts = append(parts, fmt.Sprintf("%s=%s", hc.name, truncate(val, 30)))
-		}
-		logger.Debug("hash group: first PG row", zap.String("table", table), zap.String("cols", strings.Join(parts, ",")))
+	// M1: stream PG rows straight into the spool (the caller's pgRows
+	// cursor is unscanned). Fail-loud on any spool/disk error.
+	pgSpool := v.newSideSpool()
+	defer pgSpool.Close()
+	tidbSpool := v.newSideSpool()
+	defer tidbSpool.Close()
+
+	pgValues := make([]interface{}, len(pgCols))
+	pgPtrs := make([]interface{}, len(pgCols))
+	for i := range pgValues {
+		pgPtrs[i] = &pgValues[i]
 	}
 
-	// Compute row hashes for PG (with trim handling)
-	pgHashCounts := make(map[string]int) // hash -> count
-	for _, row := range pgData {
+	firstPGRow := true
+	for pgRows.Next() {
+		if err := pgRows.Scan(pgPtrs...); err != nil {
+			tr.Status = reporter.StatusFail
+			tr.Error = fmt.Sprintf("scan %s row: %v", v.srcLabel(), err)
+			return tr
+		}
+		row := make([]string, len(pgCols))
+		for i, val := range pgValues {
+			row[i] = normalizeValue(val)
+		}
+
+		// Debug: log first PG row hash details
+		if firstPGRow && len(hashCols) > 0 {
+			var parts []string
+			for _, hc := range hashCols {
+				val := "\\N"
+				if hc.pgIdx < len(row) {
+					val = row[hc.pgIdx]
+				}
+				if trimCols[strings.ToLower(hc.name)] {
+					val = trimTrailingWhitespace(val)
+				}
+				parts = append(parts, fmt.Sprintf("%s=%s", hc.name, truncate(val, 30)))
+			}
+			logger.Debug("hash group: first PG row", zap.String("table", table), zap.String("cols", strings.Join(parts, ",")))
+			firstPGRow = false
+		}
+
 		h := computeRowHashTrimmed(row, hashCols, trimCols)
-		pgHashCounts[h]++
+		if err := pgSpool.Add(h); err != nil {
+			tr.Status = reporter.StatusFail
+			tr.Error = fmt.Sprintf("hash group: %v", err)
+			return tr
+		}
 	}
+	// A mid-scan failure (timeout included) must surface — with the spool
+	// as the only copy of the side's hashes, silently truncating here
+	// would compare partial multisets (review 高风险3).
+	if err := pgRows.Err(); err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("hash group: scan %s: %v", v.srcLabel(), annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
+		return tr
+	}
+
+	logger.Info("no-PK table: querying full PG table for hash group comparison",
+		zap.String("table", table),
+		zap.Uint64("row_count", pgSpool.Rows()))
+
+	// Query TiDB for the full table and stream its hashes into the spool.
+	// P0-2: query-level deadline on the full-table scan.
+	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
+	defer cancel()
+	var tidbRows *sql.Rows
+	if wm := v.wmFilterFor(qctx); wm != nil {
+		tidbRows, err = tidbConn.QueryContext(qctx,
+			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
+	} else {
+		tidbRows, err = tidbConn.QueryContext(qctx,
+			fmt.Sprintf("SELECT * FROM %s", v.tgtDialect.QuoteIdent(table)))
+	}
+	if err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("hash group: query TiDB: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
+		return tr
+	}
+	defer tidbRows.Close()
 
 	tidbValues := make([]interface{}, len(tidbCols))
 	tidbPtrs := make([]interface{}, len(tidbCols))
@@ -209,8 +284,6 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 		tidbPtrs[i] = &tidbValues[i]
 	}
 
-	// Compute row hashes for TiDB (with trim handling)
-	tidbHashCounts := make(map[string]int)
 	tidbRowCount := 0
 	firstTiDBRow := true
 	for tidbRows.Next() {
@@ -221,9 +294,6 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 		for i, val := range tidbValues {
 			tidbRow[i] = normalizeValue(val)
 		}
-		h := computeTiDBRowHashTrimmed(tidbRow, tidbHashCols, trimCols)
-		tidbHashCounts[h]++
-		tidbRowCount++
 
 		// Debug: log first TiDB row hash details
 		if firstTiDBRow && len(tidbHashCols) > 0 {
@@ -241,47 +311,103 @@ func (v *Validator) validateHashGroup(ctx context.Context, pgDB *sql.DB, tidbCon
 			logger.Debug("hash group: first TiDB row", zap.String("table", table), zap.String("cols", strings.Join(parts, ",")))
 			firstTiDBRow = false
 		}
-	}
 
-	// Compare multisets
-	var mismatchDetails []string
-
-	// Check PG hashes against TiDB
-	for h, pgCnt := range pgHashCounts {
-		tidbCnt := tidbHashCounts[h]
-		if pgCnt != tidbCnt {
-			if tidbCnt == 0 {
-				mismatchDetails = append(mismatchDetails,
-					fmt.Sprintf("%s has %d row(s) with hash %s not found in TiDB", v.srcLabel(), pgCnt, truncate(h, 16)))
-			} else {
-				mismatchDetails = append(mismatchDetails,
-					fmt.Sprintf("hash %s: %s count=%d TiDB count=%d", truncate(h, 16), v.srcLabel(), pgCnt, tidbCnt))
-			}
+		h := computeTiDBRowHashTrimmed(tidbRow, tidbHashCols, trimCols)
+		if err := tidbSpool.Add(h); err != nil {
+			tr.Status = reporter.StatusFail
+			tr.Error = fmt.Sprintf("hash group: %v", err)
+			return tr
 		}
+		tidbRowCount++
+	}
+	// See the PG-side note: a truncated TiDB scan must fail, never
+	// silently compare partial multisets (review 高风险3).
+	if err := tidbRows.Err(); err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("hash group: scan TiDB: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
+		return tr
 	}
 
-	// Check TiDB hashes not in PG
-	for h, tidbCnt := range tidbHashCounts {
-		pgCnt := pgHashCounts[h]
-		if pgCnt == 0 {
+	// Compare multisets via the sorted spool iterators (M1: streaming
+	// lockstep walk; the legacy per-side map lookups produced exactly this
+	// set of differing (hash, pgCount, tidbCount) triples).
+	//
+	// Bounded detail accumulation (review 阻断1): details cap INSIDE the
+	// walk callback — O(1) memory in the mismatch count. mismatchCount
+	// keeps the true total; the Suggestion renders len(mismatchDetails) =
+	// min(true, hashGroupMaxDetails), exactly the legacy post-truncation
+	// length.
+	pgIt, err := pgSpool.Finish()
+	if err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("hash group: %v", err)
+		return tr
+	}
+	defer pgIt.Close()
+	tidbIt, err := tidbSpool.Finish()
+	if err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("hash group: %v", err)
+		return tr
+	}
+	defer tidbIt.Close()
+
+	var mismatchDetails []string
+	mismatchCount := 0
+	pgDistinct := 0
+	walkErr := walkHashCounters(pgIt, tidbIt, func(h string, pgCnt, tidbCnt int) {
+		if pgCnt > 0 {
+			pgDistinct++ // every distinct hash present on the PG side
+		}
+		if pgCnt == tidbCnt {
+			return
+		}
+		mismatchCount++
+		if len(mismatchDetails) >= hashGroupMaxDetails {
+			return
+		}
+		if tidbCnt == 0 {
+			mismatchDetails = append(mismatchDetails,
+				fmt.Sprintf("%s has %d row(s) with hash %s not found in TiDB", v.srcLabel(), pgCnt, truncate(h, 16)))
+		} else if pgCnt == 0 {
 			mismatchDetails = append(mismatchDetails,
 				fmt.Sprintf("TiDB has %d row(s) with hash %s not found in %s", tidbCnt, truncate(h, 16), v.srcLabel()))
+		} else {
+			mismatchDetails = append(mismatchDetails,
+				fmt.Sprintf("hash %s: %s count=%d TiDB count=%d", truncate(h, 16), v.srcLabel(), pgCnt, tidbCnt))
 		}
+	})
+
+	if walkErr != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("hash group: %v", walkErr)
+		return tr
 	}
 
-	if len(mismatchDetails) > 0 {
+	if mismatchCount > 0 {
 		tr.Status = reporter.StatusFail
-		maxShow := 10
-		if len(mismatchDetails) > maxShow {
-			mismatchDetails = mismatchDetails[:maxShow]
-		}
 		tr.Error = fmt.Sprintf("hash group mismatch: %s", strings.Join(mismatchDetails, "; "))
+		if mismatchCount > len(mismatchDetails) {
+			logger.Info("hash group mismatch details truncated",
+				zap.String("table", table),
+				zap.Int("mismatches", mismatchCount),
+				zap.Int("shown", len(mismatchDetails)))
+		}
 	} else {
 		tr.Status = reporter.StatusPass
 	}
 
-	tr.Suggestion = fmt.Sprintf("hash group validation: %d %s hashes vs %d TiDB rows, %d mismatches",
-		len(pgHashCounts), v.srcLabel(), tidbRowCount, len(mismatchDetails))
+	tr.Suggestion = fmt.Sprintf("hash group validation: %d %s hashes vs %d TiDB rows, %d mismatches%s",
+		pgDistinct, v.srcLabel(), tidbRowCount, len(mismatchDetails), spoolSuffixFor(pgSpool, tidbSpool))
+
+	if pgSpool.Spilled() || tidbSpool.Spilled() {
+		logger.Info("hash group used row-hash spool",
+			zap.String("table", table),
+			zap.Uint64("pg_rows", pgSpool.Rows()),
+			zap.Uint64("tidb_rows", tidbSpool.Rows()),
+			zap.Bool("pg_spilled", pgSpool.Spilled()),
+			zap.Bool("tidb_spilled", tidbSpool.Spilled()))
+	}
 
 	return tr
 }
@@ -367,17 +493,46 @@ func isApproximateFloatType(dt string) bool {
 		dt == "double" || dt == "double precision"
 }
 
+// streamAggregateHash feeds the sorted (hash, count) stream into md5 in
+// exactly the legacy "join(sortedHashesWithDuplicates, \",\")" byte order.
+func streamAggregateHash(it hashCountIter) (string, int64, error) {
+	h := md5.New()
+	var rows int64
+	first := true
+	for {
+		hash, count, err := it.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", 0, err
+		}
+		rows += int64(count)
+		for i := 0; i < count; i++ {
+			if !first {
+				h.Write([]byte(","))
+			}
+			h.Write([]byte(hash))
+			first = false
+		}
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), rows, nil
+}
+
 // validateAggregateHash computes a single aggregate hash for each side (PG and TiDB)
 // by sorting all individual row hashes and hashing the concatenation. This gives a
 // fast yes/no answer: if the aggregate hashes match, the tables are identical.
 // If they differ, the caller should fall back to hash_group or bucket for details.
-func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, tr reporter.TableReport, pgCols []*sql.ColumnType, pgData [][]string, skipCols map[int]bool) reporter.TableReport {
+// M1: the sorted hash lists live in the bounded-memory spool, never in RAM.
+func (v *Validator) validateAggregateHash(ctx context.Context, tidbConn *sql.Conn, table string, tr reporter.TableReport, pgCols []*sql.ColumnType, pgRows *sql.Rows, skipCols map[int]bool) reporter.TableReport {
 	logger := zap.L()
 	logger.Info("using aggregate hash validation for no-PK table", zap.String("table", table))
 
-	schema := v.cfg.Source.Schema
-	if schema == "" {
-		schema = "public"
+	tidbCols, err := v.tidbPeekColumns(ctx, tidbConn, table, "aggregate hash: ")
+	if err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = err.Error()
+		return tr
 	}
 
 	// Build sorted column list for consistent hashing
@@ -399,19 +554,45 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 		hashCols = append(hashCols, colMapping{pgIdx: idx, name: name})
 	}
 
-	// Compute sorted list of PG row hashes
-	pgHashes := make([]string, 0, len(pgData))
-	for _, row := range pgData {
-		pgHashes = append(pgHashes, computeRowHash(row, hashCols))
+	pgSpool := v.newSideSpool()
+	defer pgSpool.Close()
+	tidbSpool := v.newSideSpool()
+	defer tidbSpool.Close()
+
+	// Stream PG row hashes into the spool (legacy: materialized [][]string)
+	pgValues := make([]interface{}, len(pgCols))
+	pgPtrs := make([]interface{}, len(pgCols))
+	for i := range pgValues {
+		pgPtrs[i] = &pgValues[i]
 	}
-	sort.Strings(pgHashes)
-	pgAggregate := fmt.Sprintf("%x", md5.Sum([]byte(strings.Join(pgHashes, ","))))
+	for pgRows.Next() {
+		if err := pgRows.Scan(pgPtrs...); err != nil {
+			tr.Status = reporter.StatusFail
+			tr.Error = fmt.Sprintf("aggregate hash: scan %s row: %v", v.srcLabel(), err)
+			return tr
+		}
+		row := make([]string, len(pgCols))
+		for i, val := range pgValues {
+			row[i] = normalizeValue(val)
+		}
+		if err := pgSpool.Add(computeRowHash(row, hashCols)); err != nil {
+			tr.Status = reporter.StatusFail
+			tr.Error = fmt.Sprintf("aggregate hash: %v", err)
+			return tr
+		}
+	}
+	// Mid-scan failure must fail the table — never compare a partial
+	// multiset (review 高风险3).
+	if err := pgRows.Err(); err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("aggregate hash: scan %s: %v", v.srcLabel(), annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
+		return tr
+	}
 
 	// Query TiDB full table. P0-2: query-level deadline on the full-table scan.
 	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
 	defer cancel()
 	var tidbRows *sql.Rows
-	var err error
 	if wm := v.wmFilterFor(qctx); wm != nil {
 		tidbRows, err = tidbConn.QueryContext(qctx,
 			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
@@ -426,13 +607,6 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 	}
 	defer tidbRows.Close()
 
-	tidbCols, _ := tidbRows.ColumnTypes()
-	if tidbCols == nil {
-		tr.Status = reporter.StatusFail
-		tr.Error = "aggregate hash: failed to get TiDB column types"
-		return tr
-	}
-
 	// MS-03: target-side hash-column matching relocated into the target
 	// dialect (docs/MS03-DIALECT-MAP.md, TargetDialect.MatchHashColumns).
 	tidbHashCols := v.tgtDialect.MatchHashColumns(pgColNames, tidbCols)
@@ -443,7 +617,6 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 		tidbPtrs[i] = &tidbValues[i]
 	}
 
-	var tidbHashes []string
 	for tidbRows.Next() {
 		if err := tidbRows.Scan(tidbPtrs...); err != nil {
 			continue
@@ -452,10 +625,48 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 		for i, val := range tidbValues {
 			tidbRow[i] = normalizeValue(val)
 		}
-		tidbHashes = append(tidbHashes, computeTiDBRowHash(tidbRow, tidbHashCols))
+		if err := tidbSpool.Add(computeTiDBRowHash(tidbRow, tidbHashCols)); err != nil {
+			tr.Status = reporter.StatusFail
+			tr.Error = fmt.Sprintf("aggregate hash: %v", err)
+			return tr
+		}
 	}
-	sort.Strings(tidbHashes)
-	tidbAggregate := fmt.Sprintf("%x", md5.Sum([]byte(strings.Join(tidbHashes, ","))))
+	// See the PG-side note (review 高风险3).
+	if err := tidbRows.Err(); err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("aggregate hash: scan TiDB: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
+		return tr
+	}
+
+	// Sorted-hash-list aggregate, streamed through md5 (byte-identical to
+	// the legacy sort+join+md5 over the in-memory slices).
+	pgIt, err := pgSpool.Finish()
+	if err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("aggregate hash: %v", err)
+		return tr
+	}
+	defer pgIt.Close()
+	pgAggregate, pgHashRows, aerr := streamAggregateHash(pgIt)
+	if aerr != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("aggregate hash: %v", aerr)
+		return tr
+	}
+
+	tidbIt, err := tidbSpool.Finish()
+	if err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("aggregate hash: %v", err)
+		return tr
+	}
+	defer tidbIt.Close()
+	tidbAggregate, tidbHashRows, aerr := streamAggregateHash(tidbIt)
+	if aerr != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("aggregate hash: %v", aerr)
+		return tr
+	}
 
 	if pgAggregate != tidbAggregate {
 		tr.Status = reporter.StatusFail
@@ -464,17 +675,37 @@ func (v *Validator) validateAggregateHash(ctx context.Context, pgDB *sql.DB, tid
 		tr.Status = reporter.StatusPass
 	}
 
-	tr.Suggestion = fmt.Sprintf("aggregate hash validation: src_hash=%s tidb_hash=%s, %d %s rows vs %d TiDB rows",
-		truncate(pgAggregate, 16), truncate(tidbAggregate, 16), len(pgHashes), v.srcLabel(), len(tidbHashes))
+	tr.Suggestion = fmt.Sprintf("aggregate hash validation: src_hash=%s tidb_hash=%s, %d %s rows vs %d TiDB rows%s",
+		truncate(pgAggregate, 16), truncate(tidbAggregate, 16), pgHashRows, v.srcLabel(), tidbHashRows, spoolSuffixFor(pgSpool, tidbSpool))
+
+	if pgSpool.Spilled() || tidbSpool.Spilled() {
+		logger.Info("aggregate hash used row-hash spool",
+			zap.String("table", table),
+			zap.Uint64("pg_rows", pgSpool.Rows()),
+			zap.Uint64("tidb_rows", tidbSpool.Rows()))
+	}
 
 	return tr
 }
 
+// bucketDiffInfo remembers the first (lowest-hash) differing hash in a
+// mismatched bucket plus its signed count delta (src - tidb), reproducing
+// the legacy per-bucket multiset detail form. Legacy picked a map-random
+// differing hash; lowest-hash is the deterministic normalization.
+type bucketDiffInfo struct {
+	hash  string
+	delta int
+}
+
 // validateBucketCompare divides table rows into N buckets based on row hash modulo,
-// compares row counts per bucket, and drills into mismatched buckets using hash_group.
-func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, tr reporter.TableReport, pgCols []*sql.ColumnType, pgData [][]string, skipCols map[int]bool) reporter.TableReport {
+// compares row counts per bucket, and drills into mismatched buckets using hash
+// counts. M1: hash buckets derive from the sorted spool walk — a bucket
+// mismatches iff it contains at least one hash whose counts differ across
+// sides (exactly the legacy per-bucket count+multiset verdict), with the
+// same detail messages.
+func (v *Validator) validateBucketCompare(ctx context.Context, tidbConn *sql.Conn, table string, tr reporter.TableReport, pgCols []*sql.ColumnType, pgRows *sql.Rows, skipCols map[int]bool) reporter.TableReport {
 	logger := zap.L()
-	bucketCount := v.cfg.Compare.NoPKBucketCount
+	bucketCount := v.compareCfg().NoPKBucketCount
 	if bucketCount <= 0 {
 		bucketCount = 100
 	}
@@ -483,9 +714,11 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 		zap.String("table", table),
 		zap.Int("bucket_count", bucketCount))
 
-	schema := v.cfg.Source.Schema
-	if schema == "" {
-		schema = "public"
+	tidbCols, err := v.tidbPeekColumns(ctx, tidbConn, table, "bucket compare: ")
+	if err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = err.Error()
+		return tr
 	}
 
 	// Build sorted column list
@@ -507,19 +740,51 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 		hashCols = append(hashCols, colMapping{pgIdx: idx, name: name})
 	}
 
-	// Assign PG rows to buckets
-	pgBuckets := make([][]string, bucketCount) // bucket -> list of row hashes
-	for _, row := range pgData {
+	pgSpool := v.newSideSpool()
+	defer pgSpool.Close()
+	tidbSpool := v.newSideSpool()
+	defer tidbSpool.Close()
+
+	// Per-bucket row totals are plain int64 arrays (bounded by
+	// bucketCount, same exposure the legacy per-bucket slices had).
+	pgBucketTotals := make([]int64, bucketCount)
+	tidbBucketTotals := make([]int64, bucketCount)
+
+	pgValues := make([]interface{}, len(pgCols))
+	pgPtrs := make([]interface{}, len(pgCols))
+	for i := range pgValues {
+		pgPtrs[i] = &pgValues[i]
+	}
+	for pgRows.Next() {
+		if err := pgRows.Scan(pgPtrs...); err != nil {
+			tr.Status = reporter.StatusFail
+			tr.Error = fmt.Sprintf("bucket compare: scan %s row: %v", v.srcLabel(), err)
+			return tr
+		}
+		row := make([]string, len(pgCols))
+		for i, val := range pgValues {
+			row[i] = normalizeValue(val)
+		}
 		h := computeRowHash(row, hashCols)
-		bucket := bucketOf(h, bucketCount)
-		pgBuckets[bucket] = append(pgBuckets[bucket], h)
+		if err := pgSpool.Add(h); err != nil {
+			tr.Status = reporter.StatusFail
+			tr.Error = fmt.Sprintf("bucket compare: %v", err)
+			return tr
+		}
+		pgBucketTotals[bucketOf(h, bucketCount)]++
+	}
+	// Mid-scan failure must fail the table — never compare a partial
+	// multiset (review 高风险3).
+	if err := pgRows.Err(); err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("bucket compare: scan %s: %v", v.srcLabel(), annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
+		return tr
 	}
 
-	// Query TiDB full table and assign to buckets. P0-2: query-level deadline.
+	// Query TiDB full table. P0-2: query-level deadline.
 	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
 	defer cancel()
 	var tidbRows *sql.Rows
-	var err error
 	if wm := v.wmFilterFor(qctx); wm != nil {
 		tidbRows, err = tidbConn.QueryContext(qctx,
 			fmt.Sprintf("SELECT * FROM %s WHERE %s", v.tgtDialect.QuoteIdent(table), v.tgtDialect.WmPredicateFragment(wm)), wmArgs(wm)...)
@@ -534,13 +799,6 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 	}
 	defer tidbRows.Close()
 
-	tidbCols, _ := tidbRows.ColumnTypes()
-	if tidbCols == nil {
-		tr.Status = reporter.StatusFail
-		tr.Error = "bucket compare: failed to get TiDB column types"
-		return tr
-	}
-
 	// MS-03: target-side hash-column matching relocated into the target
 	// dialect (docs/MS03-DIALECT-MAP.md, TargetDialect.MatchHashColumns).
 	tidbHashCols := v.tgtDialect.MatchHashColumns(pgColNames, tidbCols)
@@ -551,7 +809,6 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 		tidbPtrs[i] = &tidbValues[i]
 	}
 
-	tidbBuckets := make([][]string, bucketCount)
 	for tidbRows.Next() {
 		if err := tidbRows.Scan(tidbPtrs...); err != nil {
 			continue
@@ -561,61 +818,96 @@ func (v *Validator) validateBucketCompare(ctx context.Context, pgDB *sql.DB, tid
 			tidbRow[i] = normalizeValue(val)
 		}
 		h := computeTiDBRowHash(tidbRow, tidbHashCols)
-		bucket := bucketOf(h, bucketCount)
-		tidbBuckets[bucket] = append(tidbBuckets[bucket], h)
+		if err := tidbSpool.Add(h); err != nil {
+			tr.Status = reporter.StatusFail
+			tr.Error = fmt.Sprintf("bucket compare: %v", err)
+			return tr
+		}
+		tidbBucketTotals[bucketOf(h, bucketCount)]++
+	}
+	// See the PG-side note (review 高风险3).
+	if err := tidbRows.Err(); err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("bucket compare: scan TiDB: %v", annotateQueryTimeout(err, v.compareCfg().QueryTimeoutDuration()))
+		return tr
 	}
 
-	// Compare buckets: check row counts, drill into mismatched buckets
-	var mismatchDetails []string
-	mismatchedBuckets := 0
+	// Bucket verdicts from the lockstep hash-count walk: a bucket
+	// mismatches iff some hash in it differs across sides. bucketDiffs
+	// keeps the first (lowest-hash) differing hash + signed delta for the
+	// equal-totals detail form.
+	pgIt, err := pgSpool.Finish()
+	if err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("bucket compare: %v", err)
+		return tr
+	}
+	defer pgIt.Close()
+	tidbIt, err := tidbSpool.Finish()
+	if err != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("bucket compare: %v", err)
+		return tr
+	}
+	defer tidbIt.Close()
 
-	for i := 0; i < bucketCount; i++ {
-		pgCount := len(pgBuckets[i])
-		tidbCount := len(tidbBuckets[i])
-		if pgCount != tidbCount {
-			mismatchedBuckets++
-			if len(mismatchDetails) < 5 {
-				mismatchDetails = append(mismatchDetails,
-					fmt.Sprintf("bucket %d: %s=%d rows TiDB=%d rows", i, v.srcLabel(), pgCount, tidbCount))
-			}
+	bucketDiffs := make(map[int]bucketDiffInfo)
+	walkErr := walkHashCounters(pgIt, tidbIt, func(h string, pgCnt, tidbCnt int) {
+		if pgCnt == tidbCnt {
+			return
+		}
+		b := bucketOf(h, bucketCount)
+		if _, seen := bucketDiffs[b]; !seen {
+			bucketDiffs[b] = bucketDiffInfo{hash: h, delta: pgCnt - tidbCnt}
+		}
+	})
+	if walkErr != nil {
+		tr.Status = reporter.StatusFail
+		tr.Error = fmt.Sprintf("bucket compare: %v", walkErr)
+		return tr
+	}
+
+	// Compare buckets in bucket order (deterministic, matching the legacy
+	// 0..N-1 loop): count-mismatched buckets take form 1; equal-count
+	// buckets with multiset diffs take form 2.
+	var mismatchDetails []string
+	mismatchedBuckets := len(bucketDiffs)
+
+	for i := 0; i < bucketCount && len(mismatchDetails) < 5; i++ {
+		d, ok := bucketDiffs[i]
+		if !ok {
 			continue
 		}
-		// Same count — check if the hash multisets match
-		if pgCount > 0 {
-			pgMap := make(map[string]int)
-			for _, h := range pgBuckets[i] {
-				pgMap[h]++
-			}
-			for _, h := range tidbBuckets[i] {
-				pgMap[h]--
-			}
-			for h, diff := range pgMap {
-				if diff != 0 {
-					mismatchedBuckets++
-					if len(mismatchDetails) < 5 {
-						mismatchDetails = append(mismatchDetails,
-							fmt.Sprintf("bucket %d: hash %s count differs by %d", i, truncate(h, 16), diff))
-					}
-					break
-				}
-			}
+		if pgBucketTotals[i] != tidbBucketTotals[i] {
+			mismatchDetails = append(mismatchDetails,
+				fmt.Sprintf("bucket %d: %s=%d rows TiDB=%d rows", i, v.srcLabel(), pgBucketTotals[i], tidbBucketTotals[i]))
+		} else {
+			mismatchDetails = append(mismatchDetails,
+				fmt.Sprintf("bucket %d: hash %s count differs by %d", i, truncate(d.hash, 16), d.delta))
 		}
 	}
 
 	if mismatchedBuckets > 0 {
 		tr.Status = reporter.StatusFail
-		if len(mismatchDetails) > 5 {
-			mismatchDetails = append(mismatchDetails[:5],
-				fmt.Sprintf("... and %d more mismatched buckets", mismatchedBuckets-5))
-		}
+		// Legacy detail shape: at most 5 bucket details and NOTHING more.
+		// (The legacy "… and N more mismatched buckets" suffix branch was
+		// dead code — the detail loop above caps at 5 — and is deliberately
+		// NOT revived; the true bucket count already leads the message.)
 		tr.Error = fmt.Sprintf("bucket mismatch (%d/%d buckets): %s",
 			mismatchedBuckets, bucketCount, strings.Join(mismatchDetails, "; "))
 	} else {
 		tr.Status = reporter.StatusPass
 	}
 
-	tr.Suggestion = fmt.Sprintf("bucket validation: %d buckets, %d mismatched, %d %s rows",
-		bucketCount, mismatchedBuckets, len(pgData), v.srcLabel())
+	tr.Suggestion = fmt.Sprintf("bucket validation: %d buckets, %d mismatched, %d %s rows%s",
+		bucketCount, mismatchedBuckets, pgSpool.Rows(), v.srcLabel(), spoolSuffixFor(pgSpool, tidbSpool))
+
+	if pgSpool.Spilled() || tidbSpool.Spilled() {
+		logger.Info("bucket compare used row-hash spool",
+			zap.String("table", table),
+			zap.Uint64("pg_rows", pgSpool.Rows()),
+			zap.Uint64("tidb_rows", tidbSpool.Rows()))
+	}
 
 	return tr
 }

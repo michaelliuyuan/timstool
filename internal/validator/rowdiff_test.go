@@ -499,12 +499,15 @@ func (s *sideScript) sawQueries(substr string) []string {
 // sawFullScan reports whether a full-table SELECT * (no LIMIT/OFFSET — the
 // hash_group/aggregate re-run shape) was issued on this side. The M1/M2
 // guardrail re-run must issue one on both sides; the chunk windows all carry
-// LIMIT, so this is unambiguous re-run evidence.
+// LIMIT, so this is unambiguous re-run evidence. The M1 tidbPeekColumns
+// zero-row metadata probe ("SELECT * … WHERE 1=0") is explicitly excluded —
+// it satisfies the textual shape but proves nothing about a real scan
+// (review 中风险1: without this the anchor is tautological on the TiDB side).
 func (s *sideScript) sawFullScan() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, q := range s.queries {
-		if strings.Contains(q, "SELECT *") && !strings.Contains(q, "LIMIT") && !strings.Contains(q, "OFFSET") {
+		if strings.Contains(q, "SELECT *") && !strings.Contains(q, "LIMIT") && !strings.Contains(q, "OFFSET") && !strings.Contains(q, "WHERE 1=0") {
 			return true
 		}
 	}

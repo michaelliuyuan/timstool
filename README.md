@@ -304,6 +304,17 @@ compare:
   compare_mode: "sample"       # quick(行数) | sample(抽样,默认) | checksum(分块哈希) | full(全量)
   checksum_chunk_size: 50000   # checksum 模式每块行数
   checksum_parallel: 4         # checksum 模式并发数
+  # M1 无PK/降级路径内存上限（row-hash spool）: hash_group/aggregate/bucket 与
+  # checksum 降级重跑不再整表驻留内存（历史问题: 亿行无PK表 ~50G RSS）。
+  # 两侧流式扫表 → 逐行哈希 → 计数先进内存 map（与旧实现一致），越过
+  # 65536 个去重哈希阈值（约 5MB 计数内存）后有序分段落盘
+  # （<dataDir>/spool/<任务ID>/），归并比对。小表完全不落盘、行为与旧版
+  # 一致；大表内存峰值有界（与表大小无关），代价是约 10-30% 的额外磁盘
+  # I/O。落盘量取决于去重哈希数，最坏（全差异）= 行数 × 18B × 2 侧 × 并发
+  # 表数（级联归并瞬间可再翻约一倍），部署时请按此口径预留 <dataDir> 所在
+  # 盘的空间；实际去重数更低时占用相应更小。任务完成/失败/取消均自动清理
+  # 临时文件，服务重启时启动恢复清扫残留；磁盘写失败会让该表显式 failed
+  # （错误信息含 row-hash spool），绝不静默退化为无界内存。
 
 # Web 监控面板（CLI 模式可选）
 web:
