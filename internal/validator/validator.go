@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -60,6 +61,16 @@ type Validator struct {
 	// compare/{id}/diff/). Empty — the orchestrator/CLI default — keeps the
 	// drill fully off and Run() behavior byte-identical.
 	diffDetailDir string
+
+	// spoolRoot is the M1 row-hash spool root for this run (per-task dir
+	// under <dataDir>/spool on the compare path; a self-cleaning temp dir
+	// for orchestrator/CLI runs). Run() prepares and removes it; the
+	// no-PK/degraded hash paths bound their memory through it. Spill-space
+	// headroom is an ops concern (worst-case sizing formula in README);
+	// in-run write failures stay fail-loud (review r2: an upfront catalog
+	// preflight poisoned the shared query deadline and could starve the
+	// connection pool at high concurrency — removed).
+	spoolRoot string
 
 	// MS-03 dialect injection: source-side and target-side specifics live
 	// behind CompareDialect/TargetDialect (pure relocation; see
@@ -336,6 +347,17 @@ func (v *Validator) RunWithDSNs(ctx context.Context, pgDSN, tidbDSN, schema stri
 	return clone.Run(ctx, opts)
 }
 
+// newSideSpool returns a row-hash spool for one side of one table. Run()
+// normally sets spoolRoot; the defensive fallback keeps direct-call tests
+// working (their spools never spill on small fixtures anyway).
+func (v *Validator) newSideSpool() *rowHashSpool {
+	root := v.spoolRoot
+	if root == "" {
+		root = os.TempDir()
+	}
+	return newRowHashSpool(root, defaultSpoolRunEntries)
+}
+
 // getTiDBConn gets a dedicated connection from the TiDB connection pool and
 // initializes the session (timezone to UTC) via the target dialect - this
 // ensures TIMESTAMP values are returned in UTC, matching PostgreSQL's
@@ -360,6 +382,29 @@ func (v *Validator) Run(ctx context.Context, opts common.ValidateOpts) (*reporte
 	// directory; empty keeps the drill (and this Run) byte-identical for
 	// orchestrator/CLI callers.
 	v.diffDetailDir = opts.DiffDetailDir
+
+	// M1 row-hash spool: bounded-memory hash counting for the no-PK and
+	// degraded-unique paths. The compare path passes a per-task directory
+	// (removed by the caller-visible cleanup below); everyone else gets a
+	// self-cleaning temp dir so CLI runs are bounded too. Failure to
+	// prepare the dir fails the run loud — never silently unbounded.
+	if opts.SpoolRoot != "" {
+		// Errata seq=211: clear kill -9 leftovers from a previous attempt
+		// at THIS root before use (same-task reruns after crash recovery).
+		os.RemoveAll(opts.SpoolRoot)
+		if err := os.MkdirAll(opts.SpoolRoot, 0o755); err != nil {
+			return nil, fmt.Errorf("row-hash spool: prepare %s: %w", opts.SpoolRoot, err)
+		}
+		v.spoolRoot = opts.SpoolRoot
+		defer os.RemoveAll(opts.SpoolRoot)
+	} else {
+		d, err := os.MkdirTemp("", "timstool-spool-*")
+		if err != nil {
+			return nil, fmt.Errorf("row-hash spool: create temp dir: %w", err)
+		}
+		v.spoolRoot = d
+		defer os.RemoveAll(d)
+	}
 
 	// Resolve effective mode: CLI flag > config default
 	mode := opts.Mode
@@ -1277,18 +1322,17 @@ func (v *Validator) validateSampling(ctx context.Context, pgDB *sql.DB, tidbConn
 }
 
 // validateSamplingWithHashGroup handles no-PK table validation using hash group
-// comparison. It queries ALL rows from PG (hash_group is an exact strategy,
-// not a sampled one), then uses validateHashGroup to compare the multiset of
-// row hashes against TiDB's full table.
+// comparison. It opens the full PG table scan (hash_group is an exact strategy,
+// not a sampled one) and hands the streaming cursor to validateHashGroup, which
+// counts both sides through the bounded-memory row-hash spool (M1 — the legacy
+// full-table [][]string materialization is gone).
 func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, ratio float64, tr reporter.TableReport, schema string) reporter.TableReport {
-	logger := zap.L()
-
 	// P0-2: query-level deadline on the full-table scan — a hung hash_group
 	// query fails this table, never the run.
 	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
 	defer cancel()
 
-	// Hash group is an exact strategy 鈥?query the full PG table, not a sample.
+	// Hash group is an exact strategy — query the full PG table, not a sample.
 	// Sampling would cause mismatches because TiDB is also queried in full.
 	var pgRows *sql.Rows
 	var err error
@@ -1326,34 +1370,12 @@ func (v *Validator) validateSamplingWithHashGroup(ctx context.Context, pgDB *sql
 		return tr
 	}
 
-	pgValues := make([]interface{}, len(pgCols))
-	pgPtrs := make([]interface{}, len(pgCols))
-	for i := range pgValues {
-		pgPtrs[i] = &pgValues[i]
-	}
-
-	var pgData [][]string
-	for pgRows.Next() {
-		if err := pgRows.Scan(pgPtrs...); err != nil {
-			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("scan %s row: %v", v.srcLabel(), err)
-			return tr
-		}
-		row := make([]string, len(pgCols))
-		for i, val := range pgValues {
-			row[i] = normalizeValue(val)
-		}
-		pgData = append(pgData, row)
-	}
-
-	logger.Info("no-PK table: querying full PG table for hash group comparison",
-		zap.String("table", table),
-		zap.Int("row_count", len(pgData)))
-
-	return v.validateHashGroup(ctx, pgDB, tidbConn, table, tr, pgCols, pgData, skipCols)
+	return v.validateHashGroup(ctx, tidbConn, table, tr, pgCols, pgRows, skipCols)
 }
 
-// validateNoPKWithAggregate wraps full-table PG query + aggregate hash validation.
+// validateNoPKWithAggregate opens the full PG scan and hands the streaming
+// cursor to validateAggregateHash (M1 spool; legacy full-table [][]string
+// materialization removed).
 func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, tr reporter.TableReport, schema string) reporter.TableReport {
 	// P0-2: query-level deadline on the full-table scan.
 	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
@@ -1393,30 +1415,12 @@ func (v *Validator) validateNoPKWithAggregate(ctx context.Context, pgDB *sql.DB,
 		return tr
 	}
 
-	pgValues := make([]interface{}, len(pgCols))
-	pgPtrs := make([]interface{}, len(pgCols))
-	for i := range pgValues {
-		pgPtrs[i] = &pgValues[i]
-	}
-
-	var pgData [][]string
-	for pgRows.Next() {
-		if err := pgRows.Scan(pgPtrs...); err != nil {
-			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("aggregate hash: scan %s row: %v", v.srcLabel(), err)
-			return tr
-		}
-		row := make([]string, len(pgCols))
-		for i, val := range pgValues {
-			row[i] = normalizeValue(val)
-		}
-		pgData = append(pgData, row)
-	}
-
-	return v.validateAggregateHash(ctx, pgDB, tidbConn, table, tr, pgCols, pgData, skipCols)
+	return v.validateAggregateHash(ctx, tidbConn, table, tr, pgCols, pgRows, skipCols)
 }
 
-// validateNoPKWithBucket wraps full-table PG query + bucket validation.
+// validateNoPKWithBucket opens the full PG scan and hands the streaming
+// cursor to validateBucketCompare (M1 spool; legacy full-table [][]string
+// materialization removed).
 func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, tidbConn *sql.Conn, table string, tr reporter.TableReport, schema string) reporter.TableReport {
 	// P0-2: query-level deadline on the full-table scan.
 	qctx, cancel := context.WithTimeout(ctx, v.compareCfg().QueryTimeoutDuration())
@@ -1456,27 +1460,7 @@ func (v *Validator) validateNoPKWithBucket(ctx context.Context, pgDB *sql.DB, ti
 		return tr
 	}
 
-	pgValues := make([]interface{}, len(pgCols))
-	pgPtrs := make([]interface{}, len(pgCols))
-	for i := range pgValues {
-		pgPtrs[i] = &pgValues[i]
-	}
-
-	var pgData [][]string
-	for pgRows.Next() {
-		if err := pgRows.Scan(pgPtrs...); err != nil {
-			tr.Status = reporter.StatusFail
-			tr.Error = fmt.Sprintf("bucket compare: scan %s row: %v", v.srcLabel(), err)
-			return tr
-		}
-		row := make([]string, len(pgCols))
-		for i, val := range pgValues {
-			row[i] = normalizeValue(val)
-		}
-		pgData = append(pgData, row)
-	}
-
-	return v.validateBucketCompare(ctx, pgDB, tidbConn, table, tr, pgCols, pgData, skipCols)
+	return v.validateBucketCompare(ctx, tidbConn, table, tr, pgCols, pgRows, skipCols)
 }
 
 func (v *Validator) getTables(ctx context.Context, pgDB *sql.DB, include []string) ([]string, error) {

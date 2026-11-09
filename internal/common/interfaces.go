@@ -60,6 +60,11 @@ type ValidateOpts struct {
 	// (TableReport.row_diffs). Empty = feature off (orchestrator/CLI
 	// default — Run behavior unchanged).
 	DiffDetailDir string
+	// SpoolRoot is the M1 row-hash spool root for this run: the compare
+	// path passes a per-task directory (<dataDir>/spool/<id>, removed when
+	// the run settles); empty = a self-cleaning temp dir so CLI runs get
+	// bounded memory too. Disk failures fail the run loud.
+	SpoolRoot string
 }
 
 type PrecheckOpts struct {
