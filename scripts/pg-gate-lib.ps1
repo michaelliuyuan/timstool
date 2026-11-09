@@ -356,7 +356,10 @@ function Wait-CompareDone {
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $deadline) {
         $t = Invoke-GateApi -Method Get -Path "/compare/tasks/$CompareId"
-        if ($t.status -ne 'running') { return $t }
+        # A1 queue: 'queued' is NOT terminal - the task is waiting for the run
+        # slot and will be dispatched automatically. Only completed/failed/
+        # cancelled end the wait (running and queued keep polling).
+        if ($t.status -ne 'running' -and $t.status -ne 'queued') { return $t }
         Start-Sleep -Milliseconds 700
     }
     throw "compare task $CompareId did not finish in ${TimeoutSec}s"

@@ -136,6 +136,7 @@ const cmpModeText = (m: string) => CMP_MODE_TEXT[m] || m
 // 状态胶囊按任务 status 诚实呈现（结论级胶囊 D2 已裁 v2：completed 不误红）。
 // FEAT-DASH-UNIFY D②：运行态统一 info 蓝档（与 muted 灰/结论四档分离，不回退红档）。
 const CMP_STATUS_PILL: Record<string, { cls: string; text: string }> = {
+  queued: { cls: 'tims-pill--warn', text: '排队中' },
   running: { cls: 'tims-pill--info', text: '运行中' },
   completed: { cls: 'tims-pill--muted', text: '已完成' },
   failed: { cls: 'tims-pill--fail', text: '失败' },

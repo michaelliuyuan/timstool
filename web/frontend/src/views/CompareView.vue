@@ -676,8 +676,11 @@ async function refreshTasks() {
       if (fresh) {
         activeTask.value = fresh
         // Fallback when the terminal WS message was dropped (L3): the poll
-        // alone must still load the finished report.
-        if (prevStatus === 'running' && fresh.status === 'completed') {
+        // alone must still load the finished report. A1: a queued task can
+        // be dispatched AND finish between two 5s polls (queued→running→
+        // completed), so every non-terminal predecessor counts — not just
+        // 'running'.
+        if ((prevStatus === 'running' || prevStatus === 'queued') && fresh.status === 'completed') {
           loadReport(fresh.id)
         }
       }
@@ -801,7 +804,9 @@ async function startCompare() {
     activeTask.value = data
     activeReport.value = null
     doneTables.value = [] // FEAT-CMP-TBL-DURATION: fresh run, fresh live list
-    ElMessage.success('比对任务已发起')
+    // A1: 202 = 任务排队等待（有任务正在比对），向用户说明排队而非沉默。
+    if (data.status === 'queued') ElMessage.success('已有比对任务进行中，本任务已加入队列')
+    else ElMessage.success('比对任务已发起')
     saveCompareParams() // silent params memory (fire-and-forget)
     await refreshTasks()
   } catch (e: any) {
@@ -813,12 +818,17 @@ async function startCompare() {
 
 async function cancelActive() {
   if (!activeTask.value) return
+  // A1: 取消排队任务 = 出队（立即生效）；取消运行任务 = 中断比对。
+  const queued = activeTask.value.status === 'queued'
   try {
-    await ElMessageBox.confirm('确认取消当前比对任务？进行中的比对将中断。', '确认', { type: 'warning' })
+    await ElMessageBox.confirm(
+      queued ? '确认取消该排队中的比对任务？任务将移出队列，立即生效。' : '确认取消当前比对任务？进行中的比对将中断。',
+      '确认', { type: 'warning' })
   } catch { return }
   try {
     await apiClient.cancelCompare(activeTask.value.id)
-    ElMessage.success('已请求取消')
+    ElMessage.success(queued ? '已取消排队' : '已请求取消')
+    await refreshTasks()
   } catch (e: any) {
     ElMessage.error(e.response?.data?.error || e.message)
   }
@@ -861,10 +871,25 @@ const showChunkProgress = computed(() => {
 })
 
 function statusTag(s: string) {
-  return s === 'completed' ? 'success' : s === 'running' ? 'primary' : s === 'failed' ? 'danger' : 'info'
+  return s === 'completed' ? 'success' : s === 'running' ? 'primary' : s === 'failed' ? 'danger' : s === 'queued' ? 'warning' : 'info'
 }
 function statusText(s: string) {
-  return { completed: '已完成', running: '比对中', failed: '失败', cancelled: '已取消' }[s] || s
+  return { completed: '已完成', running: '比对中', failed: '失败', cancelled: '已取消', queued: '排队中' }[s] || s
+}
+// A1 队列：排队位次（纯展示派生，不动既有字段语义）。后端按 QueueSeq（严格
+// 入队序）派发，位次即「queue_seq 不大于自身的排队任务数」（FIFO 头为第 1 位）；
+// queue_seq 缺省（旧记录）时退化为 created_at 比较，仅作展示兜底。
+function queuePosition(t: CompareTask): number {
+  const ownSeq = (t as any).queue_seq
+  const ownTime = new Date(t.created_at).getTime()
+  return tasks.value.filter((x) => {
+    if (x.status !== 'queued') return false
+    const xs = (x as any).queue_seq
+    if (typeof ownSeq === 'number' && ownSeq > 0 && typeof xs === 'number' && xs > 0) {
+      return xs <= ownSeq
+    }
+    return new Date(x.created_at).getTime() <= ownTime
+  }).length
 }
 function tableStatusTag(s: string) {
   return { pass: 'success', fail: 'danger', warn: 'warning', skip: 'info' }[s] || 'info'
@@ -1126,7 +1151,14 @@ onMounted(async () => {
   if (hit) await viewTask(hit)
   connectWS()
   pollTimer = window.setInterval(() => {
-    if (activeTask.value?.status === 'running') refreshTasks()
+    // A1: keep refreshing while anything is in flight. Checking only the
+    // CURRENT status of one task is a trap: a queued task can walk queued→
+    // running→terminal inside a single 5s tick, so if the terminal WS frame
+    // is lost the UI freezes at 「排队中」. Instead poll while ANY row is
+    // still non-terminal (queued/running) — the condition clears itself the
+    // moment the list is fully settled.
+    const settled = (s?: string) => !s || s === 'completed' || s === 'failed' || s === 'cancelled'
+    if (!tasks.value.every((t) => settled(t.status))) refreshTasks()
   }, 5000)
 })
 
@@ -1381,8 +1413,9 @@ onUnmounted(() => {
         <div style="display: flex; justify-content: space-between; align-items: center;">
           <span style="font-weight: bold;">{{ activeTask.name }}（{{ activeTask.id }}）</span>
           <el-space>
-            <el-tag :type="statusTag(activeTask.status)">{{ statusText(activeTask.status) }}</el-tag>
-            <el-button v-if="activeTask.status === 'running'" size="small" type="danger" @click="cancelActive">取消</el-button>
+            <el-tag :type="statusTag(activeTask.status)">{{ statusText(activeTask.status) }}{{ activeTask.status === 'queued' ? `（第 ${queuePosition(activeTask)} 位）` : '' }}</el-tag>
+            <!-- A1: 排队中的任务可直接取消（出队即取消，不打断任何运行） -->
+            <el-button v-if="activeTask.status === 'running' || activeTask.status === 'queued'" size="small" type="danger" @click="cancelActive">取消</el-button>
           </el-space>
         </div>
       </template>
@@ -1570,7 +1603,7 @@ onUnmounted(() => {
         </el-table-column>
         <el-table-column label="状态" width="90">
           <template #default="{ row }">
-            <el-tag :type="statusTag(row.status)" size="small">{{ statusText(row.status) }}</el-tag>
+            <el-tag :type="statusTag(row.status)" size="small">{{ statusText(row.status) }}{{ row.status === 'queued' ? `（第 ${queuePosition(row)} 位）` : '' }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="表进度" width="120" class-name="hide-sm">

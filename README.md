@@ -571,17 +571,18 @@ GET    /api/v1/sources/tables/{table}/columns  # 列出表列（类型可比较�
 #### 独立数据比对
 
 ```
-POST   /api/v1/compare/tasks                   # 创建并启动比对任务（源/目标连接 + 模式 + 表清单）
+POST   /api/v1/compare/tasks                   # 创建比对任务（源/目标连接 + 模式 + 表清单）
+                                               #   空闲时 201 立即开跑；已有任务运行/排队时 202 + status=queued 入队
 GET    /api/v1/compare/tasks                   # 比对历史列表
 GET    /api/v1/compare/tasks/{compareID}       # 比对任务详情（状态、表进度、当前表）
 GET    /api/v1/compare/tasks/{compareID}/report  # 比对报告（默认 HTML 家族报告附件；?format=json 原样 report.json 字节）
-POST   /api/v1/compare/tasks/{compareID}/cancel  # 取消进行中的比对
-DELETE /api/v1/compare/tasks/{compareID}       # 删除比对记录
+POST   /api/v1/compare/tasks/{compareID}/cancel  # 取消比对：运行中→cancelling（异步中断）；排队中→cancelled（立即出队）
+DELETE /api/v1/compare/tasks/{compareID}       # 删除比对记录（运行中拒绝，需先取消；排队/历史可删）
 GET    /api/v1/compare/options                 # 读取已保存的连接配置（密码恒为空）
 PUT    /api/v1/compare/options                 # 保存连接配置（部分合并；密码永不落盘）
 ```
 
-> 比对模式：`quick`（行数估算，最快）/ `sample`（行数+随机采样，推荐）/ `checksum`（行数+分块哈希校验，支持分块大小与并行数）。表清单留空表示比对全部表。任务数据持久化在 `<dataDir>/compare/{id}/`，与迁移任务存储隔离；同一时刻仅允许一个比对任务运行，进程重启后遗留的 running 任务自动标记为失败。
+> 比对模式：`quick`（行数估算，最快）/ `sample`（行数+随机采样，推荐）/ `checksum`（行数+分块哈希校验，支持分块大小与并行数）。表清单留空表示比对全部表。任务数据持久化在 `<dataDir>/compare/{id}/`，与迁移任务存储隔离。**A1 任务队列**：同一时刻仍仅一个比对任务真正运行，但遇忙不再返回 409 `already running`——新任务以 `status=queued` 进入 FIFO 排队队列（API 返回 202；队列状态即 task.json，重启不丢），前台任务结束（完成/失败/取消）后自动依序接跑队首；排队任务可通过 cancel 立即出队、也可直接删除。进程重启后遗留的 running 任务自动标记为失败；重启后排队任务中，带数据源引用（`source_ref`/`target_ref`）者按序恢复调度，未带引用（内联凭据）者因密码永不落盘而显式标记失败并给出重新提交提示。
 
 #### 健康检查
 

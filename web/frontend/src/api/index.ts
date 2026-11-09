@@ -373,9 +373,15 @@ export interface CompareReport {
 export interface CompareTask {
   id: string
   name: string
-  status: 'running' | 'completed' | 'failed' | 'cancelled'
+  /** A1 queue: 'queued' = waiting for the single run slot (FIFO). */
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
   source: Record<string, any>
   target: Record<string, any>
+  /** A1 queue: datasource ids backing this task (present when created via refs; never secrets). */
+  source_ref?: string
+  target_ref?: string
+  /** A1 queue: strict FIFO admission sequence (absent on non-queued/legacy records). */
+  queue_seq?: number
   mode: string
   sample_ratio: number
   checksum_chunk_size: number
