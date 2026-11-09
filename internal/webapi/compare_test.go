@@ -243,18 +243,262 @@ func TestCompareTask_PersistRedactsPasswords(t *testing.T) {
 	}
 }
 
-func TestCompareTask_ConcurrentRejected(t *testing.T) {
+// A1: a busy slot no longer 409s — the second POST gets 202 + a queued
+// task; task.json on disk IS the queue record (status=queued, no started_at).
+// The old 409 contract is dead by design.
+func TestCompareTask_BusySlotQueues(t *testing.T) {
 	s, _ := newTestServer(t)
 	s.compare.cancel = func() {}
 	s.compare.runningID = "other"
 	defer func() { s.compare.cancel = nil; s.compare.runningID = "" }()
 
 	w, req := doReq("POST", "/api/v1/compare/tasks",
-		`{"source":{"host":"s"},"target":{"host":"t"}}`)
+		`{"source":{"host":"s","user":"u","password":"secret1"},"target":{"host":"t","password":"secret2"}}`)
 	s.handleCreateCompare(w, req)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("expected 409 while running, got %d", w.Code)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 queued while running, got %d body=%s", w.Code, w.Body.String())
 	}
+	var queued CompareTask
+	if err := json.Unmarshal(w.Body.Bytes(), &queued); err != nil {
+		t.Fatalf("decode queued: %v", err)
+	}
+	if queued.Status != CompareStatusQueued {
+		t.Fatalf("queued status = %q", queued.Status)
+	}
+	if queued.StartedAt != nil {
+		t.Fatalf("queued task must not carry started_at: %+v", queued.StartedAt)
+	}
+	// M1: the queued response is password-redacted, and the on-disk queue
+	// record must be too (stash lives in memory only).
+	if strings.Contains(w.Body.String(), "secret1") || strings.Contains(w.Body.String(), "secret2") {
+		t.Fatalf("password leaked in queued response: %s", w.Body.String())
+	}
+	t2, err := s.loadCompareTask(queued.ID)
+	if err != nil || t2 == nil {
+		t.Fatalf("reload queued task: %v", err)
+	}
+	if t2.Status != CompareStatusQueued {
+		t.Fatalf("on-disk queued status = %q", t2.Status)
+	}
+	raw, err := os.ReadFile(filepath.Join(s.compareDir(queued.ID), "task.json"))
+	if err != nil {
+		t.Fatalf("task.json missing: %v", err)
+	}
+	if strings.Contains(string(raw), "secret1") || strings.Contains(string(raw), "secret2") {
+		t.Fatalf("password leaked to disk: %s", raw)
+	}
+	// The submitted passwords must be stashed in memory for the dispatch.
+	if c, ok := s.compare.queuedCreds[queued.ID]; !ok || c.sourcePassword != "secret1" || c.targetPassword != "secret2" {
+		t.Fatalf("queued credentials not stashed: %+v", s.compare.queuedCreds)
+	}
+}
+
+// A1 fairness: while ANY queued task waits, a new POST also queues (202)
+// even though the slot itself is free — no line jumping.
+func TestCompareTask_PostQueuesBehindWaitingQueue(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.compare.cancel = func() {}
+	s.compare.runningID = "other"
+	w, req := doReq("POST", "/api/v1/compare/tasks", `{"source":{"host":"s"},"target":{"host":"t"}}`)
+	s.handleCreateCompare(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("first post status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	// Slot frees (no dispatch fires in this hand-made scenario) — a new POST
+	// must STILL queue behind the waiting task.
+	s.compare.cancel = nil
+	s.compare.runningID = ""
+	w, req = doReq("POST", "/api/v1/compare/tasks", `{"source":{"host":"s2"},"target":{"host":"t2"}}`)
+	s.handleCreateCompare(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("second post status = %d body=%s", w.Code, w.Body.String())
+	}
+	var second CompareTask
+	if err := json.Unmarshal(w.Body.Bytes(), &second); err != nil {
+		t.Fatalf("decode second: %v", err)
+	}
+	if second.Status != CompareStatusQueued {
+		t.Fatalf("second status = %q, want queued (FIFO fairness)", second.Status)
+	}
+	// The admission decision is what this pins. The slot really is free here,
+	// so the self-heal drain now hands it to the FIFO head — wait until the
+	// queue is drained so the temp-dir cleanup never races a goroutine.
+	compareWaitQueueDrained(t, s)
+}
+
+// compareWaitQueueDrained polls until no queued task remains and the running
+// slot is idle (bounded), so a test's temp-dir cleanup cannot race a dispatch.
+func compareWaitQueueDrained(t *testing.T, s *Server) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		s.compare.mu.Lock()
+		idle := s.compare.cancel == nil
+		s.compare.mu.Unlock()
+		if idle && s.earliestQueuedCompare() == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("compare queue never drained")
+}
+
+// A1: queued tasks can be cancelled (removed from the queue at once) and
+// deleted; cancelling a non-queued, non-running task still 409s.
+func TestCompareTask_QueuedCancelAndDelete(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.compare.cancel = func() {}
+	s.compare.runningID = "other"
+	defer func() { s.compare.cancel = nil; s.compare.runningID = "" }()
+
+	w, req := doReq("POST", "/api/v1/compare/tasks", `{"source":{"host":"s"},"target":{"host":"t"}}`)
+	s.handleCreateCompare(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("queue status = %d body=%s", w.Code, w.Body.String())
+	}
+	var queued CompareTask
+	if err := json.Unmarshal(w.Body.Bytes(), &queued); err != nil {
+		t.Fatalf("decode queued: %v", err)
+	}
+
+	// Cancel the queued task → immediate cancelled (not "cancelling").
+	// (Routed through the real router: the handler reads {compareID} via chi.)
+	w, req = doReq("POST", compareURL(queued.ID)+"/cancel", "")
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"cancelled"`) {
+		t.Fatalf("queued cancel status=%d body=%s", w.Code, w.Body.String())
+	}
+	t2, err := s.loadCompareTask(queued.ID)
+	if err != nil || t2 == nil {
+		t.Fatalf("reload cancelled: %v", err)
+	}
+	if t2.Status != CompareStatusCancelled || t2.FinishedAt == nil {
+		t.Fatalf("queued task not cancelled on disk: %+v", t2)
+	}
+	if _, ok := s.compare.queuedCreds[queued.ID]; ok {
+		t.Fatalf("stashed credentials survive queued cancel")
+	}
+
+	// Cancel again → 409 (neither running nor queued).
+	w, req = doReq("POST", compareURL(queued.ID)+"/cancel", "")
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("double cancel status = %d", w.Code)
+	}
+
+	// Delete a fresh queued task → 200, dir gone (running still blocks).
+	w, req = doReq("POST", "/api/v1/compare/tasks", `{"source":{"host":"s"},"target":{"host":"t"}}`)
+	s.handleCreateCompare(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("requeue status = %d body=%s", w.Code, w.Body.String())
+	}
+	var q2 CompareTask
+	if err := json.Unmarshal(w.Body.Bytes(), &q2); err != nil {
+		t.Fatalf("decode q2: %v", err)
+	}
+	w, req = doReq("DELETE", compareURL(q2.ID), "")
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("queued delete status = %d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(s.compareDir(q2.ID)); !os.IsNotExist(err) {
+		t.Fatalf("queued compare dir still exists after delete")
+	}
+	if _, ok := s.compare.queuedCreds[q2.ID]; ok {
+		t.Fatalf("stashed credentials survive queued delete")
+	}
+}
+
+// compareWaitSlotIdle polls until the running slot is free (bounded).
+func compareWaitSlotIdle(t *testing.T, s *Server) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		s.compare.mu.Lock()
+		idle := s.compare.cancel == nil
+		s.compare.mu.Unlock()
+		if idle {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("compare slot never went idle")
+}
+
+// A1 end-to-end: two tasks queued behind a fake slot are dispatched FIFO —
+// the inline credentials ride the in-memory stash — and the first task's
+// real finish() hands the slot to the second automatically.
+func TestCompareTask_FifoAutoDispatch(t *testing.T) {
+	s, _ := newTestServer(t)
+	s.compare.cancel = func() {}
+	s.compare.runningID = "other"
+
+	for _, name := range []string{"first", "second"} {
+		w, req := doReq("POST", "/api/v1/compare/tasks",
+			`{"name":"`+name+`","source":{"host":"127.0.0.1","port":1},"target":{"host":"127.0.0.1","port":2}}`)
+		s.handleCreateCompare(w, req)
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("%s: queue status = %d body=%s", name, w.Code, w.Body.String())
+		}
+	}
+
+	// Release the fake slot and kick the first dispatch by hand (in
+	// production the running task's finish() does exactly this).
+	s.compare.cancel = nil
+	s.compare.runningID = ""
+	s.dispatchNextCompare()
+
+	// Both run sequentially against unreachable ports and fail fast; the
+	// first finish dispatches the second without any external nudging.
+	compareWaitSlotIdle(t, s)
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		list := s.listCompareTasksForTest()
+		var first, second *CompareTask
+		for _, tsk := range list {
+			if tsk.Name == "first" {
+				first = tsk
+			}
+			if tsk.Name == "second" {
+				second = tsk
+			}
+		}
+		if first != nil && second != nil &&
+			first.Status != CompareStatusQueued && first.Status != CompareStatusRunning &&
+			second.Status != CompareStatusQueued && second.Status != CompareStatusRunning {
+			if second.StartedAt == nil {
+				t.Fatalf("second task never dispatched: %+v", second)
+			}
+			if first.StartedAt == nil || second.StartedAt.Before(*first.StartedAt) {
+				t.Fatalf("FIFO order violated: first=%v second=%v", first.StartedAt, second.StartedAt)
+			}
+			if second.Status != CompareStatusFailed {
+				t.Fatalf("second task status = %q, want failed (unreachable DB)", second.Status)
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("queued tasks never drained: %+v", s.listCompareTasksForTest())
+}
+
+// listCompareTasksForTest loads every on-disk compare task (test helper).
+func (s *Server) listCompareTasksForTest() []*CompareTask {
+	entries, err := os.ReadDir(filepath.Join(s.dataDir, "compare"))
+	if err != nil {
+		return nil
+	}
+	var out []*CompareTask
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if t, err := s.loadCompareTask(e.Name()); err == nil && t != nil {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func TestCompareTask_ListGetReportDelete(t *testing.T) {
@@ -408,5 +652,119 @@ func TestCompareTask_RecoverStaleRunning(t *testing.T) {
 	}
 	if t2.FinishedAt == nil {
 		t.Fatalf("recovered task missing finished_at")
+	}
+}
+
+// A1 restart recovery: queued tasks survive a restart in FIFO order.
+// Ref-backed tasks re-resolve credentials from the datasource registry and
+// are re-dispatched; a ref pointing at a MISSING datasource fails explicitly
+// and the queue moves on; inline-credential tasks fail with the explicit
+// creds-lost message (passwords are NEVER persisted — the red line).
+func TestCompareTask_RecoverQueuedOnRestart(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	// Seed the datasource registry: one postgres source + one tidb target.
+	ds := `[{"id":"dsrc0001","name":"src","type":"postgres",
+	  "fields":{"host":"127.0.0.1","port":"5433","user":"u","password":"pw-src","database":"d"}},
+	 {"id":"dtgt0001","name":"tgt","type":"tidb",
+	  "fields":{"host":"127.0.0.1","port":"4400","user":"root","password":"pw-tgt","database":"d"}}]`
+	if err := os.WriteFile(s.datasourcesFile(), []byte(ds), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	seed := func(id, name, srcRef, tgtRef, created, body string) {
+		t.Helper()
+		dir := s.compareDir(id)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		taskJSON := `{"id":"` + id + `","name":"` + name + `","status":"queued"` +
+			`,"source_ref":"` + srcRef + `","target_ref":"` + tgtRef + `"` +
+			body + `,"created_at":"` + created + `"}`
+		if err := os.WriteFile(filepath.Join(dir, "task.json"), []byte(taskJSON), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// FIFO order is earliest CreatedAt first: ref task oldest, then the
+	// broken-ref task, then the inline task.
+	base := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)
+	mid := time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339Nano)
+	late := time.Now().Add(-10 * time.Second).UTC().Format(time.RFC3339Nano)
+
+	// Recoverable: both refs exist.
+	seed("aa000001", "ref-task", "dsrc0001", "dtgt0001", base,
+		`,"source":{"host":"old"},"target":{"host":"old"},"mode":"quick"`)
+	// Refs present but the source datasource is gone → explicit failure,
+	// queue moves on to the next head.
+	seed("bb000002", "broken-ref", "gone0001", "dtgt0001", mid,
+		`,"source":{"host":"old"},"target":{"host":"old"},"mode":"quick"`)
+	// Inline credentials, no refs → explicit creds-lost failure (never a
+	// silent drop, never a password on disk).
+	seed("cc000003", "inline-task", "", "", late,
+		`,"source":{"host":"old"},"target":{"host":"old"},"mode":"quick"`)
+
+	s.recoverStaleCompares()
+
+	// The inline task failed immediately, without ever running.
+	inline, err := s.loadCompareTask("cc000003")
+	if err != nil || inline == nil {
+		t.Fatalf("reload inline: %v", err)
+	}
+	if inline.Status != CompareStatusFailed || inline.Error != errCompareCredsLost.Error() {
+		t.Fatalf("inline queued task not failed explicitly: %+v", inline)
+	}
+	if inline.StartedAt != nil {
+		t.Fatalf("inline task must never start: %+v", inline.StartedAt)
+	}
+
+	// The ref task was dispatched (it runs against unreachable ports, then
+	// fails; its finish() fails the broken-ref task via the dispatch loop).
+	compareWaitSlotIdle(t, s)
+	deadline := time.Now().Add(20 * time.Second)
+	var broken, ref *CompareTask
+	for time.Now().Before(deadline) {
+		broken, _ = s.loadCompareTask("bb000002")
+		ref, _ = s.loadCompareTask("aa000001")
+		if broken != nil && broken.Status == CompareStatusFailed &&
+			ref != nil && ref.Status == CompareStatusFailed {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// The broken-ref task failed with the resolution error, never ran.
+	if broken == nil || broken.Status != CompareStatusFailed || !strings.Contains(broken.Error, "source_ref") {
+		t.Fatalf("broken-ref task not failed with source_ref error: %+v", broken)
+	}
+	if broken.StartedAt != nil {
+		t.Fatalf("broken-ref task must never start: %+v", broken.StartedAt)
+	}
+
+	if ref == nil || ref.StartedAt == nil {
+		t.Fatalf("ref queued task never dispatched after restart: %+v", ref)
+	}
+	if ref.Status != CompareStatusFailed {
+		t.Fatalf("ref task status = %q, want failed (unreachable DB)", ref.Status)
+	}
+	if ref.Error == errCompareCredsLost.Error() {
+		t.Fatalf("ref-backed task must not hit the creds-lost path: %+v", ref)
+	}
+	if ref.SourceRef != "dsrc0001" || ref.TargetRef != "dtgt0001" {
+		t.Fatalf("refs not preserved on the dispatched task: %+v", ref)
+	}
+	// The re-resolved snapshot (registry ports), not the stale seeded host.
+	if ref.Source.Host != "127.0.0.1" || ref.Source.Port != 5433 {
+		t.Fatalf("source not re-resolved from the registry: %+v", ref.Source)
+	}
+	if ref.Target.Port != 4400 {
+		t.Fatalf("target not re-resolved from the registry: %+v", ref.Target)
+	}
+	// The re-resolved passwords ran in memory only — never hit the disk.
+	raw, err := os.ReadFile(filepath.Join(s.compareDir("aa000001"), "task.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "pw-src") || strings.Contains(string(raw), "pw-tgt") {
+		t.Fatalf("password leaked to disk during recovery dispatch: %s", raw)
 	}
 }

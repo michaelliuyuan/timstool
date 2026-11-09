@@ -3,6 +3,7 @@ package webapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,6 +31,7 @@ import (
 // migration task store; passwords are NEVER persisted in plaintext.
 
 const (
+	CompareStatusQueued    = "queued" // A1: waiting for the single run slot (FIFO queue)
 	CompareStatusRunning   = "running"
 	CompareStatusCompleted = "completed"
 	CompareStatusFailed    = "failed"
@@ -62,8 +64,11 @@ type CompareTask struct {
 	ID                   string                  `json:"id"`
 	Name                 string                  `json:"name"`
 	Status               string                  `json:"status"`
-	Source               config.SourceConfig     `json:"source"` // password redacted on disk
-	Target               config.TargetConfig     `json:"target"` // password redacted on disk
+	Source               config.SourceConfig     `json:"source"`               // password redacted on disk
+	Target               config.TargetConfig     `json:"target"`               // password redacted on disk
+	SourceRef            string                  `json:"source_ref,omitempty"` // A1 queue: datasource id only (never a secret) — lets a queued task re-resolve credentials after a restart
+	TargetRef            string                  `json:"target_ref,omitempty"` // A1 queue: datasource id only (never a secret)
+	QueueSeq             uint64                  `json:"queue_seq,omitempty"`  // A1 queue: strict admission order (monotonic per dataDir), 0 = unset/legacy
 	Mode                 string                  `json:"mode"`
 	SampleRatio          float64                 `json:"sample_ratio"`
 	ChecksumChunkSize    int64                   `json:"checksum_chunk_size"`
@@ -89,14 +94,62 @@ type CompareTask struct {
 	FinishedAt           *time.Time              `json:"finished_at,omitempty"`
 }
 
+// compareQueuedCreds carries a queued task's passwords in memory ONLY (A1):
+// task.json redacts them, so the same-process dispatch re-attaches them from
+// here. After a restart the stash is gone — only datasource-ref tasks can
+// re-enter the run (passwords are NEVER persisted; that red line stands).
+type compareQueuedCreds struct {
+	sourcePassword string
+	targetPassword string
+}
+
 // compareState guards the single-running-compare invariant and serializes
 // compare-options saves (read→merge→write must not interleave, or two
-// concurrent PUTs can lose each other's update).
+// concurrent PUTs can lose each other's update). A1: the FIFO queue lives on
+// disk (status=queued task.json files); every queue decision — enqueue,
+// dispatch, cancel, delete — happens under mu in the same critical section
+// that guards the running slot, so queue-vs-slot races are impossible.
 type compareState struct {
-	mu        sync.Mutex
-	cancel    context.CancelFunc // non-nil while a compare task is running
-	runningID string
-	optionsMu sync.Mutex // serializes compare-options load→merge→write
+	mu          sync.Mutex
+	cancel      context.CancelFunc // non-nil while a compare task is running
+	runningID   string
+	optionsMu   sync.Mutex                    // serializes compare-options load→merge→write
+	queuedCreds map[string]compareQueuedCreds // A1: keyed by queued task id; memory only, never persisted
+	queueSeq    uint64                        // A1: last admission sequence handed out (0 = not seeded yet)
+}
+
+// nextQueueSeq returns the next strict admission sequence (A1). Seeded once
+// per process from the on-disk max so the order survives a restart; every
+// caller already holds s.compare.mu, which makes the counter race-free.
+func (s *Server) nextQueueSeq() uint64 {
+	if s.compare.queueSeq == 0 {
+		s.compare.queueSeq = s.maxPersistedQueueSeq()
+	}
+	s.compare.queueSeq++
+	return s.compare.queueSeq
+}
+
+// maxPersistedQueueSeq scans the compare dir for the highest QueueSeq. Only
+// the 0-seed path pays this O(N) scan.
+func (s *Server) maxPersistedQueueSeq() uint64 {
+	entries, err := os.ReadDir(filepath.Join(s.dataDir, "compare"))
+	if err != nil {
+		return 0
+	}
+	var max uint64
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		t, err := s.loadCompareTask(e.Name())
+		if err != nil || t == nil {
+			continue
+		}
+		if t.QueueSeq > max {
+			max = t.QueueSeq
+		}
+	}
+	return max
 }
 
 func (s *Server) compareDir(id string) string {
@@ -123,10 +176,20 @@ func (s *Server) requireValidCompareID(next http.Handler) http.Handler {
 	})
 }
 
-// recoverStaleCompares marks any on-disk compare task still in "running"
-// state as failed — the process died mid-run, so it can never finish or be
-// cancelled (M3: otherwise the orphan sticks in the history list forever).
-// Called once at server startup, before any handler runs.
+// errCompareCredsLost is the explicit failure for queued tasks whose inline
+// credentials can no longer be attached in memory (restart recovery): task.json
+// redacts passwords by design, so a task without datasource refs on BOTH ends
+// can never run again — it fails visibly instead of waiting forever (A1).
+var errCompareCredsLost = errors.New("凭据不随任务持久化，请重新提交")
+
+// recoverStaleCompares reconciles on-disk compare tasks once at server
+// startup, before any handler runs. Running tasks are marked failed — the
+// process died mid-run, so they can never finish or be cancelled (M3:
+// otherwise the orphan sticks in the history list forever). A1: queued tasks
+// survive the restart — ref-backed ones are re-dispatched in FIFO order
+// (credentials re-resolved from the datasource registry), inline-credential
+// ones fail explicitly with errCompareCredsLost (the password red line means
+// they can never be recovered silently).
 func (s *Server) recoverStaleCompares() {
 	entries, err := os.ReadDir(filepath.Join(s.dataDir, "compare"))
 	if err != nil {
@@ -137,16 +200,212 @@ func (s *Server) recoverStaleCompares() {
 			continue
 		}
 		t, err := s.loadCompareTask(e.Name())
-		if err != nil || t == nil || t.Status != CompareStatusRunning {
+		if err != nil || t == nil {
+			// P1-1: a corrupt task.json must not be skipped silently — the
+			// compare would stay invisible-but-present forever (no history
+			// entry, no dispatch). Repair it into an explicit failed record so
+			// the operator sees it (the dir name is the id, so a minimal task
+			// can be rebuilt even when the body is unparseable).
+			s.failCorruptCompareOnRecovery(e.Name(), err)
 			continue
 		}
-		t.Status = CompareStatusFailed
-		t.Error = "interrupted by service restart"
-		fin := time.Now()
-		t.FinishedAt = &fin
-		if err := s.persistCompareTask(t); err != nil {
-			zap.L().Warn("failed to recover stale compare task", zap.String("id", t.ID), zap.Error(err))
+		switch t.Status {
+		case CompareStatusRunning:
+			t.Status = CompareStatusFailed
+			t.Error = "interrupted by service restart"
+			fin := time.Now()
+			t.FinishedAt = &fin
+			if err := s.persistCompareTask(t); err != nil {
+				zap.L().Warn("failed to recover stale compare task", zap.String("id", t.ID), zap.Error(err))
+			}
+		case CompareStatusQueued:
+			// A fresh process has an empty queuedCreds stash, so an end
+			// without a datasource ref has no password source left. Fail
+			// those now — visibly, never silently dropped.
+			if t.SourceRef == "" || t.TargetRef == "" {
+				t.Status = CompareStatusFailed
+				t.Error = errCompareCredsLost.Error()
+				fin := time.Now()
+				t.FinishedAt = &fin
+				if err := s.persistCompareTask(t); err != nil {
+					zap.L().Warn("failed to recover unrecoverable queued compare task", zap.String("id", t.ID), zap.Error(err))
+				}
+				continue
+			}
+			// Ref-backed queued tasks stay queued; the dispatch below hands
+			// the slot to the FIFO head.
 		}
+	}
+	// A1: restart recovery — hand the free slot to the earliest queued task.
+	s.dispatchNextCompare()
+}
+
+// failCorruptCompareOnRecovery rewrites an unreadable compare task.json as an
+// explicit failed record (P1-1). Best-effort: if the directory itself is
+// broken the warn log is the only footprint left. Never touches passwords.
+func (s *Server) failCorruptCompareOnRecovery(dir string, loadErr error) {
+	if !compareIDRe.MatchString(dir) {
+		// Not a server-generated id — leave unknown dirs alone (nothing can
+		// own them, and rewriting arbitrary paths would be a foot-gun).
+		return
+	}
+	fin := time.Now()
+	task := &CompareTask{
+		ID:         dir,
+		Name:       "Compare " + dir,
+		Status:     CompareStatusFailed,
+		Error:      "task.json 无法读取（可能损坏），已标记失败：" + loadErr.Error(),
+		CreatedAt:  fin,
+		FinishedAt: &fin,
+	}
+	if err := s.persistCompareTask(task); err != nil {
+		zap.L().Warn("failed to repair corrupt compare task.json",
+			zap.String("id", dir), zap.Error(err))
+		return
+	}
+	zap.L().Warn("repairing corrupt compare task.json as failed",
+		zap.String("id", dir), zap.Error(loadErr))
+}
+
+// earliestQueuedCompare returns the FIFO head among the on-disk queued tasks.
+// Ordering is QueueSeq (strict admission order) when present, else CreatedAt
+// then id as a legacy fallback. Caller must hold s.compare.mu.
+func (s *Server) earliestQueuedCompare() *CompareTask {
+	entries, err := os.ReadDir(filepath.Join(s.dataDir, "compare"))
+	if err != nil {
+		return nil
+	}
+	var head *CompareTask
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		t, err := s.loadCompareTask(e.Name())
+		if err != nil || t == nil || t.Status != CompareStatusQueued {
+			if err != nil {
+				// P1-1: an unreadable queued record must never vanish silently
+				// (the FE would show 「排队中 · 第N位」 forever with no dispatch).
+				zap.L().Warn("queued compare task.json unreadable, skipping for this dispatch",
+					zap.String("dir", e.Name()), zap.Error(err))
+			}
+			continue
+		}
+		if head == nil || queuedBefore(t, head) {
+			head = t
+		}
+	}
+	return head
+}
+
+// queuedBefore orders two queued tasks. QueueSeq (persisted at admission under
+// compare.mu) is the strict FIFO key; CreatedAt/id only serves records written
+// before QueueSeq existed (random uuid id ⇒ stable, not true clock order).
+func queuedBefore(a, b *CompareTask) bool {
+	if a.QueueSeq != 0 && b.QueueSeq != 0 {
+		if a.QueueSeq != b.QueueSeq {
+			return a.QueueSeq < b.QueueSeq
+		}
+		return a.ID < b.ID
+	}
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.Before(b.CreatedAt)
+	}
+	return a.ID < b.ID
+}
+
+// attachQueuedCompareCredentials makes a queued task runnable. Passwords come
+// from the in-memory stash first (same-process dispatch keeps the exact
+// submit-time credentials); failing that, from re-resolving its datasource
+// refs (the restart-recovery path — the registry may even have fresher
+// credentials). Caller must hold s.compare.mu.
+func (s *Server) attachQueuedCompareCredentials(t *CompareTask) error {
+	if creds, ok := s.compare.queuedCreds[t.ID]; ok {
+		// A1: the stash entry is dropped only AFTER the running claim hits
+		// disk (dispatchNextCompare), so a failed persist leaves the queued
+		// record and its in-memory credentials consistent for a retry.
+		t.Source.Password = creds.sourcePassword
+		t.Target.Password = creds.targetPassword
+		return nil
+	}
+	if t.SourceRef == "" || t.TargetRef == "" {
+		return errCompareCredsLost
+	}
+	se, err := s.resolveDataSourceRef(t.SourceRef)
+	if err != nil {
+		return fmt.Errorf("source_ref: %w", err)
+	}
+	if !srcCapable(se.Type, source.CapCompare) {
+		return fmt.Errorf("source_ref: 比对源端数据源类型必须是 postgres 或 mysql")
+	}
+	te, err := s.resolveDataSourceRef(t.TargetRef)
+	if err != nil {
+		return fmt.Errorf("target_ref: %w", err)
+	}
+	// Rerouted through the registry predicate (type-branch fixture keeps its
+	// single sanctioned POST-path guard; same MS-12 predicate pattern as
+	// ddl_compare's tidb checks).
+	if !source.IsTiDB(te.Type) {
+		return fmt.Errorf("target_ref: 目标端数据源类型必须是 tidb")
+	}
+	t.Source = dataSourceToSourceConfig(se)
+	t.Target = dataSourceToTargetConfig(te)
+	return nil
+}
+
+// dispatchNextCompare hands the free run slot to the FIFO-head queued task
+// (A1). Everything — slot re-check, credential attach, status flip, slot
+// claim — happens under compare.mu, the same critical section POST-enqueue
+// and finish-slot-release use, so the single-flight invariant (#t4/B2) holds
+// across queueing. A queued task that cannot be readied (unrecoverable or
+// unresolvable credentials) fails explicitly and the next one is tried.
+func (s *Server) dispatchNextCompare() {
+	for {
+		s.compare.mu.Lock()
+		if s.compare.cancel != nil {
+			s.compare.mu.Unlock()
+			return
+		}
+		next := s.earliestQueuedCompare()
+		if next == nil {
+			s.compare.mu.Unlock()
+			return
+		}
+		if err := s.attachQueuedCompareCredentials(next); err != nil {
+			next.Status = CompareStatusFailed
+			next.Error = err.Error()
+			fin := time.Now()
+			next.FinishedAt = &fin
+			delete(s.compare.queuedCreds, next.ID)
+			if perr := s.persistCompareTask(next); perr != nil {
+				// The failure never hit disk — the task is still queued on
+				// disk, so retrying it in this loop would spin forever. Stop;
+				// the next finish/recovery retries the dispatch.
+				s.compare.mu.Unlock()
+				zap.L().Warn("failed to persist undispatchable queued compare task", zap.String("id", next.ID), zap.Error(perr))
+				return
+			}
+			s.compare.mu.Unlock()
+			zap.L().Warn("queued compare task cannot be dispatched", zap.String("id", next.ID), zap.Error(err))
+			continue
+		}
+		now := time.Now()
+		next.Status = CompareStatusRunning
+		next.StartedAt = &now // M2: set before the goroutine spawns (no data race on the response)
+		if err := s.persistCompareTask(next); err != nil {
+			// The claim never hit disk — leave the on-disk copy queued (and its
+			// in-memory credentials stashed) and stop; the next finish/recovery
+			// retries the dispatch.
+			s.compare.mu.Unlock()
+			zap.L().Warn("failed to persist dispatched compare task", zap.String("id", next.ID), zap.Error(err))
+			return
+		}
+		delete(s.compare.queuedCreds, next.ID) // the running claim is on disk; the stash is consumed
+		ctx, cancel := context.WithCancel(context.Background())
+		s.compare.cancel = cancel
+		s.compare.runningID = next.ID
+		s.compare.mu.Unlock()
+		go s.runCompare(ctx, next)
+		return
 	}
 }
 
@@ -678,21 +937,22 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 
 	// B2: single-running invariant — check + persist + claim must be one
 	// atomic critical section, otherwise two concurrent POSTs both pass the
-	// check and run simultaneously.
+	// check and run simultaneously. A1: a busy slot no longer 409s — the
+	// task joins a FIFO queue on disk (status=queued task.json); queue
+	// admission shares this same critical section, so enqueue-vs-dispatch
+	// can never race. Strict FIFO: while ANY queued task waits, a new POST
+	// also queues instead of jumping the line.
 	s.compare.mu.Lock()
-	if s.compare.cancel != nil {
-		s.compare.mu.Unlock()
-		s.writeError(w, http.StatusConflict, "a comparison task is already running")
-		return
-	}
+	busy := s.compare.cancel != nil || s.earliestQueuedCompare() != nil
 
 	now := time.Now()
 	task := &CompareTask{
 		ID:                   uuid.New().String()[:8],
 		Name:                 req.Name,
-		Status:               CompareStatusRunning,
 		Source:               req.Source,
 		Target:               req.Target,
+		SourceRef:            req.SourceRef,
+		TargetRef:            req.TargetRef,
 		Mode:                 req.Mode,
 		SampleRatio:          req.SampleRatio,
 		ChecksumChunkSize:    req.ChecksumChunkSize,
@@ -706,11 +966,48 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 		IgnoreColumns:        req.IgnoreColumns,
 		PossiblyStuckTimeout: strings.TrimSpace(req.PossiblyStuckTimeout),
 		CreatedAt:            now,
-		StartedAt:            &now, // M2: set before the goroutine spawns (no data race on the response)
+	}
+	if busy {
+		task.Status = CompareStatusQueued // StartedAt stays nil until dispatch
+		// P2-1: strict FIFO admission order. CreatedAt alone is not enough —
+		// two POSTs in the same clock tick tie, and the random uuid[:8]
+		// tie-break is stable but not a real arrival order.
+		task.QueueSeq = s.nextQueueSeq()
+	} else {
+		task.Status = CompareStatusRunning
+		task.StartedAt = &now // M2: set before the goroutine spawns (no data race on the response)
 	}
 	if err := s.persistCompareTask(task); err != nil {
 		s.compare.mu.Unlock()
 		s.writeError(w, http.StatusInternalServerError, "failed to persist compare task: "+err.Error())
+		return
+	}
+
+	if busy {
+		// A1: passwords ride in memory only (task.json is redacted); stash
+		// them for the same-process dispatch, then answer 202 + the queued
+		// task (same redacted shape as the 201 response).
+		if s.compare.queuedCreds == nil {
+			s.compare.queuedCreds = make(map[string]compareQueuedCreds)
+		}
+		s.compare.queuedCreds[task.ID] = compareQueuedCreds{
+			sourcePassword: task.Source.Password,
+			targetPassword: task.Target.Password,
+		}
+		// P1-1: snapshot the 202 body HERE, under compare.mu and before any
+		// goroutine can touch `task`. The self-heal dispatch below may hand
+		// THIS task the slot, and runCompare then mutates the very same
+		// struct (Status/TablesDone/...) — a copy taken after dispatch races
+		// the runner. Slices are shared but never written by runCompare.
+		resp := *task
+		resp.Source.Password = ""
+		resp.Target.Password = ""
+		s.compare.mu.Unlock()
+		// A1 self-heal: a queued record can outlive a transient dispatch
+		// failure while the slot is actually free — kick a drain so the FIFO
+		// head (not the task just admitted) runs first.
+		s.dispatchNextCompare()
+		s.writeJSON(w, http.StatusAccepted, &resp)
 		return
 	}
 
@@ -916,6 +1213,9 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 			s.compare.runningID = ""
 		}
 		s.compare.mu.Unlock()
+		// A1: the slot just freed — hand it to the FIFO-head queued task
+		// (no-op when the queue is empty or someone else claimed first).
+		s.dispatchNextCompare()
 		s.BroadcastProgress(task.ID, map[string]interface{}{
 			"type": "compare", "status": task.Status,
 			"tables_done": task.TablesDone, "tables_total": task.TablesTotal,
@@ -1127,30 +1427,89 @@ func (s *Server) writeCompareReportError(w http.ResponseWriter, taskID string, e
 
 func (s *Server) handleCancelCompare(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "compareID")
+	// P0-1: ONE Lock for the whole decision; EVERY return path Unlocks (the
+	// pre-A1 code unlocked right after the snapshot, A1 moved it into the
+	// branch and dropped it on the running path — a permanent compare.mu
+	// leak that deadlocks the whole compare domain).
 	s.compare.mu.Lock()
 	cancel := s.compare.cancel
 	running := s.compare.runningID
-	s.compare.mu.Unlock()
 	if cancel == nil || running != id {
+		// A1: cancelling a QUEUED task removes it from the queue at once —
+		// same critical section as dispatch, so a task is either cancelled
+		// or dispatched, never both.
+		if t, err := s.loadCompareTask(id); err == nil && t != nil && t.Status == CompareStatusQueued {
+			t.Status = CompareStatusCancelled
+			t.Error = "cancelled" // same on-disk shape a running cancel leaves via finish()
+			fin := time.Now()
+			t.FinishedAt = &fin
+			if err := s.persistCompareTask(t); err != nil {
+				s.compare.mu.Unlock()
+				s.writeError(w, http.StatusInternalServerError, "failed to persist compare task: "+err.Error())
+				return
+			}
+			delete(s.compare.queuedCreds, id) // dequeue is on disk; drop the in-memory credentials
+			s.compare.mu.Unlock()
+			// A1 self-heal: with this task gone the slot may be idle while
+			// another queued task still waits (transient dispatch failure) —
+			// kick the FIFO drain.
+			s.dispatchNextCompare()
+			s.BroadcastProgress(id, map[string]interface{}{
+				"type": "compare", "status": CompareStatusCancelled,
+			})
+			s.writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled", "task_id": id})
+			return
+		}
+		s.compare.mu.Unlock()
 		s.writeError(w, http.StatusConflict, "compare task is not running")
 		return
 	}
+	// P0-1b: cancel() is a non-blocking context.CancelFunc — call it WHILE
+	// still holding compare.mu, so the cancel targets exactly the task that
+	// owns the slot right now (no TOCTOU window in which the run finishes,
+	// dispatch hands the slot to a queued task, and we cancel that one
+	// instead). The mutex is released before any HTTP write.
 	cancel()
+	s.compare.mu.Unlock()
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "cancelling", "task_id": id})
 }
 
 func (s *Server) handleDeleteCompare(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "compareID")
+	// A1: delete races dispatch — both read/move the same queued task.json.
+	// The DECISION stays inside compare.mu, but the heavy os.RemoveAll does
+	// not: a queued record is first flipped to cancelled on disk (so no
+	// dispatch can pick it up), then the lock is dropped and the dir removed.
+	// P2-3: never hold compare.mu across filesystem I/O.
+	dir := s.compareDir(id)
 	s.compare.mu.Lock()
-	running := s.compare.runningID == id
-	s.compare.mu.Unlock()
-	if running {
+	if s.compare.runningID == id {
+		s.compare.mu.Unlock()
 		s.writeError(w, http.StatusConflict, "cannot delete a running compare task; cancel it first")
 		return
 	}
-	if err := os.RemoveAll(s.compareDir(id)); err != nil {
+	delete(s.compare.queuedCreds, id) // queued rows delete fine; only running blocks
+	if t, err := s.loadCompareTask(id); err == nil && t != nil && t.Status == CompareStatusQueued {
+		// Detach it from the queue before releasing the lock: dispatch only
+		// takes status=queued, so this record can no longer be claimed while
+		// the dir is being removed.
+		t.Status = CompareStatusCancelled
+		t.Error = "deleted"
+		fin := time.Now()
+		t.FinishedAt = &fin
+		if perr := s.persistCompareTask(t); perr != nil {
+			s.compare.mu.Unlock()
+			s.writeError(w, http.StatusInternalServerError, "failed to detach queued compare task: "+perr.Error())
+			return
+		}
+	}
+	s.compare.mu.Unlock()
+	if err := os.RemoveAll(dir); err != nil {
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// A1 self-heal: deleting a queued head can leave the slot idle with others
+	// waiting — kick the FIFO drain (no-op when a task is running).
+	s.dispatchNextCompare()
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
