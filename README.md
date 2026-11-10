@@ -16,6 +16,9 @@
 
 ## 近期更新
 
+- **无 PK 表落盘比对（M1 row-hash spool）**（`e101007`，PR #2，2026-11-10）— 数据比对的无 PK/降级路径（hash_group / aggregate / bucket 与 checksum 降级重跑）不再整表驻留内存：双侧流式扫表 + 逐行哈希 + 计数先进内存 map（与旧实现一致），越过 65536 个去重哈希阈值（约 5MB 计数内存）后有序分段落盘（`<dataDir>/spool/<任务ID>/`）归并比对。小表完全不落盘、行为与旧版一致；大表内存峰值有界且与表大小无关（实测恒定 ~50MB，修复亿行级无 PK 表 ~50GB RSS 的历史问题），代价约 10-30% 额外磁盘 I/O。任务完成/失败/取消自动清理临时文件，服务重启清扫残留；磁盘写失败显式 failed（错误信息含 row-hash spool），绝不静默退化为无界内存。资源口径（评审+实机实验定稿）：级联归并磁盘峰值 ≈2×（单侧上界，实测每表 ≤1.5×）；fd 绝对上界 566（8 路级联瞬时），规划口径 294（4 路，默认并发）/ 558（8 路），上界随 concurrency 线性；fd 峰值出现在级联前、磁盘峰值出现在级联中，两峰异相勿叠加估算；窄 ulimit 环境按 4 路 ≥1024 / 8 路 ≥2048 预留。
+- **比对任务 FIFO 排队（A1）**（`c0db4f0`，PR #1，2026-11-10）— 「数据比对」创建任务遇忙不再 409 拒绝：同一时刻仍仅一个任务真正运行，新任务 202 入队（`status=queued` FIFO），前台任务结束（完成/失败/取消）自动依序接跑；队列状态即 task.json，重启不丢；排队任务可取消出队/直接删除；进程重启后遗留 running 任务自动标失败，排队任务中带数据源引用（`source_ref`/`target_ref`）者按序恢复调度，内联凭据者显式失败并提示重新提交（密码永不落盘的必然结果）。
+- **linux/amd64 二进制交付**（2026-11-10）— 基于 `e101007` 构建纯静态二进制（CGO_ENABLED=0、Go 1.26.4、`-trimpath -ldflags "-s -w"`）：`timstool_linux_amd64` 44,204,194B / SHA256 `4a6b576b…cf77d`；zip 13,718,141B / SHA256 `fda6098c…4fa2`。
 - **时间戳水位补齐**（`e1cf148`）— Web「数据同步」组新增「时间戳水位补齐」页面：基于更新时间列的拉式批同步（PG→TiDB），每表配置水位列（自动探测可比较类型列 timestamp/date/int/bigint，含索引提示）、初始水位（留空 = MIN(col) 全量补齐）、批次大小、冲突策略（replace/ignore/error）；默认 `≥` 模式每轮重读边界时刻的行保证同秒迟到行不丢，严格模式用 `>` 跳过边界重读（同秒迟到行可能丢失，UI 有提示）；表级水位状态、累计行数、运行历史（run 级表级结果与耗时）全量记录，手动触发、可重跑。边界说明：源端 DELETE 不会被捕获（可用「数据比对」兜底核对）；不更新水位列的 UPDATE 会漏同步。适合无 CDC 权限或定时补齐场景。
 - **源端 DDL 一键导出**（`10ba895`）— Web 新增「DDL 导出」页面 + `export-ddl` CLI：按 schema 导出 postgres / mysql / tidb（MySQL-wire SHOW CREATE walk）DDL，每个 schema 一个自包含目录（tables.sql / indexes.sql / views.sql / sequences.sql / functions.sql / procedures.sql / triggers.sql / types.sql + README.txt + manifest.json 对象计数与跳过清单），Web 端一键 zip 下载；pg / mysql 源勾选「TiDB 变体」额外生成 `tidb-tables.sql`（类型映射后的 CREATE TABLE 参考，含 `DDL 导出 tidb 版本`）。不支持的语句逐条跳过：服务端记 Warn 日志 + 响应头 `X-Tims-Skipped` 计数 + UI 跳过提示；选择 TiDB 变体但未勾选 tables 类型时 UI 预警。
 - **统一数据源管理**（`c0a2467`）— 服务端统一数据源注册表：Web「数据源」页面集中管理 postgres / mysql / tidb 连接档案（创建/编辑/删除/测试连接），向导、数据比对、CDC、DDL 导出、兼容评估、水位补齐等页面改为**按引用选择数据源**，不再手填重复连接；密码**只写不读**（服务端保存，列表仅显示 `has_password`，彻底移出浏览器 localStorage），任务详情返回前脱敏；TiDB 数据源支持可选 `pd_addr` / `status_port`（严格校验格式与端口 + 自动归一化存储）；数据源页内嵌 Lightning 环境校验（`POST /api/v1/validate-lightning`）与迁移选项记忆（服务端持久化，跨浏览器/重启生效）。
@@ -28,6 +31,32 @@
 - **进度分母恒定**（`b0706ca`）— 迁移开始即预登记全部表，进度分母全程恒定，修复进度长期挂在 100% 附近不动或回退跳变的问题；恢复任务时已完成表进度归零重算，避免虚高。
 - **Lightning 日志增强**（`bf14b57`）— 每张表的 Lightning 导入结果单独记录，Lightning 日志落独立文件，排障更直观。
 - **迁移选项记忆**（`f48a516`）— 临时目录、是否使用 Lightning、Lightning 路径在任务间记忆，新建任务自动预填。
+
+## 待办与后续计划
+
+> 2026-11-10 比对引擎专项（A1 任务队列 + M1 无 PK 落盘比对，PR #1 / #2 已合入 main 并在远程 103 环境部署验证）闭环后的遗留事项与排期快照，完成一项移除一项。
+
+### 待收口（P1，闭环尾巴）
+
+| 事项 | 方案 | 状态 |
+|------|------|------|
+| #t110 fd/落盘口径文档 | 纯文档+注释（零逻辑变更）：README spool 披露补「初次落盘量」语义与「×2 为单侧上界」脚注；deployment.md 补 fd 容量表与 ulimit 指引（4 路 ≥1024 / 8 路 ≥2048）；`rowhashspool.go` 注释 4→8 对齐 `MaxConcBudget=8` | 本地 `ed9e17e`（分支 `docs/t110-spool-disclosure`）已评审签发，待推送/合入 main |
+| 103 环境夹具清理 | 删除验证期自建夹具表（PG 5433 / TiDB 4001 两侧：`m1_smoke_nopk`、`m1_smoke_nopk2m`、`casc`、`big4m`、`te_win32`）；只删上列自建夹具，业务数据/配置零接触；完成后核对 8080 health 与现役进程/二进制指纹不变 | 待执行回执 |
+
+### 已排期（P2）
+
+| 事项 | 方案 |
+|------|------|
+| #t109 Version 回显 | 基线无 `Version` 符号，构建注入 `-X main.Version` 实为空操作，二进制无法自报版本号；补符号 + 版本回显（启动日志/health），随下次动代码的任务顺路携带 |
+
+### 候选 Epic 池（P3，按优先级待点单）
+
+1. **Web :8080 鉴权** — 当前服务无认证（含 `GET /api/v1/datasources` 无门枚举暴露面，与 MC-11 并档处理）
+2. **CDC 能力补齐** — 功能面最大缺口
+3. **CIR/PG 语义对齐批**（S）— 已有分析 `0dd249e` 可直取
+4. **比对重试韧性批**（M）
+5. **PG zip 对称批**（S）
+6. **尾批 P3 簇** — 徽标单一真源、result Error 透出等小项
 
 ## 特性
 
