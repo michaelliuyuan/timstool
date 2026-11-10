@@ -617,12 +617,9 @@ func TestCompareHeartbeatThresholdDerivation(t *testing.T) {
 		if want != c.want {
 			t.Fatalf("clamp semantics drifted for ps=%q qt=%q: %v want %v", c.ps, c.qt, want, c.want)
 		}
-		got := (config.CompareConfig{
-			PossiblyStuckTimeout: task.PossiblyStuckTimeout,
-			QueryTimeout:         task.QueryTimeout,
-		}).PossiblyStuckTimeoutDuration()
+		got := compareHeartbeatThreshold(task)
 		if got != want {
-			t.Fatalf("hb literal for ps=%q qt=%q: %v want %v (QueryTimeout dropped?)", c.ps, c.qt, got, want)
+			t.Fatalf("hb derivation for ps=%q qt=%q: %v want %v (QueryTimeout dropped?)", c.ps, c.qt, got, want)
 		}
 	}
 }

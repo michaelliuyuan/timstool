@@ -1116,6 +1116,18 @@ func buildCompareRunParams(task *CompareTask, reportFile string) (float64, commo
 	return sampleRatio, opts, compareCfg
 }
 
+// compareHeartbeatThreshold derives the possibly-stuck threshold from the
+// task-level knobs. It exists as a named function (not an inline literal)
+// so the anchor can read the REAL production derivation: 红队 M1 was a
+// dropped QueryTimeout, and a test that re-assembled its own literal could
+// never catch that regression.
+func compareHeartbeatThreshold(task *CompareTask) time.Duration {
+	return (config.CompareConfig{
+		PossiblyStuckTimeout: task.PossiblyStuckTimeout,
+		QueryTimeout:         task.QueryTimeout,
+	}).PossiblyStuckTimeoutDuration()
+}
+
 // inheritChunkedCountKnobs (BUG-CMP-COUNT-P1 A6) copies ONLY the two
 // chunked-count knobs from the live config.yaml snapshot onto the compare
 // task's override. The override is built field-by-field from task-level
@@ -1281,12 +1293,9 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 	// and the threshold knob is task-level either way. 红队 M1: QueryTimeout
 	// must ride along — PossiblyStuckTimeoutDuration() clamps ps against qt
 	// (ps<=qt → 2×qt), so dropping it silently rewrote the threshold for
-	// legacy tasks too. The literal mirrors buildCompareRunParams exactly
-	// (pinned by TestCompareHeartbeatThresholdDerivation).
-	hbThreshold := (config.CompareConfig{
-		PossiblyStuckTimeout: task.PossiblyStuckTimeout,
-		QueryTimeout:         task.QueryTimeout,
-	}).PossiblyStuckTimeoutDuration()
+	// legacy tasks too. Derivation lives in compareHeartbeatThreshold,
+	// which the anchor reads directly (no test-side re-assembly).
+	hbThreshold := compareHeartbeatThreshold(task)
 	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
 	defer heartbeatCancel()
 	go s.compareHeartbeat(heartbeatCtx, task, &taskMu, hbThreshold)
