@@ -792,6 +792,14 @@ func TestClassifyPerDBOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Nil report + nil error (a broken engine contract) must be an error
+	// row, never a panic and never a green pass. NOTE: the artifact must
+	// exist here, otherwise the artifact check returns first and masks the
+	// nil dereference (the first version of this anchor did exactly that).
+	if row, bad := classifyPerDBOutcome("dbone", nil, path, &CompareTask{}); !bad || row.Status != compareDBStatusError {
+		t.Fatalf("nil report must be an error row: bad=%v row=%+v", bad, row)
+	}
+
 	// Green report + landed artifact → pass row, not an error row.
 	row, bad := classifyPerDBOutcome("dbone", green, path, &CompareTask{})
 	if bad || row.Status != string(reporter.StatusPass) || row.Database != "dbone" {

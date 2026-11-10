@@ -306,6 +306,13 @@ type CompareDatabaseResult struct {
 //     failure mode, one layer deeper than the missing directory;
 //  3. otherwise the in-memory report is trustworthy.
 func classifyPerDBOutcome(db string, report *reporter.Report, reportFile string, task *CompareTask) (CompareDatabaseResult, bool) {
+	// Defensive: a nil report with a nil error would otherwise dereference
+	// nil inside compareDBResultFromReport. The engine's only (report,nil)
+	// return is a finished report, so this branch means the contract was
+	// broken — treat it as that database's error, never a green row.
+	if report == nil {
+		return CompareDatabaseResult{Database: db, Status: compareDBStatusError, Error: "引擎未返回比对报告"}, true
+	}
 	if (task.Watermark != nil || len(task.TableWatermarks) > 0) && compareAllTablesSkipped(report) {
 		return CompareDatabaseResult{
 			Database: db, Status: compareDBStatusError,
