@@ -58,7 +58,7 @@ var validateCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(validateCmd)
 	validateCmd.Flags().String("level", "L2", "validation level: L1 (row count), L2 (sampling), L3 (checksum)")
-	validateCmd.Flags().String("mode", "sample", "validation mode: quick (fast row count), sample (sampling), checksum (chunked hash), full (all checks)")
+	validateCmd.Flags().String("mode", "sample", "validation mode: quick (fast row count), sample (sampling), checksum (chunked hash, full comparison)")
 	validateCmd.Flags().Float64("sample-ratio", 0.01, "sample ratio for L2 validation (0.0-1.0)")
 	validateCmd.Flags().StringSlice("tables", nil, "specific tables to validate (default: all)")
 	validateCmd.Flags().String("report", "validation-report.json", "output report file path")

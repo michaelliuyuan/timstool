@@ -37,7 +37,7 @@ Prerequisites:
 		// effective enable state with priority flag > env > yaml, then gate the
 		// subcommand. An explicit `timstool cdc` invocation is treated as opt-in
 		// intent: we do not hard-refuse, but print a clear enable hint and exit
-		// unless the user opts in via --enable-cdc or PG2TIDB_CDC_FORCE=1.
+		// unless the user opts in via --enable-cdc or TIMSTOOL_CDC_FORCE=1.
 		enabled := resolveCDCEnableFromCmd(cfg.CDC.Enable, cmd)
 		forced := os.Getenv("TIMSTOOL_CDC_FORCE") == "1"
 		if !enabled && !forced {
