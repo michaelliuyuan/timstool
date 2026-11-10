@@ -842,3 +842,54 @@ func TestClassifyPerDBOutcome(t *testing.T) {
 		t.Fatalf("watermark guard must precede the artifact check: bad=%v row=%+v", bad, row)
 	}
 }
+
+// TestPerDBArtifactChain_EndToEnd closes the one link the unit anchors leave
+// open: the loop creates the directory, the ENGINE writes report.json through
+// reporter.SaveJSON, and the download face reads it back with 200. No database
+// is needed for that chain — the engine's save is a plain filesystem write —
+// but it must be exercised through the real functions in the real order,
+// because B1 was precisely a break between those three steps.
+func TestPerDBArtifactChain_EndToEnd(t *testing.T) {
+	s, _ := newTestServer(t)
+	task := &CompareTask{
+		ID: "dd000004", Status: CompareStatusCompleted, Mode: "quick",
+		Databases: []string{"*"}, ResolvedDatabases: []string{"chain_db"},
+		DatabasesDone: 1, DatabasesTotal: 1,
+		DatabaseResults: []CompareDatabaseResult{{Database: "chain_db", Status: compareDBStatusPass}},
+	}
+	if err := s.persistCompareTask(task); err != nil {
+		t.Fatal(err)
+	}
+
+	// Step 1: exactly what the loop does before the run.
+	slug := compareDBSlug(0, "chain_db")
+	dbDir := filepath.Join(s.compareDir(task.ID), "db", slug)
+	if err := os.MkdirAll(dbDir, 0o755); err != nil {
+		t.Fatalf("loop-side mkdir: %v", err)
+	}
+	reportFile := filepath.Join(dbDir, "report.json")
+
+	// Step 2: exactly what the engine does (validator.go:624) — reporter.Save
+	// on the ReportFile the loop handed over.
+	rpt := reporter.NewReport("data-validation")
+	rpt.AddTableReport(reporter.TableReport{TableName: "t1", Status: reporter.StatusPass})
+	rpt.Finish(reporter.StatusPass, "validated 1 tables at level quick")
+	if err := rpt.Save(reportFile); err != nil {
+		t.Fatalf("engine-side Save: %v", err)
+	}
+
+	// Step 3: the loop's own acceptance check must agree the artifact landed.
+	if err := verifyPerDBReport(reportFile); err != nil {
+		t.Fatalf("artifact chain broken between engine and loop: %v", err)
+	}
+
+	// Step 4: the download faces read that very file back with 200.
+	base := "/api/v1/compare/tasks/" + task.ID + "/report?db=chain_db"
+	for _, format := range []string{"json", ""} {
+		w, req := doReq("GET", base+"&format="+format, "")
+		s.router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("format=%q face: %d %s", format, w.Code, w.Body.String())
+		}
+	}
+}
