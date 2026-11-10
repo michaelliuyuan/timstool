@@ -20,6 +20,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -921,8 +922,15 @@ func TestRunCompareMultiDB_Wiring_ArtifactFailure(t *testing.T) {
 	// Restore even on failure: a leaked stub would make every later loop
 	// test silently green (the false-anchor shape 红队 seq=19 caught).
 	t.Cleanup(func() { comparePerDBRun = prev })
+	// 红队 ⑥.1: count how often the loop actually routes through the seam.
+	// If the loop is refactored back to s.executeCompareRun directly, the
+	// stub below is never called, the REAL engine fails on unreachable
+	// src/tgt hosts, and every downstream assertion used to pass for the
+	// WRONG reason (connection failure, not missing report.json).
+	var hits int32
 	comparePerDBRun = func(_ *Server, _ context.Context, _ *CompareTask, _ *sync.Mutex,
 		_ config.SourceConfig, _ config.TargetConfig, _, _, _ string) (*reporter.Report, error) {
+		atomic.AddInt32(&hits, 1)
 		// Healthy report, NO file written — the engine's silent-save-failure.
 		rpt := reporter.NewReport("data-validation")
 		rpt.AddTableReport(reporter.TableReport{TableName: "t1", Status: reporter.StatusPass})
@@ -959,6 +967,17 @@ func TestRunCompareMultiDB_Wiring_ArtifactFailure(t *testing.T) {
 		if r.Status != compareDBStatusError {
 			t.Fatalf("db %s must be error, got %q", r.Database, r.Status)
 		}
+		// 红队 ⑥.1: the failure reason must be the MISSING ARTIFACT. If the
+		// seam is bypassed the rows still end error/failed — but on
+		// connection errors, and the anchor would pass vacuously.
+		if !strings.Contains(r.Error, "库报告未落盘") {
+			t.Fatalf("db %s must fail for the missing artifact, got %q", r.Database, r.Error)
+		}
+	}
+	// 红队 ⑥.1: the stub must be the engine the loop actually called, once
+	// per database — "seam installed but unused" dies here.
+	if got := int(atomic.LoadInt32(&hits)); got != len(task.ResolvedDatabases) {
+		t.Fatalf("the stubbed engine must be called once per database, got %d hits for %d databases (seam bypassed?)", got, len(task.ResolvedDatabases))
 	}
 	// The per-db directories still exist (the loop creates them before the
 	// run) — the failure is the MISSING report.json, not a missing dir.
@@ -982,16 +1001,22 @@ func TestRunCompareMultiDB_Wiring_ArtifactFailure(t *testing.T) {
 // a helper that production no longer calls), and no runtime test can see
 // them. These assertions slice the named function bodies FIRST, then look
 // for the exact wiring, so a same-named symbol elsewhere cannot fake a pass.
+// 红队 20:04 hardened it: sanitization now also strips block comments and
+// STRING LITERALS (a bare contains used to be satisfiable by
+// logger.Debug("hbThreshold := compareHeartbeatThreshold(task)")), positive
+// assertions must be assignment lines (not log lines), and the seam's
+// DEFAULT body got its own invariant (it had none — swapping the default
+// for a fabricated report left the whole suite green).
 func TestCompareCallSiteInvariants(t *testing.T) {
 	src, err := os.ReadFile("compare.go")
 	if err != nil {
 		t.Fatalf("read compare.go: %v", err)
 	}
-	body := stripLineComments(functionBody(string(src), "func (s *Server) runCompare("))
+	body := sanitizeGoCode(functionBody(string(src), "func (s *Server) runCompare("))
 	if body == "" {
 		t.Fatal("runCompare body not found (function renamed? update this anchor)")
 	}
-	if !strings.Contains(body, "hbThreshold := compareHeartbeatThreshold(task)") {
+	if !containsAsCode(body, "hbThreshold := compareHeartbeatThreshold(task)") {
 		t.Error("runCompare must derive the heartbeat threshold via compareHeartbeatThreshold(task)")
 	}
 	if strings.Contains(body, "PossiblyStuckTimeoutDuration()") {
@@ -1002,15 +1027,29 @@ func TestCompareCallSiteInvariants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read compare_multidb.go: %v", err)
 	}
-	loop := stripLineComments(functionBody(string(multi), "func (s *Server) runCompareMultiDB("))
+	loop := sanitizeGoCode(functionBody(string(multi), "func (s *Server) runCompareMultiDB("))
 	if loop == "" {
 		t.Fatal("runCompareMultiDB body not found (function renamed? update this anchor)")
 	}
-	if !strings.Contains(loop, "classifyPerDBOutcome(") {
+	if !containsAsCode(loop, "classifyPerDBOutcome(") {
 		t.Error("the multi-db loop must classify through classifyPerDBOutcome (the B1 wiring)")
 	}
 	if strings.Contains(loop, "compareDBResultFromReport(db, report)") {
 		t.Error("the loop must not take the report straight to a result row (that is the bypass)")
+	}
+
+	// 红队 ⑥.2: the seam's DEFAULT value must remain the real engine. A
+	// default body that fabricates a report replaces the engine in every
+	// real binary while the entire suite stays green (nothing executed it).
+	seam := sanitizeGoCode(functionBody(string(multi), "var comparePerDBRun = func"))
+	if seam == "" {
+		t.Fatal("comparePerDBRun seam not found (renamed? update this anchor)")
+	}
+	if !strings.Contains(seam, "s.executeCompareRun(") {
+		t.Error("the seam's production value must call the real engine (s.executeCompareRun)")
+	}
+	if strings.Contains(seam, "reporter.NewReport(") {
+		t.Error("the seam must not fabricate reports (engine silently replaced by a stub)")
 	}
 }
 
@@ -1043,16 +1082,76 @@ func functionBody(src, signature string) string {
 	return ""
 }
 
-// stripLineComments removes //-comments line by line so source-level
-// assertions inspect CODE, not prose (a comment mentioning the forbidden
-// symbol must not satisfy — or trip — the anchor).
-func stripLineComments(b string) string {
-	var out []string
-	for _, line := range strings.Split(b, "\n") {
-		if idx := strings.Index(line, "//"); idx >= 0 {
-			line = line[:idx]
+// sanitizeGoCode strips //-comments, /* */-comments, interpreted string
+// literals, raw string literals and rune literals from a Go source slice so
+// contains-style assertions inspect CODE, not prose (红队 ⑥.3: a comment or
+// logger.Debug("...") string mentioning a symbol must neither satisfy a
+// positive assertion nor trip a negative one). Strings collapse to "" so
+// token joining cannot invent new identifiers.
+func sanitizeGoCode(b string) string {
+	var out []byte
+	i := 0
+	for i < len(b) {
+		c := b[i]
+		switch {
+		case c == '/' && i+1 < len(b) && b[i+1] == '/':
+			for i < len(b) && b[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < len(b) && b[i+1] == '*':
+			if end := strings.Index(b[i+2:], "*/"); end >= 0 {
+				i += 2 + end + 2
+			} else {
+				i = len(b)
+			}
+			out = append(out, ' ')
+		case c == '"':
+			i = consumeQuoted(b, i, '"')
+			out = append(out, '"', '"')
+		case c == '`':
+			i = consumeQuoted(b, i, '`')
+			out = append(out, '"', '"')
+		case c == '\'':
+			i = consumeQuoted(b, i, '\'')
+			out = append(out, '\'', '\'')
+		default:
+			out = append(out, c)
+			i++
 		}
-		out = append(out, line)
 	}
-	return strings.Join(out, "\n")
+	return string(out)
+}
+
+// consumeQuoted returns the index just past the closing delimiter of a
+// quoted run starting at open (handled: backslash escapes inside
+// interpreted strings and rune literals).
+func consumeQuoted(b string, i int, delim byte) int {
+	i++ // opening delimiter
+	for i < len(b) && b[i] != delim {
+		if b[i] == '\\' && delim != '`' {
+			i++ // skip the escaped byte
+		}
+		i++
+	}
+	if i < len(b) {
+		i++ // closing delimiter
+	}
+	return i
+}
+
+// containsAsCode reports whether some line of the sanitized body mentions
+// the snippet on an ASSIGNMENT line that is not a log call (红队 ⑥.3: the
+// positive assertions must bind to real statements — a bare contains was
+// satisfiable from a logger.Debug string literal).
+func containsAsCode(body, snippet string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.Contains(t, "logger") {
+			continue
+		}
+		if strings.Contains(t, snippet) && strings.Contains(t, ":=") {
+			return true
+		}
+	}
+	return false
 }
