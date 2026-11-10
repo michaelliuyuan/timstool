@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -916,6 +917,9 @@ func TestRunCompareMultiDB_Wiring_ArtifactFailure(t *testing.T) {
 	s, _ := newTestServer(t)
 
 	prev := comparePerDBRun
+	origPtr := reflect.ValueOf(prev).Pointer()
+	// Restore even on failure: a leaked stub would make every later loop
+	// test silently green (the false-anchor shape 红队 seq=19 caught).
 	t.Cleanup(func() { comparePerDBRun = prev })
 	comparePerDBRun = func(_ *Server, _ context.Context, _ *CompareTask, _ *sync.Mutex,
 		_ config.SourceConfig, _ config.TargetConfig, _, _, _ string) (*reporter.Report, error) {
@@ -962,6 +966,14 @@ func TestRunCompareMultiDB_Wiring_ArtifactFailure(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(s.compareDir(task.ID), "db", compareDBSlug(i, db))); err != nil {
 			t.Fatalf("per-db dir for %s must still exist: %v", db, err)
 		}
+	}
+
+	// Guard against seam leakage: the production executeCompareRun must be
+	// back in place, otherwise later loop tests would run against the stub
+	// and pass vacuously (the false-anchor shape this commit exists to kill).
+	comparePerDBRun = prev
+	if reflect.ValueOf(comparePerDBRun).Pointer() != origPtr {
+		t.Fatal("seam not restored to the production engine after the stub test")
 	}
 }
 
