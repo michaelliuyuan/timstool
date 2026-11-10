@@ -828,4 +828,17 @@ func TestClassifyPerDBOutcome(t *testing.T) {
 	if row, bad = classifyPerDBOutcome("dbone", skipped, skipPath, &CompareTask{}); bad {
 		t.Fatalf("non-watermark skipped run must not be an error: %+v", row)
 	}
+
+	// PRECEDENCE (equivalence with the legacy single-db flow): the
+	// watermark all-skipped guard runs BEFORE the artifact check, so a
+	// run that both skipped everything AND failed to land a report must
+	// report the skip reason. Swapping the two branches would change the
+	// user-visible message for a shipped behavior — pin it.
+	if err := os.Remove(skipPath); err != nil {
+		t.Fatal(err)
+	}
+	row, bad = classifyPerDBOutcome("dbone", skipped, skipPath, &CompareTask{Watermark: &config.WatermarkFilter{}})
+	if !bad || !strings.Contains(row.Error, "所有表均被跳过") {
+		t.Fatalf("watermark guard must precede the artifact check: bad=%v row=%+v", bad, row)
+	}
 }
