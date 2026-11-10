@@ -291,6 +291,50 @@ type CompareDatabaseResult struct {
 	Error       string `json:"error,omitempty"`
 }
 
+// classifyPerDBOutcome turns one finished per-database run into its summary
+// row. It is the single place that decides what a returned report MEANS,
+// kept as a pure function so the anchors read the production logic instead
+// of re-implementing it (the M1 false-anchor lesson).
+//
+// Order matters and mirrors the legacy single-db flow:
+//  1. a watermark-active run that skipped every table produced no
+//     evidence — error (the legacy compareAllTablesSkipped guard);
+//  2. the engine downgrades a failed reporter.Save to a Warn and hands
+//     back a healthy in-memory report (validator.go:624-626), so the
+//     artifact on disk is the only proof the ?db= face will work. A
+//     missing/unparsable report.json is an error — 红队 B1's real
+//     failure mode, one layer deeper than the missing directory;
+//  3. otherwise the in-memory report is trustworthy.
+func classifyPerDBOutcome(db string, report *reporter.Report, reportFile string, task *CompareTask) (CompareDatabaseResult, bool) {
+	if (task.Watermark != nil || len(task.TableWatermarks) > 0) && compareAllTablesSkipped(report) {
+		return CompareDatabaseResult{
+			Database: db, Status: compareDBStatusError,
+			Error: "所有表均被跳过（无可比列或列全被排除），未产生比对结果",
+		}, true
+	}
+	if artErr := verifyPerDBReport(reportFile); artErr != nil {
+		return CompareDatabaseResult{Database: db, Status: compareDBStatusError, Error: artErr.Error()}, true
+	}
+	return compareDBResultFromReport(db, report), false
+}
+
+// verifyPerDBReport confirms the per-database report artifact really exists
+// and really parses. The engine (validator.go:624-626) downgrades a failed
+// reporter.Save to a Warn and hands back the in-memory report, so without
+// this check a full/read-only/permission-broken data dir yields a green
+// task whose ?db= face 404s.
+func verifyPerDBReport(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("库报告未落盘（%s）: %w", path, err)
+	}
+	var rpt reporter.Report
+	if err := json.Unmarshal(raw, &rpt); err != nil {
+		return fmt.Errorf("库报告落盘但不可解析（%s）: %w", path, err)
+	}
+	return nil
+}
+
 // compareDBResultFromReport summarizes one finished per-database run.
 func compareDBResultFromReport(db string, rpt *reporter.Report) CompareDatabaseResult {
 	r := CompareDatabaseResult{
@@ -581,11 +625,12 @@ func (s *Server) runCompareMultiDB(ctx context.Context, task *CompareTask, taskM
 		// loop continues.
 		var report *reporter.Report
 		var rerr error
+		reportFile := filepath.Join(dbDir, "report.json")
 		if mkErr := os.MkdirAll(dbDir, 0o755); mkErr != nil {
 			rerr = fmt.Errorf("创建库报告目录失败: %w", mkErr)
 		} else {
 			report, rerr = s.executeCompareRun(ctx, task, taskMu, src, tgt,
-				filepath.Join(dbDir, "report.json"),
+				reportFile,
 				filepath.Join(s.compareDir(task.ID), "diff", slug),
 				filepath.Join(s.dataDir, "spool", task.ID, slug))
 		}
@@ -599,15 +644,11 @@ func (s *Server) runCompareMultiDB(ctx context.Context, task *CompareTask, taskM
 		if rerr != nil {
 			results = append(results, CompareDatabaseResult{Database: db, Status: compareDBStatusError, Error: rerr.Error()})
 			errDBs = append(errDBs, db)
-		} else if (task.Watermark != nil || len(task.TableWatermarks) > 0) && compareAllTablesSkipped(report) {
-			// The legacy all-skipped watermark guard, applied per database.
-			results = append(results, CompareDatabaseResult{
-				Database: db, Status: compareDBStatusError,
-				Error: "所有表均被跳过（无可比列或列全被排除），未产生比对结果",
-			})
+		} else if row, rowBad := classifyPerDBOutcome(db, report, reportFile, task); rowBad {
+			results = append(results, row)
 			errDBs = append(errDBs, db)
 		} else {
-			results = append(results, compareDBResultFromReport(db, report))
+			results = append(results, row)
 		}
 
 		taskMu.Lock()

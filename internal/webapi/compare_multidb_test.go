@@ -734,3 +734,98 @@ func TestCompareReport_MultiDbFaces_NonASCIIDb(t *testing.T) {
 		t.Fatalf("disposition must use the sanitized slug: %q", cd)
 	}
 }
+
+// TestVerifyPerDBReport pins 红队 B1's root cause: the engine downgrades a
+// failed reporter.Save to a Warn and still returns a healthy in-memory
+// report (validator.go:624-626), so a full/read-only data dir produced a
+// GREEN task whose ?db= face 404s. The loop must verify the artifact on
+// disk instead of trusting the returned report.
+func TestVerifyPerDBReport(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "report.json")
+
+	// Missing artifact (save silently skipped/failed) must be an error.
+	if err := verifyPerDBReport(path); err == nil {
+		t.Fatal("missing report.json must not pass the artifact check")
+	}
+
+	// Garbage on disk must be an error too (half-written temp leftovers).
+	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyPerDBReport(path); err == nil {
+		t.Fatal("unparsable report.json must not pass the artifact check")
+	}
+
+	// A real report passes.
+	rpt := reporter.NewReport("data-validation")
+	rpt.AddTableReport(reporter.TableReport{TableName: "t1", Status: reporter.StatusPass})
+	rpt.Finish(reporter.StatusPass, "validated 1 tables")
+	raw, err := json.Marshal(rpt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyPerDBReport(path); err != nil {
+		t.Fatalf("valid report.json rejected: %v", err)
+	}
+}
+
+// TestClassifyPerDBOutcome pins that classification runs through the same
+// function the loop uses (production logic, not a test-side re-statement),
+// and that a healthy in-memory report with a MISSING artifact is an error —
+// not the green pass the engine's Warn-and-continue would otherwise allow.
+func TestClassifyPerDBOutcome(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "report.json")
+
+	green := reporter.NewReport("data-validation")
+	green.AddTableReport(reporter.TableReport{TableName: "t1", Status: reporter.StatusPass})
+	green.Finish(reporter.StatusPass, "validated 1 tables")
+	raw, err := json.Marshal(green)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Green report + landed artifact → pass row, not an error row.
+	row, bad := classifyPerDBOutcome("dbone", green, path, &CompareTask{})
+	if bad || row.Status != string(reporter.StatusPass) || row.Database != "dbone" {
+		t.Fatalf("green run misclassified: bad=%v row=%+v", bad, row)
+	}
+
+	// Green report + MISSING artifact → error row (the engine lied).
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	row, bad = classifyPerDBOutcome("dbone", green, path, &CompareTask{})
+	if !bad || row.Status != compareDBStatusError || !strings.Contains(row.Error, "未落盘") {
+		t.Fatalf("missing artifact must be an error row: bad=%v row=%+v", bad, row)
+	}
+
+	// Watermark run that skipped every table is an error even with a
+	// landed artifact (the legacy guard wins, no evidence produced).
+	skipped := reporter.NewReport("data-validation")
+	skipped.AddTableReport(reporter.TableReport{TableName: "t1", Status: reporter.StatusSkip})
+	skipped.Finish(reporter.StatusSkip, "all tables skipped")
+	skipRaw, err := json.Marshal(skipped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skipPath := filepath.Join(dir, "skipped.json")
+	if err := os.WriteFile(skipPath, skipRaw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	row, bad = classifyPerDBOutcome("dbone", skipped, skipPath, &CompareTask{Watermark: &config.WatermarkFilter{}})
+	if !bad || row.Status != compareDBStatusError || !strings.Contains(row.Error, "所有表均被跳过") {
+		t.Fatalf("all-skipped watermark run must stay an error: bad=%v row=%+v", bad, row)
+	}
+	// ... and WITHOUT the watermark it is a legitimate skip (not an error).
+	if row, bad = classifyPerDBOutcome("dbone", skipped, skipPath, &CompareTask{}); bad {
+		t.Fatalf("non-watermark skipped run must not be an error: %+v", row)
+	}
+}
