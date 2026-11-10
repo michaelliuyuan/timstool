@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -353,6 +354,17 @@ func TestCreateCompare_MultiDbPersisted(t *testing.T) {
 		}
 	}
 
+	// 红队 B1 anchor: the loop must create each per-db report directory
+	// BEFORE the run — reporter.Save's os.CreateTemp(dir) needs it to exist
+	// and nothing else creates it. Even though both runs died at connect,
+	// the directories must be there (the fabricate-based face tests mask
+	// this by hand-creating them, so the real loop pins it here).
+	for i, db := range task.ResolvedDatabases {
+		if _, err := os.Stat(filepath.Join(s.compareDir(resp.ID), "db", compareDBSlug(i, db))); err != nil {
+			t.Fatalf("per-db report dir for %s missing: %v", db, err)
+		}
+	}
+
 	// Summary artifacts landed with one error row per database.
 	sumRaw, err := os.ReadFile(filepath.Join(s.compareDir(resp.ID), "summary.json"))
 	if err != nil {
@@ -452,6 +464,19 @@ func TestCompareReport_MultiDbFaces(t *testing.T) {
 	// Unknown db name: 404 before any filesystem touch.
 	if code, _ := get("?db=../etc&format=json"); code != http.StatusNotFound {
 		t.Fatalf("unknown db must 404, got %d", code)
+	}
+	// 红队 m5: per-db format=csv is an explicit named 404, never the html
+	// face served under a csv ask.
+	if code, body := get("?db=shop_2024&format=csv"); code != http.StatusNotFound || !strings.Contains(body, "汇总 CSV") {
+		t.Fatalf("per-db csv: %d %s", code, body)
+	}
+	// 红队 m3: the download filename carries the header-safe slug.
+	{
+		w, req := doReq("GET", base+"?db=shop_2024&format=json", "")
+		s.router.ServeHTTP(w, req)
+		if cd := w.Header().Get("Content-Disposition"); !strings.Contains(cd, "compare-report-aa000001-02-shop_2024.json") {
+			t.Fatalf("per-db json disposition must use the slug: %q", cd)
+		}
 	}
 	// Missing summary on an unfinished task: 404 with the cause named.
 	if code, body := get("?format=json&db=nope_db"); code != http.StatusNotFound || !strings.Contains(body, "解析出的库名") {
@@ -568,3 +593,147 @@ func TestMultiDBTaskJSONMarshalStability(t *testing.T) {
 // silence unused-import linters when fixtures shrink.
 var _ = sql.Open
 var _ sync.Mutex
+
+// TestCompareHeartbeatThresholdDerivation pins 红队 M1: the hoisted
+// heartbeat threshold literal must derive EXACTLY like the pre-A2
+// buildCompareRunParams config — QueryTimeout included, because
+// PossiblyStuckTimeoutDuration() clamps ps against qt (ps<=qt → 2×qt).
+// Dropping QueryTimeout again would silently widen the threshold for
+// legacy single-db tasks too.
+func TestCompareHeartbeatThresholdDerivation(t *testing.T) {
+	cases := []struct {
+		ps, qt string
+		want   time.Duration
+	}{
+		{"", "", 60 * time.Minute},      // defaults ps=5m, qt=30m → clamp 2×30m
+		{"", "5m", 10 * time.Minute},    // ps=5m <= qt=5m → clamp 2×5m
+		{"120m", "", 120 * time.Minute}, // ps=120m > qt=30m → stays
+		{"3m", "10m", 20 * time.Minute}, // 3m <= 10m → clamp 2×10m
+	}
+	for _, c := range cases {
+		task := &CompareTask{PossiblyStuckTimeout: c.ps, QueryTimeout: c.qt}
+		_, _, cfg := buildCompareRunParams(task, "x")
+		want := cfg.PossiblyStuckTimeoutDuration()
+		if want != c.want {
+			t.Fatalf("clamp semantics drifted for ps=%q qt=%q: %v want %v", c.ps, c.qt, want, c.want)
+		}
+		got := (config.CompareConfig{
+			PossiblyStuckTimeout: task.PossiblyStuckTimeout,
+			QueryTimeout:         task.QueryTimeout,
+		}).PossiblyStuckTimeoutDuration()
+		if got != want {
+			t.Fatalf("hb literal for ps=%q qt=%q: %v want %v (QueryTimeout dropped?)", c.ps, c.qt, got, want)
+		}
+	}
+}
+
+// TestMultiDBFinishDecision pins the loop's terminal verdict (红队 M2): a
+// summary write failure must fail the task — never a green completed with
+// missing summary faces — and cancellation still wins while disclosing it.
+func TestMultiDBFinishDecision(t *testing.T) {
+	if st, msg := multiDBFinishDecision(false, nil, "", 3); st != CompareStatusCompleted || msg != "" {
+		t.Fatalf("clean sweep: %q %q", st, msg)
+	}
+	st, msg := multiDBFinishDecision(false, []string{"a", "b"}, "", 3)
+	if st != CompareStatusFailed || !strings.Contains(msg, "2/3") || !strings.Contains(msg, "a, b") {
+		t.Fatalf("failed dbs: %q %q", st, msg)
+	}
+	st, msg = multiDBFinishDecision(false, nil, "汇总报告写盘失败: disk full", 3)
+	if st != CompareStatusFailed || !strings.Contains(msg, "汇总报告写盘失败") {
+		t.Fatalf("summary write failure must fail the task: %q %q", st, msg)
+	}
+	st, msg = multiDBFinishDecision(false, []string{"a"}, "汇总报告写盘失败: disk full", 3)
+	if st != CompareStatusFailed || !strings.Contains(msg, "1/3") || !strings.Contains(msg, "汇总报告写盘失败") {
+		t.Fatalf("summary failure must append to the failed-db message: %q %q", st, msg)
+	}
+	st, msg = multiDBFinishDecision(true, []string{"a"}, "汇总报告写盘失败: disk full", 3)
+	if st != CompareStatusCancelled || !strings.Contains(msg, "cancelled") || !strings.Contains(msg, "汇总报告写盘失败") {
+		t.Fatalf("cancel wins but discloses: %q %q", st, msg)
+	}
+	if st, msg := multiDBFinishDecision(true, nil, "", 3); st != CompareStatusCancelled || msg != "cancelled" {
+		t.Fatalf("plain cancel: %q %q", st, msg)
+	}
+}
+
+// TestCompareSummaryOverallStatus_Empty pins 红队 m4: an empty summary
+// never reads as "pass" — the only way to reach one is a run that ended
+// before the first database produced a row.
+func TestCompareSummaryOverallStatus_Empty(t *testing.T) {
+	if s := compareSummaryOverallStatus(nil); s != compareDBStatusCancelled {
+		t.Fatalf("empty verdict = %q want cancelled", s)
+	}
+}
+
+// TestCompareSummaryCSV_FormulaInjection pins 红队 m2: text cells starting
+// with = + - @ get the apostrophe guard (numeric columns stay numeric).
+func TestCompareSummaryCSV_FormulaInjection(t *testing.T) {
+	task := &CompareTask{ID: "aa000001", Mode: "quick",
+		Source: config.SourceConfig{Host: "s", Port: 1}, Target: config.TargetConfig{Host: "t", Port: 1}}
+	sum := buildCompareSummary(task, []CompareDatabaseResult{
+		{Database: "-evil", Status: compareDBStatusError, Error: "=1+1"},
+		{Database: "+plus", Status: compareDBStatusError, Error: "@sum(a)"},
+		{Database: "ok", Status: compareDBStatusPass},
+	}, time.Now(), time.Now(), "")
+	csv := string(compareSummaryCSV(sum))
+	for _, want := range []string{"'-evil", "'=1+1", "'+plus", "'@sum(a)", "ok,pass"} {
+		if !strings.Contains(csv, want) {
+			t.Errorf("CSV missing guarded cell %q", want)
+		}
+	}
+}
+
+// TestRenderCompareSummaryHTML_LongErrorRuneSafe pins 红队 m1: the error
+// cell truncates at a rune boundary (no half-character mojibake) and only
+// then escapes.
+func TestRenderCompareSummaryHTML_LongErrorRuneSafe(t *testing.T) {
+	task := &CompareTask{ID: "aa000001", Mode: "quick"}
+	sum := buildCompareSummary(task, []CompareDatabaseResult{
+		{Database: "db", Status: compareDBStatusError, Error: strings.Repeat("错", 100)},
+	}, time.Now(), time.Now(), "")
+	html := renderCompareSummaryHTML(task, sum)
+	if strings.Contains(html, "\uFFFD") {
+		t.Fatal("rune-slicing artifact in truncated error")
+	}
+	if !strings.Contains(html, strings.Repeat("错", 80)+"...") {
+		t.Fatal("truncation must cut at 80 runes and mark it")
+	}
+}
+
+// TestCompareReport_MultiDbFaces_NonASCIIDb pins 红队 m3: resolved names
+// come from the server's listing and can be non-ASCII (PG allows them) —
+// download headers must carry the sanitized slug, never the raw name.
+func TestCompareReport_MultiDbFaces_NonASCIIDb(t *testing.T) {
+	s, _ := newTestServer(t)
+	task := &CompareTask{
+		ID: "cc000003", Status: CompareStatusCompleted, Mode: "quick",
+		Databases: []string{"*"}, ResolvedDatabases: []string{"订单库"},
+		DatabasesDone: 1, DatabasesTotal: 1,
+		DatabaseResults: []CompareDatabaseResult{{Database: "订单库", Status: compareDBStatusPass}},
+	}
+	if err := s.persistCompareTask(task); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(s.compareDir(task.ID), "db", compareDBSlug(0, "订单库"))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpt := reporter.NewReport("data-validation")
+	rpt.AddTableReport(reporter.TableReport{TableName: "t1", Status: reporter.StatusPass})
+	rpt.Finish(reporter.StatusPass, "validated 1 tables at level quick")
+	raw, _ := json.Marshal(rpt)
+	if err := os.WriteFile(filepath.Join(dir, "report.json"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, req := doReq("GET", "/api/v1/compare/tasks/cc000003/report?db="+url.QueryEscape("订单库")+"&format=json", "")
+	s.router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("per-db json: %d %s", w.Code, w.Body.String())
+	}
+	cd := w.Header().Get("Content-Disposition")
+	if strings.Contains(cd, "订单库") {
+		t.Fatalf("raw non-ASCII db name leaked into the header: %q", cd)
+	}
+	if !strings.Contains(cd, "compare-report-cc000003-01-___.json") {
+		t.Fatalf("disposition must use the sanitized slug: %q", cd)
+	}
+}

@@ -330,6 +330,12 @@ func compareDBStatusRank(s string) int {
 // compareSummaryOverallStatus derives the cross-database verdict from the
 // per-database rows (error/cancelled poison it, then fail, then warn).
 func compareSummaryOverallStatus(results []CompareDatabaseResult) string {
+	if len(results) == 0 {
+		// 红队 m4: an empty summary only exists for a run that ended
+		// before the first database produced a row — reading "pass"
+		// would mislead; fall back to cancelled.
+		return compareDBStatusCancelled
+	}
 	worst := compareDBStatusPass
 	for _, r := range results {
 		if compareDBStatusRank(r.Status) < compareDBStatusRank(worst) {
@@ -442,10 +448,25 @@ func atomicWriteFile(path string, data []byte) error {
 	return os.Rename(tmpName, path)
 }
 
+// compareCSVSafeCell neutralizes CSV formula injection (红队 m2): Excel
+// and friends interpret a leading = + - @ as a formula, so text cells get
+// a leading apostrophe. The numeric columns are exempt — a negative count
+// must stay a number.
+func compareCSVSafeCell(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@':
+		return "'" + s
+	}
+	return s
+}
+
 // compareSummaryCSV renders the 汇总 CSV: one row per database plus a
 // totals row. UTF-8 BOM + CRLF so Excel opens the Chinese headers
 // correctly (the FE exportCsv precedent); every cell passes through the
-// csv writer's quoting.
+// csv writer's quoting, text cells through compareCSVSafeCell.
 func compareSummaryCSV(sum *CompareSummary) []byte {
 	var b strings.Builder
 	b.WriteString("\uFEFF")
@@ -453,26 +474,26 @@ func compareSummaryCSV(sum *CompareSummary) []byte {
 	_ = w.Write([]string{"库名", "状态", "表总数", "通过", "失败", "警告", "跳过", "差异行数", "耗时", "错误"})
 	for _, r := range sum.Databases {
 		_ = w.Write([]string{
-			r.Database, r.Status,
+			compareCSVSafeCell(r.Database), compareCSVSafeCell(r.Status),
 			fmt.Sprintf("%d", r.TotalTables),
 			fmt.Sprintf("%d", r.PassTables),
 			fmt.Sprintf("%d", r.FailTables),
 			fmt.Sprintf("%d", r.WarnTables),
 			fmt.Sprintf("%d", r.SkipTables),
 			fmt.Sprintf("%d", r.DiffRows),
-			r.Duration,
-			r.Error,
+			compareCSVSafeCell(r.Duration),
+			compareCSVSafeCell(r.Error),
 		})
 	}
 	_ = w.Write([]string{
-		"合计（" + fmt.Sprintf("%d", sum.Totals.Databases) + " 库）", sum.Status,
+		compareCSVSafeCell("合计（" + fmt.Sprintf("%d", sum.Totals.Databases) + " 库）"), compareCSVSafeCell(sum.Status),
 		fmt.Sprintf("%d", sum.Totals.TotalTables),
 		fmt.Sprintf("%d", sum.Totals.PassTables),
 		fmt.Sprintf("%d", sum.Totals.FailTables),
 		fmt.Sprintf("%d", sum.Totals.WarnTables),
 		fmt.Sprintf("%d", sum.Totals.SkipTables),
 		fmt.Sprintf("%d", sum.Totals.TotalDiffRows),
-		sum.Duration,
+		compareCSVSafeCell(sum.Duration),
 		"",
 	})
 	w.Flush()
@@ -493,7 +514,9 @@ func compareSummaryCSV(sum *CompareSummary) []byte {
 //     error, never a green 「completed」;
 //   - cancellation stops the loop: the in-flight database is recorded as
 //     cancelled, the partial summary is still written (note discloses it),
-//     and the task settles as cancelled.
+//     and the task settles as cancelled;
+//   - a summary that cannot land fails the task too (multiDBFinishDecision)
+//     — the summary faces are part of the deliverable, not a bonus.
 func (s *Server) runCompareMultiDB(ctx context.Context, task *CompareTask, taskMu *sync.Mutex, finish func(status, errMsg string), logger *zap.Logger) {
 	started := time.Now()
 
@@ -549,10 +572,23 @@ func (s *Server) runCompareMultiDB(ctx context.Context, task *CompareTask, taskM
 		tgt.Database = db
 		slug := compareDBSlug(i, db)
 		dbDir := filepath.Join(s.compareDir(task.ID), "db", slug)
-		report, rerr := s.executeCompareRun(ctx, task, taskMu, src, tgt,
-			filepath.Join(dbDir, "report.json"),
-			filepath.Join(s.compareDir(task.ID), "diff", slug),
-			filepath.Join(s.dataDir, "spool", task.ID, slug))
+		// 红队 B1: the engine writes report.json via reporter.Save's
+		// os.CreateTemp(dir), which needs the per-db directory to EXIST —
+		// nothing else creates it (the engine self-creates only the diff/
+		// and spool/ roots), and a failed save is swallowed as a Warn
+		// inside the validator, leaving a green task with a 404 ?db= face.
+		// A mkdir failure is honored like a connect failure: error row,
+		// loop continues.
+		var report *reporter.Report
+		var rerr error
+		if mkErr := os.MkdirAll(dbDir, 0o755); mkErr != nil {
+			rerr = fmt.Errorf("创建库报告目录失败: %w", mkErr)
+		} else {
+			report, rerr = s.executeCompareRun(ctx, task, taskMu, src, tgt,
+				filepath.Join(dbDir, "report.json"),
+				filepath.Join(s.compareDir(task.ID), "diff", slug),
+				filepath.Join(s.dataDir, "spool", task.ID, slug))
+		}
 		// B1 (the legacy rule): check ctx FIRST regardless of rerr — Run
 		// swallows per-table cancellations into failed table reports.
 		if ctx.Err() != nil {
@@ -589,26 +625,49 @@ func (s *Server) runCompareMultiDB(ctx context.Context, task *CompareTask, taskM
 		note = fmt.Sprintf("任务取消：已覆盖 %d/%d 个库", len(results), len(resolved))
 	}
 	sum := buildCompareSummary(task, results, started, time.Now(), note)
+	sumErr := ""
 	if serr := writeCompareSummary(s.compareDir(task.ID), sum); serr != nil {
 		logger.Warn("failed to write multi-db summary", zap.String("compare_id", task.ID), zap.Error(serr))
+		sumErr = fmt.Sprintf("汇总报告写盘失败: %v", serr)
 	}
 
 	taskMu.Lock()
 	task.DatabaseResults = results
 	taskMu.Unlock()
 
-	switch {
-	case cancelled:
-		finish(CompareStatusCancelled, "cancelled")
-	case len(errDBs) > 0:
-		msg := fmt.Sprintf("%d/%d 个库执行失败：%s", len(errDBs), len(resolved), strings.Join(errDBs, ", "))
-		finish(CompareStatusFailed, msg)
-	default:
+	status, msg := multiDBFinishDecision(cancelled, errDBs, sumErr, len(resolved))
+	if status == CompareStatusCompleted {
 		logger.Info("multi-db comparison finished",
 			zap.String("compare_id", task.ID),
 			zap.String("overall", sum.Status),
 			zap.Int("databases", len(results)))
-		finish(CompareStatusCompleted, "")
+	}
+	finish(status, msg)
+}
+
+// multiDBFinishDecision is the loop's terminal verdict as a pure function
+// (table-tested): cancellation wins; else any failed database fails the
+// task naming them; else a summary write failure ALSO fails the task (红队
+// M2 — writeCompareSummary's contract comment says a summary that cannot
+// land must not read as completed; before this the loop only Warn'd and
+// finished green); only a clean sweep completes.
+func multiDBFinishDecision(cancelled bool, errDBs []string, sumErr string, resolved int) (string, string) {
+	switch {
+	case cancelled:
+		if sumErr != "" {
+			return CompareStatusCancelled, "cancelled；" + sumErr
+		}
+		return CompareStatusCancelled, "cancelled"
+	case len(errDBs) > 0:
+		msg := fmt.Sprintf("%d/%d 个库执行失败：%s", len(errDBs), resolved, strings.Join(errDBs, ", "))
+		if sumErr != "" {
+			msg += "；" + sumErr
+		}
+		return CompareStatusFailed, msg
+	case sumErr != "":
+		return CompareStatusFailed, sumErr
+	default:
+		return CompareStatusCompleted, ""
 	}
 }
 
@@ -800,10 +859,14 @@ tr.row-fail td:first-child { box-shadow: inset 3px 0 0 #E13C3C; }
 			if r.Duration != "" {
 				durHTML = fmt.Sprintf(`<td class="num">%s</td>`, mcHTMLEsc(r.Duration))
 			}
-			errStr := mcHTMLEsc(r.Error)
-			if len(errStr) > 80 {
-				errStr = errStr[:80] + "..."
+			// 红队 m1: truncate at a RUNE boundary on the raw string — byte-
+			// slicing the escaped text halves multi-byte characters (and can
+			// cut an HTML entity in half) — then escape.
+			errStr := r.Error
+			if runes := []rune(errStr); len(runes) > 80 {
+				errStr = string(runes[:80]) + "..."
 			}
+			errStr = mcHTMLEsc(errStr)
 			fmt.Fprintf(&sb,
 				`<tr%s><td class="num">%d</td><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%d</td><td class="num">%d</td><td class="num">%d</td><td class="num">%d</td><td class="num">%d</td>%s%s<td>%s</td></tr>`,
 				rowClass, idx+1, mcHTMLEsc(r.Database), mcHTMLEsc(badgeClass), mcHTMLEsc(compareDBStatusCN(r.Status)),

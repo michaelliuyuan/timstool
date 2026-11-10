@@ -1278,8 +1278,15 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 	// #t95 P1: possibly-stuck heartbeat — flags the task when NO progress
 	// event lands within the threshold (slow-but-moving stays green). Task-
 	// scoped since A2: the multi-db loop runs per-database compare configs,
-	// and the threshold knob is task-level either way.
-	hbThreshold := (config.CompareConfig{PossiblyStuckTimeout: task.PossiblyStuckTimeout}).PossiblyStuckTimeoutDuration()
+	// and the threshold knob is task-level either way. 红队 M1: QueryTimeout
+	// must ride along — PossiblyStuckTimeoutDuration() clamps ps against qt
+	// (ps<=qt → 2×qt), so dropping it silently rewrote the threshold for
+	// legacy tasks too. The literal mirrors buildCompareRunParams exactly
+	// (pinned by TestCompareHeartbeatThresholdDerivation).
+	hbThreshold := (config.CompareConfig{
+		PossiblyStuckTimeout: task.PossiblyStuckTimeout,
+		QueryTimeout:         task.QueryTimeout,
+	}).PossiblyStuckTimeoutDuration()
 	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
 	defer heartbeatCancel()
 	go s.compareHeartbeat(heartbeatCtx, task, &taskMu, hbThreshold)
@@ -1508,6 +1515,12 @@ func (s *Server) handleCompareMultiReport(w http.ResponseWriter, task *CompareTa
 		s.writeError(w, http.StatusNotFound, "compare report not found — ?db= 必须是该任务解析出的库名之一")
 		return
 	}
+	// 红队 m5: per-db reports have json/html faces only — an explicit named
+	// 404 instead of silently serving the html face under a csv ask.
+	if format == "csv" {
+		s.writeError(w, http.StatusNotFound, "compare report not found — 汇总 CSV 仅在汇总面提供（不带 ?db=）；单库报告请用 format=json/html")
+		return
+	}
 	reportPath := filepath.Join(s.compareDir(task.ID), "db", slug, "report.json")
 	if format == "json" {
 		b, err := os.ReadFile(reportPath)
@@ -1516,7 +1529,9 @@ func (s *Server) handleCompareMultiReport(w http.ResponseWriter, task *CompareTa
 			return
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-report-%s-%s.json", task.ID, db))
+		// 红队 m3: the filename carries the slug (header-safe ASCII) — the
+		// raw db name comes from the server's listing and can be non-ASCII.
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-report-%s-%s.json", task.ID, slug))
 		w.Write(b)
 		return
 	}
@@ -1534,11 +1549,12 @@ func (s *Server) handleCompareMultiReport(w http.ResponseWriter, task *CompareTa
 	// The family renderer reads task.Source/Target.Database for the meta
 	// grid — a shallow copy with this database's names shows which pair
 	// the report covers (the task-level fields stay the multi-db ones).
+	// 红队 m3: filename uses the header-safe slug, same as the json face.
 	dbTask := *task
 	dbTask.Source.Database = db
 	dbTask.Target.Database = db
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-report-%s-%s.html", task.ID, db))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-report-%s-%s.html", task.ID, slug))
 	w.Write([]byte(renderDataCompareReportHTML(&dbTask, &rpt)))
 }
 

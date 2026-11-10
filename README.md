@@ -599,7 +599,7 @@ PUT    /api/v1/compare/options                 # 保存连接配置（部分合�
 
 > 比对模式：`quick`（行数估算，最快）/ `sample`（行数+随机采样，推荐）/ `checksum`（行数+分块哈希校验，支持分块大小与并行数）。表清单留空表示比对全部表。任务数据持久化在 `<dataDir>/compare/{id}/`，与迁移任务存储隔离。**A1 任务队列**：同一时刻仍仅一个比对任务真正运行，但遇忙不再返回 409 `already running`——新任务以 `status=queued` 进入 FIFO 排队队列（API 返回 202；队列状态即 task.json，重启不丢），前台任务结束（完成/失败/取消）后自动依序接跑队首；排队任务可通过 cancel 立即出队、也可直接删除。进程重启后遗留的 running 任务自动标记为失败；重启后排队任务中，带数据源引用（`source_ref`/`target_ref`）者按序恢复调度，未带引用（内联凭据）者因密码永不落盘而显式标记失败并给出重新提交提示。
 >
-> **A2 多库批量**：`databases` 支持显式库名与通配模式（`*`/`?`，可混合，最多 64 条；`exclude_databases` 从解析结果中扣除）。含通配时运行期连源库枚举库名解析（PG 走 `pg_database`；MySQL 走 `SHOW DATABASES` 并自动排除系统库），字面量直接按名执行；解析结果（上限 256 库）在开跑前落盘（`resolved_databases`），进度为「X/Y 库 · 表 done/total」。引擎逐库**串行**复用既有单库流程（keyset/超时/心跳语义零改动，不开新并发面），目标 TiDB 需已建同名库。任一库连接失败/水位全跳过时记录该库 `status=error` 并继续其余库，最终任务状态为 failed 并点名失败库；每库产出独立 `db/{序号}-{库名}/report.json`，收尾写跨库汇总（`summary.json` + 汇总 `summary.csv`：每库 PASS/FAIL/差异表数一行 + 合计行）。行级差异明细与内容对照按库分目录存放，下载路由以 `?db=<库名>` 选择。
+> **A2 多库批量**：`databases` 支持显式库名与通配模式（`*`/`?`，可混合，最多 64 条；`exclude_databases` 从解析结果中扣除）。含通配时运行期连源库枚举库名解析（PG 走 `pg_database`；MySQL 走 `SHOW DATABASES` 并自动排除系统库），字面量直接按名执行；解析结果（上限 256 库）在开跑前落盘（`resolved_databases`），进度为「X/Y 库 · 表 done/total」。注意通配口径的方言差异：MySQL 侧自动剔除系统库，PG 侧 `pg_database` 里可连接的业务库都会命中（含 `postgres` 维护库），不需要的库请用 `exclude_databases` 排除。引擎逐库**串行**复用既有单库流程（keyset/超时/心跳语义零改动，不开新并发面），目标 TiDB 需已建同名库。任一库连接失败/水位全跳过时记录该库 `status=error` 并继续其余库，最终任务状态为 failed 并点名失败库；每库产出独立 `db/{序号}-{库名}/report.json`，收尾写跨库汇总（`summary.json` + 汇总 `summary.csv`：每库 PASS/FAIL/差异表数一行 + 合计行；汇总写盘失败则任务判 failed，不产出绿色完成）。行级差异明细与内容对照按库分目录存放，下载路由以 `?db=<库名>` 选择。
 
 #### 健康检查
 
