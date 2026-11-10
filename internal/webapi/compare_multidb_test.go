@@ -1007,12 +1007,17 @@ func TestRunCompareMultiDB_Wiring_ArtifactFailure(t *testing.T) {
 // assertions must be assignment lines (not log lines), and the seam's
 // DEFAULT body got its own invariant (it had none — swapping the default
 // for a fabricated report left the whole suite green).
+// 红队 20:32 residual hardening: the source is sanitized BEFORE slicing so
+// a "}" inside a string literal cannot end the slice early (false red), and
+// each pinned call must appear EXACTLY ONCE — a dead `if false { ... }` copy
+// of the real call used to satisfy the positive assertions while the live
+// path did something else.
 func TestCompareCallSiteInvariants(t *testing.T) {
 	src, err := os.ReadFile("compare.go")
 	if err != nil {
 		t.Fatalf("read compare.go: %v", err)
 	}
-	body := sanitizeGoCode(functionBody(string(src), "func (s *Server) runCompare("))
+	body := functionBody(sanitizeGoCode(string(src)), "func (s *Server) runCompare(")
 	if body == "" {
 		t.Fatal("runCompare body not found (function renamed? update this anchor)")
 	}
@@ -1022,12 +1027,19 @@ func TestCompareCallSiteInvariants(t *testing.T) {
 	if strings.Contains(body, "PossiblyStuckTimeoutDuration()") {
 		t.Error("runCompare must not inline the threshold derivation (the M1 regression shape)")
 	}
+	// 红队 ⑥.2: exactly ONE derivation — a dead-code duplicate of the real
+	// call (inside `if false { ... }`) used to satisfy the positive while
+	// the live path kept the constant.
+	if n := strings.Count(body, "hbThreshold :="); n != 1 {
+		t.Errorf("runCompare must derive hbThreshold exactly once, found %d (dead-code duplication?)", n)
+	}
 
 	multi, err := os.ReadFile("compare_multidb.go")
 	if err != nil {
 		t.Fatalf("read compare_multidb.go: %v", err)
 	}
-	loop := sanitizeGoCode(functionBody(string(multi), "func (s *Server) runCompareMultiDB("))
+	cleanMulti := sanitizeGoCode(string(multi))
+	loop := functionBody(cleanMulti, "func (s *Server) runCompareMultiDB(")
 	if loop == "" {
 		t.Fatal("runCompareMultiDB body not found (function renamed? update this anchor)")
 	}
@@ -1037,11 +1049,14 @@ func TestCompareCallSiteInvariants(t *testing.T) {
 	if strings.Contains(loop, "compareDBResultFromReport(db, report)") {
 		t.Error("the loop must not take the report straight to a result row (that is the bypass)")
 	}
+	if n := strings.Count(loop, "classifyPerDBOutcome("); n != 1 {
+		t.Errorf("the loop must classify exactly once per database, found %d call sites (dead-code duplication?)", n)
+	}
 
 	// 红队 ⑥.2: the seam's DEFAULT value must remain the real engine. A
 	// default body that fabricates a report replaces the engine in every
 	// real binary while the entire suite stays green (nothing executed it).
-	seam := sanitizeGoCode(functionBody(string(multi), "var comparePerDBRun = func"))
+	seam := functionBody(cleanMulti, "var comparePerDBRun = func")
 	if seam == "" {
 		t.Fatal("comparePerDBRun seam not found (renamed? update this anchor)")
 	}
@@ -1051,12 +1066,23 @@ func TestCompareCallSiteInvariants(t *testing.T) {
 	if strings.Contains(seam, "reporter.NewReport(") {
 		t.Error("the seam must not fabricate reports (engine silently replaced by a stub)")
 	}
+	// 红队 ⑥.3: exactly ONE return, and it is the real engine — an
+	// `if false { return s.executeCompareRun(...) }` plus a live
+	// `return seamFakeReport` used to pass both contains checks.
+	if n := strings.Count(seam, "return s.executeCompareRun("); n != 1 {
+		t.Errorf("the seam must return the real engine exactly once, found %d", n)
+	}
+	if n := strings.Count(seam, "return "); n != 1 {
+		t.Errorf("the seam must have exactly one return statement, found %d (dead-code duplication?)", n)
+	}
 }
 
 // functionBody returns the source text of a top-level function, from its
 // signature to the matching closing brace (brace-counted), or "" when the
 // signature is absent. Counting starts at the signature's first "{" so a
-// declaration split across lines still resolves.
+// declaration split across lines still resolves. The input must ALREADY be
+// sanitized (红队 20:32 ⑤): braces inside string literals would otherwise
+// end the slice early.
 func functionBody(src, signature string) string {
 	i := strings.Index(src, signature)
 	if i < 0 {
