@@ -893,3 +893,146 @@ func TestPerDBArtifactChain_EndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// TestRunCompareMultiDB_Wiring_ArtifactFailure is the WIRING anchor 红队 seq=19
+// demanded: it drives the REAL runCompareMultiDB loop (through runCompare's
+// dispatch) with a stubbed engine that returns a healthy in-memory report but
+// writes NOTHING to disk — the exact shape of "validator downgraded Save to a
+// Warn" (validator.go:624-626). The loop must consult the artifact and settle
+// the task as failed, naming the database.
+//
+// Why this test exists: every earlier A2 anchor read a pure helper, so
+// deleting the classifyPerDBOutcome call from the loop left them all green.
+// This one fails if that wiring is removed.
+func TestRunCompareMultiDB_Wiring_ArtifactFailure(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	prev := comparePerDBRun
+	t.Cleanup(func() { comparePerDBRun = prev })
+	comparePerDBRun = func(_ *Server, _ context.Context, _ *CompareTask, _ *sync.Mutex,
+		_ config.SourceConfig, _ config.TargetConfig, _, _, _ string) (*reporter.Report, error) {
+		// Healthy report, NO file written — the engine's silent-save-failure.
+		rpt := reporter.NewReport("data-validation")
+		rpt.AddTableReport(reporter.TableReport{TableName: "t1", Status: reporter.StatusPass})
+		rpt.Finish(reporter.StatusPass, "validated 1 tables at level quick")
+		return rpt, nil
+	}
+
+	task := &CompareTask{
+		ID:        "ee000005",
+		Name:      "wiring",
+		Mode:      "quick",
+		Databases: []string{"dbone", "dbtwo"},
+		Source:    config.SourceConfig{Host: "src", Port: 5432, User: "u", Type: "postgres"},
+		Target:    config.TargetConfig{Host: "tgt", Port: 4000, User: "u"},
+	}
+	if err := s.persistCompareTask(task); err != nil {
+		t.Fatal(err)
+	}
+	// mark the running slot so finish() takes its ownership branch
+	s.compare.mu.Lock()
+	s.compare.runningID = task.ID
+	s.compare.cancel = func() {}
+	s.compare.mu.Unlock()
+
+	s.runCompare(context.Background(), task)
+
+	if task.Status != CompareStatusFailed {
+		t.Fatalf("a database whose artifact never landed must fail the task, got %q (error=%q)", task.Status, task.Error)
+	}
+	if !strings.Contains(task.Error, "dbone") || !strings.Contains(task.Error, "2/2") {
+		t.Fatalf("failure must name every database with the count: %q", task.Error)
+	}
+	for _, r := range task.DatabaseResults {
+		if r.Status != compareDBStatusError {
+			t.Fatalf("db %s must be error, got %q", r.Database, r.Status)
+		}
+	}
+	// The per-db directories still exist (the loop creates them before the
+	// run) — the failure is the MISSING report.json, not a missing dir.
+	for i, db := range task.ResolvedDatabases {
+		if _, err := os.Stat(filepath.Join(s.compareDir(task.ID), "db", compareDBSlug(i, db))); err != nil {
+			t.Fatalf("per-db dir for %s must still exist: %v", db, err)
+		}
+	}
+}
+
+// TestCompareCallSiteInvariants is the source-level backstop 红队 seq=19
+// asked for: some regressions are call-site substitutions (the anchor reads
+// a helper that production no longer calls), and no runtime test can see
+// them. These assertions slice the named function bodies FIRST, then look
+// for the exact wiring, so a same-named symbol elsewhere cannot fake a pass.
+func TestCompareCallSiteInvariants(t *testing.T) {
+	src, err := os.ReadFile("compare.go")
+	if err != nil {
+		t.Fatalf("read compare.go: %v", err)
+	}
+	body := stripLineComments(functionBody(string(src), "func (s *Server) runCompare("))
+	if body == "" {
+		t.Fatal("runCompare body not found (function renamed? update this anchor)")
+	}
+	if !strings.Contains(body, "hbThreshold := compareHeartbeatThreshold(task)") {
+		t.Error("runCompare must derive the heartbeat threshold via compareHeartbeatThreshold(task)")
+	}
+	if strings.Contains(body, "PossiblyStuckTimeoutDuration()") {
+		t.Error("runCompare must not inline the threshold derivation (the M1 regression shape)")
+	}
+
+	multi, err := os.ReadFile("compare_multidb.go")
+	if err != nil {
+		t.Fatalf("read compare_multidb.go: %v", err)
+	}
+	loop := stripLineComments(functionBody(string(multi), "func (s *Server) runCompareMultiDB("))
+	if loop == "" {
+		t.Fatal("runCompareMultiDB body not found (function renamed? update this anchor)")
+	}
+	if !strings.Contains(loop, "classifyPerDBOutcome(") {
+		t.Error("the multi-db loop must classify through classifyPerDBOutcome (the B1 wiring)")
+	}
+	if strings.Contains(loop, "compareDBResultFromReport(db, report)") {
+		t.Error("the loop must not take the report straight to a result row (that is the bypass)")
+	}
+}
+
+// functionBody returns the source text of a top-level function, from its
+// signature to the matching closing brace (brace-counted), or "" when the
+// signature is absent. Counting starts at the signature's first "{" so a
+// declaration split across lines still resolves.
+func functionBody(src, signature string) string {
+	i := strings.Index(src, signature)
+	if i < 0 {
+		return ""
+	}
+	open := strings.Index(src[i:], "{")
+	if open < 0 {
+		return ""
+	}
+	open += i
+	depth := 0
+	for j := open; j < len(src); j++ {
+		switch src[j] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return src[i : j+1]
+			}
+		}
+	}
+	return ""
+}
+
+// stripLineComments removes //-comments line by line so source-level
+// assertions inspect CODE, not prose (a comment mentioning the forbidden
+// symbol must not satisfy — or trip — the anchor).
+func stripLineComments(b string) string {
+	var out []string
+	for _, line := range strings.Split(b, "\n") {
+		if idx := strings.Index(line, "//"); idx >= 0 {
+			line = line[:idx]
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}

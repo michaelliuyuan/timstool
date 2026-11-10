@@ -318,6 +318,22 @@ func classifyPerDBOutcome(db string, report *reporter.Report, reportFile string,
 	return compareDBResultFromReport(db, report), false
 }
 
+// comparePerDBRun is the engine call for one database, kept behind a
+// package-level seam (the compareListSourceDatabases / compareHeartbeatTick
+// pattern) so a wiring anchor can drive runCompareMultiDB END TO END without
+// a live database. The production value is the real executeCompareRun —
+// single-db engine call, unchanged.
+//
+
+// Wiring anchors matter here: 红队 seq=19 showed every earlier A2 anchor read
+// a pure function but never executed the loop's call site, so bypassing
+// classifyPerDBOutcome in runCompareMultiDB left the suite green. This seam
+// exists so that CANNOT happen silently.
+var comparePerDBRun = func(s *Server, ctx context.Context, task *CompareTask, taskMu *sync.Mutex,
+	src config.SourceConfig, tgt config.TargetConfig, reportFile, diffDir, spoolRoot string) (*reporter.Report, error) {
+	return s.executeCompareRun(ctx, task, taskMu, src, tgt, reportFile, diffDir, spoolRoot)
+}
+
 // verifyPerDBReport confirms the per-database report artifact really exists
 // and really parses. The engine (validator.go:624-626) downgrades a failed
 // reporter.Save to a Warn and hands back the in-memory report, so without
@@ -629,7 +645,7 @@ func (s *Server) runCompareMultiDB(ctx context.Context, task *CompareTask, taskM
 		if mkErr := os.MkdirAll(dbDir, 0o755); mkErr != nil {
 			rerr = fmt.Errorf("创建库报告目录失败: %w", mkErr)
 		} else {
-			report, rerr = s.executeCompareRun(ctx, task, taskMu, src, tgt,
+			report, rerr = comparePerDBRun(s, ctx, task, taskMu, src, tgt,
 				reportFile,
 				filepath.Join(s.compareDir(task.ID), "diff", slug),
 				filepath.Join(s.dataDir, "spool", task.ID, slug))
