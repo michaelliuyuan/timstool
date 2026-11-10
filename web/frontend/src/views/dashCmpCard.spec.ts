@@ -89,10 +89,10 @@ describe('FEAT-DASH-CMP-CARD ③: CompareView query 钩子', () => {
 })
 
 describe('FEAT-DASH-CMP-CARD ④: 递版与既有面零回归', () => {
-  it('package.json 递版（FEAT-DASH-UNIFY 后 = 3.23.5）', () => {
+  it('package.json 递版（A2 多库批量后 = 3.23.6）', () => {
     const p = readFileSync(resolve(__dirname, '../../package.json'), 'utf8')
-    expect(p).toContain('"version": "3.23.5"')
-    expect(p).not.toContain('"version": "3.23.4"')
+    expect(p).toContain('"version": "3.23.6"')
+    expect(p).not.toContain('"version": "3.23.5"')
   })
 
   it('既有四指标卡四档 label 原样在位（第五卡纯增）', () => {

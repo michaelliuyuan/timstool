@@ -242,6 +242,22 @@ const loadingTables = ref(false)
 const tableSearch = ref('')
 const selectedTables = ref<string[]>([])
 
+// ---- A2 多库批量 (#102): one task covering N databases ----
+// databases holds explicit names and/or wildcard patterns (* ?), resolved
+// server-side at run start (literals pass through, wildcards expand against
+// the source listing, excludes subtract); the engine loops the databases
+// sequentially through the unchanged single-db flow and the summary rows
+// (task.database_results) render below. Switch off = the legacy payload
+// (databases keys omitted, byte-identical create body).
+const multiDb = ref(false)
+const multiDbs = ref<string[]>([])
+const excludeDbs = ref<string[]>([])
+// The database whose per-db report is loaded into activeReport ('' = none;
+// multi-db tasks render the cross-db table instead until a row is opened).
+const activeDb = ref('')
+
+const isMultiTask = (t: CompareTask | null | undefined) => !!t && (t.databases_total ?? 0) > 0
+
 // ---- #wm-override: per-table watermark exceptions (P1A/P4A) ----
 // One editor entry per table; an entry ACTIVATES under the SAME rule as the
 // global group (column + value, or column + full interval) — a half-filled
@@ -663,7 +679,7 @@ let pollTimer: number | undefined
 // the table named by current_table); newest first, bounded height (收拢式防刷屏).
 // Deliberately NOT part of the persisted task schema — refresh resets it and
 // report.json stays the persistent truth (D2 ruling).
-interface DoneTableEntry { name: string; status: string; duration?: string }
+interface DoneTableEntry { name: string; status: string; duration?: string; db?: string }
 const doneTables = ref<DoneTableEntry[]>([])
 
 async function refreshTasks() {
@@ -699,6 +715,11 @@ function connectWS() {
         activeTask.value.tables_done = data.tables_done ?? activeTask.value.tables_done
         activeTask.value.tables_total = data.tables_total ?? activeTask.value.tables_total
         activeTask.value.current_table = data.current_table ?? ''
+        // A2 多库 (#102): 「X/Y 库 · 当前库」 counters ride the same
+        // broadcast; absent keys leave single-db tasks untouched.
+        activeTask.value.databases_done = data.databases_done ?? activeTask.value.databases_done
+        activeTask.value.databases_total = data.databases_total ?? activeTask.value.databases_total
+        activeTask.value.current_database = data.current_database ?? activeTask.value.current_database
         // #t95 P1: chunk progress + possibly_stuck heartbeat ride the same
         // broadcast — the UI can show 「正在校验 X，chunk i/N」 and tell a
         // slow run from a stuck one.
@@ -709,9 +730,12 @@ function connectWS() {
         // FEAT-CMP-TBL-DURATION: table-done broadcasts carry table_status —
         // chunk-progress and terminal broadcasts don't, so the field is the
         // gate. Each hit lights the finished table's 耗时 immediately.
+        // A2: the dedup key carries the current database (the same table
+        // name in the next database is a different row).
         if (data.table_status && data.current_table) {
-          const entry: DoneTableEntry = { name: data.current_table, status: data.table_status, duration: data.table_duration }
-          if (!doneTables.value.some(e => e.name === entry.name)) {
+          const entry: DoneTableEntry = { name: data.current_table, status: data.table_status, duration: data.table_duration, db: activeTask.value.current_database }
+          const key = `${entry.db ?? ''}#${entry.name}`
+          if (!doneTables.value.some(e => `${e.db ?? ''}#${e.name}` === key)) {
             doneTables.value.unshift(entry)
           }
         }
@@ -725,18 +749,77 @@ function connectWS() {
   }
 }
 
-async function loadReport(id: string) {
+async function loadReport(id: string, db?: string) {
+  // A2 多库: the no-db json face of a multi-db task is the cross-database
+  // SUMMARY (not a CompareReport) — the FE renders it from the task's own
+  // database_results rows, so nothing is fetched here until a database row
+  // is opened (viewDbReport).
+  if (!db) {
+    const t = tasks.value.find(x => x.id === id) ?? activeTask.value
+    if (isMultiTask(t)) {
+      activeReport.value = null
+      activeDb.value = ''
+      loadingReport.value = false
+      return
+    }
+  }
   loadingReport.value = true
   try {
     // MC-16: explicit format='json' — the endpoint's no-param default is
     // now the server-rendered html family report.
-    const { data } = await apiClient.getCompareReport(id, 'json')
+    const { data } = await apiClient.getCompareReport(id, 'json', db)
     activeReport.value = data
+    activeDb.value = db || ''
   } catch {
     activeReport.value = null
   } finally {
     loadingReport.value = false
   }
+}
+
+// A2 多库: open one database's per-db report below the summary table.
+async function viewDbReport(db: string) {
+  if (!activeTask.value) return
+  activeDb.value = db
+  await loadReport(activeTask.value.id, db)
+}
+
+// A2 多库: summary downloads — the server-written artifacts (summary.csv /
+// the html summary face), same anchor-download channel as the rowdiff CSV.
+function downloadSummaryCsv() {
+  const t = activeTask.value
+  if (!t) return
+  const a = document.createElement('a')
+  a.href = apiClient.compareSummaryCsvUrl(t.id)
+  a.download = `compare-summary-${t.id}.csv`
+  a.click()
+}
+
+async function downloadSummaryReport() {
+  const t = activeTask.value
+  if (!t) return
+  try {
+    const { data } = await apiClient.getCompareReport(t.id, 'html')
+    downloadBlob(data, 'text/html;charset=utf-8', `compare-summary-${t.id}.html`)
+  } catch (e: any) {
+    const raw = e?.response?.data
+    let cause = e?.message
+    if (typeof raw === 'string' && raw) {
+      try { cause = JSON.parse(raw)?.error || cause } catch { /* non-JSON body */ }
+    } else if (raw?.error) {
+      cause = String(raw.error)
+    }
+    ElMessage.error(`下载汇总报告失败：${cause}`)
+  }
+}
+
+// A2 多库: per-db status vocabulary (pass/warn/fail + the loop-only
+// error/cancelled rows).
+function dbStatusTag(s: string) {
+  return { pass: 'success', warn: 'warning', fail: 'danger', error: 'danger', cancelled: 'info' }[s] || 'info'
+}
+function dbStatusText(s: string) {
+  return { pass: '通过', warn: '警告', fail: '失败', error: '执行失败', cancelled: '已取消' }[s] || s
 }
 
 async function startCompare() {
@@ -746,6 +829,13 @@ async function startCompare() {
   }
   if (!targetRef.value && !form.target.host) {
     ElMessage.warning('请先选择目标库数据源或填写连接信息')
+    return
+  }
+  // A2 多库 (#102): the switch alone is not a selection — an empty list
+  // would silently fall back to the legacy single-db run.
+  const dbSel = multiDb.value ? multiDbs.value.map(d => d.trim()).filter(d => d !== '') : []
+  if (multiDb.value && dbSel.length === 0) {
+    ElMessage.warning('多库批量已开启，请至少填写一个库名或通配模式')
     return
   }
   starting.value = true
@@ -800,6 +890,13 @@ async function startCompare() {
           : { table, column: e.column.trim(), value: e.value.trim(), op: e.op }),
       // #ignore: value-comparison exclusion list (trimmed; server dedups).
       ignore_columns: ignoreCols.value.map((c) => c.trim()).filter((c) => c !== ''),
+      // A2 多库 (#102): selection + exclusions ride ONLY when the switch is
+      // on with a non-empty list — the legacy single-db body stays
+      // byte-identical (keys omitted).
+      ...(multiDb.value && dbSel.length > 0 ? {
+        databases: dbSel,
+        exclude_databases: excludeDbs.value.map((d) => d.trim()).filter((d) => d !== ''),
+      } : {}),
     })
     activeTask.value = data
     activeReport.value = null
@@ -837,6 +934,7 @@ async function cancelActive() {
 async function viewTask(t: CompareTask) {
   activeTask.value = t
   activeReport.value = null
+  activeDb.value = '' // A2: fresh watch session starts at the summary face
   doneTables.value = [] // FEAT-CMP-TBL-DURATION: live list is per-watch-session (refresh-restart accepted, D2)
   if (t.status === 'completed') await loadReport(t.id)
 }
@@ -859,9 +957,22 @@ async function removeTask(t: CompareTask) {
 
 const progressPct = computed(() => {
   const t = activeTask.value
-  if (!t || !t.tables_total) return 0
+  if (!t) return 0
+  // A2 多库: overall = finished databases + the current database's table
+  // fraction, over the database total (clamped — the terminal broadcast
+  // can land with done==total and the last table at 100%).
+  if (t.databases_total && t.databases_total > 0) {
+    const perDb = t.tables_total ? t.tables_done / t.tables_total : 0
+    const done = (t.databases_done || 0) + perDb
+    return Math.min(100, Math.round((done / t.databases_total) * 100))
+  }
+  if (!t.tables_total) return 0
   return Math.round((t.tables_done / t.tables_total) * 100)
 })
+
+// A2 多库: the db-prefixed progress line shows for tasks that carry the
+// database counters (absent/0 = legacy single-db task).
+const multiProgress = computed(() => isMultiTask(activeTask.value))
 
 // #t95 P1: chunk i/N shows only for checksum-mode tasks that actually carry
 // chunk progress (quick/sample modes and pre-P1 tasks never emit the fields).
@@ -923,12 +1034,14 @@ function countCell(t: { status?: string; error?: string }, key: 'source_rows' | 
 
 // ---- 行级差异（row-diff drill）: failed checksum tables carry a bounded
 // summary (three-class counts + sample keys) in row_diffs; the full detail
-// downloads as CSV via the read-only rowdiff route. ----
+// downloads as CSV via the read-only rowdiff route. A2 多库: the URL and
+// the content fetch carry the viewed database (?db=) — per-db artifacts
+// live in per-db subdirectories. ----
 function downloadRowDiff(file: string) {
   const t = activeTask.value
   if (!t || !file) return
   const a = document.createElement('a')
-  a.href = apiClient.compareRowDiffUrl(t.id, file)
+  a.href = apiClient.compareRowDiffUrl(t.id, file, activeDb.value || undefined)
   a.download = file
   a.click()
 }
@@ -961,8 +1074,10 @@ function rowDiffContentFile(rdf?: CompareRowDiffs): string | null {
 // 缓存键含任务维度（红队①，leader 终裁）：content 文件名由表名派生、
 // 跨任务确定——两任务比同一表时，不带 t.id 的键会让后展开的任务看到
 // 先展开任务的陈旧行（校验工具展示错行=最劣级缺陷）。
+// A2 多库: the viewed database joins the key — the same table name in two
+// databases of one multi-db task has two different content artifacts.
 function rowDiffCacheKey(table: string, rdf?: CompareRowDiffs): string {
-  return `${activeTask.value?.id ?? ''}#${table}#${rdf?.file ?? ''}`
+  return `${activeTask.value?.id ?? ''}#${activeDb.value}#${table}#${rdf?.file ?? ''}`
 }
 function rowDiffState(table: string, rdf?: CompareRowDiffs): RowDiffContentState | null {
   return rowDiffContentCache.value[rowDiffCacheKey(table, rdf)] ?? null
@@ -985,7 +1100,7 @@ function onReportRowExpand(row: any) {
   const t = activeTask.value
   if (!t) return
   rowDiffContentCache.value[key] = { status: 'loading', entries: [], error: '' }
-  apiClient.getCompareRowDiffContent(t.id, file)
+  apiClient.getCompareRowDiffContent(t.id, file, activeDb.value || undefined)
     .then(res => {
       rowDiffContentCache.value[key] = { status: 'done', entries: res.data ?? [], error: '' }
     })
@@ -1110,12 +1225,14 @@ function exportCsv() {
 // MC-16: the HTML report moved server-side (family single source of truth —
 // TiMS banner, meta grid, Chinese badges, # column; the client-side assembly
 // is deleted). The button downloads the server-rendered artifact as a blob,
-// same channel as the CSV export.
+// same channel as the CSV export. A2 多库: with a database row open the
+// download carries its ?db= (the per-db report face); the summary face has
+// its own button next to the summary table.
 async function downloadReport() {
   const t = activeTask.value
   if (!t) return
   try {
-    const { data } = await apiClient.getCompareReport(t.id, 'html')
+    const { data } = await apiClient.getCompareReport(t.id, 'html', activeDb.value || undefined)
     downloadBlob(data, 'text/html;charset=utf-8', `compare-report-${t.id}.html`)
   } catch (e: any) {
     // MC-17 ③: the html face is responseType 'text', so an error body that
@@ -1230,6 +1347,23 @@ onUnmounted(() => {
         <el-divider content-position="left">比对配置</el-divider>
         <el-form-item label="任务名称">
           <el-input v-model="form.name" placeholder="可选，自动生成" style="width: 350px;" />
+        </el-form-item>
+        <el-form-item label="多库批量">
+          <div style="width: 100%;">
+            <el-switch v-model="multiDb" />
+            <span style="color: var(--tims-text-2); font-size: var(--tims-font-xs); margin-left: 8px;">一个任务依次比对多个库，产出跨库汇总（A2）</span>
+            <template v-if="multiDb">
+              <el-select v-model="multiDbs" multiple allow-create filterable default-first-option
+                         placeholder="库名或通配模式，如 shop_2024、shop_*（回车添加，可混合）" style="width: 100%; margin-top: 8px;" />
+              <el-select v-model="excludeDbs" multiple allow-create filterable default-first-option
+                         placeholder="排除的库名/模式，如 *_test、postgres（可选，回车添加）" style="width: 100%; margin-top: 8px;" />
+              <div style="font-size: var(--tims-font-xs); color: var(--tims-text-2); margin-top: 6px;">
+                通配符支持 * 与 ?（含通配时运行期连源库枚举库名解析，MySQL 自动排除系统库）；目标 TiDB 需已建同名库；
+                进度为「X/Y 库 · 表 done/total」，库与库之间串行执行（资源安全）。上方连接里的数据库仅作为通配解析的入口库；
+                已选表/水位/排除字段对每个库同样生效。
+              </div>
+            </template>
+          </div>
         </el-form-item>
         <el-form-item label="选择表">
           <div style="width: 100%;">
@@ -1426,7 +1560,7 @@ onUnmounted(() => {
         style="margin-bottom: 12px;"
       />
       <div v-if="activeTask.status === 'running'" style="color: var(--tims-text-2); margin-bottom: 12px;">
-        比对进度：{{ activeTask.tables_done }} / {{ activeTask.tables_total || '?' }} 张表
+        比对进度：<template v-if="multiProgress">库 {{ activeTask.databases_done || 0 }} / {{ activeTask.databases_total }}<span v-if="activeTask.current_database">（当前：{{ activeTask.current_database }}）</span> · </template>{{ activeTask.tables_done }} / {{ activeTask.tables_total || '?' }} 张表
         <span v-if="activeTask.current_table">
           （当前：{{ activeTask.current_table }}<template v-if="showChunkProgress">，chunk {{ activeTask.current_chunk }}/{{ activeTask.total_chunks }}</template>）
         </span>
@@ -1438,8 +1572,8 @@ onUnmounted(() => {
       <div v-if="activeTask.status === 'running' && doneTables.length" class="done-tables-box">
         <div class="done-tables-head">已完成表（{{ doneTables.length }}，最新在前）</div>
         <div class="done-tables-list">
-          <div v-for="t in doneTables" :key="t.name" class="done-tables-row">
-            <span class="done-tables-name">{{ t.name }}</span>
+          <div v-for="t in doneTables" :key="`${t.db ?? ''}#${t.name}`" class="done-tables-row">
+            <span class="done-tables-name">{{ t.db ? `${t.db} · ${t.name}` : t.name }}</span>
             <el-tag size="small" :type="tableStatusTag(t.status)">{{ tableStatusText(t.status) }}</el-tag>
             <span class="tims-num done-tables-dur">{{ t.duration || '—' }}</span>
           </div>
@@ -1455,8 +1589,54 @@ onUnmounted(() => {
       />
       <el-alert v-if="activeTask.error" type="error" :closable="false" :title="activeTask.error" style="margin-bottom: 12px;" />
 
+      <!-- A2 多库 (#102): cross-database summary — one row per database
+           (pass/warn/fail + the loop-only error/cancelled rows), summary
+           CSV/HTML downloads (server-written artifacts), and 查看 opening
+           that database's per-db report in the table below. -->
+      <template v-if="activeTask.database_results?.length">
+        <div style="margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">
+          <span style="font-weight: 600;">跨库汇总（{{ activeTask.database_results.length }} 个库）</span>
+          <span>
+            <el-button size="small" @click="downloadSummaryCsv">下载汇总 CSV</el-button>
+            <el-button size="small" @click="downloadSummaryReport">下载汇总报告</el-button>
+          </span>
+        </div>
+        <div class="tims-table-scroll" style="margin-bottom: 12px;">
+          <el-table stripe :data="activeTask.database_results" size="small" max-height="260">
+            <el-table-column prop="database" label="库名" min-width="140" />
+            <el-table-column label="状态" width="100">
+              <template #default="{ row }">
+                <el-tag :type="dbStatusTag(row.status)" size="small">{{ dbStatusText(row.status) }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="total_tables" label="表总数" width="90" align="right" class-name="tims-num-col" />
+            <el-table-column prop="pass_tables" label="通过" width="80" align="right" class-name="tims-num-col" />
+            <el-table-column label="失败" width="80" align="right" class-name="tims-num-col">
+              <template #default="{ row }">
+                <span :class="row.fail_tables > 0 ? 'diff-high' : ''">{{ row.fail_tables }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="差异行数" width="100" align="right">
+              <template #default="{ row }">
+                <span class="tims-num" :class="diffHeat(row.diff_rows)">{{ row.diff_rows }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="duration" label="耗时" width="90" class-name="hide-sm" />
+            <el-table-column label="错误" min-width="160" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.error || '—' }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="80">
+              <template #default="{ row }">
+                <el-button size="small" link type="primary" @click="viewDbReport(row.database)">查看</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </template>
+
       <template v-if="activeReport">
         <div style="margin-bottom: 12px; text-align: right;">
+          <el-tag v-if="activeDb" size="small" type="info" style="margin-right: 8px;">库 {{ activeDb }}</el-tag>
           <el-button size="small" @click="exportCsv">导出 CSV</el-button>
           <el-button size="small" @click="downloadReport">下载报告</el-button>
         </div>
@@ -1607,7 +1787,10 @@ onUnmounted(() => {
           </template>
         </el-table-column>
         <el-table-column label="表进度" width="120" class-name="hide-sm">
-          <template #default="{ row }">{{ row.tables_done }} / {{ row.tables_total || '?' }}</template>
+          <!-- A2 多库: 库 X/Y 前缀（databases_total 仅多库任务携带） -->
+          <template #default="{ row }">
+            <span v-if="row.databases_total > 0">库 {{ row.databases_done || 0 }}/{{ row.databases_total }} · </span>{{ row.tables_done }} / {{ row.tables_total || '?' }}
+          </template>
         </el-table-column>
           <el-table-column label="创建时间" width="180" class-name="hide-sm">
           <template #default="{ row }">{{ new Date(row.created_at).toLocaleString() }}</template>

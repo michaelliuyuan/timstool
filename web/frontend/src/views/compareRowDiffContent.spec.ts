@@ -184,7 +184,9 @@ describe('CompareView row-diff content probe (行内容对照)', () => {
     const w = await openReportPanel()
     await expandRow(w, 0)
     expect(mockGetContent).toHaveBeenCalledTimes(1)
-    expect(mockGetContent).toHaveBeenCalledWith('rd0diff', 'orders-9f2c1b7a.content.json')
+    // A2 多库: the third slot is the viewed database (undefined on
+    // single-db tasks) — arity pinned.
+    expect(mockGetContent).toHaveBeenCalledWith('rd0diff', 'orders-9f2c1b7a.content.json', undefined)
 
     // collapse + re-expand → served from the one-shot cache, no refetch
     await expandRow(w, 0)
@@ -308,7 +310,7 @@ describe('CompareView row-diff content probe (行内容对照)', () => {
     const w = await openReportPanel()
     await expandRow(w, 0) // 任务 A（rd0diff）展开 orders
     expect(mockGetContent).toHaveBeenCalledTimes(1)
-    expect(mockGetContent).toHaveBeenCalledWith('rd0diff', 'orders-9f2c1b7a.content.json')
+    expect(mockGetContent).toHaveBeenCalledWith('rd0diff', 'orders-9f2c1b7a.content.json', undefined)
 
     // 切到任务 B（rd1diff）——同一张表、同一个派生 content 文件名
     const viewBtns = w.findAll('button').filter(b => b.text().includes('查看'))
@@ -318,7 +320,7 @@ describe('CompareView row-diff content probe (行内容对照)', () => {
     await expandRow(w, 0)
     // 缓存键含任务维度 → 必须发第二次请求（带 B 的 id），绝不串 A 的旧行
     expect(mockGetContent).toHaveBeenCalledTimes(2)
-    expect(mockGetContent).toHaveBeenLastCalledWith('rd1diff', 'orders-9f2c1b7a.content.json')
+    expect(mockGetContent).toHaveBeenLastCalledWith('rd1diff', 'orders-9f2c1b7a.content.json', undefined)
     expect(document.body.innerHTML).toContain('zzz-B') // 渲染的是 B 的数据
     expect(document.body.innerHTML).not.toContain('>c<') // A 的旧值不得串显
 

@@ -119,9 +119,9 @@ describe('FEAT-DASH-UNIFY 红线: 零后端零新接口 + 递版', () => {
     expect(s).not.toMatch(/fetch\('/)
   })
 
-  it('package.json 递版 3.23.5（旧版零残留）', () => {
+  it('package.json 递版 3.23.6（旧版零残留）', () => {
     const p = readFileSync(resolve(__dirname, '../../package.json'), 'utf8')
-    expect(p).toContain('"version": "3.23.5"')
-    expect(p).not.toContain('"version": "3.23.4"')
+    expect(p).toContain('"version": "3.23.6"')
+    expect(p).not.toContain('"version": "3.23.5"')
   })
 })

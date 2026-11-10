@@ -29,8 +29,9 @@ import (
 
 // dcReportVersion is the data-compare report renderer's own version stamp
 // (rendered once in the footer badge). It versions the REPORT face — the
-// FE app version (web/frontend) is an independent line.
-const dcReportVersion = "3.19.36"
+// FE app version (web/frontend) is an independent line. A2 (#102) bumped
+// it: the family gained the multi-db summary face (renderCompareSummaryHTML).
+const dcReportVersion = "3.19.37"
 
 // dcStatusCN is the data-compare report's status translator (reporter.statusCN
 // twin — kept local because the reporter one is unexported; the compare engine

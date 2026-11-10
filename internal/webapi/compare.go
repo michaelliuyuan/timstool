@@ -48,15 +48,20 @@ type CompareTaskRequest struct {
 	Mode                 string                  `json:"mode"`       // quick | sample | checksum (= watermark.base_mode when watermark active)
 	SampleRatio          float64                 `json:"sample_ratio"`
 	ChecksumChunkSize    int64                   `json:"checksum_chunk_size"`
-	ChecksumParallel     int                     `json:"checksum_parallel"`          // deprecated (#t4): kept for compat, folded into Concurrency
-	Parallel             int                     `json:"parallel"`                   // deprecated (#t4): kept for compat, folded into Concurrency
-	Concurrency          int                     `json:"concurrency"`                // #t4 unified budget 1-8 (0 = derive from legacy knobs)
-	QueryTimeout         string                  `json:"query_timeout"`              // #t94 per-query deadline (empty = validator default 30m)
-	Tables               []string                `json:"tables"`                     // empty = all tables
-	Watermark            *config.WatermarkFilter `json:"watermark,omitempty"`        // #t3 optional filter group
+	ChecksumParallel     int                     `json:"checksum_parallel"` // deprecated (#t4): kept for compat, folded into Concurrency
+	Parallel             int                     `json:"parallel"`          // deprecated (#t4): kept for compat, folded into Concurrency
+	Concurrency          int                     `json:"concurrency"`       // #t4 unified budget 1-8 (0 = derive from legacy knobs)
+	QueryTimeout         string                  `json:"query_timeout"`     // #t94 per-query deadline (empty = validator default 30m)
+	Tables               []string                `json:"tables"`            // empty = all tables
+	Watermark            *config.WatermarkFilter `json:"watermark,omitempty"`
 	TableWatermarks      []config.TableWatermark `json:"table_watermarks,omitempty"` // #wm-override per-table filters (P1A)
 	IgnoreColumns        []string                `json:"ignore_columns,omitempty"`   // #ignore value-comparison exclusion list
 	PossiblyStuckTimeout string                  `json:"possibly_stuck_timeout"`     // #t95 P1 heartbeat threshold (empty = validator default 5m)
+	// A2 multi-db (#102): databases holds explicit names and/or wildcard
+	// patterns (* ?); exclude_databases subtracts from the resolved set.
+	// Both absent/empty = the legacy single-database task (byte-compatible).
+	Databases        []string `json:"databases,omitempty"`
+	ExcludeDatabases []string `json:"exclude_databases,omitempty"`
 }
 
 // CompareTask is the persisted (password-redacted) compare task state.
@@ -88,10 +93,23 @@ type CompareTask struct {
 	PossiblyStuck        bool                    `json:"possibly_stuck,omitempty"`         // #t95 P1: no progress within possibly_stuck_timeout
 	LastProgressAt       time.Time               `json:"last_progress_at,omitempty"`       // #t95 P1: last per-table/per-chunk progress event
 	PossiblyStuckTimeout string                  `json:"possibly_stuck_timeout,omitempty"` // #t95 P1: heartbeat threshold (empty = 5m)
-	Error                string                  `json:"error,omitempty"`
-	CreatedAt            time.Time               `json:"created_at"`
-	StartedAt            *time.Time              `json:"started_at,omitempty"`
-	FinishedAt           *time.Time              `json:"finished_at,omitempty"`
+	// A2 multi-db (#102). All omitempty: a legacy single-database task
+	// persists byte-identically (no new keys), and old task.json files load
+	// untouched. ResolvedDatabases/DatabasesDone/DatabasesTotal/
+	// CurrentDatabase/DatabaseResults are run-time state written by the
+	// multi-db loop (the resolved list persists before the first database
+	// starts, so progress and the ?db= report routing survive a restart).
+	Databases         []string                `json:"databases,omitempty"`
+	ExcludeDatabases  []string                `json:"exclude_databases,omitempty"`
+	ResolvedDatabases []string                `json:"resolved_databases,omitempty"`
+	DatabasesDone     int                     `json:"databases_done,omitempty"`
+	DatabasesTotal    int                     `json:"databases_total,omitempty"`
+	CurrentDatabase   string                  `json:"current_database,omitempty"`
+	DatabaseResults   []CompareDatabaseResult `json:"database_results,omitempty"`
+	Error             string                  `json:"error,omitempty"`
+	CreatedAt         time.Time               `json:"created_at"`
+	StartedAt         *time.Time              `json:"started_at,omitempty"`
+	FinishedAt        *time.Time              `json:"finished_at,omitempty"`
 }
 
 // compareQueuedCreds carries a queued task's passwords in memory ONLY (A1):
@@ -900,6 +918,26 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.IgnoreColumns = igCols
+	// A2 (#102): multi-db selection intake — names/wildcards validated and
+	// canonicalized; the exclusion list only means something together with
+	// a selection (a lone exclude list on a single-db task is a body
+	// mistake, surfaced now instead of silently ignored).
+	dbs, derr := normalizeCompareDBList(req.Databases, "databases")
+	if derr != nil {
+		s.writeError(w, http.StatusBadRequest, derr.Error())
+		return
+	}
+	exclDBs, ederr := normalizeCompareDBList(req.ExcludeDatabases, "exclude_databases")
+	if ederr != nil {
+		s.writeError(w, http.StatusBadRequest, ederr.Error())
+		return
+	}
+	if len(exclDBs) > 0 && len(dbs) == 0 {
+		s.writeError(w, http.StatusBadRequest, "exclude_databases 仅在 databases 多库模式下有效")
+		return
+	}
+	req.Databases = dbs
+	req.ExcludeDatabases = exclDBs
 	switch req.Mode {
 	case "":
 		// #t3: a watermark task's mode IS the filter's base algorithm.
@@ -971,6 +1009,8 @@ func (s *Server) handleCreateCompare(w http.ResponseWriter, r *http.Request) {
 		TableWatermarks:      req.TableWatermarks,
 		IgnoreColumns:        req.IgnoreColumns,
 		PossiblyStuckTimeout: strings.TrimSpace(req.PossiblyStuckTimeout),
+		Databases:            req.Databases,
+		ExcludeDatabases:     req.ExcludeDatabases,
 		CreatedAt:            now,
 	}
 	if busy {
@@ -1222,81 +1262,40 @@ func (s *Server) runCompare(ctx context.Context, task *CompareTask) {
 		// A1: the slot just freed — hand it to the FIFO-head queued task
 		// (no-op when the queue is empty or someone else claimed first).
 		s.dispatchNextCompare()
-		s.BroadcastProgress(task.ID, map[string]interface{}{
+		prog := map[string]interface{}{
 			"type": "compare", "status": task.Status,
 			"tables_done": task.TablesDone, "tables_total": task.TablesTotal,
-		})
+		}
+		// A2 (#102): the terminal broadcast of a multi-db task carries the
+		// database counters too (the FE's final list refresh keys off them).
+		if task.DatabasesTotal > 0 {
+			prog["databases_done"] = task.DatabasesDone
+			prog["databases_total"] = task.DatabasesTotal
+		}
+		s.BroadcastProgress(task.ID, prog)
 	}
 
-	// MS-08: the source TYPE must travel with the config so NewValidator
-	// assembles the right source dialect/driver (ruling seq 410 option 1) -
-	// the empty-config default would pin every source to postgresDialect.
-	v := validator.NewValidator(config.Config{Source: task.Source})
-	v.OnTableDone(func(done, total int, tr reporter.TableReport) {
-		taskMu.Lock()
-		defer taskMu.Unlock()
-		task.TablesDone = done
-		task.TablesTotal = total
-		task.CurrentTable = tr.TableName
-		// #t95 P1: every progress event is a heartbeat — clears a stale
-		// possibly_stuck flag and refreshes LastProgressAt.
-		task.PossiblyStuck = false
-		task.LastProgressAt = time.Now()
-		if err := s.persistCompareTask(task); err != nil {
-			logger.Warn("failed to persist compare progress", zap.Error(err))
-		}
-		s.BroadcastProgress(task.ID, tableDoneProgress(task, done, total, tr))
-	})
-	// #t95 P1: chunk-level progress (checksum mode) — the UI shows
-	// 「正在校验 X，chunk i/N」; quick/sample modes never fire it.
-	v.OnChunkProgress(func(table string, idx, total int) {
-		taskMu.Lock()
-		defer taskMu.Unlock()
-		task.CurrentTable = table
-		task.CurrentChunk = idx + 1
-		task.TotalChunks = total
-		task.PossiblyStuck = false
-		task.LastProgressAt = time.Now()
-		if err := s.persistCompareTask(task); err != nil {
-			logger.Warn("failed to persist compare chunk progress", zap.Error(err))
-		}
-		s.BroadcastProgress(task.ID, map[string]interface{}{
-			"type": "compare", "status": task.Status,
-			"current_table": table, "current_chunk": task.CurrentChunk, "total_chunks": task.TotalChunks,
-			"possibly_stuck": task.PossiblyStuck,
-		})
-	})
-
-	_, validateOpts, compareCfg := buildCompareRunParams(task,
-		filepath.Join(s.compareDir(task.ID), "report.json"))
-	// BUG-CMP-COUNT-P1 A6: inherit ONLY the two chunked-count knobs from
-	// the live config.yaml (cdcCfgSnapshot is the existing concurrency-safe
-	// read seam, MS-11e E2). buildCompareRunParams builds the compare
-	// override field-by-field from task-level knobs, so without this the
-	// new keys would arrive as the zero value — and 0 means DISABLED,
-	// silently turning chunked counting off on the exact UI path the bug
-	// was reported from. A snapshot failure (config file not wired / read
-	// error) falls back to the explicit DefaultConfig values — never the
-	// zero value.
-	inheritChunkedCountKnobs(&compareCfg, s.cdcCfgSnapshot, logger)
 	// #t95 P1: possibly-stuck heartbeat — flags the task when NO progress
-	// event lands within the threshold (slow-but-moving stays green).
+	// event lands within the threshold (slow-but-moving stays green). Task-
+	// scoped since A2: the multi-db loop runs per-database compare configs,
+	// and the threshold knob is task-level either way.
+	hbThreshold := (config.CompareConfig{PossiblyStuckTimeout: task.PossiblyStuckTimeout}).PossiblyStuckTimeoutDuration()
 	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
 	defer heartbeatCancel()
-	go s.compareHeartbeat(heartbeatCtx, task, &taskMu, compareCfg.PossiblyStuckTimeoutDuration())
-	// Row-diff drill: standalone compare tasks get the per-task diff
-	// directory (failed checksum tables stream their row-level detail
-	// there; the summary rides report.json). Empty for every other
-	// validator caller — the feature is compare-only by design.
-	validateOpts.DiffDetailDir = filepath.Join(s.compareDir(task.ID), "diff")
-	// M1 row-hash spool: per-task temp dir under <dataDir>/spool; the
-	// validator removes it when the run settles (any ending), and startup
-	// recovery purges leftovers from crashes.
-	validateOpts.SpoolRoot = filepath.Join(s.dataDir, "spool", task.ID)
-	// MS-08: DSNByType dispatches on the source type (PG keeps the legacy
-	// postgresql:// DSN byte-identically; MySQL assembles the driver DSN).
-	report, err := v.RunWithDSNs(ctx, task.Source.DSNByType(), task.Target.DSN(),
-		task.Source.Schema, compareCfg, task.Parallel, validateOpts)
+	go s.compareHeartbeat(heartbeatCtx, task, &taskMu, hbThreshold)
+
+	// A2 (#102): multi-database tasks branch into the dedicated loop —
+	// resolution, per-database sequential runs, cross-db summary; the
+	// legacy single-database flow below stays byte-identical.
+	if len(task.Databases) > 0 {
+		s.runCompareMultiDB(ctx, task, &taskMu, finish, logger)
+		return
+	}
+
+	report, err := s.executeCompareRun(ctx, task, &taskMu, task.Source, task.Target,
+		filepath.Join(s.compareDir(task.ID), "report.json"),
+		filepath.Join(s.compareDir(task.ID), "diff"),
+		filepath.Join(s.dataDir, "spool", task.ID))
 	// B1: check ctx FIRST regardless of err — Run swallows per-table ctx
 	// cancellations into failed table reports and returns (rpt, nil), so a
 	// mid-run cancel must not be reported as "completed".
@@ -1387,6 +1386,14 @@ func (s *Server) handleGetCompare(w http.ResponseWriter, r *http.Request) {
 // generic body (no server-side paths — the raw *fs.PathError carries the
 // absolute path; the original error goes to the server log). MC-14/15
 // policy, applied to the standalone compare namespace.
+//
+// A2 multi-db (#102) branches first: without ?db= the response is the
+// cross-database summary (format=json → verbatim summary.json bytes,
+// format=csv → verbatim summary.csv, html → the family summary face);
+// ?db=<name> (a name from the task's resolved list) serves that
+// database's per-db report in the same json/html family faces. Legacy
+// single-database tasks keep the exact pre-A2 contract (format=csv on a
+// single-db task is a 404 naming the mismatch — there is no summary).
 func (s *Server) handleCompareReport(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "compareID")
 	task, err := s.loadCompareTask(id)
@@ -1394,8 +1401,22 @@ func (s *Server) handleCompareReport(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusNotFound, "compare task not found")
 		return
 	}
+	format := r.URL.Query().Get("format")
+	db := r.URL.Query().Get("db")
+	if len(task.Databases) > 0 {
+		s.handleCompareMultiReport(w, task, format, db)
+		return
+	}
+	if format == "csv" {
+		s.writeError(w, http.StatusNotFound, "compare report not found — format=csv 仅多库任务提供（汇总 CSV）；单库任务请用 format=json/html")
+		return
+	}
+	if db != "" {
+		s.writeError(w, http.StatusNotFound, "compare report not found — ?db= 仅多库任务提供")
+		return
+	}
 	reportPath := filepath.Join(s.compareDir(id), "report.json")
-	if r.URL.Query().Get("format") == "json" {
+	if format == "json" {
 		b, err := os.ReadFile(reportPath)
 		if err != nil {
 			s.writeCompareReportError(w, id, err)
@@ -1420,6 +1441,105 @@ func (s *Server) handleCompareReport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-report-%s.html", id))
 	w.Write([]byte(renderDataCompareReportHTML(task, &rpt)))
+}
+
+// compareDBSlugFor maps a database name from the task's resolved list onto
+// its per-db subdirectory slug (the run ordinal the loop used). Unknown
+// names (not in ResolvedDatabases) resolve false — the caller 404s.
+func compareDBSlugFor(task *CompareTask, db string) (string, bool) {
+	for i, name := range task.ResolvedDatabases {
+		if name == db {
+			return compareDBSlug(i, db), true
+		}
+	}
+	return "", false
+}
+
+// handleCompareMultiReport serves the A2 faces: the cross-database summary
+// (no db param) or one database's report (?db=<name>). Read errors follow
+// the writeCompareReportError family policy (missing → 404 with the cause
+// named, decode failure → 500 generic, original to the log).
+func (s *Server) handleCompareMultiReport(w http.ResponseWriter, task *CompareTask, format, db string) {
+	if db == "" {
+		switch format {
+		case "csv":
+			b, err := os.ReadFile(filepath.Join(s.compareDir(task.ID), "summary.csv"))
+			if err != nil {
+				s.writeCompareReportError(w, task.ID, err)
+				return
+			}
+			w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-summary-%s.csv", task.ID))
+			w.Write(b)
+			return
+		case "json":
+			b, err := os.ReadFile(filepath.Join(s.compareDir(task.ID), "summary.json"))
+			if err != nil {
+				s.writeCompareReportError(w, task.ID, err)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-summary-%s.json", task.ID))
+			w.Write(b)
+			return
+		}
+		// html (the default family face): decode summary.json and render.
+		b, err := os.ReadFile(filepath.Join(s.compareDir(task.ID), "summary.json"))
+		if err != nil {
+			s.writeCompareReportError(w, task.ID, err)
+			return
+		}
+		var sum CompareSummary
+		if err := json.Unmarshal(b, &sum); err != nil {
+			zap.L().Warn("decode compare summary.json failed", zap.String("task", task.ID), zap.Error(err))
+			s.writeError(w, http.StatusInternalServerError, "read compare summary failed — summary.json exists but is unreadable (corrupt artifact); cause logged server-side")
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-summary-%s.html", task.ID))
+		w.Write([]byte(renderCompareSummaryHTML(task, &sum)))
+		return
+	}
+	// Per-database report face. The name must be one the run resolved —
+	// unknown names 404 before any filesystem touch (the {compareID}
+	// allow-list twin policy, applied to the db selector).
+	slug, ok := compareDBSlugFor(task, db)
+	if !ok {
+		s.writeError(w, http.StatusNotFound, "compare report not found — ?db= 必须是该任务解析出的库名之一")
+		return
+	}
+	reportPath := filepath.Join(s.compareDir(task.ID), "db", slug, "report.json")
+	if format == "json" {
+		b, err := os.ReadFile(reportPath)
+		if err != nil {
+			s.writeCompareReportError(w, task.ID, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-report-%s-%s.json", task.ID, db))
+		w.Write(b)
+		return
+	}
+	b, err := os.ReadFile(reportPath)
+	if err != nil {
+		s.writeCompareReportError(w, task.ID, err)
+		return
+	}
+	var rpt reporter.Report
+	if err := json.Unmarshal(b, &rpt); err != nil {
+		zap.L().Warn("decode per-db report.json failed", zap.String("task", task.ID), zap.String("db", db), zap.Error(err))
+		s.writeError(w, http.StatusInternalServerError, "read compare report failed — report.json exists but is unreadable (corrupt artifact); cause logged server-side")
+		return
+	}
+	// The family renderer reads task.Source/Target.Database for the meta
+	// grid — a shallow copy with this database's names shows which pair
+	// the report covers (the task-level fields stay the multi-db ones).
+	dbTask := *task
+	dbTask.Source.Database = db
+	dbTask.Target.Database = db
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=compare-report-%s-%s.html", task.ID, db))
+	w.Write([]byte(renderDataCompareReportHTML(&dbTask, &rpt)))
 }
 
 // writeCompareReportError maps a missing report.json → 404 with the cause

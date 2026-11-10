@@ -53,7 +53,9 @@ describe('MS-11i pen1: responsive tables + empty/action unification', () => {
 
   it('Compare: both tables scroll-wrapped + history/result columns pruned', () => {
     const s = src('CompareView.vue')
-    expect(s.split('class="tims-table-scroll"').length - 1).toBe(2)
+    // A2 多库 (#102): the cross-db summary table joins the report/history
+    // tables in the scroll-wrap family (3 wrapped tables now).
+    expect(s.split('class="tims-table-scroll"').length - 1).toBe(3)
     expect(s).toContain('prop="id" label="ID" width="90" class-name="hide-sm"')
     expect(s).toContain('label="表进度" width="120" class-name="hide-sm"')
     // 第8单 2026-10-24: 创建时间回归定宽 180（族先例 TaskListView 同 toLocaleString 全时间戳格式），

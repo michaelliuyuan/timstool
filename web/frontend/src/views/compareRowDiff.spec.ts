@@ -214,7 +214,9 @@ describe('CompareView row-diff drill (行级差异)', () => {
     const src = viewSrc()
     expect(src).toContain('type="expand"')
     expect(src).toContain('downloadRowDiff(row.row_diffs.file)')
-    expect(src).toContain('apiClient.compareRowDiffUrl(t.id, file)')
+    // A2 多库 (#102): the URL carries the viewed database (?db=) — per-db
+    // artifacts live in per-db diff subdirectories.
+    expect(src).toContain('apiClient.compareRowDiffUrl(t.id, file, activeDb.value || undefined)')
     expect(src).toContain("row.row_diffs.note")
     expect(src).toContain('无行级差异信息')
   })

@@ -5,7 +5,7 @@ package webapi
 // the unit-11 表详情 face (8-column header, failure-first sort with
 // original #, thousand separators, count pills, details/summary expand
 // rows + print force-open, suggestion brief cut, G summary mapping with
-// verbatim passthrough, V3.19.36 badge), verbatim JSON serving,
+// verbatim passthrough, V3.19.37 badge), verbatim JSON serving,
 // default-format html, the 404 dual cause set, the corrupt-artifact 500
 // (generic body, no path leak), the four mode-label mappings, XSS escaping
 // of every attacker-controllable string, and the credential negative
@@ -142,7 +142,7 @@ func TestDataCompareReport_HTML(t *testing.T) {
 		`<tr class="row-detail"><td colspan="9"><details><summary>诊断详情</summary>`, // C expand row structure (9-column span)
 		"tr.row-detail details > *:not(summary) { display: block !important; }",   // C print force-open
 		"tr.row-detail details::details-content { display: block !important; content-visibility: visible !important; }",
-		`<span class="tims-version">V3.19.36</span>`, // version badge
+		`<span class="tims-version">V3.19.37</span>`, // version badge
 		"由 TiMS (TiDB Migration Suite) 生成 &middot; 数据比对 &middot; ",
 	} {
 		if !strings.Contains(body, want) {
@@ -164,15 +164,15 @@ func TestDataCompareReport_HTML(t *testing.T) {
 			t.Errorf("dropped column header still rendered: %q", gone)
 		}
 	}
-	// Version badge: exactly one V3.19.36 stamp, no stale version.
-	if n := strings.Count(body, "V3.19.36"); n != 1 {
-		t.Errorf("V3.19.36 badge count=%d want 1", n)
+	// Version badge: exactly one V3.19.37 stamp, no stale version.
+	if n := strings.Count(body, "V3.19.37"); n != 1 {
+		t.Errorf("V3.19.37 badge count=%d want 1", n)
 	}
 	if n := strings.Count(body, `class="tims-version"`); n != 1 {
 		t.Errorf("tims-version badge count=%d want 1", n)
 	}
-	if strings.Contains(body, "V3.19.35") {
-		t.Error("stale version V3.19.35 rendered")
+	if strings.Contains(body, "V3.19.36") {
+		t.Error("stale version V3.19.36 rendered")
 	}
 	// The pre-MC-16 browser-side title/footer vocabulary must be gone.
 	if strings.Contains(body, "TimsTool") {

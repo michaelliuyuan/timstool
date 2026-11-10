@@ -34,7 +34,8 @@ func (s *Server) handleCompareRowDiff(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "compareID")
 	file := chi.URLParam(r, "file")
 
-	if task, err := s.loadCompareTask(id); err != nil || task == nil {
+	task, err := s.loadCompareTask(id)
+	if err != nil || task == nil {
 		s.writeError(w, http.StatusNotFound, "compare task not found")
 		return
 	}
@@ -42,7 +43,19 @@ func (s *Server) handleCompareRowDiff(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusNotFound, "row diff file not found — the name is outside the artifact whitelist (engine artifacts are {table}-{hash8}.csv)")
 		return
 	}
-	path := filepath.Join(s.compareDir(id), "diff", file)
+	// A2 (#102): a multi-db task's per-db drill artifacts live under
+	// diff/{db-slug}/; ?db=<name> (a resolved name) selects the
+	// subdirectory. Unknown names 404 before any filesystem touch.
+	diffDir := filepath.Join(s.compareDir(id), "diff")
+	if db := r.URL.Query().Get("db"); db != "" {
+		slug, ok := compareDBSlugFor(task, db)
+		if !ok {
+			s.writeError(w, http.StatusNotFound, "row diff file not found — ?db= 必须是该任务解析出的库名之一")
+			return
+		}
+		diffDir = filepath.Join(diffDir, slug)
+	}
+	path := filepath.Join(diffDir, file)
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {

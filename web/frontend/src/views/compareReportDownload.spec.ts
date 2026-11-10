@@ -121,7 +121,9 @@ describe('CompareView report download (MC-16)', () => {
 
   it('the report panel loads with the explicit json format', async () => {
     await openReportPanel()
-    expect(mockGetCompareReport).toHaveBeenCalledWith('mc16dl', 'json')
+    // A2 多库 (#102): loadReport passes the db selector slot (undefined on
+    // single-db tasks) — the arity is pinned so the face stays explicit.
+    expect(mockGetCompareReport).toHaveBeenCalledWith('mc16dl', 'json', undefined)
   })
 
   it('下载报告 fires a format=html server request and downloads the blob', async () => {
@@ -133,7 +135,7 @@ describe('CompareView report download (MC-16)', () => {
     await dlBtn.trigger('click')
     await flushPromises()
 
-    expect(mockGetCompareReport).toHaveBeenCalledWith('mc16dl', 'html')
+    expect(mockGetCompareReport).toHaveBeenCalledWith('mc16dl', 'html', undefined)
     const [blob] = (URL.createObjectURL as ReturnType<typeof vi.fn>).mock.calls[0] as Blob[]
     expect(blob).toBeInstanceOf(Blob)
     expect(blob.type).toContain('text/html')
@@ -154,19 +156,22 @@ describe('CompareView report download (MC-16)', () => {
   it('api client branches the html face to responseType text', () => {
     const src = apiSrc()
     const i = src.indexOf('getCompareReport')
-    const slice = src.slice(i, i + 400)
+    const slice = src.slice(i, i + 500)
     expect(slice).toContain("format === 'html'")
     expect(slice).toContain("responseType: 'text'")
-    expect(slice).toContain("params: { format }")
+    // A2 多库: the json branch carries the optional ?db= selector.
+    expect(slice).toContain('params: { format, db }')
   })
 
   // MC-17 ④: format is required — the MC-16 default flip means a
   // parameterless call would fetch HTML into a JSON-typed consumer.
+  // A2 多库 (#102): the union gained 'csv' (the multi-db summary face) and
+  // the optional db selector — format itself stays required.
   it('api client signature requires the format argument (MC-17)', () => {
     const src = apiSrc()
     const i = src.indexOf('getCompareReport')
     const slice = src.slice(i, i + 400)
-    expect(slice).toContain("(id: string, format: 'html' | 'json')")
+    expect(slice).toContain("(id: string, format: 'html' | 'json' | 'csv', db?: string)")
     expect(slice).not.toContain('format?:')
   })
 

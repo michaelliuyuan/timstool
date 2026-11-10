@@ -395,6 +395,18 @@ export interface CompareTask {
   watermark?: { column: string; value?: string; op?: string; base_mode: string; range_start?: string; range_end?: string }
   /** #ignore value-comparison exclusion list (columns never compared). */
   ignore_columns?: string[]
+  /** A2 多库 (#102): selection as submitted — explicit names and/or wildcards; absent = legacy single-db task. */
+  databases?: string[]
+  /** A2 多库: exclusion patterns subtracted from the resolved set. */
+  exclude_databases?: string[]
+  /** A2 多库: concrete database list persisted at run start (progress + ?db= routing). */
+  resolved_databases?: string[]
+  /** A2 多库: 「X/Y 库」 progress counters (absent/0 = single-db task). */
+  databases_done?: number
+  databases_total?: number
+  current_database?: string
+  /** A2 多库: per-database verdict rows once the run settles. */
+  database_results?: CompareDatabaseResult[]
   tables_done: number
   tables_total: number
   current_table?: string
@@ -407,6 +419,20 @@ export interface CompareTask {
   created_at: string
   started_at?: string
   finished_at?: string
+}
+
+/** A2 多库 (#102): one database's row in the cross-database summary. */
+export interface CompareDatabaseResult {
+  database: string
+  status: 'pass' | 'warn' | 'fail' | 'error' | 'cancelled'
+  total_tables: number
+  pass_tables: number
+  fail_tables: number
+  warn_tables: number
+  skip_tables: number
+  diff_rows: number
+  duration?: string
+  error?: string
 }
 
 export interface CreateCompareRequest {
@@ -432,6 +458,10 @@ export interface CreateCompareRequest {
   table_watermarks?: { table: string; column: string; value?: string; op?: string; range_start?: string; range_end?: string }[]
   /** #ignore value-comparison exclusion list (columns never compared). */
   ignore_columns?: string[]
+  /** A2 多库 (#102): explicit names and/or wildcards (* ?); absent = legacy single-db task. */
+  databases?: string[]
+  /** A2 多库: exclusion patterns subtracted from the resolved set (only with databases). */
+  exclude_databases?: string[]
 }
 
 export interface CompareOptions {
@@ -653,10 +683,16 @@ export const apiClient = {
   // MC-17 ④: format is required — the server default flipped to the html
   // family face in MC-16, so a parameterless call would fetch HTML into a
   // JSON-typed consumer. Both call sites pass it explicitly.
-  getCompareReport: (id: string, format: 'html' | 'json') =>
+  // A2 多库 (#102): db selects one database's per-db report on a multi-db
+  // task (?db=<name>); without it the multi-db faces serve the
+  // cross-database summary (format=csv downloads summary.csv — text, not
+  // the typed JSON face).
+  getCompareReport: (id: string, format: 'html' | 'json' | 'csv', db?: string) =>
     format === 'html'
-      ? api.get(`/compare/tasks/${id}/report`, { params: { format: 'html' }, responseType: 'text' })
-      : api.get<CompareReport>(`/compare/tasks/${id}/report`, { params: { format } }),
+      ? api.get(`/compare/tasks/${id}/report`, { params: { format: 'html', db }, responseType: 'text' })
+      : format === 'csv'
+        ? api.get(`/compare/tasks/${id}/report`, { params: { format: 'csv' }, responseType: 'text' })
+        : api.get<CompareReport>(`/compare/tasks/${id}/report`, { params: { format, db } }),
 
   cancelCompare: (id: string) =>
     api.post(`/compare/tasks/${id}/cancel`),
@@ -666,15 +702,22 @@ export const apiClient = {
 
   // Row-diff detail artifact URL (row-diff drill): a read-only GET served as
   // a CSV attachment — returns a same-origin URL for anchor downloads (the
-  // report family's open-read policy; no auth header needed).
-  compareRowDiffUrl: (id: string, file: string) =>
-    `/api/v1/compare/tasks/${id}/rowdiff/${encodeURIComponent(file)}`,
+  // report family's open-read policy; no auth header needed). A2 多库: db
+  // scopes the URL into the per-db diff subdirectory of a multi-db task.
+  compareRowDiffUrl: (id: string, file: string, db?: string) =>
+    `/api/v1/compare/tasks/${id}/rowdiff/${encodeURIComponent(file)}` + (db ? `?db=${encodeURIComponent(db)}` : ''),
 
   // Row-diff content artifact (B-line content probe): the {stem}.content.json
   // sibling of a committed CSV detail, inline application/json fetched once
   // per expanded row (lazy, cached client-side; degrades to the CSV download).
-  getCompareRowDiffContent: (id: string, file: string) =>
-    api.get<CompareRowDiffContentEntry[]>(`/compare/tasks/${id}/rowdiff-content/${encodeURIComponent(file)}`),
+  // A2 多库: db scopes the fetch into the per-db diff subdirectory.
+  getCompareRowDiffContent: (id: string, file: string, db?: string) =>
+    api.get<CompareRowDiffContentEntry[]>(`/compare/tasks/${id}/rowdiff-content/${encodeURIComponent(file)}`, { params: { db } }),
+
+  // A2 多库 (#102): the cross-database summary CSV — a read-only GET
+  // attachment (same open-read policy), URL for anchor downloads.
+  compareSummaryCsvUrl: (id: string) =>
+    `/api/v1/compare/tasks/${id}/report?format=csv`,
 
   // Saved compare-page connection profile (passwords are never persisted
   // server-side; the fields exist so a round-trip response can be typed).
