@@ -183,7 +183,7 @@
 
 ## 4. 前端实现细节
 
-**技术栈**（`web/frontend/package.json`，版本 `3.23.6`，FE 版本号随提交递增并打进报告页 badge）：Vue `3.5.34` + TypeScript `~6.0.2` + Vite `8.0.12` + vue-router `4.6.4` + Element Plus `2.14.1` + ECharts `6.1.0`（vue-echarts）+ axios；测试 vitest `4.1.9` + @vue/test-utils + jsdom。
+**技术栈**（`web/frontend/package.json`，版本 `3.23.7`，FE 版本号随提交递增并打进报告页 badge）：Vue `3.5.34` + TypeScript `~6.0.2` + Vite `8.0.12` + vue-router `4.6.4` + Element Plus `2.14.1` + ECharts `6.1.0`（vue-echarts）+ axios；测试 vitest `4.1.9` + @vue/test-utils + jsdom。
 
 **目录约定**：`src/views`（页面 + co-located spec）、`src/components`（通用组件）、`src/composables`（`useDataSources`/`useSourceSchema`/`dataSourceTypes`/`sourceTypes`/`reconcileModel`）、`src/api/index.ts`（axios 封装，长操作超时 `LONG_TIMEOUT = 120000` 即 120s，`api/index.ts:15`）、`src/router/index.ts`。
 
